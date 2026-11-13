@@ -274,6 +274,11 @@ pub fn heap_committed_by(committed: fn() -> u64) {
 pub struct HeapPages {
     /// The allocator's pages (mimalloc's: 64 KiB, 512 KiB or 4 MiB, each of one block size).
     pub pages: u64,
+    /// The bytes the pages span (each page's reserved blocks times its block size, mimalloc's
+    /// `reserved`): committed
+    /// whole where the allocator commits a page as it takes it, as mimalloc does for its small
+    /// pages and, with `page_commit_on_demand` 0, for every page.
+    pub spanned: u64,
     /// The bytes of the blocks its pages have ever handed out or made ready (a page's capacity
     /// times its block size): what the pages hold resident, at most.
     pub committed: u64,
