@@ -33,12 +33,17 @@ struct Matrix {
     project: PathBuf,
     blaze: PathBuf,
     engine: PathBuf,
+    /// Query the build history after each timed blaze invocation, never inside its wall timer.
+    duckdb: Option<PathBuf>,
     blaze_commit: String,
     cargo: PathBuf,
     /// Inputs only. Never seed a daemon image, compiled std or build output.
     toolchains: PathBuf,
     library: Option<PathBuf>,
     sources: Option<PathBuf>,
+    /// A `cargo vendor --locked --versioned-dirs` tree. Prepared outside all timers. Both
+    /// tools see the same checkout-relative directory source; never overwrite project config.
+    vendor: Option<PathBuf>,
     volumes: Vec<PathBuf>,
     out: PathBuf,
     runs: u32,
@@ -195,6 +200,26 @@ impl Side<'_> {
         }
         Ok(())
     }
+
+    fn profile(&self, previous: &mut u64, verb: &str) -> Result<Value> {
+        let Some(duckdb) = self.m.duckdb.as_ref().filter(|_| self.blaze) else {
+            return Ok(Value::Null);
+        };
+        // `run` and `test` may have auxiliary builds. Keep the row of the actual command,
+        // not a query's rows from an earlier trial. Footprint is null when never sampled.
+        let sql = "select b.build_id,b.command,b.outcome,b.tree,b.blaze,b.dur_ns/1e6 daemon_ms, (select max(c.value) from counters c where c.build_id=b.build_id and c.name='footprint bytes') peak_footprint_bytes from builds b order by b.build_id desc limit 1";
+        let raw = output(
+            self.command().env("BLAZE_DUCKDB", duckdb).args(["debug", "sql", sql, "--json"]),
+        )?;
+        let row: Value = serde_json::from_str(&raw)?;
+        let id = row["build_id"].as_u64().ok_or("profile has no build ID")?;
+        let command = row["command"].as_str().unwrap_or("").split_whitespace().next();
+        if id <= *previous || row["outcome"] != "ok" || command != Some(verb) {
+            return Err(format!("no successful fresh profile for {verb}: {row}").into());
+        }
+        *previous = id;
+        Ok(row)
+    }
     fn invoke(&self, args: &[String], log: &Path) -> Result<f64> {
         let mut cmd = self.command();
         let file = fs::File::create_new(log)?;
@@ -267,6 +292,7 @@ fn trial(
         Side { m, blaze: false, root: dir.join("c") },
     ];
     let result = (|| -> Result<()> {
+        let mut previous_build = 0;
         for s in &sides {
             fs::create_dir(&s.root)?;
             if s.blaze {
@@ -285,6 +311,18 @@ fn trial(
                     .arg(s.project()),
             )?;
             git(&s.project(), &["checkout", "--detach", sha])?;
+            if let Some(vendor) = &m.vendor {
+                let dir = s.project().join("bench-vendor");
+                fs::create_dir(&dir)?;
+                seed(vendor, &dir)?;
+                let cargo = s.project().join(".cargo");
+                fs::create_dir_all(&cargo)?;
+                if cargo.join("config").exists() {
+                    return Err("cannot stage a vendor override over .cargo/config".into());
+                }
+                let mut config = fs::File::create_new(cargo.join("config.toml"))?;
+                config.write_all(b"[source.crates-io]\nreplace-with = 'bench-vendor'\n[source.bench-vendor]\ndirectory = 'bench-vendor'\n")?;
+            }
         }
         for (k, &(kind, verb)) in CASES.iter().enumerate() {
             let case = format!("{kind}-{verb}");
@@ -342,10 +380,11 @@ fn trial(
                 };
                 let load = host::load()?;
                 let ms = s.invoke(&args, &log.with_extension("log"))?;
+                let profile = s.profile(&mut previous_build, verb)?;
                 if let Some((p, old)) = edited {
                     fs::write(p, old)?;
                 }
-                let row = json!({"volume":volume,"trial":i,"warmup":i==0,"case":case,"tool":tool,"args":args,"start_cpu_pct":load,"wall_ms":ms});
+                let row = json!({"volume":volume,"trial":i,"warmup":i==0,"case":case,"tool":tool,"args":args,"start_cpu_pct":load,"wall_ms":ms,"profile":profile});
                 writeln!(rows, "{row}")?;
                 rows.flush()?;
                 if i != 0 {
