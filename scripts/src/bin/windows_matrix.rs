@@ -39,6 +39,9 @@ struct Matrix {
     toolchains: PathBuf,
     library: Option<PathBuf>,
     sources: Option<PathBuf>,
+    /// A `cargo vendor --locked --versioned-dirs` tree. Prepared outside all timers. Both
+    /// tools see the same checkout-relative directory source; never overwrite project config.
+    vendor: Option<PathBuf>,
     volumes: Vec<PathBuf>,
     out: PathBuf,
     runs: u32,
@@ -285,6 +288,18 @@ fn trial(
                     .arg(s.project()),
             )?;
             git(&s.project(), &["checkout", "--detach", sha])?;
+            if let Some(vendor) = &m.vendor {
+                let dir = s.project().join("bench-vendor");
+                fs::create_dir(&dir)?;
+                seed(vendor, &dir)?;
+                let cargo = s.project().join(".cargo");
+                fs::create_dir_all(&cargo)?;
+                if cargo.join("config").exists() {
+                    return Err("cannot stage a vendor override over .cargo/config".into());
+                }
+                let mut config = fs::File::create_new(cargo.join("config.toml"))?;
+                config.write_all(b"[source.crates-io]\nreplace-with = 'bench-vendor'\n[source.bench-vendor]\ndirectory = 'bench-vendor'\n")?;
+            }
         }
         for (k, &(kind, verb)) in CASES.iter().enumerate() {
             let case = format!("{kind}-{verb}");
