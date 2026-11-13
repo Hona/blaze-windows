@@ -6,6 +6,7 @@
 //! is what a driver, the daemon or the command line has to know before it asks for them.
 
 pub mod command;
+pub mod env;
 pub mod home;
 pub mod lock;
 pub mod msvc;

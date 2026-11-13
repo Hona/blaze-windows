@@ -194,9 +194,11 @@ impl std::fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {}
 
 /// Whether a connect failed because nothing listens at the socket: no file there, or one a
-/// daemon that is gone left.
+/// daemon that is gone left. On Windows an `AF_UNIX` connect to a name whose directory is not
+/// there (a home no daemon has run in yet) fails with `WSAENETDOWN` (10050, `NetworkDown`), measured.
 pub fn nothing_listens(error: &ClientError) -> bool {
-    matches!(error, ClientError::Io(it) if matches!(it.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused))
+    matches!(error, ClientError::Io(it) if matches!(it.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+        || (cfg!(windows) && it.kind() == io::ErrorKind::NetworkDown))
 }
 
 /// A connection to the daemon; `None` when none answers and none was to be started.
@@ -491,7 +493,7 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
 }
 
 /// What the daemon this command started said on its pipe ([`started`]).
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Heard {
     /// It listens: it said [`Phase::Listening`].
@@ -515,7 +517,7 @@ fn within(phase: Phase, long: Duration) -> Duration {
 /// What the daemon said on its ready pipe so far, read as bytes come ([`Hearing::feed`]): its
 /// phases' bytes ([`Phase::byte`]) and its records of what its start's thread is inside
 /// ([`crate::serve::INSIDE`]), which may arrive cut across reads.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 #[derive(Debug)]
 struct Hearing {
     phase: Phase,
@@ -525,7 +527,7 @@ struct Hearing {
     held: Vec<u8>,
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 impl Hearing {
     fn new() -> Hearing {
         // alloc: one start's pipe, a record of at most 515 bytes held
@@ -590,7 +592,7 @@ impl Hearing {
 }
 
 /// A ready pipe's word refused ([`Hearing::feed`]).
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 fn refused(said: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, said)
 }
@@ -651,15 +653,10 @@ fn activated(socket: &Path) -> anyhow::Result<bool> {
     Ok(activated)
 }
 
-/// How often a Windows start asks again whether the daemon it started listens: the wait between
-/// is one on the daemon's process ending ([`crate::raw::process::ended_within`]).
-#[cfg(all(windows, feature = "native"))]
-const ASK_AGAIN: Duration = Duration::from_millis(20);
-
 /// [`connect`] on Windows, where the daemon's socket is `AF_UNIX` too (blaze-core's IOCP driver):
-/// a daemon of another build is stopped and this one started, as on Unix. No socket unit serves
-/// it, and the daemon started says nothing on a ready pipe (`blaze serve --ready-fd` is Unix's):
-/// the start is asked whether it listens until it does, ends, or [`STARTING`] has passed.
+/// a daemon of another build is stopped and this one started, as on Unix, and waited for on the
+/// pipe it says each phase of its start on until it listens (`blaze serve --ready-fd`, here a
+/// handle's number). No socket unit serves it: Windows has no launchd or systemd.
 #[cfg(all(windows, feature = "native"))]
 pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     use anyhow::Context as _;
@@ -680,44 +677,101 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
         Some(refused) => eprintln!("blaze: starting the daemon ({refused})"),
         None => eprintln!("blaze: starting the daemon"),
     }
-    let (log, mut child) = started()?;
-    let pid = child.id();
-    let until = std::time::Instant::now() + STARTING;
-    // Bounded: each turn waits `ASK_AGAIN` on the process, and the turns end at `until`.
-    loop {
-        match Client::unix(&socket) {
+    let (log, ready, child) = started()?;
+    let pid = child.pid;
+    let listening = tracing::info_span!(
+        target: "blaze",
+        "client: wait for the daemon it started to listen",
+        pid,
+    )
+    .entered();
+    let heard =
+        heard(ready, STARTING).context("waiting for the daemon it started to say it listens")?;
+    drop(listening);
+    match heard {
+        Heard::Listening => match Client::unix(&socket) {
             Ok(client) => {
                 say_started(&log, pid);
-                return Ok(Some(client));
+                Ok(Some(client))
             }
-            Err(error) if !nothing_listens(&error) => {
-                return Err(DaemonError::Connect { socket, error }.into());
+            Err(error) => Err(DaemonError::Connect { socket, error }.into()),
+        },
+        Heard::Ended { phase, inside } => {
+            crate::raw::process::ended_within(pid, ENDING)
+                .context("waiting for the daemon that closed its pipe to end")?;
+            let ended = child.ended().context("asking how the daemon it started ended")?;
+            Err(match ended {
+                Some(code) => {
+                    DaemonError::Exited { socket, log, pid, phase, ended: Reaped::Code(code as i32) }
+                }
+                None => DaemonError::Closed { socket, log, pid, phase, inside },
             }
-            Err(_) => {}
+            .into())
         }
-        if crate::raw::process::ended_within(pid, ASK_AGAIN)
-            .context("waiting on the daemon it started")?
-        {
-            let status = child.try_wait().context("asking how the daemon it started ended")?;
-            let Some(code) = status.and_then(|it| it.code()) else {
-                anyhow::bail!(
-                    "the daemon (`blaze serve`, pid {pid}) was started and ended before it listened at {}, \
-                     and how it ended is unread; its log {} says why",
-                    socket.display(),
-                    log.display()
-                );
-            };
-            let ended = Reaped::Code(code);
-            return Err(DaemonError::Exited { socket, log, pid, phase: Phase::Launched, ended }.into());
-        }
-        if std::time::Instant::now() >= until {
-            // No ready pipe says what the start is inside on Windows: its log does.
-            let inside = None;
-            return Err(DaemonError::NotListening { socket, log, pid, phase: Phase::Launched, inside }.into());
+        Heard::Nothing { phase, inside } => {
+            Err(DaemonError::NotListening { socket, log, pid, phase, inside }.into())
         }
     }
 }
 
+/// [`heard`] on Windows, where a pipe has no wait with a deadline: a thread of its own reads
+/// it (a blocking read, which ends as the daemon closes its end) and hands each read over, and
+/// this one waits at most [`within`] the phase for the next. One that gives up leaves the
+/// thread to the daemon's close, or to this process's end.
+#[cfg(all(windows, feature = "native"))]
+fn heard(ready: std::io::PipeReader, long: Duration) -> io::Result<Heard> {
+    use crossbeam_channel::RecvTimeoutError;
+    use std::{io::Read as _, time::Instant};
+    let (said, word) = crossbeam_channel::unbounded::<io::Result<Vec<u8>>>();
+    std::thread::Builder::new()
+        .name("blaze-ready".to_owned()) // alloc: once a start
+        .spawn(move || {
+            let mut ready = ready;
+            let mut bytes = [0u8; 1024];
+            // Bounded: each read takes bytes or ends, and the daemon's are bounded too
+            // (`crate::serve::REPORTS_MAX`) before it closes the pipe.
+            loop {
+                let read = ready.read(&mut bytes);
+                let ended = !matches!(read, Ok(1..));
+                // alloc: each read's bytes, a few a start
+                let sent = said.send(read.map(|it| bytes[..it].to_vec()));
+                if ended || sent.is_err() {
+                    return;
+                }
+            }
+        })?;
+    let mut hearing = Hearing::new();
+    let mut deadline = Instant::now() + within(hearing.phase, long);
+    // Bounded: each turn takes a read or ends; the phases only move forward, and within one
+    // every turn is before its deadline.
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let bytes = match word.recv_timeout(left) {
+            Ok(Ok(bytes)) if bytes.is_empty() => {
+                return Ok(Heard::Ended { phase: hearing.phase, inside: hearing.inside });
+            }
+            Ok(Ok(bytes)) => bytes,
+            // A pipe whose writer is gone reads as broken on Windows: the daemon ended.
+            Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Ok(Heard::Ended { phase: hearing.phase, inside: hearing.inside });
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {
+                return Ok(Heard::Nothing { phase: hearing.phase, inside: hearing.inside });
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Ok(Heard::Ended { phase: hearing.phase, inside: hearing.inside });
+            }
+        };
+        let was = hearing.phase;
+        if hearing.feed(&bytes)? {
+            return Ok(Heard::Listening);
+        }
+        if hearing.phase != was {
+            deadline = Instant::now() + within(hearing.phase, long);
+        }
+    }
+}
 #[cfg(all(not(any(unix, windows)), feature = "native"))]
 pub fn connect(_: Start) -> anyhow::Result<Option<Client>> {
     anyhow::bail!(
@@ -1250,16 +1304,17 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::io::PipeReader, std::pr
     Ok((log, ready, child))
 }
 
-/// Starts `blaze serve` detached from this console, so that its Ctrl-C and close do not end it,
-/// with its output appended to its log; the log and the daemon's process. The daemon inherits
-/// no handle of this command's but its log: whoever reads this command's output would
+/// Starts `blaze serve` detached from this console and out of this command's job, so that its
+/// Ctrl-C, its close and the job's end do not end it, in its state directory (so no directory
+/// of the command's is held open), with its output appended to its log; the log, the pipe it
+/// says its start's phases on (its handle's number after `--ready-fd`), and the daemon. It
+/// inherits no handle of this command's but its log and that pipe
+/// ([`crate::raw::process::spawn_detached`]): whoever reads this command's output would
 /// otherwise wait for the daemon to end.
 #[cfg(all(windows, feature = "native"))]
-fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
+fn started() -> anyhow::Result<(std::path::PathBuf, std::io::PipeReader, crate::raw::process::Detached)> {
     use anyhow::Context as _;
-    use std::os::windows::process::CommandExt as _;
-    /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`.
-    const DETACHED: u32 = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
+    use std::os::windows::io::AsHandle as _;
     let state = crate::serve::state()?;
     crate::socket::private_dir(&state)
         .with_context(|| format!("the daemon's directory {}", state.display()))?;
@@ -1267,18 +1322,15 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
     let mut options = std::fs::OpenOptions::new();
     let file = crate::socket::private_file(options.create(true).append(true), &log)
         .with_context(|| format!("the daemon's log {}", log.display()))?;
-    let mut daemon = std::process::Command::new(
-        std::env::current_exe().context("finding blaze's own executable")?,
-    );
-    daemon.arg("serve");
-    daemon.stdin(std::process::Stdio::null()).stdout(file.try_clone()?).stderr(file);
-    daemon.creation_flags(DETACHED);
-    let withheld = crate::raw::process::withhold_inheritance();
-    let child = daemon.spawn().context("starting the daemon (`blaze serve`)");
-    drop(withheld);
-    Ok((log, child?))
+    let blaze = std::env::current_exe().context("finding blaze's own executable")?;
+    let (ready, said) = std::io::pipe().context("making the pipe the daemon says it listens on")?;
+    let args = |handle: usize| vec!["serve".into(), "--ready-fd".into(), handle.to_string().into()];
+    let child = crate::raw::process::spawn_detached(&blaze, args, &state, &file, said.as_handle())
+        .context("starting the daemon (`blaze serve`)")?;
+    // The daemon's copy alone is left, so its end closes the pipe.
+    drop(said);
+    Ok((log, ready, child))
 }
-
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
@@ -2127,5 +2179,25 @@ mod refusals {
                 && !running.contains("SIGKILL"),
             "{running}"
         );
+    }
+}
+
+#[cfg(all(test, windows, feature = "native"))]
+mod windows_tests {
+    use super::*;
+
+    /// A connect where no daemon ever ran (no directory), where the socket's directory is
+    /// there with no socket, and where a name is no socket is each "nothing listens", so a
+    /// command starts the daemon.
+    #[test]
+    fn nothing_listens_where_no_daemon_ran() {
+        let dir = std::env::temp_dir().join(format!("blaze-no-daemon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = Client::unix(&dir.join("home").join("v2.sock")).err().expect("no daemon");
+        assert!(nothing_listens(&missing), "{missing}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let none = Client::unix(&dir.join("v2.sock")).err().expect("no daemon");
+        assert!(nothing_listens(&none), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
