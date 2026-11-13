@@ -645,8 +645,8 @@ impl Region {
     /// - Windows: `DiscardVirtualMemory` per range: the pages leave the working set now and their
     ///   bytes are unspecified until written, as on macOS, and they stay committed, so an
     ///   optimistic read ([`crate::racy::copy_out`]) of a page being given back reads some bytes
-    ///   and never faults. The commit charge of a range stays from its first [`Region::reuse`]
-    ///   to the region's end (`docs/memory-budget.md`, Windows).
+    ///   and never faults. The commit charge of a range stays until it is reused and given back
+    ///   with [`Region::evict_out`], which the pool does once its readers drained.
     ///
     /// Never plain `MADV_FREE`, which the kernel goes on counting (rule `one-memory-measure`).
     ///
@@ -675,6 +675,36 @@ impl Region {
     /// each range was made the process's with [`Region::reuse`] and not given back since.
     #[track_caller]
     pub unsafe fn evict(&self, ranges: &[Range<usize>]) -> Result<usize, MemError> {
+        // SAFETY: the caller's.
+        unsafe { self.evicted(ranges, false) }
+    }
+
+    /// [`Region::evict`], with the pages taken out of the address space where the system
+    /// charges a page given back otherwise: Windows decommits them (`MEM_DECOMMIT`), which gives
+    /// back their commit charge too, and a read of them faults until [`Region::reuse`] commits
+    /// them again. Elsewhere it is [`Region::evict`]. What the store's pool does once no
+    /// optimistic read of the pages can be in flight (its readers drained).
+    ///
+    /// # Errors
+    ///
+    /// As [`Region::evict`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Region::evict`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Region::evict`], and nothing reads the ranges at all, not even through
+    /// [`crate::racy::copy_out`], until each is reused.
+    #[track_caller]
+    pub unsafe fn evict_out(&self, ranges: &[Range<usize>]) -> Result<usize, MemError> {
+        // SAFETY: the caller's.
+        unsafe { self.evicted(ranges, true) }
+    }
+
+    #[track_caller]
+    unsafe fn evicted(&self, ranges: &[Range<usize>], out: bool) -> Result<usize, MemError> {
         if !self.sparse {
             panic!(
                 "evicting pages of a {:?} region of {} reserved bytes that is not sparse: give a \
@@ -701,8 +731,12 @@ impl Region {
         }
         os::check_evict().map_err(|os| MemError::Evict { tag: self.tag, os })?;
         // SAFETY: each range is page-aligned inside this live sparse reservation (checked
-        // above), and the caller says nothing references or reads them but atomically.
-        let given = unsafe { os::evict(self.base, ranges) };
+        // above), and the caller says nothing references or reads them but atomically, and with
+        // `out` nothing reads them at all.
+        let given = match out {
+            true => unsafe { os::evict_out(self.base, ranges) },
+            false => unsafe { os::evict(self.base, ranges) },
+        };
         self.held.fetch_sub(given, Ordering::AcqRel);
         tag::sub(self.tag, given);
         tag::decommitted(given);

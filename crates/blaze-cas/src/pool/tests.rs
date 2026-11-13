@@ -76,6 +76,7 @@ use super::{
     Append, BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins,
     Plant, Pool, PoolError, PrefetchCounts, Rank, ReadStep, Reading, Run, Seen, State, WINDOW, Window, Windows,
     checks_of,
+    readers,
     drive::Loader,
     evict::{Sweep, Visit},
     loads::prefetch_slot,
@@ -159,6 +160,40 @@ impl Give for Poison {
     }
 
     unsafe fn evict(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError> {
+        // SAFETY: the caller's.
+        unsafe { self.given(pool, ranges) }
+    }
+
+    /// The oracle's fifth rule: a page leaves the address space only while no optimistic read
+    /// that may copy it is in flight (every reader of the world runs on this thread). The real
+    /// region gives it back in place even so: a planted bug that writes a page the sweep took
+    /// (`Plant::UnpinnedTail`) is the oracle's to name from the bytes, not a fault's.
+    unsafe fn evict_out(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError> {
+        let inside = !readers::none_inside_here();
+        if inside {
+            self.note(format!(
+                "pages from {} taken out of the address space while an optimistic read that may copy them is in flight",
+                ranges.first().map_or(0, |it| it.start as u64 / PAGE)
+            ));
+        }
+        // SAFETY: the caller's.
+        unsafe { self.given(pool, ranges) }
+    }
+
+    fn drained(&self) -> bool {
+        readers::none_inside_here()
+    }
+}
+
+impl Poison {
+    /// The pages of `ranges` checked, poisoned and uncounted, and given back in place by the
+    /// real region on Windows (discarded: their bytes then the poison or zeros), so its count of
+    /// what the process holds falls.
+    ///
+    /// # Safety
+    ///
+    /// [`Give::evict`]'s.
+    unsafe fn given(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError> {
         let mut given = 0;
         for range in ranges {
             for page in range.start as u64 / PAGE..range.end as u64 / PAGE {
@@ -173,8 +208,6 @@ impl Give for Poison {
             }
             given += range.len();
         }
-        // And the real region discards them, as Windows' kernel does (their bytes are then the
-        // poison or zeros), and its count of what the process holds falls.
         #[cfg(windows)]
         // SAFETY: the caller's contract: every page is Evicting with no pin, reused and not
         // given back since.
@@ -1343,6 +1376,19 @@ fn directed(plant: Plant) -> Plan {
         // A plan of a file of eight pages or more, with a budget of six (`BUDGET`): the
         // prefetch reads six and waits for them to be read.
         Plant::PrefetchUncharged => by_hand(&[300, 500_000], vec![Act::Prefetch { file: 0 }]),
+        // An optimistic read looks at the page and the sweep gives it back before the read
+        // copies: the give-back may not take it out of the address space.
+        Plant::NoDrain => {
+            let mut acts = hold.to_vec();
+            acts.extend([
+                Act::Release { reader: 0 },
+                Act::Optimistic { reader: 1, file: 0, rec: 0 },
+                Act::Evict,
+                Act::Advance { reader: 1 },
+                Act::Advance { reader: 1 },
+            ]);
+            by_hand(&[300], acts)
+        }
     }
 }
 
@@ -1357,7 +1403,8 @@ fn rule_of(plant: Plant) -> Rule {
         }
         // The kernel's stand-in was given a page that was pinned, or not `Evicting`; or was
         // asked to make a page the process's that a load in flight had made so already.
-        Plant::EvictPinned | Plant::NoEvicting | Plant::DoubleClaim => Rule::GivenBack,
+        // A page left the address space while a read that may copy it was in flight.
+        Plant::EvictPinned | Plant::NoEvicting | Plant::DoubleClaim | Plant::NoDrain => Rule::GivenBack,
         // The append reached the disk as whatever the kernel left: its block fails its check
         // when it is read back, and nothing rotted.
         Plant::UnpinnedTail => Rule::Unexplained,
@@ -1451,6 +1498,13 @@ fn the_oracle_catches_two_loads_of_one_page() {
 #[test]
 fn the_oracle_catches_a_prefetch_the_budget_is_not_charged_for() {
     control(Plant::PrefetchUncharged);
+}
+
+/// On Windows a page given back is decommitted once the optimistic reads that may copy it
+/// left; one that did not wait would fault the read.
+#[test]
+fn the_oracle_catches_a_give_back_that_does_not_wait_for_the_reads_in_flight() {
+    control(Plant::NoDrain);
 }
 
 #[test]

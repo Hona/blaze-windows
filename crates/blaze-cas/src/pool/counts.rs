@@ -25,6 +25,9 @@ static PREFETCHED: AtomicU64 = AtomicU64::new(0);
 static EVICTED: AtomicU64 = AtomicU64::new(0);
 /// Reads that waited at the pinned bound, ever.
 static BOUND_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Bytes given back in place, still committed, because an optimistic read was in flight past
+/// the drain's bound (`super::readers::drain`), ever.
+static UNDRAINED: AtomicU64 = AtomicU64::new(0);
 
 /// The pools of this process, as [`pool_counts`] read them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -48,6 +51,9 @@ pub struct PoolCounts {
     pub evicted: u64,
     /// Reads that waited at the pinned bound, ever.
     pub bound_waits: u64,
+    /// Bytes given back in place and still committed (Windows) because an optimistic read was
+    /// in flight past the drain's bound, ever.
+    pub undrained: u64,
 }
 
 /// The counters of every store's pool in this process.
@@ -62,6 +68,7 @@ pub fn pool_counts() -> PoolCounts {
         prefetched: PREFETCHED.load(Ordering::Relaxed),
         evicted: EVICTED.load(Ordering::Relaxed),
         bound_waits: BOUND_WAITS.load(Ordering::Relaxed),
+        undrained: UNDRAINED.load(Ordering::Relaxed),
     }
 }
 
@@ -109,6 +116,10 @@ pub(crate) fn prefetched(bytes: u64) {
 
 pub(crate) fn evicted(bytes: u64) {
     EVICTED.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn undrained(bytes: u64) {
+    UNDRAINED.fetch_add(bytes, Ordering::Relaxed);
 }
 
 pub(crate) fn bound_waited() {

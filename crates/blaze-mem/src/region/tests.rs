@@ -112,6 +112,43 @@ fn only_open_windows_cost_commit_for_the_pools_state_words() {
     assert!(charge < 512 << 10);
 }
 
+/// The invariant: on Windows a page the pool gives back with [`Region::evict_out`] leaves the
+/// commit charge (the kernel says the range is reserved, not committed), and one reused is
+/// committed again and reads zeros. The control: [`Region::evict`] of the same pages leaves
+/// them committed, which is how every page the pool ever loaded stayed charged.
+#[cfg(windows)]
+#[test]
+fn a_page_given_out_leaves_the_commit_charge_and_comes_back_zeroed() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let committed = |region: &Region, at: usize| {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the address is inside the reservation; the query writes one `info`.
+        let n = unsafe { VirtualQuery(region.at(at).as_ptr().cast(), &mut info, size_of_val(&info)) };
+        assert_eq!(n, size_of_val(&info));
+        info.State == MEM_COMMIT
+    };
+    let region = Region::reserve_sparse_ranges(64 * PAGE, Tag::Other).expect("reserve");
+    region.reuse(0, 4 * PAGE).expect("reuse");
+    region.reuse(8 * PAGE, 2 * PAGE).expect("reuse");
+    for at in (0..4).chain(8..10) {
+        write_page(&region, at * PAGE, 0x5A);
+    }
+    // SAFETY: the pages just reused, which nothing references or reads.
+    let given = unsafe { region.evict(&[0..2 * PAGE]) }.expect("evict");
+    assert_eq!(given, 2 * PAGE);
+    assert!(committed(&region, 0), "a page given back in place stays committed");
+    // SAFETY: as above.
+    let given = unsafe { region.evict_out(&[2 * PAGE..4 * PAGE, 8 * PAGE..10 * PAGE]) }.expect("evict_out");
+    assert_eq!(given, 4 * PAGE);
+    assert_eq!(region.held(), 0);
+    for at in [2, 3, 8, 9] {
+        assert!(!committed(&region, at * PAGE), "page {at} given out is still committed");
+    }
+    region.reuse(8 * PAGE, PAGE).expect("reuse");
+    assert!(committed(&region, 8 * PAGE));
+    assert_eq!(ends_of(&region, 8 * PAGE), [0; 16], "a page given out reads zeros once reused");
+}
+
 /// The kernel takes the pool's give-back of its own pages: on Linux `process_madvise` of this
 /// process with `MADV_DONTNEED` (6.13 for any advice to the caller's own process, 6.14 for
 /// `PIDFD_SELF_THREAD_GROUP`), on macOS `MADV_FREE_REUSABLE`. A kernel that refuses fails here

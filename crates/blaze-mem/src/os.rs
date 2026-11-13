@@ -1112,6 +1112,36 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
     given
 }
 
+/// [`evict`], with the pages taken out of the address space where a page given back stays
+/// charged otherwise: Windows decommits each range (`MEM_DECOMMIT`), which gives back its commit
+/// charge, and a read of it faults until [`reuse`] commits it. Elsewhere [`evict`]. The prefix
+/// rule is [`evict`]'s.
+///
+/// # Safety
+///
+/// As for [`evict`], and nothing reads the ranges at all until each is reused.
+#[cfg(windows)]
+pub(crate) unsafe fn evict_out(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    let mut given = 0;
+    for range in ranges {
+        let at = base.as_ptr().wrapping_add(range.start);
+        // SAFETY: the caller says the range is committed, inside a live reservation of ours,
+        // and that nothing references or reads it.
+        if unsafe { VirtualFree(at.cast(), range.len(), MEM_DECOMMIT) } == 0 {
+            break;
+        }
+        given += range.len();
+    }
+    given
+}
+
+#[cfg(not(windows))]
+pub(crate) unsafe fn evict_out(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+    // SAFETY: the caller's, which is `evict`'s and more.
+    unsafe { evict(base, ranges) }
+}
+
 /// Through the seed's runner, which leaves the pages reading zeros, as on Linux.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
 pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
