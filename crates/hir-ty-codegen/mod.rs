@@ -2594,9 +2594,9 @@ fn compile_as<'db>(
     // What the builder made is checked before the passes change it, and what they made of it
     // after: a bad instruction of either is this function's error, never code made from it.
     let built = built.and_then(|mut ctx| {
-        verified(&ctx.func, isa, "built")?;
+        verified(&ctx.func, target, "built")?;
         tally.step(Step::Translate, || settle(&mut ctx, &cg))?;
-        verified(&ctx.func, isa, "settled")?;
+        verified(&ctx.func, target, "settled")?;
         Result::Ok(ctx)
     });
     // Back to the caller before anything can return: nothing after the build reads it.
@@ -2680,9 +2680,26 @@ fn compile_as<'db>(
 /// Every build runs it, release too: on a cold debug build of regex, serde and serde_json with
 /// std (2026-11-03), its two walks of each function were 0.76 to 0.79 s of 144 to 148 s of CPU.
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private
-fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) -> Result<()> {
-    let errors = backend::Tally::global()
-        .step(Step::Verify, || cranelift_codegen::verify_function(func, isa.flags()));
+fn verified(func: &ir::Function, target: &'static Target, stage: &'static str) -> Result<()> {
+    // `get_frame_pointer` and `get_return_address` verify only against a code generator that
+    // keeps frame pointers, which the compile of a function reading them switches to
+    // (`compiled`, as an SEH landing pad and `...` do); the rest against the flags alone.
+    let reads_frame = func.layout.blocks().any(|block| {
+        func.layout.block_insts(block).any(|inst| {
+            matches!(
+                func.dfg.insts[inst].opcode(),
+                ir::Opcode::GetFramePointer | ir::Opcode::GetReturnAddress
+            )
+        })
+    });
+    let isa = match reads_frame {
+        true => &**target_of(target, Features::BASELINE, Isa::FramePointer, false)?,
+        false => &**isa_for(target)?,
+    };
+    let errors = backend::Tally::global().step(Step::Verify, || match reads_frame {
+        true => cranelift_codegen::verify_function(func, isa),
+        false => cranelift_codegen::verify_function(func, isa.flags()),
+    });
     let Err(errors) = errors else { return Ok(()) };
     // alloc: the error's message
     let refused: Vec<&cranelift_codegen::verifier::VerifierError> =
@@ -17370,11 +17387,36 @@ mod tests {
         builder.call_memcpy(ill, to, from, bytes);
         builder.ins().return_(&[]);
         builder.finalize(target.frontend_config(isa));
-        let error = super::verified(&func, isa, "built").expect_err("ill-typed IR verified");
+        let error = super::verified(&func, target, "built").expect_err("ill-typed IR verified");
         let super::CodegenError::InvalidIr { stage, ref errors } = error else { panic!("{error}") };
         assert_eq!(stage, "built");
         assert!(errors.contains("call"), "{errors}");
         assert!(error.to_string().contains("Cranelift's verifier refuses (as built)"), "{error}");
+    }
+
+    /// A function that reads its frame pointer (an SEH landing pad's arrival slot) verifies:
+    /// against the code generator that keeps frame pointers its compile switches to, where the
+    /// flags alone answer that it needs an ISA.
+    #[test]
+    fn a_function_reading_its_frame_pointer_verifies() {
+        for triple in ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"] {
+            let target = super::Target::of(triple).unwrap();
+            let isa = &**super::isa_for(target).unwrap();
+            let pointer = target.pointer();
+            let mut sig = ir::Signature::new(isa.default_call_conv());
+            sig.returns.push(AbiParam::new(pointer));
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let frame = builder.ins().get_frame_pointer(pointer);
+            builder.ins().return_(&[frame]);
+            builder.finalize(target.frontend_config(isa));
+            assert!(cranelift_codegen::verify_function(&func, isa.flags()).is_err(), "premise");
+            super::verified(&func, target, "built").unwrap_or_else(|e| panic!("{triple}: {e}"));
+        }
     }
 
     /// One of more than 128 bytes stays a call, of `memcpy` named in place.

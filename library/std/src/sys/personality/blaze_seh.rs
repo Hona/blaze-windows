@@ -94,11 +94,18 @@ struct DispatcherContext {
     function_entry: *const RuntimeFunction,
     _establisher_frame: usize,
     _target_ip: usize,
-    context_record: *mut c_void,
+    _context_record: *mut c_void,
     _language_handler: *mut c_void,
     handler_data: *const u32,
     history_table: *mut c_void,
 }
+
+/// The size of x64's `CONTEXT`, which is 16-aligned.
+const CONTEXT_SIZE: usize = 1232;
+
+/// Room for a `CONTEXT` (x64).
+#[repr(C, align(16))]
+struct Context([u8; CONTEXT_SIZE]);
 
 /// `RUNTIME_FUNCTION`: image-relative.
 #[repr(C)]
@@ -273,13 +280,17 @@ unsafe extern "system" fn rust_eh_personality(
             }
             pad => start + pad as usize,
         };
-        // The unwinder puts `block` in `rax` at the target.
+        // The unwinder puts `block` in `rax` at the target. It works in a context of its own:
+        // the dispatcher's is the outer unwind's while frames are unwound, which a collided
+        // unwind copies back to go on from this frame, so a nested unwind working in it would
+        // leave this frame the registers of a frame below (its `rbp`, where `ARRIVAL` is).
+        let mut scratch = Context([0; CONTEXT_SIZE]);
         RtlUnwindEx(
             frame.cast(),
             target as *mut c_void,
             record,
             block.cast(),
-            dispatch.context_record,
+            (&raw mut scratch).cast(),
             dispatch.history_table,
         );
         core::intrinsics::abort_immediate()
