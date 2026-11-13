@@ -9,7 +9,7 @@ use blaze_usercode::run::OutFile;
 
 use super::{
     BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing,
-    checkout_without_git, failure, file_name, out_files, rechecks_in, verifies_in, with_reads,
+    checkout_without_git, failure, file_name, git_checkout, out_files, rechecks_in, verifies_in, with_reads,
 };
 
 const RUN: Tag = Tag(5 << 32);
@@ -382,6 +382,26 @@ fn a_package_watch_is_named_and_many_reads_are_folded() {
     let changed = differ(&was, &now);
     assert_eq!(changed.len(), 1, "{changed:?}");
     assert!(changed[0].starts_with("its other "), "{changed:?}");
+}
+
+/// A git dependency's package is read with its checkout's whole commit, found from the
+/// package's directory in the system's spelling; a registry package or one of the workspace is in
+/// no checkout.
+#[test]
+fn a_git_dependencys_package_is_in_its_checkout_of_the_commit() {
+    let root = "/h/.cache/blaze/sources/git/checkouts/betteroffice-041eea77ca348fb3/ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+    let dir = PathBuf::from(format!("{root}/crates/betteroffice-fonts-intl"));
+    assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    assert_eq!(git_checkout(Path::new(root)), Some(Path::new(root)));
+    let registry = "/h/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f/cc-1.2.0";
+    assert_eq!(git_checkout(Path::new(registry)), None);
+    assert_eq!(git_checkout(Path::new("/w/ed0a3cea5bd24119c4f2e144a978849177e06fcd/app")), None);
+    #[cfg(windows)]
+    {
+        let root = r"C:\Users\u\.blaze\sources\git\checkouts\betteroffice-041eea77ca348fb3\ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+        let dir = PathBuf::from(format!(r"{root}\crates\betteroffice-fonts-intl"));
+        assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    }
 }
 
 /// A script of a git dependency whose `git` found no repository is said to have failed for
