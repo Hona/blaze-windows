@@ -4,6 +4,7 @@
   "engine": "C:/bench/bin/blaze-engine.exe",
   "blaze_commit": "replace with the commit of those binaries",
   "cargo": "C:/bench/rust/bin/cargo.exe",
+  "toolchains": "C:/bench/prefetched/toolchains",
   "volumes": ["C:/bench/scratch", "D:/bench/scratch"],
   "out": "C:/bench/results-1",
   "runs": 5,
