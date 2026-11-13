@@ -1107,6 +1107,12 @@ fn links_image(makes: &Makes, policy: &Policy) -> bool {
     policy.mode == BuildMode::Live && *makes == Makes::Executable
 }
 
+/// A published dependency's build script is an input at a fixed version, not a program
+/// edited in this workspace. Keep its requested debug info, but no space for future patches.
+fn keeps_patch_room(build_script: bool, member: bool, source: Option<&str>) -> bool {
+    !build_script || member || blaze_lower::local(source)
+}
+
 /// `krate`'s functions, built as `unit`, compiled from its roots (the unit's own crate, or one
 /// of the crates a `Doctest` unit expands into): `Err` with the code generator's errors, each
 /// naming the function it could not compile. `checks` is the unit's check running beside it:
@@ -2100,7 +2106,11 @@ fn link_at(
         // A wasm module is linked whole and never slid or patched in place, and its debug info
         // is its name section: each expansion instantiates the module afresh.
         true => blaze_link::target::reactor(blaze_link::Debug::None, false),
-        false => blaze_link::target::output(triple(job, u), shared, debug, true),
+        false => {
+            let package = job.package(u).map_err(|it| LinkCause::Given(it.what))?;
+            let incremental = keeps_patch_room(u.target.is_custom_build(), package.is_member, package.source.as_deref());
+            blaze_link::target::output(triple(job, u), shared, debug, incremental)
+        }
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
     // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
