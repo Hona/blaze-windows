@@ -1429,7 +1429,7 @@ fn coff_object_sections_and_groups() {
             (".drectve", &SectionKind::Dropped, false),
             (".text$mn", &SectionKind::Alloc(Class::Text, rank(Some("mn"))), false),
             (".pdata", &SectionKind::Unwind(pdata), false),
-            (".xdata", &SectionKind::Unwind(Class::Rodata), false),
+            (".xdata", &SectionKind::Alloc(Class::Rodata, 0), false),
             (".tls$", &SectionKind::Alloc(Class::Tdata, 1), true),
             (".bss", &SectionKind::Alloc(Class::Bss, 0), true),
         ]
