@@ -1907,6 +1907,27 @@ impl Sim {
                     None => Done::Failed(IoError(format!("{file}: no such file to map"))),
                 }
             }
+            Effect::TryPatch { file, len, delta, whole, .. } => {
+                match self.files.get(&file) {
+                    Some(f) if !f.link && f.mapped.strong_count() == 0 => {
+                        let mut base = f.contents();
+                        match crate::fs::matches_patch(&base, len, &delta, &whole) {
+                            Ok(true) => {
+                                base.resize(len as usize, 0);
+                                for (at, bytes) in delta {
+                                    self.bytes_written += bytes.len() as u64;
+                                    base[at as usize..at as usize + bytes.len()].copy_from_slice(&bytes);
+                                }
+                                self.change(&file, &base);
+                                Done::Patched(true)
+                            }
+                            Ok(false) => Done::Patched(false),
+                            Err(e) => Done::Failed(IoError(e.to_string())),
+                        }
+                    }
+                    _ => Done::Patched(false),
+                }
+            }
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
                 Some((_, spawning)) => Done::Exited(Box::new(spawning.exit)),

@@ -15,8 +15,8 @@
 //! does later. A file that grows after it is mapped changes nothing seen: the bytes past `len` are
 //! not in the slice.
 //!
-//! Another process may still write or cut the file (the store's packs and the image are
-//! blaze's own files, but nothing in the kernel stops another writer). Writing one in place
+//! Another process may still write or cut a caller-supplied file. A path-opened Windows
+//! mapping denies writers for the lifetime of the view. Writing mapped bytes in place
 //! breaks [`MapOptions::map`]'s contract: the bytes under a live `&[u8]` change, which a reader
 //! sees as different bytes and its content-hash check refuses. Cutting one short makes a read
 //! of a page past the new end fault: `SIGBUS` on Unix, `EXCEPTION_IN_PAGE_ERROR` on Windows
