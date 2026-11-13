@@ -2182,9 +2182,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         let epoch = self.epoch_slot();
         // alloc: the unknowns still reachable, once per join
         let mut live: blaze_hash::HashSet<TermId, Global> = blaze_hash::HashSet::new_in(Global);
-        for slot in 0..state.vals.len() {
+        for slot in 0..=epoch {
             if slot == epoch || self.addressed[slot] || self.read.contains(block as usize, slot) {
-                self.unknowns(state.vals[slot], &mut |it| { live.insert(it); });
+                self.unknowns(state.vals.get(slot), &mut |it| { live.insert(it); });
             }
         }
         for fact in &state.facts {
