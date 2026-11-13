@@ -4,7 +4,7 @@
 //! one `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT=1` keeps), `target_info.rs`
 //! (`file_types`, `rustc_outputs`), `output_depinfo.rs`, and rustc's dep-info beside its output.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use blaze_manifest::targets::{CrateType, TargetKind};
 
@@ -12,33 +12,68 @@ use super::hash::CompileMode;
 use crate::query::LoadError;
 use crate::stdlib::target as platform;
 
-/// A path of the layout and a part below it, joined as the daemon names paths: with `/` on every
-/// host (`Path::join` puts a `\` between them on Windows, and a daemon name has none).
-trait Named {
-    fn named(&self, part: impl AsRef<std::ffi::OsStr>) -> PathBuf;
-}
-
-impl Named for Path {
-    fn named(&self, part: impl AsRef<std::ffi::OsStr>) -> PathBuf {
-        let mut name = self.as_os_str().to_owned();
-        if !name.as_encoded_bytes().ends_with(b"/") {
-            name.push("/");
-        }
-        name.push(part);
-        PathBuf::from(name)
-    }
-}
-
 fn error(what: String) -> LoadError {
     LoadError { what, at: None }
+}
+
+/// A file's name as the daemon names it: `/`-separated from its one root, on every system
+/// (`blaze_core::platform::path`: `C:\a` is `/C:/a`). A unit's planned files are such names,
+/// matched as text by everything that reads them (`artifact::uplifted` splits on `/`), so they
+/// are joined with `/` here, never with `Path::join`, which joins with `\` on Windows: the
+/// plan then named `/C:/t\debug\build\app/0123\out\libapp.rlib`, and the copy of a binary in
+/// `target/debug` was looked for under a name nothing had.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Name(String);
+
+impl Name {
+    /// `path`'s name: as it is, its `\`s `/` on Windows, where a `\` is a separator and no
+    /// name's part.
+    pub fn of(path: &Path) -> Name {
+        let text = path.to_string_lossy();
+        let text = match cfg!(windows) {
+            true => text.replace('\\', "/"),
+            false => text.into_owned(),
+        };
+        Name(text)
+    }
+
+    /// `self/part`, `part` one or more `/`-separated parts.
+    pub fn join(&self, part: &str) -> Name {
+        match self.0.ends_with('/') {
+            true => Name(format!("{}{part}", self.0)),
+            false => Name(format!("{}/{part}", self.0)),
+        }
+    }
+
+    /// The last part.
+    pub fn file_name(&self) -> &str {
+        self.0.rsplit('/').next().unwrap_or(&self.0)
+    }
+
+    /// The same name with its last part's extension `ext` (cargo's `with_extension`): the part
+    /// after its last `.`, if the part has one past its first byte, replaced, else `.ext` added.
+    pub fn with_extension(&self, ext: &str) -> Name {
+        let file = self.file_name();
+        let stem = match file.rfind('.') {
+            Some(at) if at > 0 => &file[..at],
+            _ => file,
+        };
+        let dir = &self.0[..self.0.len() - file.len()];
+        Name(format!("{dir}{stem}.{ext}"))
+    }
+
+    /// The name as text: what a plan holds.
+    pub fn display(&self) -> &str {
+        &self.0
+    }
 }
 
 /// cargo's `Layout` of one kind: its artifact directory (`target/<triple>/debug`), and its
 /// build directory's root (`build-dir/<triple>`) and profile directory (`.../debug`).
 pub(super) struct Layout {
-    pub dest: PathBuf,
-    pub build_root: PathBuf,
-    pub build_dest: PathBuf,
+    pub dest: Name,
+    pub build_root: Name,
+    pub build_dest: Name,
 }
 
 impl Layout {
@@ -48,47 +83,44 @@ impl Layout {
         triple: Option<&str>,
         profile_dir: &str,
     ) -> Layout {
+        let (target_dir, build_dir) = (Name::of(target_dir), Name::of(build_dir));
         let (root, build_root) = match triple {
-            Some(triple) => (target_dir.named(triple), build_dir.named(triple)),
-            None => (target_dir.to_path_buf(), build_dir.to_path_buf()),
+            Some(triple) => (target_dir.join(triple), build_dir.join(triple)),
+            None => (target_dir, build_dir),
         };
         Layout {
-            dest: root.named(profile_dir),
-            build_dest: build_root.named(profile_dir),
+            dest: root.join(profile_dir),
+            build_dest: build_root.join(profile_dir),
             build_root,
         }
     }
 
-    fn build(&self) -> PathBuf {
-        self.build_dest.named("build")
+    fn build(&self) -> Name {
+        self.build_dest.join("build")
     }
 
     /// `BuildDirLayout::deps`.
-    pub fn deps(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout { self.out_new_layout(pkg_dir) } else { self.build_dest.named("deps") }
+    pub fn deps(&self, new_layout: bool, pkg_dir: &str) -> Name {
+        if new_layout { self.out_new_layout(pkg_dir) } else { self.build_dest.join("deps") }
     }
 
     /// `BuildDirLayout::out_force_new_layout`.
-    pub fn out_new_layout(&self, pkg_dir: &str) -> PathBuf {
-        self.build().named(pkg_dir).named("out")
+    pub fn out_new_layout(&self, pkg_dir: &str) -> Name {
+        self.build().join(pkg_dir).join("out")
     }
 
     /// `BuildDirLayout::build_script`.
-    pub fn build_script(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout { self.deps(true, pkg_dir) } else { self.build().named(pkg_dir) }
+    pub fn build_script(&self, new_layout: bool, pkg_dir: &str) -> Name {
+        if new_layout { self.deps(true, pkg_dir) } else { self.build().join(pkg_dir) }
     }
 
     /// `BuildDirLayout::build_script_execution`.
-    pub fn build_script_execution(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout {
-            self.build().named(pkg_dir).named("run")
-        } else {
-            self.build().named(pkg_dir)
-        }
+    pub fn build_script_execution(&self, new_layout: bool, pkg_dir: &str) -> Name {
+        if new_layout { self.build().join(pkg_dir).join("run") } else { self.build().join(pkg_dir) }
     }
 
-    pub fn tmp(&self) -> PathBuf {
-        self.build_root.named("tmp")
+    pub fn tmp(&self) -> Name {
+        self.build_root.join("tmp")
     }
 }
 
@@ -233,20 +265,33 @@ fn file_types(
     Ok(Some(out))
 }
 
+/// The crate types a library unit of `crate_types` is built as
+/// ([`crate::schema::builds_only_its_rlib`], the one rule).
+fn built_crate_types(crate_types: &[CrateType], is_root: bool) -> impl Iterator<Item = &CrateType> {
+    let only_rlib =
+        crate::schema::builds_only_its_rlib(crate_types.iter().map(CrateType::as_str), is_root);
+    crate_types.iter().filter(move |it| !only_rlib || crate::schema::is_rlib(it.as_str()))
+}
+
 /// cargo's `TargetInfo::rustc_outputs`, with `calc_outputs_rustc`'s errors when the target
 /// has none of the crate types. `embed-metadata` is always on (`-Zno-embed-metadata` unstable).
+/// A library the build only depends on (`is_root` false) has the files of its rlib alone
+/// ([`built_crate_types`]).
 pub(super) fn rustc_outputs(
     mode: CompileMode,
     kind: &TargetKind,
     triple: &str,
     package: &str,
+    is_root: bool,
 ) -> Result<Vec<FileType>, LoadError> {
     let (types, unsupported) = match mode {
         CompileMode::Build => {
-            let crate_types = kind.rustc_crate_types();
+            // alloc: a handful of crate types, once per unit planned
+            let crate_types: Vec<&CrateType> =
+                built_crate_types(kind.rustc_crate_types(), is_root).collect();
             let mut unsupported = Vec::new();
             let mut types = Vec::new();
-            for crate_type in crate_types {
+            for &crate_type in &crate_types {
                 let flavor =
                     if crate_type.is_linkable() { Flavor::Linkable } else { Flavor::Normal };
                 match file_types(crate_type, flavor, triple)? {
@@ -254,7 +299,7 @@ pub(super) fn rustc_outputs(
                     None => unsupported.push(crate_type.clone()),
                 }
             }
-            if !types.is_empty() && !crate_types.iter().any(CrateType::requires_upstream_objects) {
+            if !types.is_empty() && !crate_types.iter().any(|it| it.requires_upstream_objects()) {
                 types.push(FileType::rmeta());
             }
             (types, unsupported)
@@ -311,11 +356,11 @@ pub(super) struct CompileFiles<'a> {
 }
 
 /// cargo's `output_dir` of a compile unit.
-pub(super) fn output_dir(it: &CompileFiles<'_>) -> PathBuf {
+pub(super) fn output_dir(it: &CompileFiles<'_>) -> Name {
     if it.kind.is_custom_build() {
         it.host_layout.build_script(it.new_layout, it.pkg_dir)
     } else if it.kind.is_example() && !it.new_layout {
-        it.layout.build_dest.named("examples")
+        it.layout.build_dest.join("examples")
     } else {
         it.layout.deps(it.new_layout, it.pkg_dir)
     }
@@ -325,11 +370,11 @@ pub(super) fn output_dir(it: &CompileFiles<'_>) -> PathBuf {
 /// dep-info, and of a root unit `output_depinfo`'s `.d` beside each copy.
 pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, LoadError> {
     let out_dir = output_dir(it);
-    let types = rustc_outputs(it.mode, it.kind, it.triple, it.package)?;
+    let types = rustc_outputs(it.mode, it.kind, it.triple, it.package, it.is_root)?;
     let mut outputs = Vec::with_capacity(types.len() * 2 + 2);
     let mut depinfo = Vec::new();
     for file in &types {
-        let path = out_dir.named(file.output_filename(it.crate_name, it.extra));
+        let path = out_dir.join(&file.output_filename(it.crate_name, it.extra));
         let hardlink = uplift_to(it, file, &path);
         let run_from = run_from(it, file, &path);
         outputs.push(path.display().to_string());
@@ -345,13 +390,13 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
         Some(extra) => format!("{}-{extra}.d", it.crate_name),
         None => format!("{}.d", it.crate_name),
     };
-    outputs.push(out_dir.named(stem).display().to_string());
+    outputs.push(out_dir.join(&stem).display().to_string());
     outputs.extend(depinfo);
     Ok(outputs)
 }
 
 /// cargo's `uplift_to`.
-fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<PathBuf> {
+fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Name) -> Option<Name> {
     if it.mode != CompileMode::Build || file.flavor == Flavor::Rmeta {
         return None;
     }
@@ -373,16 +418,16 @@ fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<Path
         if !it.artifact_dir {
             return None;
         }
-        it.layout.dest.named("examples").named(filename)
+        it.layout.dest.join("examples").join(&filename)
     } else if it.kind.is_custom_build() {
-        it.host_layout.build_script(it.new_layout, it.pkg_dir).named(filename)
+        it.host_layout.build_script(it.new_layout, it.pkg_dir).join(&filename)
     } else {
         if !it.artifact_dir {
             return None;
         }
-        it.layout.dest.named(filename)
+        it.layout.dest.join(&filename)
     };
-    (path != from).then_some(path)
+    (path != *from).then_some(path)
 }
 
 /// Where a test's or bench's program is placed to be run from: `deps/<crate>-<hash>` in the
@@ -396,21 +441,21 @@ fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<Path
 /// (`artifact::uplifted`). None of a doctest (its examples run beside their runner), of a
 /// build that writes no artifact directory, or where rustc's file is there already (the old
 /// layout with the build dir the target dir).
-fn run_from(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<PathBuf> {
+fn run_from(it: &CompileFiles<'_>, file: &FileType, from: &Name) -> Option<Name> {
     if it.mode != CompileMode::Test || !it.artifact_dir || file.flavor != Flavor::Normal {
         return None;
     }
-    let path = it.layout.dest.named("deps").named(from.file_name()?);
-    (path != from).then_some(path)
+    let path = it.layout.dest.join("deps").join(from.file_name());
+    (path != *from).then_some(path)
 }
 
 /// A build script's run: its `OUT_DIR`, and the files of `BuildScriptRunFiles`.
 pub(super) fn run_files(layout: &Layout, new_layout: bool, pkg_dir: &str) -> (String, Vec<String>) {
     let root = layout.build_script_execution(new_layout, pkg_dir);
-    let out_dir = if new_layout { layout.out_new_layout(pkg_dir) } else { root.named("out") };
+    let out_dir = if new_layout { layout.out_new_layout(pkg_dir) } else { root.join("out") };
     let stdout = if new_layout { "stdout" } else { "output" };
-    let files = [stdout, "stderr", "root-output"].map(|it| root.named(it).display().to_string());
-    (out_dir.display().to_string(), files.into())
+    let files = [stdout, "stderr", "root-output"].map(|it| root.join(it).display().to_owned());
+    (out_dir.display().to_owned(), files.into())
 }
 
 /// `bin_link_for_target`: where a bin of the package is uplifted for a unit of `triple`
@@ -420,12 +465,12 @@ pub(super) fn bin_link(
     triple: &str,
     name: &str,
     bin_name: Option<&str>,
-) -> Result<PathBuf, LoadError> {
-    let types = rustc_outputs(CompileMode::Build, &TargetKind::Bin, triple, name)?;
+) -> Result<Name, LoadError> {
+    let types = rustc_outputs(CompileMode::Build, &TargetKind::Bin, triple, name, true)?;
     let file = types
         .iter()
         .find(|it| it.flavor == Flavor::Normal)
         .ok_or_else(|| error(format!("the target `{triple}` has no executable")))?;
     let crate_name = name.replace('-', "_");
-    Ok(layout.dest.named(file.uplift_filename(name, &crate_name, bin_name)))
+    Ok(layout.dest.join(&file.uplift_filename(name, &crate_name, bin_name)))
 }
