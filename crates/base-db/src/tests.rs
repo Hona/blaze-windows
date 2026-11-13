@@ -2049,3 +2049,18 @@ fn the_oracle_catches_a_read_variable_that_changed() {
         changed_after_env(&[("FOO", "1"), ("UNRELATED", "a")], &[("FOO", "2"), ("UNRELATED", "a")]);
     assert_eq!((changed, value), (1, Some("2".to_owned())));
 }
+
+/// A file outside the VFS is read by the daemon's name of it (`/C:/a` on Windows, which the
+/// system reads as `\C:\a`, no path) where the system has it: `include_bytes!` of an absolute
+/// path a build script printed, or of one `..` above its crate.
+#[test]
+fn an_included_file_is_read_by_the_daemons_name_of_it() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-read-now-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("font.ttf.zst");
+    std::fs::write(&file, b"\x28\xb5\x2f\xfd").unwrap();
+    let named = blaze_core::platform::path::daemon(&file).unwrap();
+    let read = crate::IncludedFile::read_now(std::path::Path::new(&named));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(read.as_deref().ok(), Some(&b"\x28\xb5\x2f\xfd"[..]), "{named}");
+}
