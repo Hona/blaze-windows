@@ -204,7 +204,9 @@ fn of<'a>(
 ) -> script::Of<'a> {
     script::Of {
         units,
-        host: HOST,
+        // A script runs on the machine that builds: its library path is that machine's
+        // (`PATH` on Windows, which joins with `;` and takes `C:`), whatever the target.
+        host: crate::toolchain::own::host().unwrap_or(HOST),
         tools,
         launcher: std::path::Path::new("/opt/blaze/bin/blaze"),
         program: PathBuf::from("/w/target/debug/build/x/build-script-build"),
