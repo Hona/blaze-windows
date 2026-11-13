@@ -191,13 +191,21 @@ impl Atom {
     }
 }
 
+/// An implication: `then` holds where `premise` does. Ordered by its conclusion first, so a
+/// state's implications that conclude one atom are one run of them ([`State::concluding`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+struct Imp {
+    then: Atom,
+    premise: Atom,
+}
+
 /// What is known at a point: each slot's value (the locals, then the epoch), the atoms that
 /// hold and the implications between atoms. Sorted, so equal states are equal values.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct State {
     vals: Vec<TermId>,
     facts: Vec<Atom>,
-    imps: Vec<(Atom, Atom)>,
+    imps: Vec<Imp>,
 }
 
 impl State {
@@ -211,27 +219,42 @@ impl State {
         }
     }
 
-    fn put_imp(&mut self, imp: (Atom, Atom)) {
+    fn put_imp(&mut self, (premise, then): (Atom, Atom)) {
+        let imp = Imp { then, premise };
         if let Err(at) = self.imps.binary_search(&imp) {
             self.imps.insert(at, imp);
         }
     }
+
+    /// The implications that conclude `atom`: one binary search, not a walk of them all (a
+    /// body of 2057 blocks held 2871 at one point, and each entailment question asked this).
+    fn concluding(&self, atom: Atom) -> &[Imp] {
+        let start = self.imps.partition_point(|it| it.then < atom);
+        let end = start + self.imps[start..].partition_point(|it| it.then == atom);
+        &self.imps[start..end]
+    }
 }
 
-/// Fire implications to a fixed point. The table is sorted by premise, so prove a
-/// premise just once for all its missing conclusions, not once per conclusion. A
-/// later group can establish an earlier one's premise: take another pass iff a
-/// fact was added. There can be at most one addition per implication.
+/// Fire implications to a fixed point. Each pass takes the premises in order, and proves a
+/// premise just once for all its missing conclusions, not once per conclusion. A later
+/// group can establish an earlier one's premise: take another pass iff a fact was added.
+/// There can be at most one addition per implication. The state keeps its implications by
+/// conclusion ([`Imp`]); a pass orders the ones whose conclusion is missing by premise.
 fn saturate(state: &mut State, mut entails: impl FnMut(&State, Atom) -> bool) -> bool {
     loop {
         let before = state.facts.len();
+        // Those not missing at the start are not later: facts are only added.
+        let mut missing: Vec<(Atom, Atom)> = state.imps.iter() // alloc: one pass's missing, by premise
+            .filter(|it| !state.has(it.then))
+            .map(|it| (it.premise, it.then))
+            .collect();
+        missing.sort_unstable();
         let mut i = 0;
-        while i < state.imps.len() {
-            let premise = state.imps[i].0;
-            let end = i + state.imps[i..].partition_point(|it| it.0 == premise);
-            if state.imps[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise) {
-                for n in i..end {
-                    let then = state.imps[n].1;
+        while i < missing.len() {
+            let premise = missing[i].0;
+            let end = i + missing[i..].partition_point(|it| it.0 == premise);
+            if missing[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise) {
+                for &(_, then) in &missing[i..end] {
                     if !state.has(then) {
                         if entails(state, then.not()) { return false; }
                         state.put(then);
@@ -257,6 +280,68 @@ fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
     }));
     assert_eq!(tries, 2);
     assert!((1..103).all(|i| state.has(key(i))));
+}
+
+/// The refinement: [`saturate`] over implications kept by conclusion asks the same questions
+/// in the same order, and so adds the same facts and finds the same contradictions, as the
+/// table kept by premise it replaced (here, the reference), for an entailment that reads
+/// through `<` to `<=` and a contradiction that is a negated fact.
+#[cfg(test)]
+#[hegel::test(test_cases = 300)]
+fn saturating_by_conclusion_is_saturating_by_premise(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    fn by_premise(state: &mut State, imps: &[(Atom, Atom)], asked: &mut Vec<Atom>) -> bool {
+        loop {
+            let before = state.facts.len();
+            let mut i = 0;
+            while i < imps.len() {
+                let premise = imps[i].0;
+                let end = i + imps[i..].partition_point(|it| it.0 == premise);
+                if imps[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise, asked) {
+                    for &(_, then) in &imps[i..end] {
+                        if !state.has(then) {
+                            if entails(state, then.not(), asked) { return false; }
+                            state.put(then);
+                        }
+                    }
+                }
+                i = end;
+            }
+            if state.facts.len() == before { return true; }
+        }
+    }
+    fn entails(state: &State, atom: Atom, asked: &mut Vec<Atom>) -> bool {
+        asked.push(atom);
+        state.has(atom) || (atom.rel == Rel::Le && state.has(Atom { rel: Rel::Lt, ..atom }))
+    }
+    let atom = |tc: &hegel::TestCase| {
+        let rel = [Rel::Lt, Rel::Le, Rel::Eq, Rel::Ne][tc.draw(gs::integers::<usize>().max_value(3))];
+        let a = tc.draw(gs::integers::<u32>().max_value(3));
+        let b = tc.draw(gs::integers::<u32>().max_value(3));
+        Atom::new(rel, a, b)
+    };
+    let mut state = State { vals: vec![], facts: vec![], imps: vec![] };
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(4)) {
+        state.put(atom(&tc));
+    }
+    let mut imps = Vec::new(); // alloc: a test's table
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(12)) {
+        let imp = (atom(&tc), atom(&tc));
+        state.put_imp(imp);
+        imps.push(imp);
+    }
+    imps.sort();
+    imps.dedup();
+    let mut reference = state.clone(); // clone: the reference runs on its own copy
+    let (mut asked, mut asked_reference) = (Vec::new(), Vec::new());
+    let ran = saturate(&mut state, |s, atom| entails(s, atom, &mut asked));
+    let ran_reference = by_premise(&mut reference, &imps, &mut asked_reference);
+    assert_eq!((ran, &state.facts, &asked), (ran_reference, &reference.facts, &asked_reference));
+    for imp in &imps {
+        let concluding = state.concluding(imp.1);
+        assert!(concluding.iter().all(|it| it.then == imp.1));
+        assert_eq!(concluding.len(), imps.iter().filter(|it| it.1 == imp.1).count());
+    }
 }
 
 /// What [`prove`] found of one body, by block.
@@ -1061,7 +1146,8 @@ impl<'a, 'db> Solver<'a, 'db> {
         if depth == 0 {
             return false;
         }
-        self.visit(state.facts.len() + state.imps.len());
+        let concluding = state.concluding(atom);
+        self.visit(state.facts.len() + concluding.len());
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
         for fact in &state.facts {
             let through = |mid: TermId, strict: bool| -> bool {
@@ -1093,10 +1179,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 return true;
             }
         }
-        state
-            .imps
-            .iter()
-            .any(|&(premise, then)| then == atom && self.holds(state, premise, depth - 1))
+        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1))
     }
 
     fn entails(&self, state: &State, atom: Atom) -> bool {
@@ -1186,7 +1269,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// holds one gets the unknown `stale` names for it.
     fn kill(&mut self, state: &mut State, of: &impl Fn(Key) -> bool, stale: impl Fn(u32) -> Key) {
         state.facts.retain(|fact| !self.mentions(fact.a, of) && !self.mentions(fact.b, of));
-        state.imps.retain(|(premise, then)| {
+        state.imps.retain(|Imp { then, premise }| {
             ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
         });
         for slot in 0..state.vals.len() {
@@ -1899,7 +1982,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         // What this join makes again is forgotten in each state first.
         for state in incoming.iter_mut() {
             state.facts.retain(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
-            state.imps.retain(|(premise, then)| {
+            state.imps.retain(|Imp { then, premise }| {
                 ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, &made))
             });
         }
