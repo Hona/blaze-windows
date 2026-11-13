@@ -218,6 +218,13 @@ for each input root; the filesystem keeps its read grant, but another run withou
 capability does not gain access. Granting a directory includes its contents. The script
 can write its `OUT_DIR` and temporary directory, not the inputs.
 
+Windows redirects `LOCALAPPDATA` to the AppContainer profile. Each run gets a new profile
+that is deleted when it ends, not a persistent folder shared by packages. To consume an
+existing machine cache, point the script's own override at the cached input and grant it
+read access. For example, `GHOSTTY_VT_LIB` can name the prebuilt Ghostty archive. Its
+parent must also be allowed as a `build-script-link-dirs` entry. This does not grant
+write access to the user's cache or let the script download a missing archive.
+
 Windows does not yet trace every filesystem read. A script can be reused when its MIR
 proof shows its only inputs are a fixed list of Cargo environment variables. Those values
 and its code form the key. Other executed scripts are not reused: `rerun-if-changed`

@@ -767,7 +767,7 @@ mod tests {
         // `canonicalize` gives `\\?\C:\...`; the launcher is given plain paths.
         let plain = std::path::PathBuf::from(dir.to_str().unwrap().trim_start_matches(r"\\?\"));
         let made = super::super::make(false, super::super::Given::own()).unwrap();
-        let readers = [super::super::sid(&made.kept.container), super::super::sid(&made.kept.any)];
+        let readers = [made.container.sid, super::super::sid(&made.kept.any)];
         let mut buffer = Vec::new();
         let want = super::super::covered(&plain, &readers, READ, "test").unwrap();
         assert_eq!(reads.covered(&plain, &readers, &mut buffer).unwrap(), want);
