@@ -16,14 +16,19 @@
 use blaze_api::client::Client;
 use blaze_thin::handover::Began;
 
-/// The most bytes one read of the connection takes.
 #[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
+
+/// The most bytes one read of the connection takes.
+#[cfg(any(unix, windows))]
 const RECEIVE: usize = 64 << 10;
 
 /// The connection the thin `blaze` began, as a daemon the CLI's client speaks to.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Answered {
-    socket: std::os::unix::net::UnixStream,
+    socket: UnixStream,
     /// The request's frame as the thin `blaze` sent it.
     request: Vec<u8>,
     /// The answer's bytes the thin `blaze` read, until they are taken.
@@ -33,12 +38,12 @@ struct Answered {
 }
 
 /// Where two frames first differ, for the refusal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn differs_at(ours: &[u8], theirs: &[u8]) -> usize {
     ours.iter().zip(theirs).position(|(a, b)| a != b).unwrap_or(ours.len().min(theirs.len()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl blaze_api::client::Local for Answered {
     /// The command's request, which the thin `blaze` already sent: nothing is sent, and a
     /// frame that is not the one it sent is refused.
@@ -98,24 +103,32 @@ impl blaze_api::client::Local for Answered {
 /// The client of the command `began` names: the thin `blaze`'s connection and what it read,
 /// taken from the descriptors this process was started with. An error names the descriptor
 /// or the file that is not what the thin `blaze` hands over.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn client(began: Began) -> Result<Client, String> {
     use std::io::{Read as _, Seek as _};
+    #[cfg(unix)]
     let taken = |fd: i32, what: &str| {
         crate::raw::process::inherited(fd).map_err(|error| {
             format!("`blaze {}`: {what} (descriptor {fd}): {error}", blaze_thin::handover::WORD)
         })
     };
-    let socket = std::os::unix::net::UnixStream::from(taken(began.socket, "the daemon's connection")?);
+    #[cfg(unix)]
+    let socket = UnixStream::from(taken(began.socket, "the daemon's connection")?);
+    #[cfg(unix)]
     let mut file = std::fs::File::from(taken(began.file, "the answer read so far")?);
-    let unread =
-        |error: std::io::Error| format!("`blaze {}`: reading the answer handed over: {error}", blaze_thin::handover::WORD);
+    #[cfg(windows)]
+    let (socket, mut file) = crate::raw::process::handed(began.socket, began.file)
+        .map_err(|e| format!("the connection and answer handed to the engine: {e}"))?;
+    let unread = |error: std::io::Error| {
+        format!("`blaze {}`: reading the answer handed over: {error}", blaze_thin::handover::WORD)
+    };
     // alloc: once a command, the bytes handed over
     let mut bytes = Vec::new();
     file.seek(std::io::SeekFrom::Start(0)).map_err(unread)?;
     file.read_to_end(&mut bytes).map_err(unread)?;
-    let held = blaze_thin::handover::Held::read(&bytes)
-        .map_err(|why| format!("`blaze {}`: the answer handed over: {why}", blaze_thin::handover::WORD))?;
+    let held = blaze_thin::handover::Held::read(&bytes).map_err(|why| {
+        format!("`blaze {}`: the answer handed over: {why}", blaze_thin::handover::WORD)
+    })?;
     let answered = Answered {
         socket,
         request: held.request.to_vec(), // alloc: once a command
@@ -127,7 +140,7 @@ pub fn client(began: Began) -> Result<Client, String> {
 }
 
 /// Off Unix there is no thin `blaze` that hands a command over.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn client(began: Began) -> Result<Client, String> {
     let _ = began;
     Err(format!(
@@ -146,7 +159,15 @@ mod tests {
 
     fn answered(request: &[u8], answer: &[u8]) -> (Answered, std::os::unix::net::UnixStream) {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        (Answered { socket: ours, request: request.to_vec(), answer: answer.to_vec(), sent: false }, theirs)
+        (
+            Answered {
+                socket: ours,
+                request: request.to_vec(),
+                answer: answer.to_vec(),
+                sent: false,
+            },
+            theirs,
+        )
     }
 
     /// The handover's claim: the engine prints the answer the thin `blaze` began to read, the
@@ -164,7 +185,10 @@ mod tests {
         let mut seen = Vec::new();
         let ok = client
             .call_ref(Request::Status, |response, _| {
-                seen.push(matches!(response, ResponseRef::Flushed { seq: 7 } | ResponseRef::Done { ok: true }));
+                seen.push(matches!(
+                    response,
+                    ResponseRef::Flushed { seq: 7 } | ResponseRef::Done { ok: true }
+                ));
             })
             .unwrap();
         assert!(ok);

@@ -148,7 +148,7 @@ impl Exec {
     /// variables cargo sets for it (`env`).
     pub fn of(executable: &str, env: &[(String, String)], args: &[OsString], cwd: &Path) -> Exec {
         Exec {
-            program: shown_exe(Path::new(executable), cwd),
+            program: shown_exe(&blaze_core::platform::path::host(executable), cwd),
             args: args.to_vec(), // clone: the program's arguments, once a run
             env: env.to_vec(),   // clone: cargo's variables for it, once a run
             cwd: cwd.to_owned(),
@@ -231,7 +231,8 @@ mod tests {
         let cwd = Path::new("/w");
         let exec = Exec::of("/w/target/debug/app", &[], &[OsString::from("--n=1")], cwd);
         assert_eq!(exec.program, Path::new("target/debug/app"));
-        assert_eq!(exec.running(false), "     Running `target/debug/app --n=1`\n");
+        let expected = Path::new("target").join("debug").join("app");
+        assert_eq!(exec.running(false), format!("     Running `{} --n=1`\n", expected.display()));
         assert_eq!(shown_exe(Path::new("/w/app"), cwd), Path::new("./app"));
         assert_eq!(shown_exe(Path::new("/x/app"), cwd), Path::new("/x/app"));
     }

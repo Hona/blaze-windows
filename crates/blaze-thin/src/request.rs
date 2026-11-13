@@ -117,7 +117,11 @@ pub fn request(asked: &Asked, sent: Sent) -> Request {
         no_default_features: false,
         cargo: Some(cargo),
     };
-    Request::Build { view: ViewRef::Head(root), targets }
+    let view = ViewRef::Head(root);
+    match asked.command {
+        crate::route::Command::Check => Request::Check {view, targets},
+        _ => Request::Build {view, targets},
+    }
 }
 
 #[cfg(test)]

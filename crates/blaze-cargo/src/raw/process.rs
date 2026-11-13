@@ -232,9 +232,7 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
 /// Ctrl-Break: the program, on the same console, gets them and answers them itself, and the
 /// command ends with the code it ends with.
 #[cfg(windows)]
-pub fn run_held(
-    command: &mut std::process::Command,
-) -> std::io::Result<std::process::ExitStatus> {
+pub fn run_held(command: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
     use std::os::windows::{
         io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
         process::{ChildExt as _, CommandExt as _},
@@ -285,7 +283,8 @@ pub fn run_held(
     // SAFETY: both handles are open while `job` and `child` live, across the call.
     let held = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
     // SAFETY: as above, the child's main thread, suspended once by its creation.
-    if held == 0 || unsafe { ResumeThread(child.main_thread_handle().as_raw_handle()) } == u32::MAX {
+    if held == 0 || unsafe { ResumeThread(child.main_thread_handle().as_raw_handle()) } == u32::MAX
+    {
         let error = std::io::Error::last_os_error();
         // It never ran: ended where it stands, and its exit waited for so nothing outlives it.
         let _ = child.kill();
@@ -571,6 +570,90 @@ pub fn clock_ticks() -> Option<u64> {
     u64::try_from(ticks).ok().filter(|it| *it > 0)
 }
 
+/// Validate the two handles of a thin client handover. Duplicate rather than adopting a
+/// command-line integer: a forged command line cannot take ownership of a handle the engine
+/// already owns. Inherited originals stay open until this short-lived command exits.
+#[cfg(windows)]
+pub fn handed(
+    socket_number: i32,
+    file: i32,
+) -> std::io::Result<(uds_windows::UnixStream, std::fs::File)> {
+    use std::os::windows::io::{FromRawHandle, FromRawSocket};
+    use windows_sys::Win32::{
+        Foundation::*,
+        Networking::WinSock::*,
+        Storage::FileSystem::{FILE_TYPE_DISK, GetFileType},
+        System::Threading::{GetCurrentProcess, GetCurrentProcessId},
+    };
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected an inherited AF_UNIX stream and an inherited answer file",
+        )
+    };
+    let sock = usize::try_from(socket_number).map_err(|_| invalid())?;
+    let file = usize::try_from(file).map_err(|_| invalid())? as HANDLE;
+    for h in [file, sock as HANDLE] {
+        let mut flags = 0;
+        // SAFETY: inspect the kernel's handle table, writing a valid DWORD; refuse handles not inherited.
+        if unsafe { GetHandleInformation(h, &mut flags) } == 0 || flags & HANDLE_FLAG_INHERIT == 0 {
+            return Err(invalid());
+        }
+    }
+    // SAFETY: GetFileType validates the handle. Clear inheritance before any child starts.
+    if unsafe { GetFileType(file) } != FILE_TYPE_DISK {
+        return Err(invalid());
+    }
+    let mut info = WSAPROTOCOL_INFOW::default();
+    // SAFETY: the provider validates socket; info is initialized writable storage.
+    // Initialize Winsock in the receiving process before asking it about an inherited socket.
+    static WINSOCK: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let started = *WINSOCK.get_or_init(|| {
+        let mut data = WSADATA::default();
+        unsafe { WSAStartup(0x0202, &mut data) }
+    });
+    if started != 0 {
+        return Err(std::io::Error::from_raw_os_error(started));
+    }
+    if unsafe { WSADuplicateSocketW(sock, GetCurrentProcessId(), &mut info) } != 0
+        || info.iAddressFamily != i32::from(AF_UNIX)
+        || info.iSocketType != SOCK_STREAM
+    {
+        return Err(invalid());
+    }
+    let dup = unsafe {
+        WSASocketW(-1, -1, -1, &info, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT)
+    };
+    if dup == INVALID_SOCKET {
+        return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    // SAFETY: dup is a new owned socket (not the input integer).
+    let stream = unsafe { uds_windows::UnixStream::from_raw_socket(dup as _) };
+    let mut copy = std::ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            file,
+            GetCurrentProcess(),
+            &mut copy,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: DuplicateHandle returned a new owned file handle.
+    let file_copy = unsafe { std::fs::File::from_raw_handle(copy) };
+    for h in [file, sock as HANDLE] {
+        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((stream, file_copy))
+}
+
 /// A process started detached ([`spawn_detached`]): its handle, owned, and its process ID.
 #[cfg(windows)]
 pub struct Detached {
@@ -690,31 +773,32 @@ pub fn spawn_detached(
     let away = breakaway()?;
     // Inheritable copies of what it is given, closed here once it started: the originals stay
     // this process's alone.
-    let inheritable = |handle: std::os::windows::io::BorrowedHandle<'_>| -> std::io::Result<OwnedHandle> {
-        use windows_sys::Win32::{
-            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
-            System::Threading::GetCurrentProcess,
+    let inheritable =
+        |handle: std::os::windows::io::BorrowedHandle<'_>| -> std::io::Result<OwnedHandle> {
+            use windows_sys::Win32::{
+                Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+                System::Threading::GetCurrentProcess,
+            };
+            let mut copy = std::ptr::null_mut();
+            // SAFETY: `handle` is open while borrowed; the copy is this process's, written to a
+            // live local and owned below, so closed once.
+            let duplicated = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle.as_raw_handle(),
+                    GetCurrentProcess(),
+                    &mut copy,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if duplicated == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: as above, the copy just made.
+            Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
         };
-        let mut copy = std::ptr::null_mut();
-        // SAFETY: `handle` is open while borrowed; the copy is this process's, written to a
-        // live local and owned below, so closed once.
-        let duplicated = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                handle.as_raw_handle(),
-                GetCurrentProcess(),
-                &mut copy,
-                0,
-                1,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if duplicated == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: as above, the copy just made.
-        Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
-    };
     let nul = std::fs::File::open("NUL")?;
     let (input, output, kept) =
         (inheritable(nul.as_handle())?, inheritable(log.as_handle())?, inheritable(keep)?);
@@ -788,7 +872,10 @@ pub fn spawn_detached(
         }
         // SAFETY: both handles were just made by the call, and nothing else owns them.
         let (process, _thread) = unsafe {
-            (OwnedHandle::from_raw_handle(info.hProcess), OwnedHandle::from_raw_handle(info.hThread))
+            (
+                OwnedHandle::from_raw_handle(info.hProcess),
+                OwnedHandle::from_raw_handle(info.hThread),
+            )
         };
         Ok(Detached { process, pid: info.dwProcessId })
     })();
@@ -924,7 +1011,8 @@ mod tests {
         use std::{io::Write as _, os::windows::io::FromRawHandle as _};
         let Ok(number) = std::fs::read_to_string("handle.txt") else { return };
         println!("in {}", std::env::current_dir().unwrap().display());
-        let handle = number.trim().parse::<usize>().unwrap() as windows_sys::Win32::Foundation::HANDLE;
+        let handle =
+            number.trim().parse::<usize>().unwrap() as windows_sys::Win32::Foundation::HANDLE;
         // SAFETY: the handle the parent made this process inherit under this number, for this.
         let mut pipe = unsafe { std::fs::File::from_raw_handle(handle) };
         pipe.write_all(b"\n").unwrap();

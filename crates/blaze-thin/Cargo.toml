@@ -33,11 +33,17 @@ blaze-report.workspace = true
 
 # The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
 # blaze-engine take from here) links none of these, so the wasm seed builds none of them.
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 # Where the daemon listens, the checkout, the config files outside it, the environment.
 blaze-client.workspace = true
-libc.workspace = true
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Threading", "Win32_System_Console", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true
