@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod std_mir;
+
 use std::path::PathBuf;
 
 use base_db::{Crate, CrateType, SourceRoot, SourceRootId, TargetKind, VfsPath};

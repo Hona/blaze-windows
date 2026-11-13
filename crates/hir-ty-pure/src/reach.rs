@@ -218,6 +218,47 @@ impl State {
     }
 }
 
+/// Fire implications to a fixed point. The table is sorted by premise, so prove a
+/// premise just once for all its missing conclusions, not once per conclusion. A
+/// later group can establish an earlier one's premise: take another pass iff a
+/// fact was added. There can be at most one addition per implication.
+fn saturate(state: &mut State, mut entails: impl FnMut(&State, Atom) -> bool) -> bool {
+    loop {
+        let before = state.facts.len();
+        let mut i = 0;
+        while i < state.imps.len() {
+            let premise = state.imps[i].0;
+            let end = i + state.imps[i..].partition_point(|it| it.0 == premise);
+            if state.imps[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise) {
+                for n in i..end {
+                    let then = state.imps[n].1;
+                    if !state.has(then) {
+                        if entails(state, then.not()) { return false; }
+                        state.put(then);
+                    }
+                }
+            }
+            i = end;
+        }
+        if state.facts.len() == before { return true; }
+    }
+}
+
+#[test]
+fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
+    let key = |n| Atom::new(Rel::Le, n, n + 1);
+    let mut state = State { vals: vec![], facts: vec![key(2)], imps: vec![] };
+    for i in 3..103 { state.put_imp((key(1), key(i))); }
+    state.put_imp((key(2), key(1)));
+    let mut tries = 0;
+    assert!(saturate(&mut state, |s, atom| {
+        tries += usize::from(atom == key(1));
+        s.has(atom)
+    }));
+    assert_eq!(tries, 2);
+    assert!((1..103).all(|i| state.has(key(i))));
+}
+
 /// What [`prove`] found of one body, by block.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Reach {
@@ -443,6 +484,8 @@ struct Solver<'a, 'db> {
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
     joined: Vec<Vec<u32>>,
+    /// Dead join values have no consumer. Do not derive implications or relations for them.
+    read: hir_ty_mir::mir::ReadOnEntry,
     /// How many bits a `usize` has on the target.
     word: u32,
     /// The statement being walked, and how many unknowns it has made.
@@ -500,6 +543,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             cyclic,
             predecessors,
             joined: vec![Vec::new(); count], // alloc: one list per block, once per proof
+            read: hir_ty_mir::mir::ReadOnEntry::of(body),
             word,
             at: (0, 0),
             made: 0,
@@ -1072,23 +1116,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// Writes down what the state's implications give: the conclusion of each whose premise
     /// holds. False when one contradicts the state. Each implication fires at most once.
     fn saturate(&self, state: &mut State) -> bool {
-        let mut budget = state.imps.len();
-        loop {
-            let next = state
-                .imps
-                .iter()
-                .find(|&&(premise, then)| !state.has(then) && self.entails(state, premise))
-                .copied();
-            let Some((_, then)) = next else { return true };
-            if budget == 0 {
-                return true;
-            }
-            budget -= 1;
-            if self.entails(state, then.not()) {
-                return false;
-            }
-            state.put(then);
-        }
+        saturate(state, |state, atom| self.entails(state, atom))
     }
 
     // The state.
@@ -1811,7 +1839,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             let integer = self
                 .local_ty(slot)
                 .is_some_and(|ty| !ty.is_bool() && int_range(ty, self.word).is_some());
-            if !integer || !joined.contains(&whole) {
+            if !integer || !joined.contains(&whole) || !self.read.contains(block as usize, slot) {
                 continue;
             }
             for at in 0..incoming.len().min(4) {
@@ -1923,7 +1951,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         // value holds, once its own value is taken to be that, is implied by the value.
         for slot in 0..slots {
             let is_bool = self.local_ty(slot).is_some_and(|ty| ty.is_bool());
-            if !is_bool || !joined.contains(&(slot as u32)) {
+            if !is_bool || !joined.contains(&(slot as u32)) || !self.read.contains(block as usize, slot) {
                 continue;
             }
             let value = state.vals[slot];
