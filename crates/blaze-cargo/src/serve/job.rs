@@ -2831,13 +2831,17 @@ pub(super) fn protected(
 /// most [`blaze_gc::lease::GIVE_WAY`]. Runs on the pool: it may sync a record.
 pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> super::work::Leased {
     let now = blaze_gc::record::now_ns();
-    let builds = std::path::Path::new(builds);
+    // The daemon names paths /D:/a on Windows; the disk is asked at the host's name.
+    let builds = crate::cli::place::host_path(builds);
+    let builds = builds.as_path();
     let root = builds.parent().unwrap_or(builds);
-    let checkout_path = std::path::Path::new(checkout);
+    let checkout_path = crate::cli::place::host_path(checkout);
+    let checkout_path = checkout_path.as_path();
     // alloc: once per job, a lease or two
     let mut leases = Vec::new();
-    for dir in [units.target_dir.as_str(), units.build_dir.as_str()] {
-        let dir = std::path::Path::new(dir);
+    for named in [units.target_dir.as_str(), units.build_dir.as_str()] {
+        let host = crate::cli::place::host_path(named);
+        let dir = host.as_path();
         if leases.iter().any(|it: &blaze_gc::lease::Lease| it.dir() == dir) {
             continue;
         }
@@ -2874,7 +2878,7 @@ pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> s
             .plans
             .iter()
             .flat_map(|plan| plan.outputs.iter())
-            .filter_map(|out| std::path::Path::new(out).strip_prefix(dir).ok())
+            .filter_map(|out| std::path::Path::new(out).strip_prefix(named).ok())
             .filter_map(|rest| rest.components().next())
             .filter_map(|first| first.as_os_str().to_str())
             .collect();

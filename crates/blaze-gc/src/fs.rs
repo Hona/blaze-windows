@@ -1083,6 +1083,8 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// ancestor that is there, canonical, and the rest as given. Refused, naming it, when it is
 /// relative or the rest holds `..`, which a directory not made yet cannot resolve (review C7).
 pub fn resolve(path: &Path) -> Result<PathBuf, String> {
+    let host = on_host(path);
+    let path = host.as_path();
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
     }
@@ -1112,6 +1114,21 @@ pub fn resolve(path: &Path) -> Result<PathBuf, String> {
         }
         at = at.parent().ok_or_else(|| format!("no part of {} is there", path.display()))?;
     }
+}
+
+/// `path` as the system opens it. On Windows the daemon names `D:\a` as `/D:/a`, which the
+/// system reads as `\D:\a` on the current drive: the drive comes first again. windows: one
+/// conversion at the IO boundary belongs in one place for the whole daemon (cli::place's
+/// `host_path` is the same rule).
+fn on_host(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str() {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+            return PathBuf::from(text[1..].replace('/', "\\"));
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Where `path`'s lease is: its own for a workspace or a standard library's store, its

@@ -204,10 +204,16 @@ fn configure(bytes: &[u8]) -> Configured {
     }
     let lookup =
         |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    // As blaze-manifest's `cargo_home` finds it (`USERPROFILE` on Windows, where `C:\a` is
+    // absolute too), so the directory the configuration is searched in is a known one.
     let home = match lookup("CARGO_HOME") {
-        Some(home) if home.starts_with('/') => Some(home.to_owned()),
+        Some(home) if home.starts_with('/') || std::path::Path::new(home).is_absolute() => {
+            Some(home.to_owned())
+        }
         Some(home) => Some(format!("{}/{home}", invocation.cwd)),
-        None => lookup("HOME").filter(|it| !it.is_empty()).map(|home| format!("{home}/.cargo")),
+        None => lookup(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|it| !it.is_empty())
+            .map(|home| format!("{home}/.cargo")),
     };
     if let Some(home) =
         home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it)))
