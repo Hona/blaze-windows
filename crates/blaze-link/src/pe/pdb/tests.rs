@@ -235,3 +235,29 @@ fn a_pdb_past_an_interval_keeps_its_free_block_maps() {
     let streams = streams(&pdb);
     assert_eq!(streams.len(), STREAMS);
 }
+
+/// How long a PDB of a program of rune-desktop's size takes and how big it is: 400,000
+/// functions of 10 rows in 2,000 files, named as rustc's v0 names are long. Not a check:
+/// `cargo test --release -p blaze-link --lib a_desktop_sized_pdb -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn a_desktop_sized_pdb() {
+    let file = exe();
+    let files: Vec<String> = (0..2000).map(|n| format!("C:\\Users\\dev\\src\\crate{}\\src\\module{n}.rs", n % 300)).collect();
+    let names: Vec<String> = (0..400_000).map(|n| format!("_RNvMs{n}_NtCsajBxKdOt8Cw_16opencode_desktop4viewNtB5_4View6render{n}")).collect();
+    let lines: Vec<Lined<'_>> = (0..4_000_000u32)
+        .map(|n| Lined { at: (n % 10) * 4, file: &files[(n / 10) as usize % 2000], line: n % 5000 + 1, column: 1 })
+        .collect();
+    let functions: Vec<Func<'_>> = (0..400_000u32)
+        .map(|n| Func {
+            key: key(1),
+            addr: 0x1_4000_1000 + u64::from(n % 0x2f00),
+            size: 40,
+            name: Some(&names[n as usize]),
+            lines: (n * 10)..(n * 10 + 10),
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let pdb = write(&headers(&file), &[1; 16], &functions, &lines, &[]).unwrap();
+    eprintln!("{} functions: {:.3} s, {:.1} MB", functions.len(), started.elapsed().as_secs_f64(), pdb.len() as f64 / 1e6);
+}

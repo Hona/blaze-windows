@@ -250,32 +250,49 @@ fn types(hash: u16) -> Vec<u8> {
     out.0
 }
 
-/// A GSI hash of `records`, each `(name, offset in the symbol record stream)`.
+/// A GSI hash of `records`, each `(name, offset in the symbol record stream)`: the records by
+/// bucket (counted into place), each bucket in the readers' order of names.
 fn gsi(records: &[(&str, u32)]) -> Vec<u8> {
-    let mut sorted: Vec<(usize, &str, u32)> =
-        records.iter().map(|(name, at)| (hash_v1(name.as_bytes()) as usize % GSI_BUCKETS, *name, *at)).collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| gsi_cmp(a.1, b.1)).then(a.2.cmp(&b.2)));
-    let mut bitmap = [0u32; (GSI_BUCKETS + 32) / 32];
-    let mut starts = Vec::new();
-    let mut at = 0;
-    while at < sorted.len() {
-        let bucket = sorted[at].0;
-        bitmap[bucket / 32] |= 1 << (bucket % 32);
-        starts.push(at as u32 * 12);
-        while at < sorted.len() && sorted[at].0 == bucket {
-            at += 1;
-        }
+    let bucket_of: Vec<u16> =
+        records.iter().map(|(name, _)| (hash_v1(name.as_bytes()) as usize % GSI_BUCKETS) as u16).collect();
+    let mut starts = vec![0u32; GSI_BUCKETS + 1];
+    for it in &bucket_of {
+        starts[usize::from(*it) + 1] += 1;
     }
-    let mut out = Out::default();
-    out.u32(u32::MAX).u32(0xeffe_0000 + 19990810).u32(sorted.len() as u32 * 8);
-    out.u32((bitmap.len() + starts.len()) as u32 * 4);
-    for (_, _, at) in &sorted {
-        out.u32(at + 1).u32(1);
+    for n in 0..GSI_BUCKETS {
+        starts[n + 1] += starts[n];
+    }
+    let mut cursor = starts.clone();
+    let mut sorted = vec![0u32; records.len()];
+    for (n, it) in bucket_of.iter().enumerate() {
+        let at = &mut cursor[usize::from(*it)];
+        sorted[*at as usize] = n as u32;
+        *at += 1;
+    }
+    let mut bitmap = [0u32; (GSI_BUCKETS + 32) / 32];
+    let mut offsets = Vec::new();
+    for bucket in 0..GSI_BUCKETS {
+        let run = &mut sorted[starts[bucket] as usize..starts[bucket + 1] as usize];
+        if run.is_empty() {
+            continue;
+        }
+        run.sort_unstable_by(|a, b| {
+            let (a, b) = (&records[*a as usize], &records[*b as usize]);
+            gsi_cmp(a.0, b.0).then(a.1.cmp(&b.1))
+        });
+        bitmap[bucket / 32] |= 1 << (bucket % 32);
+        offsets.push(starts[bucket] * 12);
+    }
+    let mut out = Out(Vec::with_capacity(16 + 8 * records.len() + 4 * (bitmap.len() + offsets.len())));
+    out.u32(u32::MAX).u32(0xeffe_0000 + 19990810).u32(records.len() as u32 * 8);
+    out.u32((bitmap.len() + offsets.len()) as u32 * 4);
+    for n in &sorted {
+        out.u32(records[*n as usize].1 + 1).u32(1);
     }
     for it in bitmap {
         out.u32(it);
     }
-    for it in starts {
+    for it in offsets {
         out.u32(it);
     }
     out.0
@@ -284,22 +301,28 @@ fn gsi(records: &[(&str, u32)]) -> Vec<u8> {
 /// The order of names in a GSI bucket (`gsiRecordCmp`): shorter first, then ASCII without
 /// case, else by bytes.
 fn gsi_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then_with(|| {
-        if a.is_ascii() && b.is_ascii() {
-            a.bytes().map(|it| it.to_ascii_lowercase()).cmp(b.bytes().map(|it| it.to_ascii_lowercase()))
-        } else {
-            a.as_bytes().cmp(b.as_bytes())
-        }
-    })
+    use std::cmp::Ordering;
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    if !(a.is_ascii() && b.is_ascii()) {
+        return x.cmp(y);
+    }
+    // Bytes that are the same are the same without case: from the first that differs.
+    match x.iter().zip(y).position(|(p, q)| p != q) {
+        None => Ordering::Equal,
+        Some(at) => (x[at..].iter().map(u8::to_ascii_lowercase)).cmp(y[at..].iter().map(u8::to_ascii_lowercase)),
+    }
 }
-
 /// A function as the PDB places it.
 struct Placed<'a> {
     name: &'a str,
     section: u16,
     offset: u32,
     size: u32,
-    lines: &'a [Lined<'a>],
+    /// Its rows: indexes into the rows given.
+    lines: std::ops::Range<usize>,
 }
 
 /// The PDB of the image whose headers are `headers` and build id `id`, of its Rust
@@ -346,27 +369,34 @@ pub(crate) fn write(
                     &unnamed[start..end]
                 }
             };
-            let rows = &lines[function.lines.start as usize..function.lines.end as usize];
+            let rows = function.lines.start as usize..function.lines.end as usize;
             Placed { name, section: *section, offset: *offset, size: function.size as u32, lines: rows }
         })
         .collect();
 
-    // The files, each once, in the order first named.
+    // The files, each once, in the order first named, and each row's: a function's rows are
+    // mostly of the file of the row before.
     let mut files: Vec<&str> = Vec::new();
-    let mut file_of: Vec<(&str, u32)> = Vec::new();
-    for function in &placed {
-        for row in function.lines {
-            if let Err(at) = file_of.binary_search_by(|it| it.0.cmp(row.file)) {
-                file_of.insert(at, (row.file, files.len() as u32));
+    let mut file_of: blaze_hash::HashMap<&str, u32, std::alloc::Global> =
+        blaze_hash::HashMap::with_capacity_in(64, std::alloc::Global);
+    let mut row_files: Vec<u32> = Vec::with_capacity(lines.len());
+    let mut last: Option<(&str, u32)> = None;
+    for row in lines {
+        let n = match last {
+            Some((file, n)) if std::ptr::eq(file, row.file) || file == row.file => n,
+            _ => *file_of.entry(row.file).or_insert_with(|| {
                 files.push(row.file);
-            }
-        }
+                files.len() as u32 - 1
+            }),
+        };
+        last = Some((row.file, n));
+        row_files.push(n);
     }
-    let file = |name: &str| file_of[file_of.binary_search_by(|it| it.0.cmp(name)).unwrap()].1;
     let (names_stream, name_offsets) = string_table(&files);
 
     // The module: its symbols, then its C13 subsections.
-    let mut module = Out::default();
+    let names_len: usize = placed.iter().map(|it| it.name.len()).sum();
+    let mut module = Out(Vec::with_capacity(names_len + 80 * placed.len() + 8 * lines.len()));
     module.u32(CV_SIGNATURE_C13);
     record(&mut module, S_OBJNAME, |out| {
         out.u32(0).string("blaze");
@@ -398,24 +428,29 @@ pub(crate) fn write(
     for offset in &name_offsets {
         module.u32(*offset).u8(0).u8(0).u16(0);
     }
+    // A function's rows as `(offset, file, line)`, by offset.
+    let mut rows: Vec<(u32, u32, u32)> = Vec::new();
     for function in &placed {
         if function.lines.is_empty() {
             continue;
         }
-        let mut rows: Vec<&Lined<'_>> = function.lines.iter().collect();
-        rows.sort_by_key(|it| it.at);
+        rows.clear();
+        rows.extend(function.lines.clone().map(|at| (lines[at].at, row_files[at], lines[at].line)));
+        if !rows.is_sorted_by_key(|it| it.0) {
+            rows.sort_by_key(|it| it.0);
+        }
         let size_at = module.len() + 4;
         module.u32(DEBUG_S_LINES).u32(0);
         let start = module.len();
         module.u32(function.offset).u16(function.section).u16(0).u32(function.size);
-        for run in rows.chunk_by(|a, b| a.file == b.file) {
-            module.u32(file(run[0].file) * 8).u32(run.len() as u32).u32(12 + 8 * run.len() as u32);
-            for row in run {
-                let line = match row.line {
+        for run in rows.chunk_by(|a, b| a.1 == b.1) {
+            module.u32(run[0].1 * 8).u32(run.len() as u32).u32(12 + 8 * run.len() as u32);
+            for &(at, _, line) in run {
+                let line = match line {
                     0 => NO_LINE,
                     line => line.min(0xff_ffff),
                 };
-                module.u32(row.at).u32(line | STATEMENT);
+                module.u32(at).u32(line | STATEMENT);
             }
         }
         let size = module.len() - start;
@@ -462,7 +497,7 @@ pub(crate) fn write(
     let mut by_address: Vec<(u16, u32, &str, u32)> =
         placed.iter().zip(&publics).map(|(it, public)| (it.section, it.offset, it.name, public.1)).collect();
     by_address.extend(native.iter().copied());
-    by_address.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.cmp(b.2)));
+    by_address.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.cmp(b.2)));
     let mut publics_stream = Out::default();
     publics_stream.u32(hash.len() as u32).u32(by_address.len() as u32 * 4);
     publics_stream.u32(0).u32(0).u16(0).u16(0).u32(0).u32(0);
