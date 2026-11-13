@@ -33,6 +33,8 @@ const ROUTE: &str = "--thin-route";
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
+    #[cfg(windows)]
+    let entered = sys::counter();
     let mut words: Vec<OsString> = std::env::args_os().skip(1).collect(); // alloc: once, the command line
     let timing = words.first().is_some_and(|word| word == "--thin-timing");
     if timing {
@@ -40,7 +42,12 @@ fn main() -> ExitCode {
     }
     #[cfg(any(unix, windows))]
     {
-        native::main(words, started, timing)
+        let code = native::main(words, started, timing);
+        #[cfg(windows)]
+        if timing {
+            eprintln!("thin main_qpc={entered} exit_qpc={}", sys::counter());
+        }
+        code
     }
     #[cfg(not(any(unix, windows)))]
     {
