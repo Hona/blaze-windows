@@ -1679,10 +1679,20 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        // The front end keys the run by its `OUT_DIR` as the daemon names it (the plan's
+        // `/C:/a/out`), not as the script was given it (`C:\a\out` on Windows).
+        let named = match job.plan(self.unit).map(|plan| plan.out_dir.clone()) {
+            Ok(Some(named)) => named,
+            Ok(None) => {
+                let what = format!("the build script run of unit {} has no OUT_DIR", self.unit);
+                return self.error(what, out);
+            }
+            Err(error) => return self.error(error.what, out),
+        };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
             env: output.env.clone(),
-            out_dir: out_dir.clone(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {
