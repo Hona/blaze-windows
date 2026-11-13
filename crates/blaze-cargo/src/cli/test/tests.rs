@@ -37,6 +37,14 @@ impl Programs for Fake {
 /// A package `foo` with a lib, a bin and a test `x`, each tested, and its doc tests; out of
 /// cargo's order.
 pub(crate) fn built() -> Vec<Artifact> {
+    built_in("/w")
+}
+
+/// [`built`] of a workspace at `w`, as the daemon names it.
+pub(crate) fn built_in(w: &str) -> Vec<Artifact> {
+    let artifact = |package, kind, name, test, exe| {
+        crate::cli::run::tests::artifact_in(w, package, kind, name, test, exe)
+    };
     vec![
         artifact("foo", "test", "x", true, Some("deps/x-4567")),
         artifact("foo", "lib", "foo", false, None),

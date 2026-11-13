@@ -15,14 +15,26 @@ pub(crate) fn artifact(
     test: bool,
     exe: Option<&str>,
 ) -> Artifact {
+    artifact_in("/w", package, kind, name, test, exe)
+}
+
+/// [`artifact`] of a workspace at `w`, as the daemon names it.
+pub(crate) fn artifact_in(
+    w: &str,
+    package: &str,
+    kind: &str,
+    name: &str,
+    test: bool,
+    exe: Option<&str>,
+) -> Artifact {
     let src_path = match kind {
-        "lib" => format!("/w/{package}/src/lib.rs"),
-        "bin" if name == package => format!("/w/{package}/src/main.rs"),
-        "bin" => format!("/w/{package}/src/bin/{name}.rs"),
-        "test" => format!("/w/{package}/tests/{name}.rs"),
-        "bench" => format!("/w/{package}/benches/{name}.rs"),
-        "example" => format!("/w/{package}/examples/{name}.rs"),
-        _ => format!("/w/{package}/src/lib.rs"),
+        "lib" => format!("{w}/{package}/src/lib.rs"),
+        "bin" if name == package => format!("{w}/{package}/src/main.rs"),
+        "bin" => format!("{w}/{package}/src/bin/{name}.rs"),
+        "test" => format!("{w}/{package}/tests/{name}.rs"),
+        "bench" => format!("{w}/{package}/benches/{name}.rs"),
+        "example" => format!("{w}/{package}/examples/{name}.rs"),
+        _ => format!("{w}/{package}/src/lib.rs"),
     };
     let target = UnitTarget {
         kind: TargetKind::named(kind).unwrap(),
@@ -35,15 +47,15 @@ pub(crate) fn artifact(
         test: true,
     };
     let path = exe.map_or_else(
-        || format!("/w/target/debug/lib{name}.rlib"),
-        |it| format!("/w/target/debug/{it}"),
+        || format!("{w}/target/debug/lib{name}.rlib"),
+        |it| format!("{w}/target/debug/{it}"),
     );
     Artifact {
-        package: format!("path+file:///w/{package}#0.1.0"),
+        package: format!("path+file://{w}/{package}#0.1.0"),
         kind: if test { ArtifactKind::Test } else { ArtifactKind::named(kind).unwrap() },
         path: path.clone(),
         content: ContentId([0; 32]),
-        manifest_path: format!("/w/{package}/Cargo.toml"),
+        manifest_path: format!("{w}/{package}/Cargo.toml"),
         target,
         profile: UnitProfile {
             opt_level: "0".to_owned(),
