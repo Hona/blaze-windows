@@ -1716,6 +1716,15 @@ impl Sim {
                 self.changed(&file);
                 Done::Truncated
             }
+            Effect::SparseFile { file, len, .. } => {
+                if self.files.contains_key(&file) {
+                    Done::Failed(IoError(format!("{file}: the staged file already exists")))
+                } else {
+                    file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
+                    self.changed(&file);
+                    Done::Truncated
+                }
+            }
             // Made beside it and renamed over it: a lock of the file it replaced is of that one.
             Effect::Write { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;

@@ -515,6 +515,7 @@ impl Kqueue {
             | Effect::Write { .. }
             | Effect::WriteUnsynced { .. }
             | Effect::TryPatch { .. }
+            | Effect::SparseFile { .. }
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
             | Effect::RenameUnsynced { .. }

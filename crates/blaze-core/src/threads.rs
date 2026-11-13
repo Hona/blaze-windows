@@ -1058,6 +1058,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::TryPatch { file, len, delta, whole, .. } => at(root, &file, |path| {
             fs::try_patch(path, len, &delta, &whole).map(Done::Patched)
         }),
+        Effect::SparseFile { file, len, .. } => at(root, &file, |path| fs::sparse_file(path, len).map(|()| Done::Truncated)),
         Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
             fs::write_at(path, offset, &bytes)?;
             Ok(Done::Written)

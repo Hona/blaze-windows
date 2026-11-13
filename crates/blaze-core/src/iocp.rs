@@ -896,6 +896,7 @@ impl Iocp {
             }
             effect @ (Effect::Write { .. }
             | Effect::TryPatch { .. }
+            | Effect::SparseFile { .. }
             | Effect::WriteUnsynced { .. }
             | Effect::Rename { .. }
             | Effect::RenameUnsynced { .. }
@@ -905,6 +906,7 @@ impl Iocp {
                 match &effect {
                     Effect::Write { file, .. }
                     | Effect::TryPatch { file, .. }
+                    | Effect::SparseFile { file, .. }
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::Remove { file, .. } => self.forget(file),
                     Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
@@ -2602,6 +2604,7 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
         Effect::TryPatch { file, len, delta, whole, .. } => {
             files::try_patch(joined(at, root, &file), len, &delta, &whole).map(Done::Patched)
         }
+        Effect::SparseFile { file, len, .. } => crate::fs::sparse_file(joined(at, root, &file), len).map(|()| Done::Truncated),
         Effect::Rename { from, to: into, .. } => {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
         }

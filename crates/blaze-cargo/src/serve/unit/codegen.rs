@@ -1754,15 +1754,16 @@ pub(crate) fn debug_place(
 /// file name) goes for the executable at `exe`. ELF: beside it under the name its
 /// `.gnu_debuglink` holds, whatever the copy is called. Mach-O: the bundle a debugger looks
 /// for beside the executable, `<its file name>.dSYM`.
-fn side_path(format: blaze_link::Format, exe: &str, name: &str) -> std::path::PathBuf {
-    let exe = std::path::Path::new(exe);
-    let dir = exe.parent().unwrap_or(std::path::Path::new(""));
-    match (format, exe.file_name().and_then(|it| it.to_str())) {
-        (blaze_link::Format::MachO, Some(own)) => {
-            // alloc: once per side file written, its path
-            dir.join(format!("{own}.dSYM")).join("Contents/Resources/DWARF").join(own)
+fn side_paths(format: blaze_link::Format, exe: &str, name: &str) -> (String, Option<String>) {
+    // `exe` is a daemon name, including for a foreign target: never join it as a host path.
+    let at = exe.rfind('/').map_or(0, |i| i + 1);
+    let (dir, own) = exe.split_at(at);
+    match format {
+        blaze_link::Format::MachO => {
+            // alloc: the two bundle outputs' daemon names
+            (format!("{dir}{own}.dSYM/Contents/Resources/DWARF/{own}"), Some(format!("{dir}{own}.dSYM/Contents/Info.plist")))
         }
-        _ => dir.join(name),
+        _ => (format!("{dir}{name}"), None), // alloc: the side output's daemon name
     }
 }
 
@@ -1921,31 +1922,20 @@ fn debug_side(
     let exes = std::iter::once(path).chain(super::artifact::uplifted(path, plan));
     let mut files = Vec::new(); // alloc: once per side file made, a path or two
     for exe in exes {
-        let side = side_path(format, exe, &name);
+        let (side, plist_path) = side_paths(format, exe, &name);
         // A `.dSYM` bundle's `Info.plist` (`NAME.dSYM/Contents/Resources/DWARF/NAME`); none
         // for a side file that is no bundle.
-        if let (Some((key, file)), Some(contents)) = (&plist, side.ancestors().nth(3)) {
+        if let (Some((key, file)), Some(path)) = (&plist, plist_path) {
             files.push(SideFile {
-                path: named(contents.join("Info.plist"))?,
+                path,
                 key: *key,
                 file: Arc::clone(file), // clone: a refcount
             });
         }
         // clone: a refcount
-        files.push(SideFile { path: named(side)?, key, file: Arc::clone(&file) });
+        files.push(SideFile { path: side, key, file: Arc::clone(&file) });
     }
     Ok(files)
-}
-
-/// `path` as the text the loop names an output's path by.
-fn named(path: std::path::PathBuf) -> Result<String, LinkCause> {
-    path.into_os_string().into_string().map_err(|it| {
-        // alloc: error path
-        LinkCause::Given(format!(
-            "{}: a debug side file's path is not UTF-8, and the loop names an output by text",
-            std::path::Path::new(&it).display()
-        ))
-    })
 }
 
 /// What the build says when a splice was refused for a thunk it could not place and the
