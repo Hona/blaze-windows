@@ -807,12 +807,12 @@ fn classes_in_link_exe_order() {
         [
             Class::Text,
             Class::Plt,
+            Class::Got,
             Class::Rodata,
             Class::RelRo,
             Class::Synthetic(IDATA),
             Class::Named { name: ".CRT".into(), write: false, exec: false },
             Class::Data,
-            Class::Got,
             Class::Bss,
             pdata_class(),
             Class::Synthetic(PDATA),
@@ -822,7 +822,7 @@ fn classes_in_link_exe_order() {
     );
     assert_eq!(pe.prot(&Class::Text), crate::model::Prot::RX);
     assert_eq!(pe.prot(&Class::RelRo), crate::model::Prot::R);
-    assert_eq!(pe.prot(&Class::Got), crate::model::Prot::RW);
+    assert_eq!(pe.prot(&Class::Got), crate::model::Prot::R, "the IAT the loader makes read-only");
     assert_eq!(pe.prot(&Class::Tdata), crate::model::Prot::RW);
     assert_eq!(pe.prot(&pdata_class()), crate::model::Prot::R);
 }
@@ -1361,7 +1361,7 @@ fn object() -> Vec<u8> {
     data[0..8].copy_from_slice(&16u64.to_le_bytes());
     let data = coff.section(".data", DATA, data);
     let directives = " /DEFAULTLIB:msvcrt /DEFAULTLIB:\"oldnames\" /DEFAULTLIB:msvcrt.lib /INCLUDE:keep_me \
-                      /FAILIFMISMATCH:_MSC_VER=1900 /ALTERNATENAME:alias=target /MERGE:.a=.b";
+                      /FAILIFMISMATCH:_MSC_VER=1900 /ALTERNATENAME:alias=target /MERGE:.CRT=.rdata";
     let drectve = coff.section(".drectve", INFO, directives.as_bytes().to_vec());
     let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xc3; 4]);
     let mut entry = vec![0u8; 12];

@@ -1,0 +1,4 @@
+LIBRARY runlib.dll
+EXPORTS
+    runlib_add
+    runlib_value DATA

@@ -10,6 +10,15 @@ use crate::Undefined as Und;
 
 const MAC: &str = "aarch64-apple-darwin";
 const LINUX: &str = "x86_64-unknown-linux-gnu";
+const WINDOWS: &str = "x86_64-pc-windows-msvc";
+
+fn triple(spelling: Spelling) -> &'static str {
+    match spelling {
+        Spelling::Ld64 => MAC,
+        Spelling::Msvc => WINDOWS,
+        Spelling::Gnu | Spelling::WasmLd => LINUX,
+    }
+}
 
 fn given(args: &[&str]) -> Vec<GivenArg> {
     args.iter().map(|it| GivenArg { arg: (*it).to_owned(), from: ArgFrom::Rustflags }).collect()
@@ -20,7 +29,7 @@ fn lib(name: &str, kind: NativeLibKind, verbatim: bool) -> LinkOption {
 }
 
 fn options(spelling: Spelling, kind: Kind, args: &[&str]) -> Vec<LinkOption> {
-    let triple = if spelling == Spelling::Ld64 { MAC } else { LINUX };
+    let triple = triple(spelling);
     parse(spelling, kind, triple, &given(args)).unwrap_or_else(|errors| {
         panic!("{args:?} refused: {}", errors.iter().map(|it| it.to_string()).collect::<Vec<_>>().join("; "))
     })
@@ -28,7 +37,7 @@ fn options(spelling: Spelling, kind: Kind, args: &[&str]) -> Vec<LinkOption> {
 
 /// The one word refused of `args`, as the error names it.
 fn refused(spelling: Spelling, kind: Kind, args: &[&str]) -> String {
-    let triple = if spelling == Spelling::Ld64 { MAC } else { LINUX };
+    let triple = triple(spelling);
     let errors = parse(spelling, kind, triple, &given(args)).expect_err("refused");
     assert_eq!(errors.len(), 1, "{errors:?}");
     errors[0].to_string()
@@ -80,7 +89,7 @@ fn spellings_to_options() {
         (Gnu, Shared, &["-Wl,-soname,libx.so.1"], vec![Name("libx.so.1".into())]),
         (Gnu, Shared, &["-Wl,-soname=libx.so.1"], vec![Name("libx.so.1".into())]),
         (Ld64, Shared, &["-Wl,-exported_symbol,_PyInit_x"], vec![Export("PyInit_x".into())]),
-        (Ld64, Exe, &["-Wl,-stack_size,0x1000000"], vec![StackSize(0x100_0000)]),
+        (Ld64, Exe, &["-Wl,-stack_size,0x1000000"], vec![Stack { reserve: 0x100_0000, commit: None }]),
         (Gnu, Shared, &["-Wl,-z,nodelete"], vec![NoDelete]),
         (Gnu, Exe, &["-Wl,-z,nodelete"], vec![NoEffect(super::reason::NOT_UNLOADED)]),
         // What blaze's linker does anyway, joined and apart.
@@ -102,6 +111,153 @@ fn spellings_to_options() {
     ];
     for (spelling, kind, args, want) in table {
         assert_eq!(&options(*spelling, *kind, args), want, "{spelling:?} {kind:?} {args:?}");
+    }
+}
+
+/// link.exe's spelling: `/` or `-`, any case, each option one word, bare files by extension;
+/// what build scripts give (rune-desktop's subsystem, entry and delay-loads, winresource's
+/// `.res`, tauri-build's `resource.lib`) and what rustc gives link.exe itself.
+#[test]
+fn msvc_spellings_to_options() {
+    use Kind::{Executable as Exe, Shared};
+    use LinkOption::*;
+    use NativeLibKind::Static;
+    use crate::output::PeFlag;
+    let st = |whole| Static { whole, bundle: false };
+    use super::msvc::reason_msvc as r;
+    let table: &[(Kind, &[&str], Vec<LinkOption>)] = &[
+        (Exe, &["/SUBSYSTEM:WINDOWS"], vec![Subsystem { windows: true, version: None }]),
+        (Exe, &["-subsystem:console"], vec![Subsystem { windows: false, version: None }]),
+        (Exe, &["/SUBSYSTEM:WINDOWS,6.02"], vec![Subsystem { windows: true, version: Some((6, 2)) }]),
+        (Exe, &["/subsystem:windows,10"], vec![Subsystem { windows: true, version: Some((10, 0)) }]),
+        (Exe, &["/ENTRY:mainCRTStartup"], vec![Entry("mainCRTStartup".into())]),
+        (Exe, &["/DELAYLOAD:comctl32.dll", "delayimp.lib"], vec![
+            DelayLoad("comctl32.dll".into()),
+            lib("delayimp.lib", st(false), true),
+        ]),
+        (Exe, &[r"C:\t\out\resource.res"], vec![Input(PathBuf::from(r"C:\t\out\resource.res"))]),
+        (Exe, &[r"C:\t\out\resource.lib"], vec![lib(r"C:\t\out\resource.lib", st(false), true)]),
+        (Exe, &["extra.obj", "x.o"], vec![Input("extra.obj".into()), Input("x.o".into())]),
+        (Exe, &["/DEFAULTLIB:advapi32", "-defaultlib:user32.lib"], vec![
+            lib("advapi32", st(false), false),
+            lib("user32.lib", st(false), true),
+        ]),
+        (Exe, &["/NODEFAULTLIB:libcmt", "/NODEFAULTLIB"], vec![NoDefaultLib(Some("libcmt".into())), NoDefaultLib(None)]),
+        (Exe, &["/WHOLEARCHIVE:foo.lib"], vec![lib("foo.lib", st(true), true)]),
+        (Exe, &["/LIBPATH:C:\\lib"], vec![Search(PathBuf::from("C:\\lib"))]),
+        (Exe, &["/STACK:0x800000", "/STACK:8388608,4096"], vec![
+            Stack { reserve: 0x80_0000, commit: None },
+            Stack { reserve: 0x80_0000, commit: Some(4096) },
+        ]),
+        (Exe, &["/HEAP:2097152,8192"], vec![Heap { reserve: 0x20_0000, commit: Some(0x2000) }]),
+        (Exe, &["/INCLUDE:_tls_used"], vec![Include("_tls_used".into())]),
+        (Shared, &["/EXPORT:NvOptimusEnablement,DATA"], vec![Export("NvOptimusEnablement".into())]),
+        (Shared, &["/DEF:x.def"], vec![Def("x.def".into())]),
+        (Exe, &["/BASE:0x180000000"], vec![Base(0x1_8000_0000)]),
+        (Exe, &["/VERSION:1.2"], vec![ImageVersion { major: 1, minor: 2 }]),
+        (Exe, &["/DYNAMICBASE", "/DYNAMICBASE:NO", "/FIXED"], vec![
+            Already(r::DYNAMICBASE),
+            PeOff(PeFlag::DynamicBase),
+            PeOff(PeFlag::DynamicBase),
+        ]),
+        (Exe, &["/HIGHENTROPYVA:NO", "/NXCOMPAT:NO", "/LARGEADDRESSAWARE:NO", "/TSAWARE:NO"], vec![
+            PeOff(PeFlag::HighEntropyVa),
+            PeOff(PeFlag::NxCompat),
+            PeOff(PeFlag::LargeAddressAware),
+            PeOff(PeFlag::TerminalServerAware),
+        ]),
+        (Exe, &["/NOLOGO", "/MACHINE:X64", "/OPT:REF,ICF", "/DEBUG", "/DEBUG:FULL", "/INCREMENTAL:NO"], vec![
+            NoEffect(r::NOLOGO),
+            Already(r::MACHINE),
+            NoEffect(r::ICF),
+            NoEffect(r::DEBUG),
+            NoEffect(r::DEBUG),
+            NoEffect(r::INCREMENTAL),
+        ]),
+        (Exe, &["/MANIFEST:NO", "/MANIFESTUAC:NO", "/guard:no", "/natvis:x.natvis"], vec![
+            NoEffect(r::MANIFEST_NO),
+            NoEffect(r::MANIFESTUAC),
+            Already(r::NO_GUARD),
+            NoEffect(r::NATVIS),
+        ]),
+        (Exe, &["/MERGE:.CRT=.rdata"], vec![NoEffect(r::MERGE)]),
+    ];
+    for (kind, args, want) in table {
+        assert_eq!(&options(Spelling::Msvc, *kind, args), want, "{kind:?} {args:?}");
+    }
+    // A refused option's neighbours are read: a bare word after it is an input of its own.
+    let errors = parse(Spelling::Msvc, Kind::Executable, WINDOWS, &given(&["/FOO", "x.lib"]))
+        .unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].word, "/FOO");
+}
+
+fn windows_output() -> crate::Output {
+    crate::Output {
+        format: crate::Format::Pe,
+        arch: blaze_codegen::Arch::X86_64,
+        kind: crate::OutputKind::Executable { entry: "mainCRTStartup".into() },
+        interpreter: None,
+        platform: None,
+        incremental: false,
+        debug: crate::Debug::None,
+        live: None,
+        tags: 0,
+        stack: Some(1 << 20),
+        windows_subsystem: false,
+        dev_run: None,
+        triple: WINDOWS.into(),
+        exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
+        link: crate::LinkArgs::default(),
+    }
+}
+
+/// `apply` of link.exe's arguments: what rune-desktop's build script gives, on an executable.
+#[test]
+fn msvc_arguments_apply_to_the_output() {
+    let mut output = windows_output();
+    let args = given(&[
+        "/SUBSYSTEM:WINDOWS",
+        "/ENTRY:wmainCRTStartup",
+        "/DELAYLOAD:comctl32.dll",
+        "/DELAYLOAD:COMCTL32.dll",
+        "/DELAYLOAD:dwrite.dll",
+        "delayimp.lib",
+        r"C:\out\app.res",
+        "/STACK:0x800000,0x2000",
+        "/NODEFAULTLIB:libcmt",
+        "/NODEFAULTLIB:msvcrtd.lib",
+    ]);
+    let applied = super::apply(&mut output, &[], &args).unwrap();
+    assert!(output.windows_subsystem);
+    assert_eq!(output.kind, crate::OutputKind::Executable { entry: "wmainCRTStartup".into() });
+    assert_eq!(output.link.pe.delay_load, ["comctl32.dll", "dwrite.dll"], "each DLL once");
+    assert_eq!(output.link.inputs, [PathBuf::from(r"C:\out\app.res")]);
+    assert_eq!((output.stack, output.link.pe.stack_commit), (Some(0x80_0000), Some(0x2000)));
+    assert!(output.link.pe.no_default_libs.excludes("LIBCMT.lib"));
+    assert!(output.link.pe.no_default_libs.excludes("msvcrtd"));
+    assert!(!output.link.pe.no_default_libs.excludes("msvcrt"));
+    assert_eq!(applied.libs.len(), 1);
+    assert_eq!(applied.libs[0].name, "delayimp.lib");
+}
+
+/// A module-definition file's exports, and what of one is refused.
+#[test]
+fn a_def_files_exports() {
+    let text = "; the plugin's\nLIBRARY plugin\nEXPORTS\n    init\n    \"table\" DATA\n  shutdown PRIVATE ; last\n";
+    let (library, exports) = super::msvc::def_exports(text).unwrap();
+    assert_eq!(library.as_deref(), Some("plugin"));
+    assert_eq!(exports, ["init", "table", "shutdown"]);
+    for (text, want) in [
+        ("EXPORTS\n  a=b\n", "renamed export"),
+        ("EXPORTS\n  a @1\n", "by ordinal"),
+        ("HEAPSIZE 4096\n", "only LIBRARY and EXPORTS"),
+        ("init\n", "outside EXPORTS"),
+    ] {
+        let why = super::msvc::def_exports(text).unwrap_err();
+        assert!(why.contains(want), "{text:?}: {why}");
     }
 }
 
@@ -204,14 +360,39 @@ fn refusals_name_the_argument_the_word_where_and_why() {
         (Ld64, Exe, &["-Wl,-headerpad,zz"], "not a hexadecimal size"),
         (Ld64, Exe, &["-Wl,-headerpad,0x200000"], "1 MiB"),
         (Ld64, Exe, &["-Wl,-install_name,@rpath/x"], "this image is an executable"),
-        (Msvc, Exe, &["/STACK:8388608"], "no C driver"),
         (WasmLd, Exe, &["-zstack-size=65536"], "no C driver"),
+        (Msvc, Exe, &["/SUBSYSTEM:NATIVE"], "WINDOWS and CONSOLE subsystems only"),
+        (Msvc, Exe, &["/SUBSYSTEM:WINDOWS,six"], "WINDOWS and CONSOLE subsystems only"),
+        (Msvc, Exe, &["/STACK:big"], "not a number"),
+        (Msvc, Shared, &["/STACK:0x100000"], "this image is a shared library"),
+        (Msvc, Shared, &["/ENTRY:DllMain"], "_DllMainCRTStartup"),
+        (Msvc, Exe, &["/MACHINE:ARM64"], "x64 only"),
+        (Msvc, Exe, &["/BASE:0x140001000"], "64 KiB"),
+        (Msvc, Exe, &["/WHOLEARCHIVE"], "name the library"),
+        (Msvc, Exe, &["/OUT:x.exe"], "names and kinds the image"),
+        (Msvc, Exe, &["/DLL"], "names and kinds the image"),
+        (Msvc, Shared, &["/IMPLIB:x.lib"], "no import library"),
+        (Msvc, Exe, &["/EXPORT:NvOptimusEnablement,DATA"], "nothing from an executable"),
+        (Msvc, Shared, &["/EXPORT:a=b"], "renamed export"),
+        (Msvc, Shared, &["/EXPORT:a,@3"], "by ordinal"),
+        (Msvc, Exe, &["/MANIFEST:EMBED"], "no side-by-side or generated manifest"),
+        (Msvc, Exe, &["/MANIFESTINPUT:app.manifest"], "no side-by-side or generated manifest"),
+        (Msvc, Exe, &["/guard:cf"], "control-flow guard"),
+        (Msvc, Exe, &["/CETCOMPAT"], "CET-compatible"),
+        (Msvc, Exe, &["/LTCG"], "link-time-code-generation"),
+        (Msvc, Exe, &["/MERGE:.text=.data"], "merges only"),
+        (Msvc, Exe, &["/RELEASE"], "no header checksum"),
+        (Msvc, Exe, &["/OPT:FOO"], "does not implement it"),
+        (Msvc, Exe, &["/SECTION:.data,RWS"], "does not implement it"),
+        (Msvc, Exe, &["@link.rsp"], "response file"),
+        (Msvc, Exe, &["app.manifest"], "an input file blaze's linker does not read"),
+        (Msvc, Exe, &["/DELAYLOAD:"], "none follows"),
     ];
     for (spelling, kind, args, want) in table {
         let error = refused(*spelling, *kind, args);
         assert!(error.contains(want), "{spelling:?} {kind:?} {args:?}: {error}");
         assert!(error.contains("from `-C link-arg`"), "{error}");
-        let triple = if *spelling == Ld64 { MAC } else { LINUX };
+        let triple = triple(*spelling);
         assert!(error.contains(&format!("linking for {triple}")), "{error}");
     }
 
