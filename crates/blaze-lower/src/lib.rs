@@ -1238,17 +1238,20 @@ impl Lowered {
     /// refused unless they make the identity the front end holds, so they never describe
     /// another identity than the one a key was made from; the files are those of the source
     /// root whose content that identity holds.
-    pub fn identity_parts(&self, unit: usize) -> Result<Vec<IdentityPart>, String> {
+    pub fn identity_parts(&self, unit: usize, looked_up: ContentId) -> Result<Vec<IdentityPart>, String> {
         let db = &self.db;
         let Some(krate) = self.crates.krate(unit) else {
             return Err("it has no crate in the front end".to_owned()); // alloc: error path
         };
-        let Some(known) = self.identities.get(&krate).copied() else {
-            // alloc: error path
-            return Err(
-                "its crate's identity was not worked out since the front end's last write"
-                    .to_owned(),
-            );
+        // A sibling's build script or macro load can clear the writer's memo after the
+        // job took its key. Reconstruct missing digests for this explanation alone. The
+        // final comparison is against the actual lookup, never a later revision's key.
+        let mut remade = blaze_hash::HashMap::new_in(Global);
+        let identities = if self.identities.contains_key(&krate) {
+            &self.identities
+        } else {
+            identity_of(db, krate, &self.spellings, &mut remade);
+            &remade
         };
         let data = krate.data(db);
         let root_file = data.root_file_id;
@@ -1341,7 +1344,7 @@ impl Lowered {
         parts.push(IdentityPart::Spelling(spelled.finish()));
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
-            let Some(identity) = self.identities.get(&dep.crate_id).copied() else {
+            let Some(identity) = identities.get(&dep.crate_id).copied() else {
                 // alloc: error path
                 return Err(format!(
                     "the identity of `{}`, a crate it depends on, was not worked out since the front end's last write",
@@ -1355,10 +1358,10 @@ impl Lowered {
                 identity,
             });
         }
-        if hasher.finish() != known {
+        if hasher.finish() != looked_up {
             // alloc: error path
             return Err(
-                "what its crate's identity is made of now does not make the identity the front end holds, so its parts would not describe the key it missed under"
+                "its crate's identity changed since its record lookup, so its parts now would not describe the key it missed under"
                     .to_owned(),
             );
         }

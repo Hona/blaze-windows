@@ -804,8 +804,9 @@ impl UnitReader {
     pub(crate) fn identity_parts(
         &self,
         unit: usize,
+        looked_up: ContentId,
     ) -> Result<Vec<blaze_lower::IdentityPart>, String> {
-        self.front.identity_parts(unit)
+        self.front.identity_parts(unit, looked_up)
     }
 
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
