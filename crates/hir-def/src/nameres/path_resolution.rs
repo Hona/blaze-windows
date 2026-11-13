@@ -716,6 +716,8 @@ impl DefMap {
         reads: &mut R,
     ) -> ResolvePathResult {
         let db = q.db;
+        // The module the segment just looked up is private to ([`DefMap::segment_privacy_scope`]).
+        let mut privacy_from;
         for (i, segment) in segments.names.iter().enumerate().skip(resolved) {
             let Some(curr) = curr_per_ns.take_types_full() else {
                 // we still have path segments left, but the path so far
@@ -768,6 +770,21 @@ impl DefMap {
                     // Since it is a qualified path here, it should not contains legacy macros
                     let segment = segments.keyed_in(db, def_map, module, i);
                     reads(PathRead::Slot(module, segment));
+                    // A segment a `macro` wrote is private to where the macro is defined, not
+                    // where it is called (rustc's `resolve_ident_in_module_ext`): std's
+                    // `unicode_str!` names `crate::sys::pal::windows::api::wide_str!`, through
+                    // `pal`'s private `windows`, from every module of std that calls it.
+                    privacy_from = segments
+                        .contexts
+                        .and_then(|it| {
+                            self.segment_privacy_scope(
+                                db,
+                                it[i],
+                                def_map.module_expansion(db, module),
+                                original_module,
+                            )
+                        })
+                        .unwrap_or(original_module);
                     def_map.name_in_module(db, module, &segment)
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
@@ -865,8 +882,9 @@ impl DefMap {
                 }
             };
 
-            let visible = curr_per_ns
-                .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
+            let visible = curr_per_ns.filter_visibility(|vis| {
+                vis.is_visible_from_def_map(db, self.map_for(db, privacy_from), privacy_from)
+            });
             // A name can be a private module and a public function at once: the harness keeps
             // the module.
             curr_per_ns =
