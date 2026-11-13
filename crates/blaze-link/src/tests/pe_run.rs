@@ -214,6 +214,28 @@ fn resources_of_two_res_files_are_the_programs_and_its_manifest_is_applied() {
     assert_eq!(run(&dir.join("bare.exe"), &[]), (127, "res 127\n".into()));
 }
 
+/// `/DELAYLOAD` of three DLLs with `delayimp.lib` (`pe_run/delay.c`): none in the import
+/// directory, each loaded by its first call, and the helper's exception for one not there
+/// unwinds through the tail merge to the program's `__except`.
+#[test]
+fn delay_loaded_dlls_load_on_first_call_and_a_missing_one_raises() {
+    let (delayed, libs) = with_args(
+        output(None, &["delay.obj", "nosuch.lib"]),
+        &["/DELAYLOAD:comctl32.dll", "/DELAYLOAD:version.dll", "/DELAYLOAD:NOSUCH.dll", "delayimp.lib"],
+    );
+    let bytes = link_with(delayed, &libs).unwrap();
+    has_crt_directories(&bytes);
+    let dlls = dlls(&bytes);
+    for it in ["comctl32.dll", "version.dll", "nosuch.dll"] {
+        assert!(!dlls.contains(&it.to_owned()), "{it} is imported at load: {dlls:?}");
+    }
+    let dirs = directories(&bytes);
+    assert_eq!(dirs[object::pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].1, 4 * 32, "{dirs:x?}");
+    let dir = scratch("delay");
+    std::fs::write(dir.join("delay.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("delay.exe"), &[]), (0, "delay 0\n".into()));
+}
+
 /// The DLLs an image imports from, lowercased, in its import directory's order.
 fn dlls(bytes: &[u8]) -> Vec<String> {
     use object::LittleEndian as LE;

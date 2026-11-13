@@ -109,6 +109,9 @@ const SCRIPT: &str = "blaze v2 link target script";
 /// The domain the object of a link's resources is named in ([`crate::pe::rsrc`]).
 const RESOURCES: &str = "blaze v2 link target resources";
 
+/// The domain the object of the delay-load tail merge is named in ([`crate::pe::delay`]).
+const TAIL_MERGE: &str = "blaze v2 link target delay tail merge";
+
 /// The domain a PE archive's bytes are named in for what its members ask for.
 const ASKED: &str = "blaze v2 link target default libraries";
 
@@ -474,6 +477,19 @@ fn locate_with<A: Ask>(
         line.input(input)?;
     }
     line.make_resources()?;
+    // `/DELAYLOAD`'s tail merge, which every delay-loaded function's first call goes through
+    // ([`crate::pe::delay`]); `delayimp.lib`, which the arguments give as link.exe needs them
+    // to, defines the helper it calls.
+    if target == Target::Msvc && !output.link.pe.delay_load.is_empty() {
+        let bytes: Arc<[u8]> = crate::pe::delay::tailmerge_object().into();
+        line.out.push(Located {
+            path: PathBuf::from(crate::pe::delay::TAILMERGE),
+            // alloc: once per link with delay-loads, what errors call the made object
+            name: "the link's delay-load tail merge".to_owned(),
+            kind: NativeKind::Object,
+            made: Some((ContentId::of(TAIL_MERGE, &bytes), bytes)),
+        });
+    }
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
