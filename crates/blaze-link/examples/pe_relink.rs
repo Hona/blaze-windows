@@ -50,10 +50,13 @@ fn words(text: &str) -> Vec<String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(line), Some(out)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: pe_relink <linker-arguments> <out.exe> [runs]");
+        eprintln!("usage: pe_relink <linker-arguments> <out.exe> [runs] [links of nothing changed] [incremental] [pdb]");
         std::process::exit(2);
     };
     let runs: usize = args.get(3).map_or(1, |it| it.parse().expect("runs"));
+    let agains: usize = args.get(4).map_or(1, |it| it.parse().expect("links of nothing changed"));
+    // A dev build's image keeps room to grow, as the daemon links one; a release build's does not.
+    let incremental = args.get(5).is_some_and(|it| it == "incremental");
     let text = std::fs::read(line).expect("the line");
     // rustc writes the file UTF-16 with a BOM for link.exe.
     let text = if text.starts_with(&[0xff, 0xfe]) {
@@ -86,7 +89,10 @@ fn main() {
     }
     for run in 0..runs {
         let started = Instant::now();
-        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, Debug::None, false)
+        // The image's PDB beside it, as a dev build's ("pdb" as the sixth argument).
+        let pdb = args.get(6).is_some_and(|it| it == "pdb");
+        let debug = if pdb { Debug::Beside } else { Debug::None };
+        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, debug, incremental)
             .expect("the output");
         // rustc names the static VC runtime (`/defaultlib:libcmt`) on a `+crt-static` line.
         output.link.pe.crt_static =
@@ -123,6 +129,15 @@ fn main() {
         let made_at = started.elapsed();
         std::fs::write(PathBuf::from(out), &file).expect("the output file");
         let written_at = started.elapsed();
+        if pdb {
+            let at = Instant::now();
+            let write = image.debug_file().unwrap_or_else(|e| panic!("{e}")).expect("a PDB");
+            let made = at.elapsed();
+            let bytes = write.apply(blaze_link::Format::Pe, None).unwrap_or_else(|e| panic!("{e}"));
+            let to = PathBuf::from(out).with_file_name(&write.name);
+            std::fs::write(&to, &bytes).expect("the PDB");
+            println!("run {run}: PDB {} made in {:.3} s, {:.1} MB", to.display(), made.as_secs_f64(), bytes.len() as f64 / 1e6);
+        }
         println!(
             "run {run}: {} inputs, {:.0} MB read; locate {:.3} s, read {:.3} s, stage {:.3} s, bytes {:.3} s, write {:.3} s; total {:.3} s; {:.1} MB out",
             read.len(),
@@ -135,5 +150,19 @@ fn main() {
             written_at.as_secs_f64(),
             file.len() as f64 / 1e6,
         );
+        // A link of the same image that changes nothing: what every edit's link pays for the
+        // native inputs it did not change.
+        for _ in 0..agains {
+        let again = Instant::now();
+        let staged = image.stage(Change::default()).unwrap_or_else(|e| panic!("{e}"));
+        let staged_at = again.elapsed();
+        let file = image.bytes(staged).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "run {run} again, nothing changed: stage {:.3} s, bytes {:.3} s; {:.1} MB out",
+            staged_at.as_secs_f64(),
+            (again.elapsed() - staged_at).as_secs_f64(),
+            file.len() as f64 / 1e6
+        );
+        }
     }
 }

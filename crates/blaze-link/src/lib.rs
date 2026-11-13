@@ -80,8 +80,8 @@ pub use lazy::{LazyPlacer, Slots};
 pub use patch::Patch;
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
-    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
-    Undefined,
+    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, NoDefaultLibs, Output, OutputKind,
+    PeArgs, PeFlag, Platform, Undefined,
 };
 pub use position::{
     COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
@@ -439,7 +439,7 @@ impl Image {
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
         }
-        if output.debug == Debug::Beside && !matches!(output.format, Format::Elf | Format::MachO)
+        if output.debug == Debug::Beside && output.format == Format::Wasm
         {
             // alloc: error path
             return Err(fail(format!(
@@ -1205,6 +1205,10 @@ impl Image {
                 }
             }
             views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+            // A PDB's publics: given again only when the native code may have changed.
+            let version = state.resolved.natives_version;
+            let publics = (format == Format::Pe && self.beside.pdb_natives() != Some(version))
+                .then(|| (version, state.resolved.native_functions(state)));
             let input = beside::Input {
                 format,
                 name: &self.name,
@@ -1213,6 +1217,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
+                publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1225,6 +1230,9 @@ impl Image {
             views.push(piece)?;
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        // A PDB names native code by its objects' names; DWARF's side file does not.
+        let version = state.resolved.natives_version;
+        let publics = (format == Format::Pe).then(|| (version, state.resolved.native_functions(state)));
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1233,6 +1241,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
+            publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);

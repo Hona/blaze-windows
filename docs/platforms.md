@@ -154,6 +154,29 @@ as the repository's cargo configuration names it. That was run by hand on one ma
 crate and `demo/life`, not in CI; `harness/blaze_cli.py` and the fuzzer are not run there.
 The GNU and ARM64 Windows targets have nothing implemented.
 
+### v2's linker on Windows (2026-11-13, branch `windows/link`)
+
+The paragraphs above are v1's. v2 links PE images with its own linker (`crates/blaze-link`),
+not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0.26100:
+
+- `src/tests/pe_run.rs` links MSVC-built objects with the machine's CRT and SDK libraries and
+  runs each image: C with the dynamic and the static CRT, C++ exceptions and static
+  initialisers, TLS and TLS callbacks, a DLL and its importer (also through the DLL's own
+  import library, `Image::import_library`), `/guard:cf` and `/GS` code, a GUI program, `.res`
+  resources and their manifest, `/DELAYLOAD` (a missing DLL raises its exception), raw-dylib.
+- link.exe's arguments as rustc and build scripts give them are read (`args/msvc.rs`, listed in
+  [cargo.md](cargo.md)); one blaze does not implement is refused by name. `+crt-static` links
+  the static VC runtime, with the dynamic UCRT where the line asks for it.
+- rustc's own link line for rune-desktop (258 objects, 387 rlibs, its C libraries, 13
+  `/DELAYLOAD`s, its `.res`) links with blaze-link (`examples/pe_relink.rs`), and the program
+  renders frames byte for byte the same as link.exe's image does.
+- The image's PDB is written beside it ([v2/plan/design/pdb.md](v2/plan/design/pdb.md)):
+  dbghelp (std's backtrace) names Rust functions and their lines and C functions by name, cdb
+  breaks on a Rust function by name. It has no types or locals, and is written whole by each
+  link.
+- Not done: CFG tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a
+  `.res` manifest works).
+
 ## macOS arm64
 
 Runs on `macos-latest` in CI under both backends, with `worktrees.py` in all three of its

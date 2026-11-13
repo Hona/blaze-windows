@@ -108,3 +108,10 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   `sys::provider::spawning()` at the top of `Command::spawn` and `Command::exec` in
 #   std/src/sys/process/unix/unix.rs, which gives each child a seed of its own through
 #   `replace_entry` (new) in std/src/sys/env/unix.rs.
+# - std/src/sys/personality/blaze_seh.rs (new) and its arm in std/src/sys/personality/mod.rs,
+#   under cfg(all(target_env = "msvc", target_arch = "x86_64")) in place of the aborting stub:
+#   `rust_eh_personality` is blaze's SEH personality, the handler blaze's codegen names in the
+#   UNWIND_INFO of every function with landing pads, whose data is the function's guarded calls;
+#   `blaze.seh.resume` and `blaze.seh.release` are what those pads call. rustc's code never
+#   names any of them (its personality is `__CxxFrameHandler3`), and every other target's std is
+#   unchanged.

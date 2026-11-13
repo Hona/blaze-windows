@@ -92,6 +92,35 @@ extern "system" {
     );
 }
 
+/// A static of a DLL (a block whose first `#[link]` is a `dylib`, of no kind, or a
+/// `raw-dylib`) is reached through its import address table cell `__imp_X` on Windows, as
+/// rustc's `is_dllimport` has it; one of a `static` library or of a block that names none is
+/// the image's own, and so is every one on another target.
+#[test]
+fn a_dlls_static_is_reached_through_its_import_cell() {
+    let text = r#"
+#[link(name = "kernel32")]
+extern "C" { static IN_DYLIB: u32; }
+#[link(name = "ntdll.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "C" { #[link_name = "RAW_NAME"] static IN_RAW: u32; }
+#[link(name = "own", kind = "static")]
+extern "C" { static IN_STATIC: u32; }
+extern "C" { static IN_NONE: u32; }
+"#;
+    let named = |db: &TestDB, name: &str| {
+        let id = hir_def::test_items::static_item(db, fixture::test_crate(db), name);
+        (crate::dll_imported(db, id), crate::v2::places::static_ref(db, id).unwrap())
+    };
+    let (db, _) = frontend(&format!("//- target: x86_64-pc-windows-msvc\n{text}"));
+    let symbol = |name: &str| blaze_codegen::backend::FrontRef::Extern(name.to_owned());
+    assert_eq!(named(db, "IN_DYLIB"), (true, symbol("__imp_IN_DYLIB")));
+    assert_eq!(named(db, "IN_RAW"), (true, symbol("__imp_RAW_NAME")));
+    assert_eq!(named(db, "IN_STATIC"), (false, symbol("IN_STATIC")));
+    assert_eq!(named(db, "IN_NONE"), (false, symbol("IN_NONE")));
+    let (db, _) = frontend(text);
+    assert_eq!(named(db, "IN_DYLIB"), (false, symbol("IN_DYLIB")));
+}
+
 /// An ordinal that is no 16-bit integer is an error naming it, as rustc's.
 #[test]
 fn an_ordinal_past_16_bits_is_an_error() {

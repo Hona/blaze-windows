@@ -304,6 +304,37 @@ fn graph_key_changes_with_every_input() {
             "an rpath",
             Box::new(|it: &mut Graph| it.output.rpaths.push("/opt/blaze/runtime".to_owned())),
         ),
+        (
+            "a link argument's input",
+            Box::new(|it: &mut Graph| it.output.link.inputs.push("app.res".into())),
+        ),
+        ("the static VC runtime", Box::new(|it: &mut Graph| it.output.link.pe.crt_static = true)),
+        (
+            "a delay-loaded DLL",
+            Box::new(|it: &mut Graph| it.output.link.pe.delay_load.push("user32.dll".to_owned())),
+        ),
+        (
+            "a default library left out",
+            Box::new(|it: &mut Graph| {
+                it.output.link.pe.no_default_libs = blaze_link::NoDefaultLibs::All
+            }),
+        ),
+        (
+            "an included symbol",
+            Box::new(|it: &mut Graph| it.output.link.pe.include.push("NvOptimusEnablement".into())),
+        ),
+        ("the stack commit", Box::new(|it: &mut Graph| it.output.link.pe.stack_commit = Some(1 << 16))),
+        ("the heap", Box::new(|it: &mut Graph| it.output.link.pe.heap = Some((1 << 20, None)))),
+        ("the image base", Box::new(|it: &mut Graph| it.output.link.pe.base = Some(0x1_8000_0000))),
+        (
+            "a PE property off",
+            Box::new(|it: &mut Graph| it.output.link.pe.off.push(blaze_link::PeFlag::HighEntropyVa)),
+        ),
+        (
+            "the subsystem version",
+            Box::new(|it: &mut Graph| it.output.link.pe.subsystem_version = Some((6, 2))),
+        ),
+        ("the image version", Box::new(|it: &mut Graph| it.output.link.pe.image_version = Some((1, 0)))),
         ("the base", Box::new(|it: &mut Graph| it.base += 1 << 20)),
         ("the thread-local bias", Box::new(|it: &mut Graph| it.tls_bias -= 64)),
         ("a native's contents", Box::new(|it: &mut Graph| it.natives[0].id = id(4))),

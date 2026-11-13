@@ -21,7 +21,8 @@ use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{
-    Debug, DevRun, Format, LinkArgs, NativeKind, Output, OutputKind, Platform, Undefined,
+    Debug, DevRun, Format, LinkArgs, NativeKind, NoDefaultLibs, Output, OutputKind, PeArgs, PeFlag,
+    Platform, Undefined,
 };
 use blaze_mem::{Tag, frame, frame::Frame};
 
@@ -404,7 +405,15 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         undefined,
         nodelete,
         export_dynamic,
+        inputs,
+        pe,
     } = link;
+    // The files' bytes are the natives' own ([`NativeInput`]); where each is on the line is this.
+    count(hasher, inputs.len());
+    for input in inputs {
+        hasher.part(input.as_os_str().as_encoded_bytes());
+    }
+    pe_args(hasher, pe);
     count(hasher, rpaths.len());
     for rpath in rpaths {
         hasher.part(rpath.as_bytes());
@@ -423,6 +432,82 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     for pattern in export_dynamic {
         hasher.part(pattern.as_bytes());
     }
+}
+
+/// link.exe's arguments' part of an image ([`PeArgs`]), every field.
+fn pe_args(hasher: &mut Hasher, pe: &PeArgs) {
+    let PeArgs {
+        crt_static,
+        subsystem_version,
+        delay_load,
+        no_default_libs,
+        include,
+        stack_commit,
+        heap,
+        base,
+        off,
+        image_version,
+    } = pe;
+    let pair = |hasher: &mut Hasher, it: Option<(u16, u16)>| match it {
+        Some((major, minor)) => {
+            hasher.update(&[1]).update(&major.to_le_bytes()).update(&minor.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+    let number = |hasher: &mut Hasher, it: Option<u64>| match it {
+        Some(it) => {
+            hasher.update(&[1]).update(&it.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+    let names = |hasher: &mut Hasher, them: &[String]| {
+        count(hasher, them.len());
+        for it in them {
+            hasher.part(it.as_bytes());
+        }
+    };
+    hasher.update(&[*crt_static as u8]);
+    pair(hasher, *subsystem_version);
+    names(hasher, delay_load);
+    match no_default_libs {
+        NoDefaultLibs::None => {
+            hasher.update(&[0]);
+        }
+        NoDefaultLibs::All => {
+            hasher.update(&[1]);
+        }
+        NoDefaultLibs::Some(them) => {
+            hasher.update(&[2]);
+            names(hasher, them);
+        }
+    }
+    names(hasher, include);
+    number(hasher, *stack_commit);
+    match heap {
+        Some((reserve, commit)) => {
+            hasher.update(&[1]).update(&reserve.to_le_bytes());
+            number(hasher, *commit);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    number(hasher, *base);
+    count(hasher, off.len());
+    for flag in off {
+        hasher.update(&[match flag {
+            PeFlag::DynamicBase => 0,
+            PeFlag::HighEntropyVa => 1,
+            PeFlag::NxCompat => 2,
+            PeFlag::LargeAddressAware => 3,
+            PeFlag::TerminalServerAware => 4,
+        }]);
+    }
+    pair(hasher, *image_version);
 }
 
 pub(crate) fn format_tag(format: Format) -> u8 {

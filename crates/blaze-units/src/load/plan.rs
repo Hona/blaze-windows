@@ -539,7 +539,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         let crate_name = it.unit.target.name.replace('-', "_");
         let dir = layouts[it.kind].deps(shared.new_layout, &pkg_dirs[dep.index]);
         let file = format!("{crate_name}{}.msl", metas[dep.index].extra_filename());
-        gpu_msls[dep.index] = Some(dir.join(file).display().to_string());
+        gpu_msls[dep.index] = Some(dir.join(&file).display().to_owned());
     }
 
     let mut roots = vec![false; units.len()];

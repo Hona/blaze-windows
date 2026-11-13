@@ -203,6 +203,15 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
     }
 }
 
+/// The stamp of the file at `path` itself, a link or junction stamped and not followed:
+/// [`crate::fs::stamp`].
+pub(crate) fn stamp_path(path: &Path) -> io::Result<Stamp> {
+    let wide = sys::path(path)?;
+    let handle =
+        open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)?;
+    stamp_of(&handle)
+}
+
 /// How many threads stamp `names` names: one per [`CHUNK`] of them, at most one per core. A
 /// name costs an open, two queries and a close (some 20 µs, most of it the open), so a thread
 /// spawned for 2,048 of them (some 40 ms) costs it under 0.1%.

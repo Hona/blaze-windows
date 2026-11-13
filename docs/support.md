@@ -101,7 +101,9 @@ another blaze ([toolchain.md](toolchain.md)).
    project and on ripgrep 15.1.0.
 9. `blaze` links ELF, Mach-O and COFF executables (`unsupported_target` in
    `cargo/cli.rs`). On Windows x86-64 MSVC it links with `rust-lld` and was run by hand on a
-   toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)). On macOS
+   toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)); v2 links PE
+   with its own linker, whose state on Windows is in
+   [platforms.md](platforms.md#v2s-linker-on-windows-2026-11-13-branch-windowslink). On macOS
    arm64 it was run by hand on bun 1.4.3's dev loop (research/bun.md).
    Nobody recorded running it on Linux AArch64.
 10. CI: `storekills.py`, `storecorrupts.py` and `storeshared.py` on all four platforms.
@@ -283,7 +285,7 @@ cargo" now means one of the two, and which is unverified.
 | `panic = "abort"` | supported | unverified |
 | `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link blaze's functions against | cargo |
 | `lto = "off"` | supported | unverified |
-| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs, and a library's `cdylib`, linked as a shared library and linked again after each edit rather than spliced, and its `staticlib`, archived again after each edit with the static native libraries it bundles; a build that would write a `dylib` stops with an error, since blaze does not link one yet ([#262](https://github.com/indexable-inc/blaze/issues/262)) |
+| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs, and a library's `cdylib`, linked as a shared library and linked again after each edit rather than spliced, and its `staticlib`, archived again after each edit with the static native libraries it bundles; a build that would write a `dylib` stops with an error, since blaze does not link one yet ([#262](https://github.com/indexable-inc/blaze/issues/262)). v2: a dependency that lists an rlib beside a `cdylib`, `staticlib` or `dylib` is built as the rlib alone ([cargo.md](cargo.md#what-a-build-does)) |
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by blaze | served; an edit to the proc-macro crate itself is cargo's |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |
