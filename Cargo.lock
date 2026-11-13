@@ -2147,6 +2147,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
