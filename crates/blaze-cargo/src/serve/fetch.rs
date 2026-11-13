@@ -267,14 +267,13 @@ pub fn on_disk_mark(dir: &std::path::Path) -> Result<Option<ContentId>, String> 
 /// no empty, `.` or `..` part, under `<sources>/registry/src/` or `<sources>/git/checkouts/`.
 /// A lock file names the package (its name, a git commit), and nothing it says may move the
 /// write out of blaze's sources.
-fn outside_sources(at: &str, sources: &std::path::Path) -> Option<String> {
+fn outside_sources(at: &str, sources: &str) -> Option<String> {
     let Some(rest) = at.strip_prefix('/') else {
         return Some("it is not an absolute path".to_owned());
     };
     if let Some(part) = rest.split('/').find(|it| matches!(*it, "" | "." | "..")) {
         return Some(format!("it has a part `{part}`, which names no directory of its own"));
     }
-    let sources = sources.to_string_lossy();
     let sources = sources.trim_end_matches('/');
     let under = ["registry/src/", "git/checkouts/"];
     match under.iter().any(|it| {
@@ -310,13 +309,17 @@ pub fn keep_on_disk(
         return Ok(());
     }
     let fail = |what: String| ApiError::new(what, Some(fetch.what.clone()));
-    if let Some(why) = outside_sources(&fetch.at, sources) {
+    // Both as the daemon names them: `fetch.at` is a name, `sources` the system's path.
+    let named = blaze_core::platform::path::daemon(sources).map_err(|why| fail(why.to_string()))?;
+    if let Some(why) = outside_sources(&fetch.at, &named) {
         return Err(fail(format!(
             "blaze will not write the package `{}` to {}: {why}",
             fetch.what, fetch.at
         )));
     }
-    let at = std::path::Path::new(&fetch.at);
+    // The disk is written at the system's path of the daemon's name.
+    let host = blaze_core::platform::path::host(&fetch.at);
+    let at = host.as_path();
     let id = source_on_disk_id(source);
     if at.is_dir() {
         return same_on_disk(at, id).map_err(fail);

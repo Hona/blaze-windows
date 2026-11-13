@@ -983,7 +983,7 @@ fn take(
                 _ = failed.send(error);
             }
             if row.commit.is_none() {
-                row.commit = commit_of(Path::new(&row.workspace));
+                row.commit = commit_of(&blaze_core::platform::path::host(&row.workspace));
             }
             // `builds.misses` is what `misses` lists of the build, counted from the very
             // rows written (one-concept-one-home): `blaze slow` holds the two equal.

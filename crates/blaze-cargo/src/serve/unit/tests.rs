@@ -3217,3 +3217,35 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     assert_eq!((read[infer].hits, read[infer].ran), (4, 1), "inference: {read:?}");
     assert_eq!((read[mir].hits, read[mir].ran), (4, 1), "MIR: {read:?}");
 }
+
+/// The invariant: the stand-ins are blaze's executable, made once and kept while it is that
+/// file, and made again once it is another, whatever volume the stand-ins are on against the
+/// launcher's (`BLAZE_TEST_VOLUMES` names more directories to try, as blaze-core's tests do):
+/// on Windows a hard link on its volume and a copy on another, never a symbolic link.
+#[test]
+fn the_stand_ins_are_the_launcher_kept_and_made_again_when_it_changes() {
+    let base = tempfile::tempdir().unwrap();
+    let launcher = base.path().join(format!("blaze{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&launcher, b"blaze one").unwrap();
+    let mut dirs = vec![base.path().join("tools")];
+    if let Some(more) = std::env::var_os("BLAZE_TEST_VOLUMES") {
+        let id = std::process::id();
+        dirs.extend(std::env::split_paths(&more).map(|it| it.join(format!(".blaze-stand-ins.{id}"))));
+    }
+    for dir in &dirs {
+        let rustc = dir.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::read(&rustc).unwrap(), b"blaze one", "{}", dir.display());
+        assert!(!std::fs::symlink_metadata(&rustc).unwrap().is_symlink() || cfg!(unix));
+        let made = std::fs::metadata(&rustc).unwrap().modified().unwrap();
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::metadata(&rustc).unwrap().modified().unwrap(), made, "kept");
+        // Another launcher (a new build of blaze written in its place).
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::write(&launcher, b"blaze two, longer").unwrap();
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::read(&rustc).unwrap(), b"blaze two, longer", "{}", dir.display());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(&launcher, b"blaze one").unwrap();
+    }
+}

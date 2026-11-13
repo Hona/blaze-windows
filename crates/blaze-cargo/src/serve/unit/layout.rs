@@ -169,7 +169,7 @@ pub(crate) fn profiles(job: &Job) -> Result<Option<&Profiles>, String> {
     job.layout
         .get_or_init(|| {
             // Read off the disk at the host's name of the daemon's path (`/D:/a` on Windows).
-            let target = crate::cli::place::host_path(&job.units().target_dir);
+            let target = blaze_core::platform::path::host(&job.units().target_dir);
             let target = target.as_path();
             let span = tracing::info_span!(
                 target: "blaze",

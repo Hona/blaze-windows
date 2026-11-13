@@ -29,7 +29,7 @@ const MOST_FILES: usize = 200_000;
 /// alone; nothing there, `at` as absent.
 pub fn read(at: &str, probe: bool) -> Result<LocalRead, ApiError> {
     // t is the daemon's name (/C:/a on Windows); the disk is read at the host's.
-    let host = crate::cli::place::host_path(at);
+    let host = blaze_core::platform::path::host(at);
     let path = host.as_path();
     if !path.is_absolute() {
         return Err(ApiError::new(format!("`{at}` is under no mount of the view and is not an absolute path to read it from"), Some(at.to_owned())));
@@ -52,7 +52,7 @@ pub fn read(at: &str, probe: bool) -> Result<LocalRead, ApiError> {
 /// watch can (a watch of a directory above it would hear every file below).
 pub fn absent(at: &str) -> bool {
     matches!(
-        std::fs::metadata(crate::cli::place::host_path(at)),
+        std::fs::metadata(blaze_core::platform::path::host(at)),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
     )
 }
@@ -60,7 +60,7 @@ pub fn absent(at: &str) -> bool {
 /// The path `at` read exactly where it is: a directory whole, a file alone, or absent. What a
 /// local mount is read again as.
 pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
-    let host = crate::cli::place::host_path(at);
+    let host = blaze_core::platform::path::host(at);
     let path = host.as_path();
     let failed = |what: String| ApiError::new(what, Some(at.to_owned()));
     let meta = match std::fs::metadata(path) {

@@ -112,5 +112,41 @@ fn ask(_: &Path) -> io::Result<(String, bool)> {
     Ok(("WASI".into(), false))
 }
 
+/// Which file a path names, as its volume knows it: two paths name one file (one is a hard
+/// link of the other) exactly when their ids are equal. Windows: the volume's serial number
+/// and the file's 128-bit id (`FileIdInfo`, which ReFS needs); Unix: the device and inode.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FileId {
+    pub volume: u64,
+    pub file: u128,
+}
+
+/// The id of the file at `path`, a symbolic link followed. An error names the path.
+pub fn file_id(path: &Path) -> io::Result<FileId> {
+    id_of(path).map_err(|error| {
+        // alloc: an error path.
+        io::Error::new(error.kind(), format!("the file id of {}: {error}", path.display()))
+    })
+}
+
+#[cfg(windows)]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    let (volume, file) = crate::iocp::files::file_id(path)?;
+    Ok(FileId { volume, file })
+}
+
+#[cfg(unix)]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    Ok(FileId { volume: meta.dev(), file: u128::from(meta.ino()) })
+}
+
+#[cfg(target_os = "wasi")]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    use std::os::wasi::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    Ok(FileId { volume: meta.dev(), file: u128::from(meta.ino()) })
+}
 #[cfg(test)]
 mod tests;

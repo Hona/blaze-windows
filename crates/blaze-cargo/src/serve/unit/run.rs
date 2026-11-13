@@ -277,8 +277,8 @@ pub(crate) fn start(
         true => Sandbox::Off,
         false => Sandbox::On {
             read: vec![
-                PathBuf::from(&config.invocation.root),
-                PathBuf::from(&units.target_dir),
+                blaze_core::platform::path::host(&config.invocation.root),
+                blaze_core::platform::path::host(&units.target_dir),
                 manifest_dir,
             ],
             write: Vec::new(),
@@ -287,11 +287,13 @@ pub(crate) fn start(
             services: Vec::new(),
         },
     };
+    // clone: the daemon's name of the program, which its code memory is kept under; once per run
+    let named = program.clone();
     let command = Command {
-        program: PathBuf::from(program),
+        program: blaze_core::platform::path::host(&program),
         args: args.into_iter().map(OsString::from).collect(),
         env,
-        dir: PathBuf::from(&config.invocation.cwd),
+        dir: blaze_core::platform::path::host(&config.invocation.cwd),
         stdin: Vec::new(),
         sandbox,
         memory: None,
@@ -304,7 +306,7 @@ pub(crate) fn start(
             let loaded = job
                 .shared
                 .dev_runs
-                .loaded(&command.program.to_string_lossy())
+                .loaded(&named)
                 .map_err(|what| ApiError::new(what, None))?;
             let (command, started) =
                 loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
