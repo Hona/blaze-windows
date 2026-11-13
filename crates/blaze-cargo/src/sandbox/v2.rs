@@ -64,6 +64,10 @@ mod raw;
 /// Why a traced run on Windows is not whole: what it reads is not seen there.
 pub const NOT_TRACED_ON_WINDOWS: &str = "what a program reads is not traced on Windows";
 
+/// Whether this launcher can check a purity proof against observations and can key a
+/// script by observed reads. A cargo rerun rule does not account for undeclared inputs.
+pub(crate) const OBSERVES_READS: bool = !cfg!(windows);
+
 /// The name of each entry a variable lent to the program is in, `__BLAZE_LENT=NAME=VALUE`,
 /// which the interposers (`linux_interpose.c`, `macos_interpose.c`) take out of the program's
 /// environment as they load.

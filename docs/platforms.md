@@ -184,6 +184,11 @@ for each input root; the filesystem keeps its read grant, but another run withou
 capability does not gain access. Granting a directory includes its contents. The script
 can write its `OUT_DIR` and temporary directory, not the inputs.
 
+Windows does not yet trace every filesystem read. A script that actually runs is therefore
+not reused from the build-script cache or its purity proof. Cargo's `rerun-if-changed`
+list alone cannot prove that an undeclared file is unchanged. Inert scripts that Blaze
+proves print only constants still need not run.
+
 For an external input, set `BLAZE_SCRIPT_READ` in the shell invoking blaze, to absolute
 paths separated by `;`. Use the individual executable for a portable tool on `PATH`, or
 its dedicated installation directory if it also needs DLLs. `PATH` is not permission

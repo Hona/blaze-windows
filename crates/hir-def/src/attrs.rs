@@ -1691,6 +1691,21 @@ pub struct NativeLib {
     pub as_needed: Option<bool>,
     /// `import_name_type = ".."`, as written.
     pub import_name_type: Option<Symbol>,
+    /// `cfg(..)`: the library is linked only where it holds, in the cfg of the crate that links
+    /// the program, not of the crate that names it ([`NativeLib::linked_under`]).
+    pub cfg: Option<CfgExpr>,
+}
+
+impl NativeLib {
+    /// Whether a program linked by a crate of `cfg` links this library: its `cfg(..)` holds
+    /// there, or it has none. rustc evaluates a `#[link(.., cfg(..))]` in the session of the
+    /// crate that links (`relevant_lib`), not where the attribute is: core, built without
+    /// `+crt-static`, names `/defaultlib:libcmt` under `cfg(target_feature = "crt-static")`
+    /// and `/defaultlib:msvcrt` under its negation, and a program built with `+crt-static`
+    /// links the first. A cfg the options cannot decide links it, as `#[cfg]` keeps an item.
+    pub fn linked_under(&self, cfg: &CfgOptions) -> bool {
+        self.cfg.as_ref().is_none_or(|it| cfg.check(it) != Some(false))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1705,9 +1720,9 @@ pub enum NativeLibKind {
     Other(Symbol),
 }
 
-/// The library of a `link(...)`, and the `cfg(...)` it is linked under. `None` for one with no
-/// name (`wasm_import_module` alone).
-fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<(NativeLib, Option<CfgExpr>)> {
+/// The library of a `link(...)`, with the `cfg(...)` it is linked under. `None` for one with
+/// no name (`wasm_import_module` alone).
+fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<NativeLib> {
     let mut lib = NativeLib {
         name: Symbol::empty(),
         kind: NativeLibKind::Unspecified,
@@ -1716,8 +1731,8 @@ fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<(NativeLib, Option<CfgExpr>)>
         bundle: true,
         as_needed: None,
         import_name_type: None,
+        cfg: None,
     };
-    let mut cfg = None;
     let mut named = false;
     let mut children = TokenTreeChildren::new(tt).peekable();
     while let Some(child) = children.next() {
@@ -1728,7 +1743,7 @@ fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<(NativeLib, Option<CfgExpr>)>
         let key = LinkKey::of(key.text());
         match children.peek() {
             Some(NodeOrToken::Node(group)) if key == Some(LinkKey::cfg) => {
-                cfg = link_cfg(*group);
+                lib.cfg = link_cfg(*group);
                 children.next();
             }
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
@@ -1772,7 +1787,7 @@ fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<(NativeLib, Option<CfgExpr>)>
             _ => (),
         }
     }
-    named.then_some((lib, cfg))
+    named.then_some(lib)
 }
 
 /// The string a `link(...)` gives `key`, as `key = "value"`, interned.
@@ -2343,19 +2358,18 @@ impl AttrFlags {
         }
     }
 
-    /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
-    /// those whose `cfg(...)` the crate does not have left out, in the order written.
+    /// The native libraries the `#[link(...)]`s of an `extern` block name, in the order
+    /// written, each with its `cfg(...)`, which the crate that links a program decides
+    /// ([`NativeLib::linked_under`]), not the block's.
     #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
-        let krate = owner.lookup(db).container.krate(db);
         blaze_mem::frame::current(|frame| {
             let mut libs = Vec::new_in(frame);
             collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = &attr
                     && path_is(attr.path(), "link")
                     && let Some(tt) = attr.token_tree()
-                    && let Some((lib, cfg)) = parse_link_tt(tt)
-                    && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
+                    && let Some(lib) = parse_link_tt(tt)
                 {
                     libs.push(lib);
                 }

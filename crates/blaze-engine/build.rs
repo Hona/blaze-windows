@@ -8,6 +8,11 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_version.rs");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // Also applies to this executable under a build script's RUSTC name: probes enter
+        // the front end on the initial thread. Do not change every dependency's link flags.
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
     seed();
     version();
     blaze_codegen_code::emit_all(&[
