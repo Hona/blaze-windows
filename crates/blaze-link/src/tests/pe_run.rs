@@ -40,7 +40,12 @@ fn link(output: Output) -> Result<Vec<u8>, LinkError> {
 }
 
 /// The image `output` links with `libs` after the inputs, as the link arguments' libraries are.
-fn link_with(mut output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkError> {
+fn link_with(output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkError> {
+    link_image(output, libs).map(|it| it.0)
+}
+
+/// [`link_with`]'s file, and the image it is of.
+fn link_image(mut output: Output, libs: &[NativeLib]) -> Result<(Vec<u8>, Image), LinkError> {
     let crates = [crate::target::CrateLibs { libs, search: &[] }];
     let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused"))?;
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
@@ -71,7 +76,7 @@ fn link_with(mut output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkErro
     let mut image = Image::new(name(to), output)?;
     let mut disk = Disk::default();
     disk.link(&mut image, Change { natives, ..Change::default() })?;
-    Ok(contents(disk.file(to)))
+    Ok((contents(disk.file(to)), image))
 }
 
 /// A directory of the test's own, made empty; what the test ran stays there after it, for
@@ -457,6 +462,27 @@ fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
     };
     let error = link_with(output, &[msvcrt]).unwrap_err();
     assert!(error.what.contains("`msvcrt`") && error.what.contains("LNK2038"), "{error}");
+}
+
+/// A DLL's import library as blaze writes it (`Image::import_library`, what rustc writes as a
+/// `cdylib`'s `.dll.lib`) links the importer as `lib.exe`'s does: its function and its data.
+#[test]
+fn a_dlls_own_import_library_links_its_importer() {
+    let (dll, image) = link_image(output(Some("runlib.dll"), &["dll.obj"]), &[]).unwrap();
+    let library = image.import_library().unwrap().expect("a DLL's import library");
+    let dir = scratch("implib");
+    std::fs::write(dir.join("runlib.dll"), &dll).unwrap();
+    std::fs::write(dir.join("runlib.lib"), &library).unwrap();
+    let importer = output(None, &["usedll.obj"]);
+    let lib = NativeLib {
+        name: dir.join("runlib.lib").to_string_lossy().into_owned(),
+        kind: blaze_codegen::NativeLibKind::Dylib,
+        verbatim: true,
+        imports: Vec::new(),
+    };
+    let exe = link_with(importer, &[lib]).unwrap();
+    std::fs::write(dir.join("usedll.exe"), &exe).unwrap();
+    assert_eq!(run(&dir.join("usedll.exe"), &[]), (0, "dll 42 found\n".into()));
 }
 
 #[test]
