@@ -236,6 +236,41 @@ fn delay_loaded_dlls_load_on_first_call_and_a_missing_one_raises() {
     assert_eq!(run(&dir.join("delay.exe"), &[]), (0, "delay 0\n".into()));
 }
 
+/// A `raw-dylib` DLL delay-loaded, as rune-desktop has them (`windows-link`'s raw-dylib
+/// imports of DLLs its build script also gives `/DELAYLOAD`): `comctl32` and `version` reached
+/// through the import libraries the link makes, not the SDK's (`/NODEFAULTLIB` takes those
+/// out), and delayed alike.
+#[test]
+fn raw_dylib_imports_are_delay_loaded_too() {
+    let raw = |dll: &str, symbols: &[&str]| NativeLib {
+        name: dll.into(),
+        kind: blaze_codegen::NativeLibKind::RawDylib,
+        verbatim: false,
+        imports: symbols
+            .iter()
+            .map(|it| blaze_codegen::RawImport { symbol: (*it).into(), ordinal: None, data: false })
+            .collect(),
+    };
+    let (delayed, mut libs) = with_args(
+        output(None, &["delay.obj", "nosuch.lib"]),
+        &[
+            "/NODEFAULTLIB:comctl32.lib",
+            "/NODEFAULTLIB:version.lib",
+            "/DELAYLOAD:comctl32.dll",
+            "/DELAYLOAD:version.dll",
+            "/DELAYLOAD:nosuch.dll",
+            "delayimp.lib",
+        ],
+    );
+    libs.insert(0, raw("comctl32", &["InitCommonControlsEx"]));
+    libs.insert(1, raw("version", &["GetFileVersionInfoSizeW"]));
+    let bytes = link_with(delayed, &libs).unwrap();
+    assert!(!dlls(&bytes).iter().any(|it| it == "comctl32.dll" || it == "version.dll"));
+    let dir = scratch("raw_delay");
+    std::fs::write(dir.join("delay.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("delay.exe"), &[]), (0, "delay 0\n".into()));
+}
+
 /// The DLLs an image imports from, lowercased, in its import directory's order.
 fn dlls(bytes: &[u8]) -> Vec<String> {
     use object::LittleEndian as LE;
