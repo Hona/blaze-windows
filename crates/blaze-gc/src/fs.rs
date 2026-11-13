@@ -1222,6 +1222,7 @@ pub(crate) fn trash_between(
         }
         Err(why) => return Swept::Failed(why),
     }
+    let_go_before_moving(&mut nested);
     let swept = rename_into_trash(path, to);
     // A build that took a lease inside between the walk and the lock: the tree goes back
     // (review round 7, C1).
@@ -1265,6 +1266,7 @@ pub fn recheck_renamed(
         Ok(()) => return Ok(()),
         Err(found) => found,
     };
+    let_go_before_moving(held);
     let back = rename_no_replace(to, from);
     let at_home = |dir: &Path| {
         dir.strip_prefix(to).map_or_else(|_| dir.to_path_buf(), |rest| from.join(rest))
@@ -1471,9 +1473,53 @@ pub fn rename_into_trash(path: &Path, to: &Path) -> Swept {
             path.display()
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Swept::Gone,
+        Err(error) if refused_for_an_open_file(&error) => held_open(path, &error),
         Err(error) => {
             Swept::Failed(format!("renaming {} to {}: {error}", path.display(), to.display()))
         }
+    }
+}
+
+/// Lets go of `held`, the leases of a tree taken exclusively, where they would keep the tree
+/// from moving or going: on Windows, which refuses to rename or remove a directory while any
+/// handle is open on a file under it, whatever it shares (I54: `blaze clean` and the
+/// collector failed every rename with "Access is denied" on their own lease). There the
+/// refusal is the lock: a build holds its lease's file open while it uses its directory, so a
+/// rename after the leases were checked and let go either finds none open (and no build can
+/// open one by the old path after it) or is refused ([`held_open`]). The renamed tree's leases
+/// are then taken again ([`recheck_renamed`]). Elsewhere the locks are held through the rename
+/// and the unlink, and this does nothing.
+pub fn let_go_before_moving(held: &mut Vec<stdx::file_lock::Locked>) {
+    #[cfg(windows)]
+    held.clear();
+    #[cfg(not(windows))]
+    let _ = held;
+}
+
+/// Whether a rename or a removal failed as Windows fails one of a directory with a file open
+/// under it (`ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`); never elsewhere.
+pub fn refused_for_an_open_file(error: &io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32))
+}
+
+/// What held `path` open as Windows refused to move it ([`refused_for_an_open_file`]): its own
+/// lease held is [`Swept::Leased`], one of a build dir inside it [`Swept::NestedLeased`], each
+/// found by taking the leases of the tree, let go at once; with none held, another program has
+/// a file in it open, said with the system's refusal.
+pub fn held_open(path: &Path, error: &io::Error) -> Swept {
+    // alloc: the leases of a tree that could not move, taken to name the holder
+    let mut taken = Vec::new();
+    match take_nested_leases(path, None, &mut taken) {
+        Err(Nested::Held { dir, .. }) if dir == path => Swept::Leased,
+        Err(Nested::Held { dir, .. }) => Swept::NestedLeased { dir: text(&dir) },
+        Err(other) => Swept::Failed(format!(
+            "Windows refused to move {} ({error}), and its leases could not be read: {other}",
+            path.display()
+        )),
+        Ok(()) => Swept::Failed(format!(
+            "Windows refused to move {} ({error}): a file in it is open, and no build holds a lease in it, so another program has it open",
+            path.display()
+        )),
     }
 }
 
@@ -1568,6 +1614,9 @@ pub fn unlink(path: &Path, mut held: Vec<stdx::file_lock::Locked>) -> Result<u64
         ));
     }
     take_nested_leases(path, None, &mut held).map_err(|why| format!("{why}: it stays in trash"))?;
+    // In trash no build finds the tree by its path; on Windows the leases' own handles would
+    // keep it from going.
+    let_go_before_moving(&mut held);
     // [`remove_tree`] refuses a mount inside before it removes anything, and checks each
     // directory's device as it goes (review round 7, F3: no separate walk first).
     let removed = remove_tree(path);
