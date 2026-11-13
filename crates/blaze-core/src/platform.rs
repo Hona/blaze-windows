@@ -8,6 +8,7 @@
 pub mod command;
 pub mod home;
 pub mod lock;
+pub mod msvc;
 pub mod path;
 pub mod volume;
 

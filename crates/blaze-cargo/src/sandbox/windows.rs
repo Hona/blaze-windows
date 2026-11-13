@@ -2157,57 +2157,47 @@ mod tests {
     }
 
     /// MSVC's C compiler, run in the sandbox as `cc` runs it from a build script: found by the
-    /// variables a developer prompt sets (`VCINSTALLDIR`, `INCLUDE`, `LIB`, `PATH`), since the
-    /// container reads neither `vswhere`'s records under `ProgramData` nor the user's profile.
-    /// Visual Studio's and the SDK's directories under Program Files are every app package's
-    /// to read, so the run is granted nothing of them.
+    /// variables of the developer prompt blaze starts a sandboxed script with
+    /// ([`blaze_core::platform::msvc`]), since the container reads neither `vswhere`'s records
+    /// under `ProgramData` nor the user's profile. Visual Studio's and the SDK's directories
+    /// under Program Files are every app package's to read, so the run is granted nothing of
+    /// them.
     #[test]
     fn msvc_compiles_c_in_the_sandbox_given_a_developer_prompts_variables() {
         if let Err(why) = probe() {
             eprintln!("no sandbox can be made here, so this is not run: {why}");
             return;
         }
-        let x86 = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap());
-        let found = std::process::Command::new(x86.join(r"Microsoft Visual Studio\Installer\vswhere.exe"))
-            .args(["-latest", "-products", "*", "-property", "installationPath"])
-            .output();
-        let Some(studio) = found.ok().map(|it| String::from_utf8_lossy(&it.stdout).trim().to_owned()).filter(|it| !it.is_empty()) else {
-            eprintln!("no Visual Studio here, so this is not run");
-            return;
+        let developer = match blaze_core::platform::msvc::find() {
+            Ok(it) => it,
+            Err(why) => {
+                eprintln!("no Visual Studio here, so this is not run: {why}");
+                return;
+            }
         };
-        let last = |dir: PathBuf| {
-            let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().path()).collect();
-            names.sort();
-            names.pop().unwrap()
-        };
-        let tools = last(PathBuf::from(&studio).join(r"VC\Tools\MSVC"));
-        let kits = x86.join(r"Windows Kits\10");
-        let sdk = last(kits.join("Include"));
-        let version = sdk.file_name().unwrap().to_owned();
-        let joined = |dirs: &[PathBuf]| std::env::join_paths(dirs).unwrap();
-        let include = joined(&[tools.join("include"), sdk.join("ucrt"), sdk.join("um"), sdk.join("shared")]);
-        let lib = joined(&[
-            tools.join(r"lib\x64"),
-            kits.join("Lib").join(&version).join(r"ucrt\x64"),
-            kits.join("Lib").join(&version).join(r"um\x64"),
-        ]);
-        let bin = tools.join(r"bin\Hostx64\x64");
         let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-cl-{}", std::process::id()));
+        let system = root.join("System32").into_os_string();
+        let mut env = developer.variables("x64", "x64", Some(&system)).unwrap();
+        env.push(("SystemRoot".into(), root.clone().into_os_string()));
+        let tools = developer.vc_tools();
+        let base =
+            std::env::temp_dir().join(format!("blaze-windows-sandbox-cl-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("hello.c"), "#include <stdio.h>\nint main(void) { puts(\"hi\"); return 0; }\n").unwrap();
+        std::fs::write(
+            base.join("hello.c"),
+            "#include <stdio.h>\n#include <windows.h>\nint main(void) { puts(\"hi\"); return 0; }\n",
+        )
+        .unwrap();
         let out = base.join("out");
         let spec = Spec {
-            program: bin.join("cl.exe"),
-            args: ["/nologo", "/c", "/MT", "hello.c"].iter().map(Into::into).chain([format!("/Fo{}\\", out.display()).into()]).collect(),
-            env: vec![
-                ("SystemRoot".into(), root.clone().into_os_string()),
-                ("VCINSTALLDIR".into(), PathBuf::from(&studio).join(r"VC\").into_os_string()),
-                ("INCLUDE".into(), include),
-                ("LIB".into(), lib),
-                ("PATH".into(), joined(&[bin.clone(), root.join("System32")])),
-            ],
+            program: tools.join(r"bin\Hostx64\x64\cl.exe"),
+            args: ["/nologo", "/c", "/MT", "hello.c"]
+                .iter()
+                .map(Into::into)
+                .chain([format!("/Fo{}\\", out.display()).into()])
+                .collect(),
+            env,
             dir: base.clone(),
             read: vec![base.clone()],
             write: vec![out.clone()],
