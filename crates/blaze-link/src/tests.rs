@@ -1686,6 +1686,22 @@ fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     );
     let error = image.stage(Change { added: vec![&missing], ..Change::default() }).unwrap_err();
     assert!(error.what.contains("span table"), "{error}");
+
+    // A shorter table alone would leave the unchanged instruction with an invalid location.
+    // The same table is valid when the last user is replaced in the edit that shrinks it.
+    let mut shorter = table(9);
+    shorter.spans.pop();
+    let spans = shorter.encode();
+    let error = image.stage(Change { spans: vec![(anchor, &spans)], ..Change::default() }).unwrap_err();
+    assert!(error.what.contains("still refers to it") && error.what.contains("index: 1"), "{error}");
+    let updated = function(
+        1,
+        &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3],
+        vec![rel32(3, Target::Position(SpanRef { anchor, index: 0 }))],
+    );
+    disk.link(&mut image, Change { removed: vec![key(1)], added: vec![&updated], spans: vec![(anchor, &spans)], ..Change::default() }).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    assert_eq!(linked.u32_at(linked.rel32(linked.symbol("start") + 3) + LINE as u64), 1);
 }
 
 #[test]
