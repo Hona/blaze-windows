@@ -1396,6 +1396,16 @@ pub(crate) trait Writer: Send + Sync {
 
     fn prot(&self, class: &Class) -> Prot;
 
+    /// Whether `class` has pages of its own: it starts a page, and the class after it starts
+    /// another, whatever their protections. A PE image's sections are its loader's and its
+    /// programs' units of protection: the static CRT makes `.fptable`'s pages read-only once
+    /// it has filled them (`VirtualProtect` of the section), so nothing else may share them.
+    /// None by default.
+    fn own_pages(&self, class: &Class) -> bool {
+        let _ = class;
+        false
+    }
+
     /// How far from the base the image's regions may reach, their room included (a dev run's
     /// reservations, which hold no bytes, aside): checked on the laid-out addresses before
     /// anything is written (`Stage::check_reach`). `None` where the format sets no such limit
@@ -1539,6 +1549,11 @@ impl Writer for Formats {
     #[inline]
     fn prot(&self, class: &Class) -> Prot {
         each!(self, it => it.prot(class))
+    }
+
+    #[inline]
+    fn own_pages(&self, class: &Class) -> bool {
+        each!(self, it => it.own_pages(class))
     }
 
     fn window(&self) -> Option<Window> {

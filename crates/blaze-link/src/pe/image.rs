@@ -1889,7 +1889,9 @@ fn default_prot(segment: Segment) -> Prot {
 
 fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
     let name = match class {
-        Class::Named { name, .. } if prot != default_prot(segment) => name.as_bytes(),
+        Class::Named { name, .. } if prot != default_prot(segment) || super::own_section(class) => {
+            name.as_bytes()
+        }
         _ => segment.name(),
     };
     let mut out = [0; 8];
@@ -1905,8 +1907,10 @@ fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
 /// joins it: the loader maps both alike, and the data directories find the tables in it.
 pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
     let mut sections: Vec<Out> = Vec::with_capacity(8);
-    // The segment of the last section's first region.
+    // The segment of the last section's first region, and whether that section is a named
+    // class's own ([`super::own_section`]), which nothing joins.
     let mut last_segment = None;
+    let mut last_own = false;
     for region in placed.regions {
         if region.class == Class::ThreadVars {
             return Err(error(format_args!(
@@ -1928,6 +1932,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         let segment = place(&region.class).0;
         let in_file = !zeroed(&region.class);
         let aligned = region.addr.is_multiple_of(PAGE);
+        let own = super::own_section(&region.class);
         let extend = match sections.last() {
             Some(last) if region.addr < last.end => {
                 return Err(error(format_args!(
@@ -1936,6 +1941,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
                 )));
             }
             Some(_) if reserved(&region.class) => false,
+            Some(_) if own || last_own => false,
             Some(last) => last.prot == region.prot && (last_segment == Some(segment) || !aligned),
             None => false,
         };
@@ -1953,6 +1959,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
             )));
         }
         last_segment = Some(segment);
+        last_own = own;
         sections.push(Out {
             name: section_name(&region.class, segment, region.prot),
             start: region.addr,

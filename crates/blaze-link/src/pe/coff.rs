@@ -1229,12 +1229,27 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 });
                 object.directives.push(Directive::NoDefaultLib(library));
             }
-            // These change nothing a program observes: section merging (every section of
-            // a protection is laid out together already), incremental-link padding, the
+            // The CRT's `/MERGE:.CRT=.rdata` and `/MERGE:.rtc=.rdata`: the writer lays those
+            // into `.rdata` already (`pe::MERGED`). Any other merge would change the image's
+            // sections.
+            b"merge" => {
+                let arg = arg.ok_or_else(need)?;
+                let merged = arg.split_once('=').is_some_and(|(from, to)| {
+                    to.eq_ignore_ascii_case(".rdata")
+                        && super::MERGED.iter().any(|it| it.eq_ignore_ascii_case(from))
+                });
+                if !merged {
+                    return Err(self.err(format_args!(
+                        "the .drectve option {word}: blaze merges only {} into .rdata",
+                        super::MERGED.join(", ")
+                    )));
+                }
+            }
+            // These change nothing a program observes: incremental-link padding, the
             // control-flow-guard tables of /guard:cf (off), a check that a library is not
             // linked, and the CRT's `new_scalar.obj` telling link.exe's whole-program
             // optimizer (`/LTCG`, which blaze does not do) that `operator new` throws.
-            b"merge" | b"editandcontinue" | b"guardsym" | b"disallowlib" | b"throwingnew" => {}
+            b"editandcontinue" | b"guardsym" | b"disallowlib" | b"throwingnew" => {}
             _ => {
                 return Err(self.err(format_args!(
                     "the .drectve option {word}, which blaze does not link (it would change the image \
