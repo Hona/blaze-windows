@@ -408,9 +408,39 @@ Among those refused today: weak and re-exported libraries (`-weak_framework`, `-
 of an executable and export lists (`-rdynamic`, `--export-dynamic`, `-export_dynamic`,
 `-exported_symbols_list`, `--version-script`, `--dynamic-list`), layout scripts (`-T`), static and
 start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `-ObjC`,
-`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path (give it as
-`cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
-wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
+`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path on Linux and
+macOS (give it as `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument
+of a wasm target, which rustc gives `wasm-ld` directly.
+
+On Windows (`x86_64-pc-windows-msvc`) rustc gives the arguments to `link.exe` directly, and
+blaze reads them in its spelling (`crates/blaze-link/src/args/msvc.rs`): `/NAME[:value]` or
+`-NAME[:value]`, the name in any case, one option a word.
+
+| Option | What blaze's linker does |
+|---|---|
+| `/SUBSYSTEM:WINDOWS`, `/SUBSYSTEM:CONSOLE`, either with `,major[.minor]` | the GUI or console subsystem and its least Windows version |
+| `/ENTRY:symbol` | an executable's entry (rustc's `mainCRTStartup` with `#![windows_subsystem = "windows"]`) |
+| `/DELAYLOAD:dll` | the DLL's imports load on first call, through `delayimp.lib` |
+| `/DEFAULTLIB:lib`, `/NODEFAULTLIB[:lib]` | a library linked, a default library (an input's `/DEFAULTLIB`) not linked |
+| `/WHOLEARCHIVE:lib`, `/LIBPATH:dir` | a library linked whole, a directory searched |
+| a bare `foo.lib`, `foo.a`, `foo.obj`, `foo.o`, `foo.res` | an input file, searched for in the link's directories when not absolute |
+| `/STACK:reserve[,commit]`, `/HEAP:reserve[,commit]` | the main thread's stack and the process heap (decimal, or hex after `0x`) |
+| `/BASE:address`, `/VERSION:major[.minor]` | the preferred base (a multiple of 64 KiB) and the image version |
+| `/DYNAMICBASE:NO`, `/FIXED`, `/HIGHENTROPYVA:NO`, `/NXCOMPAT:NO`, `/LARGEADDRESSAWARE:NO`, `/TSAWARE:NO` | that property of the image off |
+| `/INCLUDE:symbol` | the symbol must be defined, and is kept |
+| `/EXPORT:name[,DATA]`, `/DEF:file` (a DLL's) | exports; a `.def` file's `LIBRARY` must be the crate's DLL |
+
+Taken because blaze's linker always does it: `/DYNAMICBASE`, `/HIGHENTROPYVA`, `/NXCOMPAT`,
+`/LARGEADDRESSAWARE`, `/TSAWARE`, `/MACHINE:X64`, `/OPT:REF`, `/GUARD:NO`, `/CETCOMPAT:NO`,
+`/FIXED:NO`. Taken because it asks nothing of the image: `/NOLOGO`, `/OPT:NOREF`, `/OPT:ICF`,
+`/OPT:NOICF`, `/DEBUG[:...]` and `/PDB*` (the profile decides debug info), `/NATVIS`,
+`/INCREMENTAL[:NO]`, `/MANIFEST:NO`, `/MANIFESTUAC` (which shapes only a generated manifest),
+`/SAFESEH`, `/LARGEPAGES`, `/WX`, `/IGNORE`, `/VERBOSE`, `/TIME`, `/MERGE:.CRT=.rdata` and
+`/MERGE:.rtc=.rdata`. Refused, by name: other subsystems, `/MACHINE` other than x64, `/OUT`,
+`/DLL`, `/IMPLIB`, exports of an executable, renamed or ordinal exports, a generated or
+side-by-side manifest (`/MANIFEST`, `/MANIFEST:EMBED`, `/MANIFESTINPUT`; embed one with a `.res`),
+`/GUARD:CF`, `/CETCOMPAT`, `/LTCG`, `/RELEASE`, other `/MERGE`s, response files and every other
+option.
 
 A crate's bundled static libraries (`static` without `-bundle`, from its rustflags' `-l`s, its
 build script's `cargo:rustc-link-lib`s or its `#[link]`s) are found first in the directories its
@@ -437,7 +467,8 @@ The rest of the rustflags that are the link's, rather than the code's, are read 
 | `split-debuginfo` (the profile's) | **differs from cargo**: unset, `packed` and `unpacked` all put the debug info of an image blaze links in one file beside it, on Linux too (cargo's default there is `off`): `NAME.debug`, named by the executable's `.gnu_debuglink` and carrying its build id, or on macOS `NAME.dSYM`, found by `LC_UUID`. The executable keeps its code, data, unwind tables, symbol table and build id, so a panic's backtrace and a debugger show what they showed. `off` puts the debug info inside the executable, as before. Windows and wasm images are as before. The side file is written beside the executable by the link that made it, and is not in the store ([debug-side-file.md](v2/plan/design/debug-side-file.md)) |
 | `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
 | `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
-| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
+| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic` | off is taken; on is refused |
+| `-C target-feature=+crt-static` | on Windows, MSVC's static VC runtime: the crates ask for `libcmt` under that cfg, and a crate that asks for the dynamic one (`msvcrt`, `vcruntime`), or one for `libcmt` without it, fails the link (link.exe's `LNK2038`). The UCRT may stay the DLL's: `/NODEFAULTLIB:libucrt.lib /DEFAULTLIB:ucrt.lib`. Elsewhere off is taken and on is refused |
 
 A refused option fails the link with an error naming the flag as written, that it came from the
 rustflags, the target and why. A unit that links nothing (a library) is not refused for one, as

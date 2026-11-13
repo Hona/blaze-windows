@@ -164,6 +164,9 @@ fn filled(region: &Region, from: usize, to: usize) -> bool {
     (from..to).all(|i| unsafe { region.at(i).as_ptr().read() } == (i % 251) as u8)
 }
 
+/// Windows makes no region of huge pages (large pages need `SeLockMemoryPrivilege` and are
+/// committed whole), so a region is aligned to 64 KiB there, never to a huge page.
+#[cfg(unix)]
 #[test]
 fn a_small_huge_region_commits_base_pages() {
     let region = Region::reserve_pages(64 << 20, Pages::Transparent, Tag::Other).expect("reserve");

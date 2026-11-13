@@ -306,7 +306,7 @@ impl World {
 }
 
 fn store_config(dir: &str, tags: u64) -> Config {
-    Config { dir: FileName::new(dir).unwrap(), layers: Vec::new(), tags, load_tags: tags + (1 << 32), loader: blaze_cas::Loader::Pumped }
+    Config { dir: FileName::new(dir).unwrap(), layers: Vec::new(), tags, load_tags: tags + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks }
 }
 
 fn response(status: u16, body: &[u8]) -> Vec<u8> {

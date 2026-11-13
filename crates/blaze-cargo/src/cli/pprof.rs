@@ -622,21 +622,29 @@ mod tests {
 
     /// S2 (round 3): the `--http` page, which holds the serve token, is written through
     /// `PrivateDir`: a 0600 regular file, the link in it, in a new 0700 directory of its own.
+    #[cfg(unix)]
     #[test]
     fn the_explorer_page_is_written_private() {
-        use std::os::unix::fs::PermissionsExt as _;
         let link = "https://ix.dev/explore#profile=http%3A%2F%2F127.0.0.1%3A1%2Fprofile.ixprof%3Ftoken%3Dabc&x";
         let (_, page) = super::open_page(link).unwrap();
         let dir = page.parent().unwrap().to_owned();
-        let (html, file_mode, dir_mode) = (
-            std::fs::read_to_string(&page).unwrap(),
-            std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-        );
+        #[cfg(unix)]
+        let private = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            ((mode(&page), mode(&dir)) == (0o600, 0o700)).then_some(()).ok_or_else(|| "not 0600 in 0700".to_owned())
+        };
+        // Windows: the directory's access control list opens it to the user, SYSTEM and the
+        // administrators alone, and the page inherits it.
+        #[cfg(windows)]
+        let private = crate::socket::windows::the_users_alone(&dir)
+            .and_then(|()| crate::socket::windows::the_users_alone(&page))
+            .map_err(|why| why.to_string());
+        let html = std::fs::read_to_string(&page).unwrap();
         let names: Vec<_> =
             std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name()).collect(); // alloc: test
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!((file_mode, dir_mode), (0o600, 0o700));
+        assert_eq!(private, Ok(()));
         assert_eq!(names, ["open.html"]);
         assert!(html.contains(&link.replace('&', "&amp;")), "{html}");
     }

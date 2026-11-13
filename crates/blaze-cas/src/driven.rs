@@ -32,10 +32,14 @@ impl Driven {
         let mut driver = blaze_core::native(root, 2)
             // alloc: the error of a store that cannot open
             .map_err(|e| format!("the native driver over {}: {e}", root.display()))?;
+        let sharing = blaze_core::platform::volume(&at)
+            // alloc: the error of a store that cannot open
+            .map_err(|e| e.to_string())?
+            .sharing;
         // alloc: setup, once a store
         let mut effects = Vec::new();
         // alloc: setup, no layers: allocates nothing
-        let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS, load_tags: TAGS + (1 << 32), loader }, &mut effects);
+        let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS, load_tags: TAGS + (1 << 32), loader, sharing }, &mut effects);
         drive(&mut driver, &mut store, &mut effects)?;
         if let Some(broken) = store.broken() {
             // alloc: the error of a store that cannot open

@@ -49,6 +49,8 @@ pub struct SharedConfig {
     pub load_tags: u64,
     /// How its reads' misses are loaded ([`crate::Loader`]).
     pub loader: crate::Loader,
+    /// Whether its directory's volume shares blocks ([`crate::Config::sharing`]).
+    pub sharing: blaze_core::Sharing,
 }
 
 /// What a store of a shared directory knows of the other writers.
@@ -116,7 +118,7 @@ impl Store {
         };
         // alloc: empty, no layers: allocates nothing
         let config =
-            Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader };
+            Config { dir: own, layers: Vec::new(), tags: config.tags, load_tags: config.load_tags, loader: config.loader, sharing: config.sharing };
         let mut store = Store::new(config, Some(peers));
         store.ask_private(effects);
         store

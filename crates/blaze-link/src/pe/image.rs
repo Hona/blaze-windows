@@ -46,6 +46,7 @@ use crate::model::{
     Class, Counts, Delta, Export, File, Function, Holds, Pages, Placed, Prot, Region, SymbolKind,
     View, WindowsUnwind, reserved, zeroed,
 };
+use crate::output::PeFlag;
 use crate::{LinkError, OutputKind};
 
 /// Room for the image's file name, which the export directory and the CodeView entry hold
@@ -746,6 +747,48 @@ fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
         (u128::from(library) << 96) | (u128::from(addr) << 32) | u128::from(import)
     });
     Ok(cells)
+}
+
+/// Each import address table cell as the file holds it, `(cell, value)` in address order: the
+/// import lookup table entry of its import (a hint/name RVA, or an ordinal), read back from the
+/// import directory [`imports`] wrote. The regions keep the cells zero; the core lays these
+/// over them ([`crate::model::Writer::encode`]). Windows' loader binds a DLL's cells only where
+/// the file's IAT holds those entries, as link.exe and lld-link write it: with zero cells it
+/// binds none and loads none of the DLLs, and the program calls through a null pointer at its
+/// first import (seen on Windows 11 26100: `__security_init_cookie`'s
+/// `GetSystemTimeAsFileTime`).
+pub(super) fn iat_slots(placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+    let Some((_, region)) = placed.region(&Class::Synthetic(IDATA)) else {
+        // alloc: none, an empty `Vec`
+        return Ok(Vec::new());
+    };
+    if region.size == 0 {
+        // alloc: none, an empty `Vec`
+        return Ok(Vec::new());
+    }
+    let base = placed.plan.base;
+    let mut slots = Vec::with_capacity(placed.imports.len());
+    let mut at = region.addr;
+    loop {
+        let descriptor = bytes_at::<{ DESCRIPTOR as usize }>(placed, at, "an import descriptor")?;
+        let (lookup, cells) = (u32_of(&descriptor, 0), u32_of(&descriptor, 16));
+        if lookup == 0 && cells == 0 {
+            break;
+        }
+        let (mut entry, mut cell) = (base + u64::from(lookup), base + u64::from(cells));
+        loop {
+            let value = u64_of(&bytes_at::<8>(placed, entry, "an import lookup table entry")?, 0);
+            if value == 0 {
+                break;
+            }
+            slots.push((cell, value));
+            entry += 8;
+            cell += 8;
+        }
+        at += DESCRIPTOR;
+    }
+    radix::sort_copy_by_key(&mut slots, |it| it.0);
+    Ok(slots)
 }
 
 /// The import directory, the lookup tables, the hint/name table and the DLL names. Each DLL's
@@ -1847,7 +1890,9 @@ fn default_prot(segment: Segment) -> Prot {
 
 fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
     let name = match class {
-        Class::Named { name, .. } if prot != default_prot(segment) => name.as_bytes(),
+        Class::Named { name, .. } if prot != default_prot(segment) || super::own_section(class) => {
+            name.as_bytes()
+        }
         _ => segment.name(),
     };
     let mut out = [0; 8];
@@ -1863,8 +1908,10 @@ fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
 /// joins it: the loader maps both alike, and the data directories find the tables in it.
 pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
     let mut sections: Vec<Out> = Vec::with_capacity(8);
-    // The segment of the last section's first region.
+    // The segment of the last section's first region, and whether that section is a named
+    // class's own ([`super::own_section`]), which nothing joins.
     let mut last_segment = None;
+    let mut last_own = false;
     for region in placed.regions {
         if region.class == Class::ThreadVars {
             return Err(error(format_args!(
@@ -1886,6 +1933,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         let segment = place(&region.class).0;
         let in_file = !zeroed(&region.class);
         let aligned = region.addr.is_multiple_of(PAGE);
+        let own = super::own_section(&region.class);
         let extend = match sections.last() {
             Some(last) if region.addr < last.end => {
                 return Err(error(format_args!(
@@ -1894,6 +1942,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
                 )));
             }
             Some(_) if reserved(&region.class) => false,
+            Some(_) if own || last_own => false,
             Some(last) => last.prot == region.prot && (last_segment == Some(segment) || !aligned),
             None => false,
         };
@@ -1911,6 +1960,7 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
             )));
         }
         last_segment = Some(segment);
+        last_own = own;
         sections.push(Out {
             name: section_name(&region.class, segment, region.prot),
             start: region.addr,
@@ -2095,7 +2145,12 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     out.put_u32(0);
     out.put_u32(0);
     out.put_u16(OPTIONAL as u16);
-    let mut characteristics = pe::IMAGE_FILE_EXECUTABLE_IMAGE | pe::IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    let args = &pe.output.link.pe;
+    let on = |flag: PeFlag| !args.off.contains(&flag);
+    let mut characteristics = pe::IMAGE_FILE_EXECUTABLE_IMAGE;
+    if on(PeFlag::LargeAddressAware) {
+        characteristics |= pe::IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    }
     if dll {
         characteristics |= pe::IMAGE_FILE_DLL;
     }
@@ -2113,12 +2168,14 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     out.put_u32(PAGE as u32);
     // A region's file offset is its RVA, so the file is aligned as memory is.
     out.put_u32(PAGE as u32);
+    let (image_major, image_minor) = args.image_version.unwrap_or((0, 0));
+    let (system_major, system_minor) = args.subsystem_version.unwrap_or((WINDOWS_VERSION, 0));
     out.put_u16(WINDOWS_VERSION);
     out.put_u16(0);
-    out.put_u16(0);
-    out.put_u16(0);
-    out.put_u16(WINDOWS_VERSION);
-    out.put_u16(0);
+    out.put_u16(image_major);
+    out.put_u16(image_minor);
+    out.put_u16(system_major);
+    out.put_u16(system_minor);
     out.put_u32(0);
     out.put_u32(size_of_image);
     out.put_u32(size(size_of_headers, "headers")?);
@@ -2128,17 +2185,25 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     } else {
         pe::IMAGE_SUBSYSTEM_WINDOWS_CUI.0
     });
-    let mut dll_characteristics = pe::IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA
-        | pe::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
-        | pe::IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
-    if !dll {
-        dll_characteristics |= pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE;
+    let mut dll_characteristics = 0u16;
+    for (flag, bit) in [
+        (PeFlag::HighEntropyVa, pe::IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA.0),
+        (PeFlag::DynamicBase, pe::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE.0),
+        (PeFlag::NxCompat, pe::IMAGE_DLLCHARACTERISTICS_NX_COMPAT.0),
+    ] {
+        if on(flag) {
+            dll_characteristics |= bit;
+        }
     }
-    out.put_u16(dll_characteristics.0);
+    if !dll && on(PeFlag::TerminalServerAware) {
+        dll_characteristics |= pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE.0;
+    }
+    out.put_u16(dll_characteristics);
     out.put_u64(pe.output.stack.unwrap_or(STACK_RESERVE));
-    out.put_u64(COMMIT);
-    out.put_u64(HEAP_RESERVE);
-    out.put_u64(COMMIT);
+    out.put_u64(args.stack_commit.unwrap_or(COMMIT));
+    let (heap, heap_commit) = args.heap.unwrap_or((HEAP_RESERVE, None));
+    out.put_u64(heap);
+    out.put_u64(heap_commit.unwrap_or(COMMIT));
     out.put_u32(0);
     out.put_u32(DIRECTORIES as u32);
     for (at, len) in directories {

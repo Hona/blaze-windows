@@ -82,6 +82,9 @@ pub struct Located {
     /// names it is matched against.
     pub name: String,
     pub kind: NativeKind,
+    /// A file the link made rather than found (a `raw-dylib`'s import library): its content's
+    /// id and its bytes, which no path on the machine holds. `path` is then only its name.
+    pub made: Option<(ContentId, Arc<[u8]>)>,
 }
 
 /// The main thread's stack where the format says it: link.exe's default, which rustc keeps,
@@ -439,8 +442,18 @@ fn locate_with<A: Ask>(
     for (path, kind) in runtimes {
         line.push(path, kind)?;
     }
+    if target == Target::Msvc {
+        vc_runtime(output.link.pe.crt_static, libs)?;
+    }
+    // Each DLL `raw-dylib`s name, and where its import library goes on the line: the place of
+    // the first to name it.
+    let mut dlls: Vec<(usize, crate::pe::raw_dylib::Dll)> = Vec::new();
     for CrateLibs { libs, search: own } in libs {
         for lib in *libs {
+            if lib.kind == NativeLibKind::RawDylib {
+                raw_dylib(&mut line, &mut dlls, lib)?;
+                continue;
+            }
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
                 continue;
             }
@@ -451,13 +464,91 @@ fn locate_with<A: Ask>(
             line.library(&lib.name, lib.kind, lib.verbatim, own)?;
         }
     }
+    for input in &output.link.inputs {
+        line.input(input)?;
+    }
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
     for name in target.end() {
         line.object(name)?;
     }
+    for (at, dll) in dlls {
+        let made = dll.library().map_err(fail)?;
+        line.out[at].made = Some(made);
+    }
     Ok(line.out)
+}
+
+/// A `raw-dylib` library on the line: its imports join its DLL's, whose import library the
+/// link makes ([`crate::pe::raw_dylib`]) and puts where the DLL is first named. Only PE has
+/// DLLs; the front end refuses a `raw-dylib` for another target, and so does this.
+fn raw_dylib(
+    line: &mut Line<'_>,
+    dlls: &mut Vec<(usize, crate::pe::raw_dylib::Dll)>,
+    lib: &NativeLib,
+) -> Result<(), LinkError> {
+    if line.output.format != Format::Pe {
+        // alloc: error path
+        return Err(fail(format!(
+            "the `raw-dylib` `{}`: a `raw-dylib` is a Windows DLL, and this links {:?}",
+            lib.name, line.output.format
+        )));
+    }
+    let name = crate::pe::raw_dylib::dll_name(lib);
+    let at = match dlls.iter().position(|(_, it)| it.name.eq_ignore_ascii_case(&name)) {
+        Some(at) => at,
+        None => {
+            line.out.push(Located {
+                path: PathBuf::from(&name),
+                // alloc: once per DLL `raw-dylib`s name, what errors call its import library
+                name: format!("raw-dylib {name}"),
+                kind: NativeKind::Archive { whole: false },
+                made: None,
+            });
+            dlls.push((line.out.len() - 1, crate::pe::raw_dylib::Dll::new(name)));
+            dlls.len() - 1
+        }
+    };
+    dlls[at].1.add(lib).map_err(fail)
+}
+
+/// MSVC's VC runtime libraries, the dynamic ones (the DLLs' import libraries and their static
+/// start-up code) and the static ones, release and debug, as `.lib` stems.
+const VC_DYNAMIC: &[&str] = &["msvcrt", "msvcrtd", "vcruntime", "vcruntimed", "msvcprt", "msvcprtd"];
+const VC_STATIC: &[&str] = &["libcmt", "libcmtd", "libvcruntime", "libvcruntimed", "libcpmt", "libcpmtd"];
+
+/// That no crate asks for the VC runtime the image does not link: `+crt-static` (`crt_static`)
+/// is the static one, and its absence the dynamic one. The crates ask for it by the cfg the
+/// front end evaluated (`libc`'s `#[link(name = "libcmt", cfg(target_feature = "crt-static"))]`),
+/// so a crate asking for the other one was compiled for another CRT than the link is for:
+/// link.exe's `LNK2038`, which the C objects' `/FAILIFMISMATCH:RuntimeLibrary` would catch only
+/// for C.
+fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError> {
+    let (wrong, flag) = match crt_static {
+        true => (VC_DYNAMIC, "the static one (`-C target-feature=+crt-static`)"),
+        false => (VC_STATIC, "the dynamic one (no `-C target-feature=+crt-static`)"),
+    };
+    for lib in libs.iter().flat_map(|it| it.libs) {
+        let name = lib.name.rsplit(['/', '\\']).next().unwrap_or(&lib.name);
+        let stem = match name.len().checked_sub(4) {
+            Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".lib") => {
+                &name[..at]
+            }
+            _ => name,
+        };
+        if wrong.iter().any(|it| it.eq_ignore_ascii_case(stem)) {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "a crate links the VC runtime library `{}`, and the image's VC runtime is {flag}: \
+                     the crate was compiled for the other C runtime (link.exe: LNK2038)",
+                    lib.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The targets blaze links: those `hir_ty_codegen::v2::toolchain` compiles for whose link
@@ -1564,6 +1655,40 @@ impl Line<'_> {
         names.contains(&key[..])
     }
 
+    /// An input file the link arguments name ([`crate::LinkArgs::inputs`]), as link.exe finds
+    /// one: an absolute path as it is, a relative one in the line's directories (link.exe's
+    /// `LIB`), ASCII case ignored. Read by its extension: `.obj` and `.o` an object, `.lib` and
+    /// `.a` an archive, `.res` a compiled resource file (an object to the reader).
+    fn input(&mut self, input: &Path) -> Result<(), LinkError> {
+        let extension = input.extension().and_then(|it| it.to_str()).unwrap_or_default();
+        let is = |it: &str| extension.eq_ignore_ascii_case(it);
+        let kind = if is("obj") || is("o") || is("res") {
+            NativeKind::Object
+        } else if is("lib") || is("a") {
+            NativeKind::Archive { whole: false }
+        } else {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "the link argument's input file {}: blaze's linker takes .obj, .o, .lib, .a and \
+                     .res files",
+                    input.display()
+                ),
+            ));
+        };
+        let path = match input.to_str() {
+            Some(name) => self.default_library(name),
+            // alloc: error path
+            None => Err(fail(format!("the input file {} is not UTF-8", input.display()))),
+        }
+        .map_err(|it| LinkError {
+            // alloc: error path
+            what: format!("the link argument's input file {}: {}", input.display(), it.what),
+            ..it
+        })?;
+        self.push(path, kind)
+    }
+
     fn object(&mut self, name: &str) -> Result<(), LinkError> {
         let path = self.found.object(name)?.to_path_buf();
         self.push(path, NativeKind::Object)
@@ -1629,14 +1754,14 @@ impl Line<'_> {
         let script = self.output.format == Format::Elf
             && matches!(kind, NativeKind::Shared { .. })
             && sniff(&path)? == Sniffed::Text;
-        let archive = pe && matches!(kind, NativeKind::Archive { .. });
+        let archive = pe && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let autolinks = self.output.format == Format::MachO
             && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let reexports =
             self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
-        self.out.push(Located { path, name, kind });
+        self.out.push(Located { path, name, kind, made: None });
         let at = self.out.len() - 1;
         if script {
             self.follow(at)?;
@@ -1744,7 +1869,8 @@ impl Line<'_> {
         Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by)), &[]))
     }
 
-    /// The libraries the members of the PE archive at `at` ask for, each after it on the line
+    /// The libraries the members of the PE archive at `at` ask for (or the COFF object at `at`
+    /// itself), each after it on the line
     /// and followed in turn, as link.exe follows `/DEFAULTLIB` from the members it takes. A
     /// member's own `/NODEFAULTLIB` takes its own out ([`crate::pe::asked_libraries`]); one in
     /// another member does not, since that member may not be taken. Every member's are
@@ -1758,12 +1884,21 @@ impl Line<'_> {
             self.output.arch,
         )?;
         for (member, library) in asked.iter() {
+            if self.output.link.pe.no_default_libs.excludes(library) {
+                continue;
+            }
             let path = self.default_library(library).map_err(|it| LinkError {
                 // alloc: error path
-                what: format!(
-                    "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
-                    self.out[at].name, it.what
-                ),
+                what: match member.is_empty() {
+                    true => format!(
+                        "{} asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                    false => format!(
+                        "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                },
                 ..it
             })?;
             self.push(path, NativeKind::Archive { whole: false })?;
@@ -1906,6 +2041,13 @@ fn files(
             // alloc: error path
             return Err(fail(format!(
                 "the framework `{name}`: frameworks are Apple's, and this links {format:?}"
+            )));
+        }
+        NativeLibKind::RawDylib => {
+            // alloc: error path
+            return Err(fail(format!(
+                "the `raw-dylib` `{name}` searched for as a file: the link makes its import \
+                 library, and no file is looked for"
             )));
         }
         NativeLibKind::Framework => {

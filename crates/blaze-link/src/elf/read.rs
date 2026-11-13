@@ -447,7 +447,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             object.grouped.push(member);
         }
         let sections = start..end(name, object.grouped.len(), "group members")?;
-        object.groups.push(Group { name: group_name, sections, largest: false });
+        object.groups.push(Group { name: group_name, sections, largest: false, local: false });
     }
 
     // Each section's fixups are one run of the column, so relocation sections are read in the
