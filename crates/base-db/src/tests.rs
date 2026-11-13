@@ -1412,6 +1412,29 @@ fn disk_module_runs() -> usize {
     DISK_MODULE_RUNS.with(Cell::get)
 }
 
+#[test]
+fn an_outside_include_and_its_record_lookup_read_the_same_host_file() {
+    let host = std::env::temp_dir().join(format!("blaze-included-record-{}.rs", std::process::id()));
+    let named = blaze_core::platform::path::daemon(&host).unwrap();
+    let path = AbsPathBuf::try_from(named.as_str()).unwrap();
+    std::fs::write(&host, b"pub struct Private;").unwrap();
+    let mut db = Db::for_tests();
+    let lib = FileId::from_raw(0);
+    db.set_file_text_with_durability(lib, "", Durability::LOW);
+    db.set_file_source_root_with_durability(lib, SourceRootId(0), Durability::MEDIUM);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(AbsPathBuf::try_from("/src/lib.rs").unwrap()));
+    db.set_source_root_with_durability(SourceRootId(0), Arc::new(SourceRoot::new_local(set)), Durability::MEDIUM);
+    let mut graph = CrateGraphBuilder::default();
+    let id = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let krate = graph.set_in_db(&mut db)[&id];
+    let read = db.files().included_file(&db, krate, &path, Durability::LOW);
+    let key = read.content(&db);
+    assert_eq!(key, crate::IncludedFile::content_now(&host));
+    assert_eq!(read.bytes(&db).map(|it| &it[..]), Some(&b"pub struct Private;"[..]));
+    std::fs::remove_file(host).unwrap();
+}
+
 /// A module file outside every source root (crates/blaze-inproc-rt's `#[path]` into
 /// library/) is read from disk as rustc reads it, noted as the crate's read, and its own
 /// modules resolve beside it; an edit of it, or its removal, reruns the reader once the disk
