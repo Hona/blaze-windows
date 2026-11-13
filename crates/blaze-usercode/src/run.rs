@@ -177,6 +177,9 @@ impl Value {
 pub enum Mode {
     Normal,
     Verify,
+    /// Cargo's declared inputs, not a complete observation. A separate given-key domain
+    /// includes the logical environment, tools, explicit grants and dependency results.
+    Declared { verify: bool, host: blaze_ids::ContentId },
     /// The platform cannot account for its reads. Keep the sandbox, not the result. No
     /// previous trace (including a record written by another launcher) authorizes reuse.
     Unobserved,
@@ -387,7 +390,7 @@ impl Run {
         let roots = spec.roots.view();
         let found = match spec.mode {
             Mode::Unobserved => None,
-            Mode::Normal | Mode::Verify => Some(index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs)).map_err(RunError::Find)?),
+            Mode::Normal | Mode::Verify | Mode::Declared { .. } => Some(index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs)).map_err(RunError::Find)?),
         };
         let (kept, verified) = match found {
             Some(Found::Hit { value, verified, .. }) => {
@@ -405,7 +408,7 @@ impl Run {
             Some(Found::Miss { .. }) | None => (None, None),
         };
         let kept = match (kept, spec.mode) {
-            (Some(value), Mode::Normal) => {
+            (Some(value), Mode::Normal | Mode::Declared { verify: false, .. }) => {
                 if let Some(out_dir) = &spec.out_dir {
                     restore(out_dir, &value.files).map_err(RunError::OutDir)?;
                 }
@@ -590,6 +593,10 @@ impl Run {
             return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
         };
         rule::widen(&mut traced, &rule, inputs).map_err(RunError::Inputs)?;
+        if matches!(self.spec.mode, Mode::Declared { .. }) && traced.files.iter().any(|(_, v)| v.is_none()) {
+            // Cargo always reruns a declaration naming a missing file, even before it appears.
+            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
+        }
         let roots = self.spec.roots.view();
         // alloc: error path, why the scan could not be made
         let (marked, stored) = roots.kept(&traced, &value).map_err(|error| {
@@ -618,7 +625,7 @@ impl Run {
                 error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
             })?;
         // Verify mode: a copy comparison that retracted is a difference too, said as one.
-        if self.spec.mode == Mode::Verify
+        if matches!(self.spec.mode, Mode::Verify | Mode::Declared { verify: true, .. })
             && let Some(ticket) = kept.retracted
         {
             let what = match kept.verdict {

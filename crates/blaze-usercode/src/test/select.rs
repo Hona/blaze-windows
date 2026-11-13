@@ -599,7 +599,7 @@ pub fn keepable(traced: &Traced) -> bool {
     !traced
         .untraceable
         .iter()
-        .any(|it| matches!(it, Untraceable::Network | Untraceable::Descriptor))
+        .any(|it| matches!(it, Untraceable::Network | Untraceable::Descriptor | Untraceable::CargoDeclared))
 }
 
 /// Records how `test` ran: its pass, when it passed and that can be kept, and an entry of its

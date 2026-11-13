@@ -137,6 +137,13 @@ pub fn prepare(
         .with(Role::OutDir, &unit.out_dir);
     let view = roots.view();
     let mut given = Given::new(RunKind::BuildScript);
+    if let Mode::Declared { host, .. } = place.mode {
+        given.part("Windows declared inputs v2", &host.0);
+        // Include even previously absent/pass-through and run-only names. Never expose values
+        // in explanations. `env_keyed` sorts stably and keeps the last value like CreateProcess.
+        let names: Vec<_> = env.vars.iter().map(|(n, _)| blaze_core::platform::env::os_name(n)).collect(); // alloc: once per prepared run
+        given.env_keyed(names.iter().zip(&env.vars).map(|(n, (_, v))| (n.as_encoded_bytes(), v.as_encoded_bytes())));
+    }
     // The roots a given string still holds once ported (`-L/ws/p/lib`, a root after a path
     // byte): its key is then this checkout's string, and the run is kept here alone.
     let mut bound = RoleSet::default();
@@ -323,6 +330,12 @@ fn shown(value: Option<&OsStr>) -> String {
 /// another value, or misses one, would be kept under a key no check makes again, and is an
 /// error naming the variable rather than a run that is never found.
 pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
+    if matches!(prepared.spec.mode, Mode::Declared { .. }) {
+        // The launcher has no trusted read trace. The caller reported it as such; only
+        // the host-computed given key and CargoRule may contribute to the persisted shape.
+        *traced = Traced { untraceable: vec![blaze_core::Untraceable::CargoDeclared], ..Traced::default() };
+        return Ok(());
+    }
     traced.env.retain(|(name, _)| !run_only(name) && !prepared.given.contains(name));
     for (name, value) in &mut traced.env {
         if make_flag(name) {
@@ -494,6 +507,28 @@ mod tests {
 
     fn inherited(path: &str) -> Vec<(OsString, OsString)> {
         vec![("PATH".into(), path.into()), ("HOME".into(), "/home/u".into())]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn declared_results_do_not_answer_observed_lookups() {
+        let unit = unit();
+        let env = inherited("/a");
+        let mut place = place();
+        let observed = prepare(&unit, &env, &place).unwrap();
+        place.mode = Mode::Declared { host: ContentId::default(), verify: false };
+        let declared = prepare(&unit, &env, &place).unwrap();
+        assert_ne!(declared.spec.key, observed.spec.key);
+        let mut changed = env;
+        changed.push(("ANOTHER_INPUT".into(), "value".into()));
+        assert_ne!(prepare(&unit, &changed, &place).unwrap().spec.key, declared.spec.key);
+
+        // The record itself, not only its opaque lookup key, identifies the policy.
+        let mut traced = Traced::default();
+        keyed(&declared, &mut traced).unwrap();
+        let shape = crate::index::Shape::of(&traced);
+        let restored = crate::index::Shape::decode(&shape.encode()).unwrap();
+        assert_eq!(restored.untraceable, vec![blaze_core::Untraceable::CargoDeclared]);
     }
 
     /// A pinned native input's digest is part of the run's key: another archive is another

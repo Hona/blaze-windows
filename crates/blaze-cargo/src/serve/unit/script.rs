@@ -102,6 +102,8 @@ fn rechecks_in(env: &[(String, String)]) -> Result<bool, ApiError> {
 /// What a build script's run told cargo, for what depends on it.
 #[derive(Debug)]
 pub(crate) struct Applied {
+    #[cfg(windows)]
+    pub(crate) result: blaze_ids::ContentId,
     /// The run's package.
     pub(crate) package_id: String,
     pub(crate) links: Option<String>,
@@ -909,7 +911,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode != blaze_usercode::run::Mode::Normal => {
+        How::Sandboxed(prepared) if !matches!(prepared.spec.mode, blaze_usercode::run::Mode::Normal | blaze_usercode::run::Mode::Declared { verify: false, .. }) => {
             false
         }
         How::Sandboxed(prepared) => {
@@ -1180,11 +1182,21 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
-        blaze_core::platform::path::host(&job.input.config.invocation.root),
-        blaze_core::platform::path::host(&units.target_dir),
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // Don't grant a Windows script the entire mutable workspace or build tree under
+    // a package-scoped key. Sibling inputs require a separately keyed read grant.
+    if !cfg!(windows) {
+        read.push(blaze_core::platform::path::host(&job.input.config.invocation.root));
+        read.push(blaze_core::platform::path::host(&units.target_dir));
+    }
+    #[cfg(windows)]
+    for dep in &job.unit(run)?.dependencies {
+        if let Some(output) = job.scripts[dep.index].get() { read.push(PathBuf::from(&output.out_dir)); }
+    }
+    #[cfg(windows)]
+    let mut mutable = Vec::new(); // alloc: explicit mutable grants only
     // A git dependency's script reads its repository at the commit, as cargo's checkout (the
     // whole repository) lets it: an asset beside its package (betteroffice-fonts-intl reads
     // `../../packages/fonts-intl/assets`). The tree is the commit's, fixed by it, and in
@@ -1206,6 +1218,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             if resolved.parent().is_none() {
                 return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} resolves to a volume root", path.display()), None));
             }
+            mutable.push(resolved.clone());
             read.push(resolved);
         }
     }
@@ -1219,16 +1232,28 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         .collect();
     read.sort_unstable();
     read.dedup();
+    #[cfg(windows)]
+    let declared_inputs = if outside(job, run) || crate::sandbox::v2::OBSERVES_READS { None } else {
+        let why = |what| ApiError::new(what, Some(unit.package.descr()));
+        let roots = declared::roots(&read).map_err(why)?;
+        let host = declared::given(job, run, &unit, &env, &roots, mutable).map_err(why)?;
+        Some((host, roots))
+    };
+    #[cfg(windows)]
+    let declared = declared_inputs.as_ref().map(|(host, _)| *host);
+    #[cfg(not(windows))]
+    let declared = None;
     let place = Place {
         code,
         read,
         pinned,
         network: false,
         memory: None,
-        mode: match rechecks(job)? {
+        mode: match (declared, rechecks(job)?) {
+            (Some(host), verify) => blaze_usercode::run::Mode::Declared { verify, host },
             _ if !crate::sandbox::v2::OBSERVES_READS => blaze_usercode::run::Mode::Unobserved,
-            true => blaze_usercode::run::Mode::Verify,
-            false => blaze_usercode::run::Mode::Normal,
+            (_, true) => blaze_usercode::run::Mode::Verify,
+            (_, false) => blaze_usercode::run::Mode::Normal,
         },
         roots: build_roots(job),
     };
@@ -1257,6 +1282,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         }
     }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
+    #[cfg(windows)]
+    let disk = match declared_inputs { Some((_, roots)) => disk.declared_inputs(roots), None => disk };
     let how = match outside(job, run) {
         true => {
             // Outside the sandbox nothing is lent: the program is given its whole environment,
@@ -1866,6 +1893,8 @@ impl ScriptRun {
             self.state = State::Done;
             return Some(false);
         };
+        #[cfg(windows)]
+        let mut result = declared::result(&value);
         let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {
@@ -1876,6 +1905,13 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        #[cfg(windows)]
+        if matches!(start.how, How::Outside(_)) {
+            let mut hash = blaze_ids::Hasher::new("Windows outside dependency result 1");
+            hash.id(&result);
+            for (path, bytes) in &files { hash.part(path.as_bytes()).part(bytes); }
+            result = hash.finish();
+        }
         // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
         // the plan's; the script ran at the system's path of it.
         let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
@@ -1904,7 +1940,7 @@ impl ScriptRun {
         };
         out.push(Response::BuildScript(executed(&package_id, &output, &out_dir)));
         let links = start.unit.package.links.clone();
-        let applied = Applied { package_id, links, output, out_dir };
+        let applied = Applied { package_id, links, output, out_dir, #[cfg(windows)] result };
         if job.scripts[self.unit].set(applied).is_err() {
             return self.error(
                 format!("the build script run of unit {} ended twice in one job", self.unit),
@@ -2272,7 +2308,14 @@ impl ScriptRun {
                     completion,
                     store,
                     disk,
-                    |exit| script::cargo_rule(unit, env, exit),
+                    |exit| {
+                        let mut rule = script::cargo_rule(unit, env, exit)?;
+                        if matches!(prepared.spec.mode, blaze_usercode::run::Mode::Declared { .. }) {
+                            // Whole environment already in the key, including absent variables.
+                            rule.env.clear();
+                        }
+                        Ok(rule)
+                    },
                     |traced| {
                         // What the run read and who read it, as events of the build's
                         // profile, before its key takes anything out of the trace.
@@ -2450,6 +2493,8 @@ impl ScriptRun {
 }
 
 pub(crate) mod pure;
+#[cfg(windows)]
+mod declared;
 mod said;
 
 #[cfg(test)]

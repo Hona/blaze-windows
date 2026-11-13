@@ -515,11 +515,20 @@ pub struct Now<'a> {
 pub struct Disk {
     files: &'static Files,
     env: Env,
+    #[cfg(windows)]
+    declared: Option<Vec<PathBuf>>,
 }
 
 impl Disk {
     pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
-        Disk { files: Files::shared(), env: Env::new(env) }
+        Disk { files: Files::shared(), env: Env::new(env), #[cfg(windows)] declared: None }
+    }
+
+    /// Check declared paths against this run's grants, both when publishing and on lookup.
+    #[cfg(windows)]
+    pub fn declared_inputs(mut self, grants: Vec<PathBuf>) -> Self {
+        self.declared = Some(grants);
+        self
     }
 
     /// The same files with another environment.
@@ -535,6 +544,70 @@ impl Disk {
 fn missing(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
         || error.raw_os_error() == Some(NOT_A_DIRECTORY)
+}
+
+/// Cargo-style filesystem stamps. Hash names as well as file stamps: editing a header
+/// doesn't touch its parent directory and renaming a file need not change its own time.
+/// Never open the contents (in particular not devices) on behalf of a script. Refuse
+/// reparses instead of following a junction with the daemon's wider access.
+#[cfg(windows)]
+fn declared_stamp(path: &Path, tree: bool, package: bool) -> Result<Option<[u8; 32]>, Unreadable> {
+    use std::os::windows::fs::MetadataExt;
+    let err = |at: &Path, e: io::Error| Unreadable { path: at.into(), error: e.to_string() };
+    blaze_vfs::outside::looked(path);
+    let mut hash = Hasher::new("blaze Windows Cargo path stamps 1");
+    let mut pending = vec![path.to_owned()]; // alloc: directory walk, only when a tree is requested
+    while let Some(at) = pending.pop() {
+        let m = match std::fs::symlink_metadata(&at) {
+            Ok(it) => it,
+            Err(e) if missing(&e) && at == path => return Ok(None),
+            Err(e) => return Err(err(&at, e)),
+        };
+        if m.file_attributes() & 0x400 != 0 {
+            return Err(Unreadable { path: at, error: "a reparse point cannot be stamped as a confined Cargo input".into() });
+        }
+        if tree && at == path && !m.is_dir() { return Ok(None); }
+        hash.part(at.strip_prefix(path).expect("a descendant").as_os_str().as_encoded_bytes());
+        if m.is_dir() {
+            hash.update(b"d");
+            if tree {
+                let mut kids = Vec::new(); // alloc: one directory, sorted by name
+                for entry in std::fs::read_dir(&at).map_err(|e| err(&at, e))? {
+                    let entry = entry.map_err(|e| err(&at, e))?;
+                    let n = entry.file_name();
+                    if package && ((at == path && n == "target") || n == ".git") { continue; }
+                    kids.push(entry.path());
+                }
+                kids.sort_unstable();
+                pending.extend(kids);
+            }
+        } else {
+            hash.update(b"f").update(&Stamp::of(&m).bytes());
+        }
+    }
+    Ok(Some(hash.finish().0))
+}
+
+/// Resolve the name before walking it with the daemon's (not the child's) access. A
+/// negative lookup has no canonical name: check its nearest existing ancestor instead.
+#[cfg(windows)]
+pub fn granted(path: &Path, roots: &[PathBuf]) -> Result<bool, Unreadable> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(real) => return Ok(roots.iter().any(|root| real.starts_with(root))),
+            Err(e) if missing(&e) && ancestor.parent().is_some() => {
+                ancestor = ancestor.parent().expect("checked parent");
+            }
+            Err(e) => return Err(Unreadable { path: path.into(), error: e.to_string() }),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn require_grant(path: &Path, roots: &[PathBuf]) -> Result<(), Unreadable> {
+    if granted(path, roots)? { return Ok(()); }
+    Err(Unreadable { path: path.into(), error: "outside the script's read grants".into() })
 }
 
 #[cfg(unix)]
@@ -620,7 +693,21 @@ impl Inputs for Disk {
     type Error = Unreadable;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared {
+            require_grant(path, roots)?;
+            return declared_stamp(path, false, false);
+        }
         self.now().file(path)
+    }
+
+    fn tree(&mut self, path: &Path, package: bool) -> Result<Option<[u8; 32]>, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared {
+            require_grant(path, roots)?;
+            return declared_stamp(path, true, package);
+        }
+        crate::trace::walk(self, path, package)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -628,6 +715,8 @@ impl Inputs for Disk {
     }
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared { require_grant(path, roots)?; }
         self.now().names(path, out)
     }
 

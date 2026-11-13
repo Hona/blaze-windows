@@ -107,6 +107,7 @@ pub fn untraceable_name(it: Untraceable) -> &'static str {
         Untraceable::Random => "random",
         Untraceable::Network => "network",
         Untraceable::Descriptor => "descriptor",
+        Untraceable::CargoDeclared => "cargo-declared",
     }
 }
 
@@ -116,6 +117,7 @@ pub fn untraceable_of(name: &str) -> Option<Untraceable> {
         "random" => Untraceable::Random,
         "network" => Untraceable::Network,
         "descriptor" => Untraceable::Descriptor,
+        "cargo-declared" => Untraceable::CargoDeclared,
         _ => return None,
     })
 }
