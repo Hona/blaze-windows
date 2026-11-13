@@ -5,8 +5,8 @@
 //! A process in an AppContainer opens a file only where the file's DACL lets its user and also
 //! the container's SID, a capability SID the process holds, or ALL APPLICATION PACKAGES (the
 //! system's own directories) open it. The container is one profile, [`PROFILE`], made once; the
-//! reads a spec names are granted to its SID, inheritably, and kept, so each directory is granted
-//! once. Writes are granted for one run to a capability SID of the run's own, derived from a
+//! reads a spec names are granted to a distinct capability per root, inheritably, and kept. Only
+//! runs which name the root hold its capability. Writes are granted for one run to a capability SID of the run's own, derived from a
 //! random name no other process holds, and taken back as the run ends: a grant a killed launcher
 //! leaves behind names a SID nothing holds again. A directory the launcher makes (the run's
 //! temporary directory, a missing writable one) is made with its grant in it, so no DACL is read
@@ -120,7 +120,8 @@ use windows_sys::{
 };
 
 /// The AppContainer profile every run is in.
-const PROFILE: &str = "blaze.sandbox";
+// Do not inherit the earlier profile's accumulated read grants.
+const PROFILE: &str = "blaze.sandbox.roots";
 
 /// What a read grant gives: open, list, read and run.
 const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
@@ -196,7 +197,13 @@ impl Given {
 pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     let _running = Running::start();
     on_interrupt()?;
-    let mut made = make(spec.network, given)?;
+    let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
+    let mut roots: Vec<&Path> = spec.read.iter().map(PathBuf::as_path).chain(program_dir)
+        .chain([spec.dir.as_path()]).collect(); // alloc: the run's capability list
+    roots.sort_unstable();
+    roots.dedup();
+    let capabilities = roots.iter().map(|path| Capability::read(path)).collect::<Result<Vec<_>, _>>()?;
+    let mut made = make_with(spec.network, given, capabilities)?;
     let temp = temporary(spec)?;
     let writable = Inheritable::new(made.run.sid(), WRITE)?;
     match writable.make_dir(&temp) {
@@ -239,15 +246,12 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
             }
         }
     }
-    let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
-    let readers = [sid(&made.kept.container), sid(&made.kept.any)];
     let checks = reads::kept();
     // Once per sandbox, the key each read path is looked up by in the kept checks.
     let mut key = Vec::with_capacity(if checks.is_some() { 260 } else { 0 });
     let mut missing = Vec::with_capacity(spec.read.len() + 2);
-    for path in
-        spec.read.iter().map(PathBuf::as_path).chain(program_dir).chain([spec.dir.as_path()])
-    {
+    for (path, cap) in roots.into_iter().zip(&made.reads) {
+        let readers = [cap.sid(), sid(&made.kept.any)];
         let seen = match checks {
             Some(checks) => checks.covered(path, &readers, &mut key)?,
             None => covered(path, &readers, READ, GRANTING_READ)?,
@@ -256,12 +260,12 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
         // Read grants are only ever added, so one seen without the lock stays: only a missing
         // one is changed, under the lock, after looking again.
         if !seen.covered {
-            missing.push((path, seen.dir));
+            missing.push((path, seen.dir, readers));
         }
     }
     if !missing.is_empty() || !found.is_empty() {
         let _lock = Lock::take()?;
-        for (path, dir) in missing {
+        for (path, dir, readers) in missing {
             grant(path, dir, readers[0], &readers, READ, GRANTING_READ)?;
         }
         for dir in found {
@@ -381,6 +385,7 @@ struct Made {
     _granted: Vec<SID_AND_ATTRIBUTES>,
     _jobs: Box<[HANDLE; 1]>,
     kept: &'static Kept,
+    reads: Vec<Capability>,
     run: Capability,
     job: Handle,
     standard: [Option<Handle>; 3],
@@ -440,11 +445,16 @@ fn copied(sid: PSID, what: &str) -> Result<SidBuffer, String> {
 }
 
 fn make(network: bool, given: Given) -> Result<Made, String> {
+    make_with(network, given, Vec::new())
+}
+
+fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made, String> {
     let kept = kept()?;
     let run = Capability::new()?;
     let enabled = SE_GROUP_ENABLED as u32;
-    let mut granted = Vec::with_capacity(1 + kept.network.len());
+    let mut granted = Vec::with_capacity(1 + kept.network.len() + reads.len());
     granted.push(SID_AND_ATTRIBUTES { Sid: run.sid(), Attributes: enabled });
+    granted.extend(reads.iter().map(|it| SID_AND_ATTRIBUTES { Sid: it.sid(), Attributes: enabled }));
     if network {
         granted.extend(
             kept.network.iter().map(|it| SID_AND_ATTRIBUTES { Sid: sid(it), Attributes: enabled }),
@@ -511,6 +521,7 @@ fn make(network: bool, given: Given) -> Result<Made, String> {
         _granted: granted,
         _jobs: jobs,
         kept,
+        reads,
         run,
         job,
         standard,
@@ -655,7 +666,19 @@ struct Capability {
 impl Capability {
     fn new() -> Result<Capability, String> {
         // alloc: once per sandbox, the name its capability is derived from.
-        let name = literal(&format!("blaze.sandbox.run.{:032x}", std::random::random::<u128>(..)));
+        Self::named(&format!("blaze.sandbox.run.{:032x}", std::random::random::<u128>(..)))
+    }
+
+    fn read(path: &Path) -> Result<Capability, String> {
+        if !path.is_absolute() {
+            return Err(format!("sandbox read root {} is not absolute", path.display()));
+        }
+        let id = blaze_ids::ContentId::of("blaze Windows sandbox read root", path.as_os_str().as_encoded_bytes());
+        Self::named(&format!("blaze.sandbox.read.{id:x}"))
+    }
+
+    fn named(name: &str) -> Result<Capability, String> {
+        let name = literal(name);
         let mut it = Capability { groups: null_mut(), group_count: 0, sids: null_mut(), count: 0 };
         // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; the four out-pointers
         // are live fields of `it`, and the lists the call makes there are freed only by
@@ -2154,6 +2177,30 @@ mod tests {
         assert!(info.TotalProcesses >= 1, "the program ran in the driver's job");
         assert_eq!(info.ActiveProcesses, 0);
         _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A read grant left on a file must not give it to the next script. Only Windows' token
+    /// access check can establish this; both runs use the same AppContainer profile.
+    #[test]
+    fn an_external_input_is_read_only_by_runs_given_that_root() {
+        let base = tempfile::tempdir().unwrap();
+        let package = base.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        let external = base.path().join("tools");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("input.txt"), "known input").unwrap();
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let mut spec = Spec {
+            program: root.join(r"System32\cmd.exe"),
+            args: vec!["/d".into(), "/c".into(), "type".into(), external.join("input.txt").into()],
+            env: vec![("SystemRoot".into(), root.into())],
+            dir: package.clone(), read: vec![external.clone()], write: Vec::new(),
+            network: false, trace: false, services: Vec::new(), live: package.join("live"),
+            report: package.join("report"), not_inputs: Vec::new(), given: None,
+        };
+        assert_eq!(run(&spec, Given::own()), Ok(0));
+        spec.read.clear();
+        assert_ne!(run(&spec, Given::own()).unwrap(), 0);
     }
 
     /// MSVC's C compiler, run in the sandbox as `cc` runs it from a build script: found by the

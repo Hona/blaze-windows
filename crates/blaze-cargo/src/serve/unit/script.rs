@@ -1121,6 +1121,21 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    #[cfg(windows)]
+    if let Some((_, paths)) = job.input.config.invocation.env.iter().find(|(name, _)| name == "BLAZE_SCRIPT_READ") {
+        // A checkout cannot choose these via a gitfile, PATH or Cargo's [env]. This is the
+        // caller's environment, before any values from the project are applied.
+        for path in std::env::split_paths(paths) {
+            if !path.is_absolute() || path.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} is not an absolute file or directory below a volume root", path.display()), None));
+            }
+            let resolved = std::fs::canonicalize(&path).map_err(|e| ApiError::new(format!("BLAZE_SCRIPT_READ: {}: {e}", path.display()), None))?;
+            if resolved.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} resolves to a volume root", path.display()), None));
+            }
+            read.push(resolved);
+        }
+    }
     // Each pinned native input it is given is read where it is laid out, and its digest is
     // part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)

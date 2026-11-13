@@ -153,6 +153,16 @@ pub fn prepare(
     let dir = crate::trace::os_bytes(unit.package.manifest_dir.as_os_str());
     given.ported("program", &program, &view);
     given.ported("dir", &dir, &view);
+    #[cfg(windows)]
+    {
+        // Giving a previously refused read can change the program's answer even if none of
+        // its files changed. Windows roots carry independent AppContainer capabilities.
+        let mut roots = blaze_ids::Hasher::new("blaze Windows script read roots 1");
+        for path in &place.read {
+            roots.part(path.as_os_str().as_encoded_bytes());
+        }
+        given.part("sandbox read roots", &roots.finish().0);
+    }
     if !place.pinned.is_empty() {
         let mut pinned: Vec<&(String, String)> = place.pinned.iter().collect(); // alloc: setup, a run's few inputs
         pinned.sort();
