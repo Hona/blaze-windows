@@ -1141,7 +1141,8 @@ impl Writer<Real> for UnitWriter {
         deps::item_errors(&self.session)?;
         let mut said: Vec<blaze_api::Diagnostic> =
             codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
-        said.extend(configs::report(&self.job, self.reader(), ok, built)?);
+        let job = Arc::clone(&self.job);
+        said.extend(configs::report(&job, || self.final_reader(), ok, built)?);
         Ok(said)
     }
 
