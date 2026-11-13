@@ -47,6 +47,7 @@
 
 pub(crate) mod files;
 mod net;
+mod observe;
 mod process;
 mod rundirs;
 mod stamp;
@@ -76,7 +77,7 @@ use std::alloc::Global;
 use windows_sys::Win32::{
     Foundation::{
         ERROR_BROKEN_PIPE, ERROR_CONNECTION_ABORTED, ERROR_HANDLE_EOF, ERROR_NETNAME_DELETED,
-        ERROR_INVALID_USER_BUFFER, ERROR_NO_DATA, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED,
+        ERROR_NO_DATA, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED,
         HANDLE,
     },
     Networking::WinSock::{SOCKET, WSAECONNRESET},
@@ -89,7 +90,7 @@ use windows_sys::Win32::{
 
 use self::{
     rundirs::RunDirs,
-    sys::{BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
+    sys::{BUFFER, Buffer, Buffers, Head, KEY_DOORBELL, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
 };
 use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
@@ -454,8 +455,14 @@ struct Journaling {
     shown: String,
     /// Flushes asked before the journal opened, marked once it has.
     unmarked: Vec<Tag>,
-    /// The read in flight was cancelled so that a flush is told: its abort is no failure.
-    hurrying: bool,
+    /// The journal, while it waits for its doorbell (`usn::Doorbell`): nothing of it is in
+    /// flight or on the threads.
+    idle: Option<Box<usn::Journal>>,
+    /// The read under way (in flight, or its records on the threads) was asked after every
+    /// flush waiting had its mark: one that then moves no further has reached the journal's end
+    /// past each, and a mark still ahead of it is the volume's error. One asked before a mark
+    /// may stop short of it.
+    asked_after_marks: bool,
     barrier: Barrier,
 }
 
@@ -469,7 +476,8 @@ impl Journaling {
             shown: String::new(),
             // alloc: none unless a flush is asked before it opens.
             unmarked: Vec::new(),
-            hurrying: false,
+            idle: None,
+            asked_after_marks: false,
             barrier: Barrier::new(),
         }
     }
@@ -1081,7 +1089,7 @@ impl Iocp {
     }
 
     /// `len` bytes at `at` of `file`, through its kept handle. A whole file is read on the
-    /// threads instead ([`files::read_whole`]): its open is most of its cost and has no
+    /// threads instead ([`observe::read_whole`]): its open is most of its cost and has no
     /// overlapped form, and a handle kept by its name would read a file replaced by another
     /// process's rename as it was.
     fn read(&mut self, file: &FileName, at: u64, len: usize, tag: Tag) -> io::Result<()> {
@@ -2064,6 +2072,9 @@ impl Iocp {
                     self.ended(id, result);
                 }
                 KEY_WAKE => {}
+                KEY_DOORBELL => {
+                    self.rang(Tag(entry.lpOverlapped as usize as u64), entry.dwNumberOfBytesTransferred)
+                }
                 KEY_EXIT => {
                     let id = SpawnId::from_bits(entry.lpOverlapped as usize as u64);
                     let Some(spawned) = self.spawns.get_mut(id) else { continue };
@@ -2160,48 +2171,71 @@ impl Iocp {
             }
         }
         let journaling = self.journals.get_mut(&tag).expect("looked up above");
+        let mut stalled = false;
         if let Some(read) = taken.read {
-            journaling.barrier.read(read.told, read.stalled);
+            journaling.barrier.read(read.told, read.stalled && journaling.asked_after_marks);
+            stalled = read.stalled;
         }
         let hurry = journaling.barrier.hurried();
         self.decide(tag);
-        let mut journal =
+        let journal =
             journal.expect("a journal handed back without an end is handed back with it");
-        journal.set_hurry(hurry);
+        // At the journal's end with no flush waiting: the journal waits for its doorbell, and
+        // nothing of it is in flight on the port.
+        if stalled && journal.caught_up() && !hurry {
+            journal.arm();
+            if let Some(journaling) = self.journals.get_mut(&tag) {
+                journaling.idle = Some(journal);
+            }
+            return;
+        }
+        self.read_journal(tag, journal);
+    }
+
+    /// The next read of the journal `tag` asked on the port: it returns at once, at the
+    /// journal's end at the latest.
+    fn read_journal(&mut self, tag: Tag, journal: Box<usn::Journal>) {
         let request = self.request(tag, Op::Journal(journal));
         if let Some(journaling) = self.journals.get_mut(&tag) {
             journaling.request = Some(request);
+            journaling.asked_after_marks = true;
         }
         self.put(request);
     }
 
+    /// The doorbell of the journal `tag` rang: a record came where it was armed, so the
+    /// journal waiting for it is read now. A doorbell rings once per arming, but a flush may
+    /// have taken the journal to read meanwhile: then that read and the next reach what came,
+    /// and the ring is nothing. A doorbell whose read failed (`code`) with a state of the
+    /// journal the read on the port tells (wrapped, deleted, made again) rings as one that saw a
+    /// record; with any other error the watch ends, naming it.
+    fn rang(&mut self, tag: Tag, code: u32) {
+        let Some(journaling) = self.journals.get_mut(&tag) else { return };
+        let Some(journal) = journaling.idle.take() else { return };
+        if code != 0 && !usn::the_read_tells(code) {
+            drop(journal);
+            // alloc: an error path.
+            let why = format!(
+                "the USN journal of {}: its doorbell's read failed: {}",
+                journaling.shown,
+                io::Error::from_raw_os_error(code as i32)
+            );
+            self.unjournal(tag, &why);
+            return self.fail(tag, why);
+        }
+        self.read_journal(tag, journal);
+    }
+
     /// A read of the journal `tag` ended: its records to be named on the threads, or, asked to
     /// end, the journal let go. What it read as it was cancelled is after the last batch's
-    /// cursor, so a watch from that cursor reads it again. A read cancelled so that a flush is
-    /// told read nothing: it is asked again at once, without waiting.
-    fn journal_read(&mut self, tag: Tag, mut journal: Box<usn::Journal>, result: io::Result<u32>) {
+    /// cursor, so a watch from that cursor reads it again.
+    fn journal_read(&mut self, tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32>) {
         let Some(journaling) = self.journals.get_mut(&tag) else { return };
         journaling.request = None;
-        let hurried = std::mem::take(&mut journaling.hurrying);
         if journaling.stopping {
             drop(journal);
             self.unjournal(tag, "it was stopped");
             self.ready.push(Completion { tag, done: Done::Unwatched });
-            return;
-        }
-        let code = result.as_ref().err().and_then(io::Error::raw_os_error).map(|it| it as u32);
-        // A read that waits for a record is the journal's doorbell: its end, records or not,
-        // says records came. Windows ends one with ERROR_INVALID_USER_BUFFER now and then as
-        // they come (5% of 90,000 waiting reads under a storm of writes, and 0 of 958,000 that
-        // do not wait, measured on Windows 11 26100 by a program of its own), having read nothing, so the cursor stays and the next
-        // read, which does not wait, reads them.
-        if journal_drain_due(journal.waits(), hurried, code) {
-            journal.set_hurry(true);
-            let request = self.request(tag, Op::Journal(journal));
-            if let Some(journaling) = self.journals.get_mut(&tag) {
-                journaling.request = Some(request);
-            }
-            self.put(request);
             return;
         }
         self.to_threads(Work::Took { tag, journal, result });
@@ -2219,7 +2253,10 @@ impl Iocp {
             );
         };
         match mark {
-            Ok(mark) => journaling.barrier.mark(flush, mark),
+            Ok(mark) => {
+                journaling.asked_after_marks = false;
+                journaling.barrier.mark(flush, mark);
+            }
             Err(error) => {
                 // alloc: an error path.
                 let why = format!(
@@ -2251,14 +2288,13 @@ impl Iocp {
                 Decision::Hurry => hurry = true,
             }
         }
+        // A journal waiting for its doorbell is read now, so the flush is told without a record
+        // coming; the doorbell stays armed, and its ring after is nothing.
         if hurry
-            && !journaling.hurrying
             && !journaling.stopping
-            && let Some(request) = journaling.request.and_then(|id| self.requests.get(id))
-            && matches!(&request.op, Op::Journal(journal) if journal.waits())
+            && let Some(journal) = journaling.idle.take()
         {
-            request.cancel();
-            journaling.hurrying = true;
+            self.read_journal(tag, journal);
         }
     }
 
@@ -2378,6 +2414,11 @@ impl Driver for Iocp {
                     if let Some(request) = journaling.request.and_then(|id| self.requests.get(id)) {
                         request.cancel();
                     }
+                    if let Some(journal) = journaling.idle.take() {
+                        drop(journal);
+                        self.unjournal(tag, "it was stopped");
+                        self.ready.push(Completion { tag, done: Done::Unwatched });
+                    }
                 }
                 Effect::Unwatch { tag } => {
                     match self.watches.get(&tag).and_then(|id| self.requests.get_mut(*id)) {
@@ -2463,10 +2504,6 @@ fn failed(tag: Tag, why: impl fmt::Display) -> Completion {
     Completion { tag, done: Done::Failed(IoError(why.to_string())) }
 }
 
-fn journal_drain_due(waiting: bool, hurried: bool, code: Option<u32>) -> bool {
-    (waiting && code == Some(ERROR_INVALID_USER_BUFFER)) || (hurried && code == Some(ERROR_OPERATION_ABORTED))
-}
-
 fn watched_already(tag: Tag) -> io::Error {
     // alloc: an error path.
     io::Error::other(format!("something is watched as {tag:?} already"))
@@ -2506,7 +2543,7 @@ fn guarded_work<T>(what: &str, run: impl FnOnce() -> io::Result<T>) -> io::Resul
 fn work_on(
     root: &Path,
     queue: &Receiver<Work>,
-    port: &Port,
+    port: &Arc<Port>,
     back: &Sender<Back>,
     woken: &Wake,
     #[cfg(test)] counted: &std::sync::atomic::AtomicU64,
@@ -2536,8 +2573,9 @@ fn work_on(
                 back.send(Back::Connected { tag, at, made })
             }
             Work::Open { tag, dir, since } => {
-                let opened = guarded_work("opening a USN journal", || usn::Journal::open(root, &dir, since).and_then(|(journal, first)| {
+                let opened = guarded_work("opening a USN journal", || usn::Journal::open(root, &dir, since).and_then(|(mut journal, first)| {
                     port.associate(journal.raw())?;
+                    journal.ring_on(Arc::clone(port), tag)?;
                     Ok((journal, first))
                 }));
                 let (journal, taken) = match opened {
@@ -2586,7 +2624,7 @@ fn joined<'a>(into: &'a mut PathBuf, root: &Path, file: &FileName) -> &'a Path {
 fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
     let Kept { at, to, paths } = kept;
     match effect {
-        Effect::ReadAll { file, .. } => match paths.of(&file).and_then(files::read_whole) {
+        Effect::ReadAll { file, .. } => match paths.of(&file).and_then(observe::read_whole) {
             Ok(bytes) => Ok(Done::Read(bytes)),
             // A file that is not there reads as empty.
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Done::Read(Vec::new())), // alloc: none, an empty `Vec`.
@@ -2658,14 +2696,6 @@ fn no_connection(conn: Conn) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn only_a_journal_doorbell_treats_1784_as_a_wake() {
-        let code = Some(ERROR_INVALID_USER_BUFFER);
-        assert!(journal_drain_due(true, false, code));
-        assert!(!journal_drain_due(false, false, code));
-        assert!(!journal_drain_due(false, true, code));
-        assert!(!journal_drain_due(true, false, Some(ERROR_OPERATION_ABORTED)));
-    }
     #[test]
     fn a_panicking_worker_reports_its_request_and_accepts_more_work() {
         let worker = std::thread::spawn(|| {
@@ -3588,6 +3618,57 @@ mod tests {
         assert!(next > at);
         let cursors: Vec<i64> = batches.iter().map(|it| usn(it.cursor).2).collect();
         assert!(cursors.windows(2).all(|it| it[0] <= it[1]), "{cursors:?}");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant: a live journal hears every file another process writes under it, and its
+    /// waits for records never fail. Before its doorbell, the live read waited on the port and
+    /// NTFS ended about half of those waits with ERROR_INVALID_USER_BUFFER (I9) when the writer
+    /// was another process; a synchronous read on the doorbell's thread ends none so.
+    #[test]
+    fn a_live_journal_hears_a_storm_another_process_writes_through_its_doorbell() {
+        let root = dir("doorbell");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: Cursor::None, tag: Tag(7) }]);
+        const FILES: usize = 400;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut writer = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while seen.len() < FILES {
+            assert!(Instant::now() < deadline, "heard {} of {FILES} files", seen.len());
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+            for it in out.drain(..) {
+                match it.done {
+                    Done::Journaled(batch) => {
+                        if batch.caught_up && writer.is_none() {
+                            // Live now: another process writes, one file a command.
+                            writer = Some(
+                                std::process::Command::new("cmd")
+                                    .args(["/D", "/C", &format!("for /L %i in (1,1,{FILES}) do @echo x> f%i.txt")])
+                                    .current_dir(&src)
+                                    .spawn()
+                                    .unwrap(),
+                            );
+                        }
+                        seen.extend(batch.files.iter().map(|it| it.as_str().to_owned()).filter(|it| it.ends_with(".txt")));
+                    }
+                    other => panic!("the watch ended or failed: {other:?}"),
+                }
+            }
+        }
+        assert!(writer.unwrap().wait().unwrap().success());
+        driver.submit(&mut vec![Effect::Unwatch { tag: Tag(7) }]);
+        loop {
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+            if out.drain(..).any(|it| matches!(it.done, Done::Unwatched)) {
+                break;
+            }
+            assert!(Instant::now() < deadline + Duration::from_secs(10), "the journal never ended");
+        }
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

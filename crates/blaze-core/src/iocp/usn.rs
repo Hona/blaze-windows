@@ -2,24 +2,27 @@
 //! (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md).
 //!
 //! The watched directory's volume is opened for traversal only, which any user may, and read
-//! with `FSCTL_READ_UNPRIVILEGED_USN_JOURNAL` (Windows 10 1709 on), overlapped on the port: from
-//! the saved USN with nothing to wait for until the read reaches the `NextUsn` the watch began
-//! at (its history), then waiting for one byte (live), so every change, then and after, is the
-//! journal's and every batch's cursor is the USN after its last record. `FSCTL_READ_USN_JOURNAL`
-//! would give names too, but it is refused to anyone outside Administrators.
+//! with `FSCTL_READ_UNPRIVILEGED_USN_JOURNAL` (Windows 10 1709 on), overlapped on the port and
+//! never waiting: from the saved USN to the `NextUsn` the watch began at (its history), then
+//! (live) again each time its [`Doorbell`], a synchronous read on a thread of its own that waits
+//! for one byte, says records came. So every change, then and after, is the journal's and every
+//! batch's cursor is the USN after its last record. `FSCTL_READ_USN_JOURNAL` would give names
+//! too, but it is refused to anyone outside Administrators.
 //!
 //! The unprivileged read gives a record without its name: the file's and its parent's
 //! reference numbers, its attributes and why it changed. [`Names`] makes names of them, keeping
 //! where each directory it has met is: a file made, written or come in under a new name is
-//! named where it is now (`OpenFileById`, `GetFinalPathNameByHandleW`); one removed, or the old
+//! named where it is now (opened by its number as an observer, `super::observe`, and
+//! `GetFinalPathNameByHandleW`); one removed, or the old
 //! name of a rename, is told as its directory's names changed ([`Lost::Unnamed`]). A record
 //! that has its name (an elevated reader's) is named from its parent with no call at all.
 //! Records whose parent is outside the watched directory cost one lookup in a map.
 //!
 //! A flush of the watch ([`crate::Effect::Flush`]) is marked with the journal's `NextUsn`,
 //! queried after it was asked ([`mark`]), and told once every record before that is told
-//! ([`crate::journal::barrier`]): nothing is written for it. While a flush waits, reads are
-//! asked without waiting, so one returns at the journal's end even when no record comes.
+//! ([`crate::journal::barrier`]): nothing is written for it. While a flush waits the journal is
+//! read again at once, not left to its doorbell, so a read reaches the journal's end, past the
+//! mark, even when no record comes.
 
 use std::{
     fmt, io,
@@ -38,15 +41,14 @@ use windows_sys::Win32::{
         ERROR_PATH_NOT_FOUND, HANDLE,
     },
     Storage::FileSystem::{
-        CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_128, FILE_ID_DESCRIPTOR,
-        FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileIdInfo,
         GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        OPEN_EXISTING, OpenFileById, VOLUME_NAME_DOS, VOLUME_NAME_GUID, VOLUME_NAME_NT,
+        OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_GUID, VOLUME_NAME_NT,
     },
     System::{
-        IO::{DeviceIoControl, OVERLAPPED},
+        IO::{CancelSynchronousIo, DeviceIoControl, OVERLAPPED},
         Ioctl::{
             FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_UNPRIVILEGED_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
             USN_JOURNAL_DATA_V1, USN_REASON_BASIC_INFO_CHANGE, USN_REASON_CLOSE,
@@ -62,7 +64,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::sys;
+use super::{
+    observe::{self, Open},
+    sys,
+};
 use crate::{Cursor, FileName, Journaled, Lost, journal::barrier::At};
 
 /// What one read of the journal fills at most.
@@ -595,25 +600,11 @@ impl Volume {
 
 impl System for Volume {
     fn find(&mut self, id: u128) -> Found {
-        let descriptor = FILE_ID_DESCRIPTOR {
-            dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
-            Type: ExtendedFileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 {
-                ExtendedFileId: FILE_ID_128 { Identifier: id.to_le_bytes() },
-            },
-        };
-        // SAFETY: an open handle on the volume, a descriptor of the size it says, and no
-        // security attributes. No access is asked: a name needs none.
-        let opened = sys::owned(unsafe {
-            OpenFileById(
-                self.hint.as_raw_handle(),
-                &descriptor,
-                0,
-                SHARE_ALL,
-                std::ptr::null(),
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        });
+        // An observer's handle (`super::observe`): a name asked of a file just made is never in
+        // the way of its maker's rename of the directory it is in. Its attributes alone are
+        // asked, as an oplock needs.
+        let at = observe::At::Id { root: self.hint.as_raw_handle(), id };
+        let opened = observe::open(at, Open { access: FILE_READ_ATTRIBUTES, link_itself: true });
         let handle = match opened {
             Ok(handle) => handle,
             Err(error) => {
@@ -629,7 +620,7 @@ impl System for Volume {
                 };
             }
         };
-        match final_path(&handle, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
+        match final_path_of(handle.raw(), FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
             Ok(()) => self.relative(),
             Err(_) => Found::Unknown,
         }
@@ -645,12 +636,17 @@ impl System for Volume {
 
 /// The path of what `handle` is open on, as `flags` asks, into `into` (no NUL).
 fn final_path(handle: &OwnedHandle, flags: u32, into: &mut Vec<u16>) -> io::Result<()> {
+    final_path_of(handle.as_raw_handle(), flags, into)
+}
+
+/// [`final_path`] of a raw handle of the caller's.
+fn final_path_of(handle: HANDLE, flags: u32, into: &mut Vec<u16>) -> io::Result<()> {
     loop {
         let room = into.capacity().max(260);
         into.resize(room, 0);
         // SAFETY: an open handle and a buffer of the length given.
         let len = unsafe {
-            GetFinalPathNameByHandleW(handle.as_raw_handle(), into.as_mut_ptr(), room as u32, flags)
+            GetFinalPathNameByHandleW(handle, into.as_mut_ptr(), room as u32, flags)
         };
         let len = len as usize;
         if len == 0 {
@@ -783,8 +779,10 @@ pub(super) struct Journal {
     /// The `NextUsn` the watch began at: its history ends there.
     target: i64,
     caught_up: bool,
-    /// A flush waits: the next read is asked without waiting.
-    hurry: bool,
+    /// The volume's device, as the doorbell opens it (NUL-terminated).
+    device: Vec<u16>,
+    /// What rings once records come, while the journal waits for them ([`Doorbell`]).
+    doorbell: Option<Doorbell>,
     /// The cursor's USN of the last batch told.
     told: i64,
     /// The request the kernel reads while a read is in flight (`METHOD_NEITHER`: in place), in
@@ -902,7 +900,8 @@ impl Journal {
             next,
             target: now,
             caught_up: next >= now,
-            hurry: false,
+            device,
+            doorbell: None,
             told: next,
             input: READ_USN_JOURNAL_DATA_V1::default(),
             // alloc: setup, the one buffer every read of the watch fills.
@@ -929,14 +928,28 @@ impl Journal {
         &self.shown
     }
 
-    /// Whether the next read is asked without waiting, as it is while a flush waits.
-    pub(super) fn set_hurry(&mut self, hurry: bool) {
-        self.hurry = hurry;
+    /// Whether the history is read and the journal's end reached: a read that then moves no
+    /// further leaves the journal to wait for its doorbell.
+    pub(super) fn caught_up(&self) -> bool {
+        self.caught_up
     }
 
-    /// Whether the read last asked waits for a record: one a flush must cancel to be told.
-    pub(super) fn waits(&self) -> bool {
-        self.input.BytesToWaitFor != 0
+    /// Starts the journal's doorbell, which posts `tag` to `port` once records come after where
+    /// it is armed ([`Journal::arm`]).
+    pub(super) fn ring_on(&mut self, port: Arc<super::sys::Port>, tag: crate::Tag) -> io::Result<()> {
+        let handle = open(&self.device, FILE_TRAVERSE, 0).map_err(|error| {
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("the USN journal of {}: opening its doorbell: {error}", self.shown))
+        })?;
+        self.doorbell = Some(Doorbell::start(handle, self.journal, port, tag)?);
+        Ok(())
+    }
+
+    /// Has the doorbell ring once a record comes at or past the next USN to read.
+    pub(super) fn arm(&self) {
+        if let Some(doorbell) = &self.doorbell {
+            doorbell.arm(self.next, self.journal);
+        }
     }
 
     /// How far the watch has told, `stalled` as the read was.
@@ -963,12 +976,10 @@ impl Journal {
             StartUsn: self.next,
             ReasonMask: REASONS,
             ReturnOnlyOnClose: 0,
-            // Ignored on an overlapped handle: a live read waits until a record comes or it is
-            // cancelled.
             Timeout: 0,
-            // Live, a read waits for a record, unless a flush waits: then it returns at once, at
-            // the journal's end, which is past the flush's mark.
-            BytesToWaitFor: u64::from(self.caught_up && !self.hurry),
+            // A read on the port never waits: it returns at once, at the journal's end, which is
+            // past any flush's mark. Waiting for records is the doorbell's ([`Doorbell`]).
+            BytesToWaitFor: 0,
             UsnJournalID: self.journal,
             MinMajorVersion: 2,
             MaxMajorVersion: 3,
@@ -1024,7 +1035,7 @@ impl Journal {
     /// The batch to tell after a read from `start`, if one is due, and the end if the watched
     /// directory moved.
     fn after(&mut self, start: i64) -> Taken {
-        let stalled = !self.waits() && self.next == start;
+        let stalled = self.next == start;
         let mut tell = false;
         if !self.caught_up && (self.next >= self.target || self.next == start) {
             self.caught_up = true;
@@ -1106,6 +1117,166 @@ impl Journal {
             }
             _ => self.end(format_args!("reading it: {error}")),
         }
+    }
+}
+
+/// Whether a doorbell's read that failed with `code` is a state of the journal the next read on
+/// the port meets too and tells ([`Journal::failed`]): wrapped past, deleted, made again.
+/// Any other is the doorbell's own failure, which ends the watch.
+pub(super) fn the_read_tells(code: u32) -> bool {
+    matches!(
+        code,
+        ERROR_HANDLE_EOF
+            | ERROR_JOURNAL_ENTRY_DELETED
+            | ERROR_JOURNAL_DELETE_IN_PROGRESS
+            | ERROR_JOURNAL_NOT_ACTIVE
+            | ERROR_INVALID_PARAMETER
+    )
+}
+
+/// A journal's doorbell: a thread of its own waiting in a synchronous read of the journal for
+/// a record at or past the USN it is armed at, which posts the journal's tag to the driver's
+/// port ([`super::sys::KEY_DOORBELL`]) once one comes, with the read's error if it failed. The
+/// driver then reads on the port, without waiting, what came.
+///
+/// Why a thread, not a waiting read on the port: the journal is read with a `METHOD_NEITHER`
+/// control code, and NTFS completes an overlapped read that waited in whatever thread wrote the
+/// record that ended its wait, where the caller's buffer is not mapped: it fails it with
+/// `ERROR_INVALID_USER_BUFFER` (1784, I9) having read nothing. Measured on Windows 11 26100
+/// (`notes/lanes/host-tools`): with the records written by another process, 51,566 of 107,685
+/// overlapped waiting reads in 6 s failed so, 1,369 of 77,036 with them written by a thread of
+/// the reader's own process, and none of 73,182 and 68,304 synchronous ones, which wait and copy
+/// in the caller's own thread. A read that does not wait failed none of 958,000.
+pub(super) struct Doorbell {
+    bell: Arc<Bell>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the driver and the doorbell's thread share.
+struct Bell {
+    /// The USN the doorbell is armed at, [`DISARMED`] while it is not.
+    at: std::sync::atomic::AtomicI64,
+    /// The journal's ID that USN is of.
+    journal: std::sync::atomic::AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+    parker: crate::wait::Parker,
+}
+
+const DISARMED: i64 = i64::MIN;
+
+/// What a doorbell's read may fill: room for any one record, which it does not look at.
+const DOORBELL_BUFFER: usize = 8 << 10;
+
+/// How long a doorbell's end waits for its thread to leave its read, cancelled
+/// (`CancelSynchronousIo`) each [`STOP_LOOK`] meanwhile.
+const STOP_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
+const STOP_LOOK: std::time::Duration = std::time::Duration::from_millis(1);
+
+impl Doorbell {
+    fn start(handle: OwnedHandle, journal: u64, port: Arc<super::sys::Port>, tag: crate::Tag) -> io::Result<Doorbell> {
+        use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+        // alloc: setup, once per watch.
+        let bell = Arc::new(Bell {
+            at: AtomicI64::new(DISARMED),
+            journal: AtomicU64::new(journal),
+            stop: AtomicBool::new(false),
+            parker: crate::wait::Parker::new(),
+        });
+        let theirs = Arc::clone(&bell);
+        let thread = std::thread::Builder::new()
+            // alloc: setup, once per watch.
+            .name("blaze-usn-doorbell".to_owned())
+            .spawn(move || ring(&theirs, &handle, &port, tag))?;
+        Ok(Doorbell { bell, thread: Some(thread) })
+    }
+
+    /// Rings once a record of the journal `journal` comes at or past `at`.
+    fn arm(&self, at: i64, journal: u64) {
+        use std::sync::atomic::Ordering;
+        self.bell.journal.store(journal, Ordering::Release);
+        self.bell.at.store(at, Ordering::Release);
+        self.bell.parker.unpark();
+    }
+}
+
+/// The doorbell's thread: armed, one read that waits for a record; then its ring.
+fn ring(bell: &Bell, handle: &OwnedHandle, port: &super::sys::Port, tag: crate::Tag) {
+    use std::sync::atomic::Ordering;
+    // alloc: setup, the doorbell's buffer for its life.
+    let mut buffer = vec![0u64; DOORBELL_BUFFER / 8];
+    let clock = crate::wait::Monotonic::new();
+    loop {
+        if bell.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let at = bell.at.swap(DISARMED, Ordering::AcqRel);
+        if at == DISARMED {
+            if bell.parker.park("a USN journal's doorbell, to be armed", None, &clock).is_err() {
+                return;
+            }
+            continue;
+        }
+        let input = READ_USN_JOURNAL_DATA_V1 {
+            StartUsn: at,
+            ReasonMask: REASONS,
+            ReturnOnlyOnClose: 0,
+            Timeout: 0,
+            BytesToWaitFor: 1,
+            UsnJournalID: bell.journal.load(Ordering::Acquire),
+            MinMajorVersion: 2,
+            MaxMajorVersion: 3,
+        };
+        let mut got = 0u32;
+        // SAFETY: a synchronous handle of the volume: the call returns once the read has ended,
+        // having read the input and written at most the buffer's length, both live meanwhile.
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.as_raw_handle(),
+                FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
+                (&raw const input).cast(),
+                size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
+                buffer.as_mut_ptr().cast(),
+                DOORBELL_BUFFER as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            )
+        };
+        if bell.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let code = if ok != 0 { 0 } else { sys::last() };
+        if port.post(super::sys::KEY_DOORBELL, code, tag.0 as usize).is_err() {
+            return;
+        }
+    }
+}
+
+impl Drop for Doorbell {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use std::sync::atomic::Ordering;
+        self.bell.stop.store(true, Ordering::Release);
+        self.bell.parker.unpark();
+        let Some(thread) = self.thread.take() else { return };
+        let clock = crate::wait::Monotonic::new();
+        let now = crate::wait::Clock::now(&clock);
+        let deadline = crate::wait::Deadline::after(now, STOP_WITHIN);
+        // Bounded: the thread leaves its read at the cancel, or before it enters one sees the
+        // stop; one that did neither by the deadline is let go, and posts nothing once it ends.
+        while !thread.is_finished() {
+            // SAFETY: the doorbell's thread, not joined, so its handle is open; a cancel of a
+            // thread in no synchronous I/O is ERROR_NOT_FOUND and does nothing.
+            unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
+            let now = crate::wait::Clock::now(&clock);
+            if deadline.passed(now) {
+                return;
+            }
+            let look = crate::wait::Deadline::after(now, STOP_LOOK);
+            if crate::wait::sleep_until("a USN doorbell's thread leaving its read", look, &clock).is_err() {
+                return;
+            }
+        }
+        _ = thread.join();
     }
 }
 
