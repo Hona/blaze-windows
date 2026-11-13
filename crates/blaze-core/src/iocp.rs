@@ -55,7 +55,7 @@ mod usn;
 mod warm;
 mod watch;
 
-pub(crate) use self::stamp::{entries, stamps};
+pub(crate) use self::stamp::{entries, stamp_path, stamps};
 
 use std::{
     cell::UnsafeCell,

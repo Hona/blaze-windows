@@ -945,6 +945,28 @@ fn created_mode() -> io::Result<u32> {
     Ok(*MODE.get_or_init(|| mode))
 }
 
+/// The [`Stamp`] of the file at `path`, a link stamped and not followed, as a sweep stamps it
+/// ([`crate::Effect::Stamp`]): for what keeps what it made of a file under the file's stamp
+/// outside a sweep (the linker's reading of a C library's directives).
+pub fn stamp(path: &Path) -> io::Result<crate::Stamp> {
+    #[cfg(windows)]
+    return crate::iocp::stamp_path(path);
+    #[cfg(unix)]
+    return std::fs::symlink_metadata(path).map(|it| {
+        use std::os::unix::fs::MetadataExt as _;
+        let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+        crate::Stamp {
+            ino: it.ino(),
+            size: it.size(),
+            mtime_ns: ns(it.mtime(), it.mtime_nsec()),
+            ctime_ns: ns(it.ctime(), it.ctime_nsec()),
+            mode: it.mode(),
+        }
+    });
+    #[cfg(target_os = "wasi")]
+    return std::fs::symlink_metadata(path).map(|it| wasi::stamp_of(&it));
+}
+
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
 #[cfg(unix)]
 pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {

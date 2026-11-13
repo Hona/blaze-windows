@@ -1500,3 +1500,34 @@ fn a_sanitizer_on_windows_or_wasm_is_an_error() {
         assert!(error.what.contains(what) && error.what.contains("wasm"), "{}", error.what);
     }
 }
+
+
+/// A file is stamped as a sweep stamps it, the same while it is unchanged and another after a
+/// write; what it was read as is kept under that stamp, so a link that finds it unchanged does
+/// not read it again.
+#[test]
+fn an_unchanged_archive_is_not_read_again() {
+    let dir = std::env::temp_dir().join(format!("blaze-link-stamp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("a.lib");
+    std::fs::write(&path, b"one").unwrap();
+    let first = blaze_core::fs::stamp(&path).unwrap();
+    assert!(!first.is_unknown(), "{first:?}");
+    assert_eq!(blaze_core::fs::stamp(&path).unwrap(), first);
+    let cache = Cache::new();
+    let reads = std::cell::Cell::new(0);
+    let read = |_: &[u8]| {
+        reads.set(reads.get() + 1);
+        Ok(vec![("m".to_owned(), "kernel32".to_owned())])
+    };
+    let asked = cache.read(&path, "a.lib", ("test", 0), read).unwrap();
+    assert_eq!(asked[0].1, "kernel32");
+    assert_eq!(cache.stamped.lock().len(), 1, "kept under its stamp");
+    cache.read(&path, "a.lib", ("test", 0), |_| unreachable!("an unchanged file is not read")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, b"two").unwrap();
+    assert_ne!(blaze_core::fs::stamp(&path).unwrap(), first);
+    cache.read(&path, "a.lib", ("test", 0), read).unwrap();
+    assert_eq!((reads.get(), cache.stamped.lock().len()), (2, 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}

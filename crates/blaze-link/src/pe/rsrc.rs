@@ -209,7 +209,7 @@ fn tables(resources: &[Resource]) -> (Vec<u8>, Vec<(u32, u32)>, Vec<u8>) {
         }
     }
     let mut strings: Vec<u8> = Vec::new();
-    let mut string_at = |id: &Id, strings: &mut Vec<u8>| -> Option<u32> {
+    let string_at = |id: &Id, strings: &mut Vec<u8>| -> Option<u32> {
         let Id::Name(name) = id else { return None };
         let offset = at + strings.len();
         strings.put_u16(name.len() as u16);
