@@ -221,8 +221,17 @@ fn work_out(
     // not kept as pure, and runs traced as any script.
     let wall = proved.effects.has(hir_ty_pure::Effects::WALL);
     // alloc: once per pure script: the names its key reads
-    let mut names: Vec<OsString> =
-        proved.env.iter().map(|it| OsString::from(it.as_str())).collect();
+    let mut names = Vec::with_capacity(proved.env.len());
+    for var in &proved.env {
+        let name = blaze_core::platform::env::name(var.as_str());
+        // A differently spelled CARGO_makeflags is still the run-local jobserver on Windows.
+        if !hir_ty_pure::allowed_env(&name) {
+            return Ok(Purity::Unproved);
+        }
+        names.push(OsString::from(name.as_ref()));
+    }
+    names.sort_unstable();
+    names.dedup();
     if wall {
         names.push(OsString::from(blaze_usercode::provider::SOURCE_DATE_EPOCH));
         names.sort();
@@ -263,7 +272,7 @@ fn work_out(
             continue;
         }
         let (unit, env) = run_of(job, run)?;
-        let mut disk = Disk::new(script_env(&unit, &env)?);
+        let mut disk = proof_inputs(script_env(&unit, &env)?);
         let guard = blaze_cas::enter();
         let roots = run_roots(job, &unit);
         let found = pure::find_hit(&job.input.store, &guard, &proof, roots.view(), &mut disk)
@@ -334,6 +343,25 @@ fn script_env(
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))
 }
 
+/// Case and precedence as in the child's CreateProcess environment, for both keeping
+/// and looking up the proof. `Env::new` stably keeps the first exact name; the Windows
+/// encoder keeps the last of the names that compare equal, before sorting the block.
+fn proof_inputs(vars: Vec<(OsString, OsString)>) -> Disk {
+    #[cfg(windows)]
+    let vars = {
+        use std::borrow::Cow;
+        let mut vars = vars;
+        vars.reverse();
+        for (key, _) in &mut vars {
+            if let Cow::Owned(upper) = blaze_core::platform::env::os_name(key) {
+                *key = upper;
+            }
+        }
+        vars
+    };
+    Disk::new(vars)
+}
+
 /// What a build's report says of run unit `run`'s script: [`purity`] of its compile, and
 /// whether the run's pure key found its value (it was not run).
 pub(crate) fn reported(job: &Job, run: usize) -> Option<(&Purity, bool)> {
@@ -394,6 +422,19 @@ fn env_only(effects: hir_ty_pure::Effects) -> bool {
 mod observation_tests {
     use super::env_only;
     use hir_ty_pure::Effects;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_proved_variable_keys_the_value_the_windows_child_sees() {
+        use blaze_usercode::trace::Inputs as _;
+        use std::ffi::OsStr;
+        let mut disk = super::proof_inputs(vec![
+            ("CARGO_KEY".into(), "old".into()), ("cargo_key".into(), "new".into()),
+        ]);
+        let name = blaze_core::platform::env::name("CARGO_Key");
+        assert_eq!(disk.env(OsStr::new(name.as_ref())), Some(OsStr::new("new")));
+        assert!(!hir_ty_pure::allowed_env(&blaze_core::platform::env::name("CARGO_makeflags")));
+    }
 
     #[test]
     fn an_unobserved_file_lookup_or_external_effect_never_makes_an_env_only_key() {
@@ -475,7 +516,7 @@ pub(crate) fn keep(
     };
     let script = unit.package.descr();
     pure::checked_value(&script, &pure.proof, value).map_err(|it| (it.0, RunPuts::default()))?;
-    let mut disk = Disk::new(script_env.to_vec()); // alloc: once per kept run of a pure script, its key's environment
+    let mut disk = proof_inputs(script_env.to_vec()); // alloc: the kept pure run's keyed environment
     pure::keep(store, &pure.proof, roots.view(), read, &mut disk, value)
         .map(|kept| {
             let mut puts = RunPuts::default();

@@ -227,7 +227,9 @@ write access to the user's cache or let the script download a missing archive.
 
 Windows does not yet trace every filesystem read. A script can be reused when its MIR
 proof shows its only inputs are a fixed list of Cargo environment variables. Those values
-and its code form the key. Other executed scripts are not reused: `rerun-if-changed`
+and its code form the key. Names are case-insensitive, as in the child process: a script
+that reads `CARGO_Key` must rerun when `CARGO_KEY` changes. Results from the older,
+case-sensitive pure key are not reused on Windows. Other executed scripts are not reused: `rerun-if-changed`
 alone cannot prove an undeclared file is unchanged. Inert scripts that Blaze proves
 print only constants still need not run.
 
