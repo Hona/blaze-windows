@@ -314,6 +314,33 @@ fn a_proc_macro_of_a_static_target_has_no_crt_static() {
     assert!(cfgs.iter().any(|it| it == "proc_macro"));
 }
 
+/// rune-desktop's and blaze's own `-C target-feature=+crt-static` on MSVC: a build script is
+/// told `crt-static` (cargo's probe, as a proc macro too, keeps a feature asked for by name),
+/// so `cc` compiles C and C++ with `/MT`; without it the target's own default (`/MD`) holds,
+/// and `CARGO_CFG_*` say Windows and MSVC.
+#[test]
+fn an_msvc_build_script_is_told_crt_static_when_the_flags_ask_for_it() {
+    let triple = "x86_64-pc-windows-msvc";
+    let flags = |it: &[&str]| CfgArgs::from_flags(&it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>());
+    let probe = |args: CfgArgs| target_cfg(triple, &CfgArgs { proc_macro: true, ..args }).unwrap();
+    let asked = cargo_cfg_env(&probe(flags(&["-C", "target-feature=+crt-static"]).unwrap()));
+    let var = |env: &[(String, String)], name: &str| {
+        env.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone())
+    };
+    let features = var(&asked, "CARGO_CFG_TARGET_FEATURE").unwrap();
+    assert!(features.split(',').any(|it| it == "crt-static"), "{features}");
+    assert_eq!(var(&asked, "CARGO_CFG_TARGET_ENV").as_deref(), Some("msvc"));
+    assert_eq!(var(&asked, "CARGO_CFG_TARGET_OS").as_deref(), Some("windows"));
+    assert_eq!(var(&asked, "CARGO_CFG_TARGET_FAMILY").as_deref(), Some("windows"));
+    assert_eq!(var(&asked, "CARGO_CFG_WINDOWS").as_deref(), Some(""));
+    assert_eq!(var(&asked, "CARGO_CFG_UNIX"), None);
+    let plain = cargo_cfg_env(&probe(CfgArgs::default()));
+    let features = var(&plain, "CARGO_CFG_TARGET_FEATURE").unwrap();
+    assert!(!features.split(',').any(|it| it == "crt-static"), "{features}");
+    let off = cargo_cfg_env(&probe(flags(&["-Ctarget-feature=-crt-static"]).unwrap()));
+    assert!(!var(&off, "CARGO_CFG_TARGET_FEATURE").unwrap().contains("crt-static"));
+}
+
 #[test]
 fn an_unknown_target_is_refused_naming_it() {
     let error = target_cfg("riscv64gc-unknown-plan9", &CfgArgs::default()).unwrap_err();

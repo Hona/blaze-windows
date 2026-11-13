@@ -12,6 +12,23 @@ use super::hash::CompileMode;
 use crate::query::LoadError;
 use crate::stdlib::target as platform;
 
+/// A path of the layout and a part below it, joined as the daemon names paths: with `/` on every
+/// host (`Path::join` puts a `\` between them on Windows, and a daemon name has none).
+trait Named {
+    fn named(&self, part: impl AsRef<std::ffi::OsStr>) -> PathBuf;
+}
+
+impl Named for Path {
+    fn named(&self, part: impl AsRef<std::ffi::OsStr>) -> PathBuf {
+        let mut name = self.as_os_str().to_owned();
+        if !name.as_encoded_bytes().ends_with(b"/") {
+            name.push("/");
+        }
+        name.push(part);
+        PathBuf::from(name)
+    }
+}
+
 fn error(what: String) -> LoadError {
     LoadError { what, at: None }
 }
@@ -32,42 +49,46 @@ impl Layout {
         profile_dir: &str,
     ) -> Layout {
         let (root, build_root) = match triple {
-            Some(triple) => (target_dir.join(triple), build_dir.join(triple)),
+            Some(triple) => (target_dir.named(triple), build_dir.named(triple)),
             None => (target_dir.to_path_buf(), build_dir.to_path_buf()),
         };
         Layout {
-            dest: root.join(profile_dir),
-            build_dest: build_root.join(profile_dir),
+            dest: root.named(profile_dir),
+            build_dest: build_root.named(profile_dir),
             build_root,
         }
     }
 
     fn build(&self) -> PathBuf {
-        self.build_dest.join("build")
+        self.build_dest.named("build")
     }
 
     /// `BuildDirLayout::deps`.
     pub fn deps(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout { self.out_new_layout(pkg_dir) } else { self.build_dest.join("deps") }
+        if new_layout { self.out_new_layout(pkg_dir) } else { self.build_dest.named("deps") }
     }
 
     /// `BuildDirLayout::out_force_new_layout`.
     pub fn out_new_layout(&self, pkg_dir: &str) -> PathBuf {
-        self.build().join(pkg_dir).join("out")
+        self.build().named(pkg_dir).named("out")
     }
 
     /// `BuildDirLayout::build_script`.
     pub fn build_script(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout { self.deps(true, pkg_dir) } else { self.build().join(pkg_dir) }
+        if new_layout { self.deps(true, pkg_dir) } else { self.build().named(pkg_dir) }
     }
 
     /// `BuildDirLayout::build_script_execution`.
     pub fn build_script_execution(&self, new_layout: bool, pkg_dir: &str) -> PathBuf {
-        if new_layout { self.build().join(pkg_dir).join("run") } else { self.build().join(pkg_dir) }
+        if new_layout {
+            self.build().named(pkg_dir).named("run")
+        } else {
+            self.build().named(pkg_dir)
+        }
     }
 
     pub fn tmp(&self) -> PathBuf {
-        self.build_root.join("tmp")
+        self.build_root.named("tmp")
     }
 }
 
@@ -294,7 +315,7 @@ pub(super) fn output_dir(it: &CompileFiles<'_>) -> PathBuf {
     if it.kind.is_custom_build() {
         it.host_layout.build_script(it.new_layout, it.pkg_dir)
     } else if it.kind.is_example() && !it.new_layout {
-        it.layout.build_dest.join("examples")
+        it.layout.build_dest.named("examples")
     } else {
         it.layout.deps(it.new_layout, it.pkg_dir)
     }
@@ -308,7 +329,7 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
     let mut outputs = Vec::with_capacity(types.len() * 2 + 2);
     let mut depinfo = Vec::new();
     for file in &types {
-        let path = out_dir.join(file.output_filename(it.crate_name, it.extra));
+        let path = out_dir.named(file.output_filename(it.crate_name, it.extra));
         let hardlink = uplift_to(it, file, &path);
         let run_from = run_from(it, file, &path);
         outputs.push(path.display().to_string());
@@ -324,7 +345,7 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
         Some(extra) => format!("{}-{extra}.d", it.crate_name),
         None => format!("{}.d", it.crate_name),
     };
-    outputs.push(out_dir.join(stem).display().to_string());
+    outputs.push(out_dir.named(stem).display().to_string());
     outputs.extend(depinfo);
     Ok(outputs)
 }
@@ -352,14 +373,14 @@ fn uplift_to(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<Path
         if !it.artifact_dir {
             return None;
         }
-        it.layout.dest.join("examples").join(filename)
+        it.layout.dest.named("examples").named(filename)
     } else if it.kind.is_custom_build() {
-        it.host_layout.build_script(it.new_layout, it.pkg_dir).join(filename)
+        it.host_layout.build_script(it.new_layout, it.pkg_dir).named(filename)
     } else {
         if !it.artifact_dir {
             return None;
         }
-        it.layout.dest.join(filename)
+        it.layout.dest.named(filename)
     };
     (path != from).then_some(path)
 }
@@ -379,16 +400,16 @@ fn run_from(it: &CompileFiles<'_>, file: &FileType, from: &Path) -> Option<PathB
     if it.mode != CompileMode::Test || !it.artifact_dir || file.flavor != Flavor::Normal {
         return None;
     }
-    let path = it.layout.dest.join("deps").join(from.file_name()?);
+    let path = it.layout.dest.named("deps").named(from.file_name()?);
     (path != from).then_some(path)
 }
 
 /// A build script's run: its `OUT_DIR`, and the files of `BuildScriptRunFiles`.
 pub(super) fn run_files(layout: &Layout, new_layout: bool, pkg_dir: &str) -> (String, Vec<String>) {
     let root = layout.build_script_execution(new_layout, pkg_dir);
-    let out_dir = if new_layout { layout.out_new_layout(pkg_dir) } else { root.join("out") };
+    let out_dir = if new_layout { layout.out_new_layout(pkg_dir) } else { root.named("out") };
     let stdout = if new_layout { "stdout" } else { "output" };
-    let files = [stdout, "stderr", "root-output"].map(|it| root.join(it).display().to_string());
+    let files = [stdout, "stderr", "root-output"].map(|it| root.named(it).display().to_string());
     (out_dir.display().to_string(), files.into())
 }
 
@@ -406,5 +427,5 @@ pub(super) fn bin_link(
         .find(|it| it.flavor == Flavor::Normal)
         .ok_or_else(|| error(format!("the target `{triple}` has no executable")))?;
     let crate_name = name.replace('-', "_");
-    Ok(layout.dest.join(file.uplift_filename(name, &crate_name, bin_name)))
+    Ok(layout.dest.named(file.uplift_filename(name, &crate_name, bin_name)))
 }
