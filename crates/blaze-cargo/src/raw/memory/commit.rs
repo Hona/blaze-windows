@@ -219,7 +219,8 @@ mod tests {
     /// released is gone from the walk.
     #[test]
     fn the_walk_finds_where_the_commit_is() {
-        const SIZE: usize = 256 << 20;
+        // Far past what other test threads commit and free as the walks run.
+        const SIZE: usize = 2 << 30;
         let before = super::commit_map();
         // SAFETY: a fresh region of the system's choosing, released below.
         let region = unsafe {
@@ -230,7 +231,7 @@ mod tests {
         // SAFETY: the region made above, released whole.
         assert_ne!(unsafe { VirtualFree(region, 0, MEM_RELEASE) }, 0);
         let after = super::commit_map();
-        let slack = 64 << 20;
+        let slack = 768 << 20;
         assert!(held.other >= before.other + SIZE as u64 - slack, "{before:?} then {held:?}");
         assert!(after.other + SIZE as u64 - slack <= held.other, "{held:?} then {after:?}");
         assert!(held.stacks > 0, "the test thread's stack: {held:?}");

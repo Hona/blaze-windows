@@ -58,6 +58,13 @@ pub(crate) fn built_in(w: &str) -> Vec<Artifact> {
     ]
 }
 
+/// `said` with each `target/debug/deps/` as this system shows a path from the workspace:
+/// cargo shows `target\debug\deps\...` on Windows.
+fn deps(said: &str) -> String {
+    let shown = ["target", "debug", "deps", ""].iter().collect::<std::path::PathBuf>();
+    said.replace("target/debug/deps/", &shown.display().to_string())
+}
+
 fn asked(command: Command, words: &[&str]) -> Invocation {
     command_line(command, words.iter().map(OsString::from).collect()).unwrap()
 }
@@ -112,11 +119,12 @@ fn executables_in_cargos_order() {
             "unittests src/main.rs (target/debug/deps/foo-89ab)",
             "tests/x.rs (target/debug/deps/x-4567)",
         ]
+        .map(deps)
     );
     assert_eq!(docs.len(), 1);
     assert_eq!(
         running(tests[0], Path::new("/w"), Kind::Bench),
-        "benches src/lib.rs (target/debug/deps/foo-0123abcd)"
+        deps("benches src/lib.rs (target/debug/deps/foo-0123abcd)")
     );
 }
 
@@ -128,9 +136,11 @@ fn every_one_passes() {
     assert_eq!(code, 0);
     assert_eq!(
         err,
-        "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n     Running unittests \
-         src/main.rs (target/debug/deps/foo-89ab)\n     Running tests/x.rs (target/debug/deps/x-4567)\n   \
-         Doc-tests foo\n"
+        deps(
+            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n     Running unittests \
+             src/main.rs (target/debug/deps/foo-89ab)\n     Running tests/x.rs (target/debug/deps/x-4567)\n   \
+             Doc-tests foo\n"
+        )
     );
     let first = &fake.ran[0];
     assert_eq!(first.program, Path::new("/w/target/debug/deps/foo-0123abcd"));
@@ -149,7 +159,7 @@ fn fail_fast_stops_at_the_first_failed_test_executable() {
     assert_eq!(fake.ran.len(), 1);
     assert_eq!(
         err,
-        "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\nerror: test failed, to rerun pass `--lib`\n"
+        deps("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\nerror: test failed, to rerun pass `--lib`\n")
     );
 }
 
@@ -360,8 +370,10 @@ fn no_run_lists_the_executables() {
     assert!(fake.ran.is_empty());
     assert_eq!(
         err,
-        "  Executable unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n  Executable unittests \
-         src/main.rs (target/debug/deps/foo-89ab)\n  Executable tests/x.rs (target/debug/deps/x-4567)\n"
+        deps(
+            "  Executable unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n  Executable unittests \
+             src/main.rs (target/debug/deps/foo-89ab)\n  Executable tests/x.rs (target/debug/deps/x-4567)\n"
+        )
     );
 }
 

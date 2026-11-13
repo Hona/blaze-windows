@@ -130,7 +130,10 @@ pub fn running(artifact: &Artifact, cwd: &Path, kind: Kind) -> String {
     let source = Path::new(&artifact.target.src_path);
     let root = package_root(artifact);
     let source = source.strip_prefix(&root).unwrap_or(source).display();
-    let exe = say::shown(Path::new(artifact.executable.as_deref().unwrap_or(&artifact.path)), cwd);
+    // The daemon's name of it (`/C:/w/...` on Windows) as the system names it, so it is shown
+    // from `cwd` as cargo shows it (`target\debug\deps\...` there).
+    let exe = blaze_core::platform::path::host(artifact.executable.as_deref().unwrap_or(&artifact.path));
+    let exe = say::shown(&exe, cwd);
     match artifact.target.kind {
         TargetKind::Test | TargetKind::Bench => format!("{source} ({exe})"),
         TargetKind::Lib | TargetKind::Bin | TargetKind::Example | TargetKind::CustomBuild => {

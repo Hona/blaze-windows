@@ -33,6 +33,12 @@ const WN: &str = "/C:/w";
 #[cfg(not(windows))]
 const WN: &str = "/w";
 
+/// `rel`, a path from the workspace written with `/`, as this system shows it (cargo shows
+/// `target\debug\foo` on Windows).
+fn shown(rel: &str) -> String {
+    rel.split('/').collect::<PathBuf>().display().to_string()
+}
+
 fn place() -> Place {
     Place { cwd: PathBuf::from(W), manifest: PathBuf::from(W).join("Cargo.toml"), root: PathBuf::from(W) }
 }
@@ -353,7 +359,7 @@ fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
     assert_eq!(
         &lines[2..],
         [
-            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
+            format!("     Running unittests src/lib.rs ({})", shown("target/debug/deps/foo-0123abcd")).as_str(),
             "error: test failed, to rerun pass `--lib`",
         ]
     );
@@ -454,7 +460,7 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
         assert_eq!(then, Then::Exit(101), "{words:?}");
         assert_eq!(programs.ran.len(), 4, "{words:?}: {err}");
         assert!(
-            err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"),
+            err.contains(&format!("     Running unittests src/lib.rs ({})", shown("target/debug/deps/foo-0123abcd"))),
             "{err}"
         );
     }
@@ -482,7 +488,7 @@ fn run_becomes_its_program() {
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
     assert_eq!(exec.cwd, PathBuf::from(W));
-    assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
+    assert!(err.ends_with(&format!("     Running `{} a b`\n", shown("target/debug/foo"))), "{err}");
 
     let two = [
         crate::cli::run::tests::artifact_in(WN, "foo", "bin", "foo", false, Some("foo")),
