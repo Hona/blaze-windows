@@ -13,11 +13,8 @@ use anyhow::Context;
 use super::{Action, CacheControl, Failure, Response, protocol};
 
 /// `program`, to run where cargo was started, as cargo runs its providers.
-#[expect(clippy::disallowed_methods, reason = "the directory is the run's, set here")]
 fn program(program: &str, cwd: &Path) -> Command {
-    let mut command = Command::new(program);
-    command.current_dir(cwd);
-    command
+    blaze_core::platform::command::command(program, cwd)
 }
 
 /// Asks the credential process `path`, started with `--cargo-plugin`; its standard error is

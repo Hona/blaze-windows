@@ -70,7 +70,8 @@ use windows_sys::{
             NO_INHERITANCE, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
             PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
             SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-            SetSecurityDescriptorDacl, WELL_KNOWN_SID_TYPE, WinBuiltinAnyPackageSid,
+            SetSecurityDescriptorDacl, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid,
+            WinBuiltinAnyPackageSid, WinCreatorOwnerRightsSid, WinLocalSystemSid,
             WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
             WinCapabilityPrivateNetworkClientServerSid,
         },
@@ -272,11 +273,24 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     }
 
     // The program's environment, once per sandbox, for the kernel.
-    let mut env = Vec::with_capacity(spec.env.len() + 2);
+    let mut env = Vec::with_capacity(spec.env.len() + 3);
     env.extend(spec.env.iter().cloned());
     // clone: as above.
     env.push(("TMP".into(), temp.clone().into_os_string()));
     env.push(("TEMP".into(), temp.into_os_string()));
+    // Windows makes an AppContainer's process only with `LOCALAPPDATA` in its environment,
+    // which it points at the container's own folder (`Packages\blaze.sandbox\AC`): without it
+    // CreateProcessW fails with ERROR_ENVVAR_NOT_FOUND (203). What the program sees is that
+    // folder, the same for every run, never the user's.
+    let named = |name: &str| env.iter().any(|(it, _)| it.eq_ignore_ascii_case(name));
+    if !named("LOCALAPPDATA") {
+        let local = std::env::var_os("LOCALAPPDATA").filter(|it| !it.is_empty()).ok_or_else(|| {
+            "the sandbox's launcher has no LOCALAPPDATA, which Windows makes an AppContainer's \
+             folder of"
+                .to_owned()
+        })?;
+        env.push(("LOCALAPPDATA".into(), local));
+    }
     let block = blaze_core::create_process::environment(&env).map_err(|it| it.to_string())?; // alloc: error path
     let mut line = blaze_core::create_process::command_line(&spec.program, &spec.args)
         .map_err(|it| it.to_string())?; // alloc: error path
@@ -918,7 +932,8 @@ fn gone_within(job: &Handle, long: Duration) -> Result<(), usize> {
             let handles: [HANDLE; AT_ONCE] =
                 std::array::from_fn(|at| held[at].as_ref().map_or(null_mut(), |it| it.0));
             let left = until.saturating_duration_since(Instant::now());
-            let ms = u32::try_from(left.as_millis()).unwrap_or(INFINITE - 1);
+            // Rounded up: a wait of the whole milliseconds below what is left ends before it.
+            let ms = u32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(INFINITE - 1);
             // SAFETY: the first `open` handles are open process handles `held` owns until the
             // wait returns; the call reads them and nothing more.
             #[expect(
@@ -929,7 +944,7 @@ fn gone_within(job: &Handle, long: Duration) -> Result<(), usize> {
             for it in &mut held {
                 *it = None;
             }
-            if waited == WAIT_TIMEOUT || waited == WAIT_FAILED {
+            if waited == WAIT_FAILED || (waited == WAIT_TIMEOUT && Instant::now() >= until) {
                 return Err(count);
             }
         }
@@ -1394,10 +1409,13 @@ fn directory(path: &Path) -> bool {
     attributes & FILE_ATTRIBUTE_DIRECTORY != 0
 }
 
-/// A security descriptor whose DACL gives one SID `mask` on a directory and everything below it,
-/// for making directories with: the system merges in what the new directory inherits from its
-/// parent, as the descriptor is not protected, so the directory gets the grant with no DACL read
-/// or rewrite and nothing below it to propagate to.
+/// A security descriptor for making directories with: its DACL gives one SID `mask` on a
+/// directory and everything below it, and gives the directory's owner (the user who makes it),
+/// the system and the administrators all of it, as the parent of a directory blaze writes in
+/// gives them. Given a DACL, Windows takes it whole and merges in nothing the parent would have
+/// given (measured: a directory made with the grant alone was the user's to open no more, os
+/// error 5), so what the user keeps is in it. No DACL is read or rewritten for it, and nothing
+/// below it to propagate to.
 struct Inheritable {
     /// The DACL, `u32`s for an ACL's and its entries' 4-byte alignment.
     _acl: Vec<u32>,
@@ -1407,11 +1425,21 @@ struct Inheritable {
 
 impl Inheritable {
     fn new(sid: PSID, mask: u32) -> Result<Inheritable, String> {
-        // SAFETY: `sid` is a SID of the run's `Made` (`run`), valid while it is; the call only
-        // reads it.
-        let sid_size = unsafe { GetLengthSid(sid) } as usize;
-        let size = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_size;
-        // alloc: once per directory the sandbox makes, the ACL of its one grant.
+        let owner = well_known(WinCreatorOwnerRightsSid, "the owner's rights")?;
+        let system = well_known(WinLocalSystemSid, "the system")?;
+        let admins = well_known(WinBuiltinAdministratorsSid, "the administrators")?;
+        let entries: [(PSID, u32); 4] = [
+            (sid, mask),
+            (owner.as_ptr().cast_mut().cast(), FILE_ALL_ACCESS),
+            (system.as_ptr().cast_mut().cast(), FILE_ALL_ACCESS),
+            (admins.as_ptr().cast_mut().cast(), FILE_ALL_ACCESS),
+        ];
+        let entry = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>();
+        // SAFETY: each SID is the run's (valid while `Made` is) or a buffer of this frame's, and
+        // the call only reads it.
+        let size = size_of::<ACL>()
+            + entries.iter().map(|(it, _)| entry + unsafe { GetLengthSid(*it) } as usize).sum::<usize>();
+        // alloc: once per directory the sandbox makes, the ACL of its grants.
         let mut acl = vec![0u32; size.div_ceil(size_of::<u32>())];
         let bytes = (acl.len() * size_of::<u32>()) as u32;
         // SAFETY: `acl` is `bytes` bytes, live, exclusive and 4-byte aligned, which the call is
@@ -1419,19 +1447,21 @@ impl Inheritable {
         if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), bytes, ACL_REVISION) } == 0 {
             return Err(failed("making the sandbox's write grant", "InitializeAcl"));
         }
-        // SAFETY: `acl` is the ACL just made, sized above for one ACCESS_ALLOWED_ACE with this
-        // SID, so the entry fits; `sid` is valid (above) and only read.
-        let added = unsafe {
-            AddAccessAllowedAceEx(
-                acl.as_mut_ptr().cast(),
-                ACL_REVISION,
-                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                mask,
-                sid,
-            )
-        };
-        if added == 0 {
-            return Err(failed("making the sandbox's write grant", "AddAccessAllowedAceEx"));
+        for (sid, mask) in entries {
+            // SAFETY: `acl` is the ACL just made, sized above for these entries, so each fits;
+            // `sid` is valid (above) and only read.
+            let added = unsafe {
+                AddAccessAllowedAceEx(
+                    acl.as_mut_ptr().cast(),
+                    ACL_REVISION,
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                    mask,
+                    sid,
+                )
+            };
+            if added == 0 {
+                return Err(failed("making the sandbox's write grant", "AddAccessAllowedAceEx"));
+            }
         }
         // alloc: as `acl` is, at an address that stays while the attributes point to it.
         let mut descriptor = Box::new(SECURITY_DESCRIPTOR::default());
@@ -1456,7 +1486,6 @@ impl Inheritable {
         }
         Ok(Inheritable { _acl: acl, descriptor })
     }
-
     /// Makes `dir` with the grant in it; an error, and nothing made, when it is there already or
     /// its parent is not.
     fn make_dir(&self, dir: &Path) -> std::io::Result<()> {
@@ -1961,7 +1990,8 @@ mod tests {
         let started = Instant::now();
         end(&job, 7);
         assert!(started.elapsed() < ENDING / 10, "ended after {:?}", started.elapsed());
-        assert_eq!(child.try_wait().unwrap().and_then(|it| it.code()), Some(7));
+        // Out of the job's list, it is ended; its handle is told a moment after.
+        assert_eq!(child.wait().unwrap().code(), Some(7));
         assert_eq!(listed(&job).unwrap().1, 0);
     }
 
@@ -2123,6 +2153,74 @@ mod tests {
         assert_ne!(asked, 0);
         assert!(info.TotalProcesses >= 1, "the program ran in the driver's job");
         assert_eq!(info.ActiveProcesses, 0);
+        _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// MSVC's C compiler, run in the sandbox as `cc` runs it from a build script: found by the
+    /// variables a developer prompt sets (`VCINSTALLDIR`, `INCLUDE`, `LIB`, `PATH`), since the
+    /// container reads neither `vswhere`'s records under `ProgramData` nor the user's profile.
+    /// Visual Studio's and the SDK's directories under Program Files are every app package's
+    /// to read, so the run is granted nothing of them.
+    #[test]
+    fn msvc_compiles_c_in_the_sandbox_given_a_developer_prompts_variables() {
+        if let Err(why) = probe() {
+            eprintln!("no sandbox can be made here, so this is not run: {why}");
+            return;
+        }
+        let x86 = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap());
+        let found = std::process::Command::new(x86.join(r"Microsoft Visual Studio\Installer\vswhere.exe"))
+            .args(["-latest", "-products", "*", "-property", "installationPath"])
+            .output();
+        let Some(studio) = found.ok().map(|it| String::from_utf8_lossy(&it.stdout).trim().to_owned()).filter(|it| !it.is_empty()) else {
+            eprintln!("no Visual Studio here, so this is not run");
+            return;
+        };
+        let last = |dir: PathBuf| {
+            let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().path()).collect();
+            names.sort();
+            names.pop().unwrap()
+        };
+        let tools = last(PathBuf::from(&studio).join(r"VC\Tools\MSVC"));
+        let kits = x86.join(r"Windows Kits\10");
+        let sdk = last(kits.join("Include"));
+        let version = sdk.file_name().unwrap().to_owned();
+        let joined = |dirs: &[PathBuf]| std::env::join_paths(dirs).unwrap();
+        let include = joined(&[tools.join("include"), sdk.join("ucrt"), sdk.join("um"), sdk.join("shared")]);
+        let lib = joined(&[
+            tools.join(r"lib\x64"),
+            kits.join("Lib").join(&version).join(r"ucrt\x64"),
+            kits.join("Lib").join(&version).join(r"um\x64"),
+        ]);
+        let bin = tools.join(r"bin\Hostx64\x64");
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-cl-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("hello.c"), "#include <stdio.h>\nint main(void) { puts(\"hi\"); return 0; }\n").unwrap();
+        let out = base.join("out");
+        let spec = Spec {
+            program: bin.join("cl.exe"),
+            args: ["/nologo", "/c", "/MT", "hello.c"].iter().map(Into::into).chain([format!("/Fo{}\\", out.display()).into()]).collect(),
+            env: vec![
+                ("SystemRoot".into(), root.clone().into_os_string()),
+                ("VCINSTALLDIR".into(), PathBuf::from(&studio).join(r"VC\").into_os_string()),
+                ("INCLUDE".into(), include),
+                ("LIB".into(), lib),
+                ("PATH".into(), joined(&[bin.clone(), root.join("System32")])),
+            ],
+            dir: base.clone(),
+            read: vec![base.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: false,
+            services: Vec::new(),
+            live: base.join("live"),
+            report: base.join("report"),
+            not_inputs: Vec::new(),
+            given: None,
+        };
+        assert_eq!(run(&spec, Given::own()), Ok(0));
+        assert!(out.join("hello.obj").is_file(), "cl wrote its object");
         _ = std::fs::remove_dir_all(&base);
     }
 }
