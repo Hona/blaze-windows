@@ -1144,23 +1144,28 @@ mod tests {
     }
 
     /// `f16` and `f128` are lowered on AArch64 under Apple's convention as under System V's,
-    /// and Cranelift's `apple_aarch64` passes and returns them; Windows' x64 refuses them.
+    /// and on x86-64 under Windows' as under System V's, and Cranelift passes and returns them
+    /// under each.
     #[test]
-    fn apple_aarch64_passes_f16_and_f128() {
-        use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    fn f16_and_f128_are_passed_under_each_convention_that_lowers_them() {
         let apple = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
         assert!(crate::f16_f128::soft_floats(&apple));
         assert!(crate::f16_f128::soft_floats(
             &Target::of("aarch64-unknown-linux-gnu").expect("a target")
         ));
-        assert!(!crate::f16_f128::soft_floats(
-            &Target::of("x86_64-pc-windows-msvc").expect("a target")
-        ));
+        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target");
+        assert!(crate::f16_f128::soft_floats(&windows));
+        passes_f16_and_f128(apple);
+        passes_f16_and_f128(windows);
+    }
+
+    fn passes_f16_and_f128(target: &Target) {
+        use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
         let isa =
-            apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
-        let mut signature = ir::Signature::new(apple.call_conv);
+            target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        let mut signature = ir::Signature::new(target.call_conv);
         signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
         signature.returns.extend([AbiParam::new(types::F128), AbiParam::new(types::F16)]);
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature);
@@ -1176,7 +1181,7 @@ mod tests {
         builder.finalize(isa.frontend_config());
         let mut compiled = cranelift_codegen::Context::for_function(func);
         if let Err(e) = compiled.compile(&*isa, &mut Default::default()) {
-            panic!("{:?}", e.inner);
+            panic!("{}: {:?}", target.triple(), e.inner);
         }
     }
 
