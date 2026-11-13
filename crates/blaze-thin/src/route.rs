@@ -20,6 +20,7 @@ use crate::say;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Build,
+    Check,
     Run,
 }
 
@@ -28,6 +29,7 @@ impl Command {
     pub const fn name(self) -> &'static str {
         match self {
             Command::Build => "build",
+            Command::Check => "check",
             Command::Run => "run",
         }
     }
@@ -95,6 +97,7 @@ pub fn words(words: &[OsString]) -> Route {
     let command = match first.to_str() {
         Some("--version" | "-V") if rest.is_empty() => return Route::Version,
         Some("build" | "b") => Command::Build,
+        Some("check" | "c") => Command::Check,
         Some("run" | "r") => Command::Run,
         _ => return Route::Engine(Why::Command(shown(first))),
     };
@@ -119,7 +122,7 @@ pub fn words(words: &[OsString]) -> Route {
             }
         };
         if program {
-            if command == Command::Build {
+            if command != Command::Run {
                 return Route::Engine(match text {
                     Some("--") => Why::Trailing,
                     _ => Why::Word(shown(word)),
@@ -169,7 +172,7 @@ const HOME: &str = "BLAZE_HOME";
 pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
     for name in names {
         let refused = match name.to_str() {
-            Some(name) => refuses(name),
+            Some(name) => refuses(&blaze_core::platform::env::name(name)),
             // No variable blaze reads has a name that is not UTF-8; the request can't carry
             // one, which is the engine's to say.
             None => true,
@@ -226,7 +229,8 @@ mod tests {
             other => panic!("{typed:?} is not the engine's: {other:?}"),
         };
         assert_eq!(engine(&[]), Why::NoCommand);
-        for first in ["test", "check", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
+        assert_eq!(asked(&["check"]).command, Command::Check);
+        for first in ["test", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
             assert_eq!(engine(&[first, "build"]), Why::Command(first.to_owned()), "{first}");
         }
         // `--version` with anything after it is blaze's cargo's own, which says the binary.
