@@ -444,6 +444,19 @@ impl World {
                     })
                     .filter(|(at, bytes)| at + bytes.len() as u64 <= len)
                     .collect();
+                // A file of a byte or two has rooms of none, where two runs may begin at one
+                // offset: only runs apart are a file's.
+                let mut end = 0;
+                let runs: Vec<(u64, Vec<u8>)> = runs
+                    .into_iter()
+                    .filter(|(at, bytes)| {
+                        let apart = *at >= end;
+                        if apart {
+                            end = at + bytes.len() as u64;
+                        }
+                        apart
+                    })
+                    .collect();
                 // clone: the value the path is to hold, the base with the patch over it.
                 let mut bytes = base.clone();
                 bytes.resize(len as usize, 0);
