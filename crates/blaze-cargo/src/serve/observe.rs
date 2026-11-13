@@ -215,7 +215,7 @@ pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiEr
 pub fn bugs() -> Vec<blaze_api::Bug> {
     let mut sites = stdx::assert::reported::sites();
     sites.sort_unstable_by_key(|it| (it.at.file(), it.at.line(), it.at.column(), it.kind, it.what));
-    sites
+    let mut bugs: Vec<_> = sites
         .into_iter()
         .map(|it| blaze_api::Bug {
             kind: it.kind.to_owned(), // alloc: the answer's copy, once a Status a site
@@ -224,7 +224,22 @@ pub fn bugs() -> Vec<blaze_api::Bug> {
             count: it.count,
             thread: it.thread.as_deref().map(str::to_owned), // alloc: as above
         })
-        .collect() // alloc: the answer's rows; none for none
+        .collect(); // alloc: the answer's rows; none for none
+    if let Some(bug) = last_panic() {
+        bugs.push(bug);
+    }
+    bugs
+}
+
+pub(super) fn last_panic() -> Option<blaze_api::Bug> {
+    let (thread, at, what) = blaze_profile::panics::latest()?;
+    Some(blaze_api::Bug {
+        kind: "last panic".into(),
+        at: at.unwrap_or_else(|| "unknown site".into()),
+        what: what.unwrap_or_else(|| "non-text payload".into()),
+        thread: Some(thread),
+        count: 1,
+    })
 }
 
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
