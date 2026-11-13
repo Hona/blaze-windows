@@ -149,10 +149,12 @@ panic site, a lint that counts panics; elsewhere the cost is one scan of the bod
 proved (rule `bounded-progress`). The facts held are not always tens: one entailment question
 walks them to depth 2 and each step's bounds walk them again, so a visit's cost is polynomial
 in them (`compiler_builtins`' `fma_round` on `u128` took 791 s of one `SpendFacts` pass on
-2026-11-13). So a proof also has fuel, 2^26 facts and implications visited over all its
-questions, past which it is refused with nothing proved; the `reach prove` span records each
-proof's `visits`. On std, alloc, core and four small crates for Windows (2026-11-13) 300 of
-44 267 proofs spent it, the slowest in 1.07 s; the cold std build went from 12-21 min to 35 s. After an edit, only the edited function's proof is redone
+2026-11-13). A join derives relations only for values read past it and proves each shared
+premise once. The `reach prove` span records estimated visits to facts and implications; the
+count is not a cutoff. On the same MIR of 25,486 proofs in a Windows build of serde, serde_json,
+anyhow and their dependencies, a whole-body cutoff at 2^26 visits refused 20 proofs and lost
+8 safe checks and 774 dead blocks. Independent questions keep their own search limits; their
+sum must not discard the answers to questions already settled. After an edit, only the edited function's proof is redone
 (its key is its body): the floor. Not measured yet on reth or tempo.
 
 ## Errors

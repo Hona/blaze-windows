@@ -244,33 +244,6 @@ fn the_oracle_runs_a_binary_search_loop() {
     }
 }
 
-/// The proof's work is bounded by its fuel, not only its rounds: the binary search above,
-/// proved with the usual fuel, is refused with too little, saying why, and then discharges
-/// nothing (the evaluator's run, which does not panic, agrees with either).
-#[test]
-fn a_proof_past_its_fuel_is_refused() {
-    // alloc: a test's text
-    let site = "{ let mut lo = 0; let mut hi = v.len(); while lo < hi { let mid = lo + (hi - lo) / 2; \
-                if v[mid] < d { lo = mid + 1; } else { hi = mid; } } lo as u32 }";
-    let search = Program { divisor: 100, ..program(&[], site, &[1, 2, 3, 4, 5], 0, 0) };
-    let refusal = |fuel: Option<u64>| {
-        reach::TEST_FUEL.set(fuel);
-        let db = fixture::db(&search.source()).into_db();
-        let krate = crate_named(&db, "kernel");
-        let refused = blaze_query::db::attach(&db, || {
-            let probe = fn_named(&db, krate, "probe");
-            reach::of_body(&db, DefWithBodyId::FunctionId(probe)).refused
-        });
-        let verdict = check(&search);
-        reach::TEST_FUEL.set(None);
-        (refused, verdict)
-    };
-    assert_eq!(refusal(None), (None, Ok(Verdict { proved: true, panicked: false })));
-    let starved = refusal(Some(64));
-    assert_eq!(starved.0, Some("its proof visited more facts than its budget"));
-    assert_eq!(starved.1, Ok(Verdict { proved: false, panicked: false }));
-}
-
 /// The control: with a model entry planted that says `first` is always `Some`, the prover
 /// discharges `v.first().unwrap()` on a slice that may be empty, and the oracle refuses it.
 #[test]
