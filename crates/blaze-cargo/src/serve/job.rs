@@ -1296,9 +1296,12 @@ pub(super) fn output_dirs_of<'a>(
 ) -> Result<Vec<std::path::PathBuf>, std::path::PathBuf> {
     use std::path::Path;
     let mut dirs = Vec::new(); // alloc: once a build that asks for a replay, a directory or two
+    // The system's paths: what a watch is asked of and the disk is looked at.
+    let roots: Vec<std::path::PathBuf> = roots.iter().map(|it| blaze_core::platform::path::host(it)).collect();
     for output in outputs {
-        let output = Path::new(output);
-        let dir = roots.iter().map(Path::new).find_map(|root| {
+        let output = blaze_core::platform::path::host(output);
+        let output = output.as_path();
+        let dir = roots.iter().find_map(|root| {
             let mut parts = output.strip_prefix(root).ok()?.components();
             let first = parts.next()?;
             // Right in the root: only a watch of the root itself would hear of it.
@@ -1404,7 +1407,7 @@ fn config_id(encoded: &[u8]) -> ContentId {
 /// Whether the watch of `dir`, a path dependency's directory outside the view, vouches that
 /// nothing under it changed since `generation` was read ([`Mounts::stale_locals`]).
 fn vouched_local(dir: &str, generation: u64) -> bool {
-    blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation)
+    blaze_vfs::outside::unchanged_since(&blaze_core::platform::path::host(dir), generation)
 }
 
 /// The directory of a build's layout profiles under its target directory
@@ -1438,12 +1441,16 @@ fn recorded_dirs(
         dirs = dirs.len(),
     )
     .entered();
-    let canonical = |dir: &Path| std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+    // Canonical: the system's own name of it, verbatim prefix and all, names the same path.
+    let canonical = |dir: &Path| {
+        let named = |it: &Path| blaze_core::platform::path::daemon(it).ok();
+        std::fs::canonicalize(dir).is_ok_and(|it| named(&it).is_some_and(|it| Some(it) == named(dir)))
+    };
     if let Some(dir) = dirs.iter().find(|dir| !canonical(dir.as_path())) {
         // clone: a reason, once a build whose answer is not kept
         return Err(Unkept::Outputs(dir.clone()));
     }
-    let layout = Path::new(&units.target_dir).join(LAYOUT);
+    let layout = blaze_core::platform::path::host(&units.target_dir).join(LAYOUT);
     let mut absent = Vec::new(); // alloc: once a build that walks, a path
     match std::fs::symlink_metadata(&layout) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent.push(layout),
@@ -2832,15 +2839,15 @@ pub(super) fn protected(
 pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> super::work::Leased {
     let now = blaze_gc::record::now_ns();
     // The daemon names paths /D:/a on Windows; the disk is asked at the host's name.
-    let builds = crate::cli::place::host_path(builds);
+    let builds = blaze_core::platform::path::host(builds);
     let builds = builds.as_path();
     let root = builds.parent().unwrap_or(builds);
-    let checkout_path = crate::cli::place::host_path(checkout);
+    let checkout_path = blaze_core::platform::path::host(checkout);
     let checkout_path = checkout_path.as_path();
     // alloc: once per job, a lease or two
     let mut leases = Vec::new();
     for named in [units.target_dir.as_str(), units.build_dir.as_str()] {
-        let host = crate::cli::place::host_path(named);
+        let host = blaze_core::platform::path::host(named);
         let dir = host.as_path();
         if leases.iter().any(|it: &blaze_gc::lease::Lease| it.dir() == dir) {
             continue;

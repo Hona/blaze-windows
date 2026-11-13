@@ -116,13 +116,15 @@ impl Drop for Scratch {
 
 /// `$CARGO_HOME` of a checkout at `at`, `$CARGO_HOME/git/checkouts/<ident>/<short id>`, when
 /// `ident` is the repository's and the short id names `commit`.
-pub(super) fn cargo_home<'a>(at: &'a str, ident: &str, commit: &str) -> anyhow::Result<&'a Path> {
+pub(super) fn cargo_home(at: &str, ident: &str, commit: &str) -> anyhow::Result<std::path::PathBuf> {
     let shape = || {
         format!(
             "`{at}` is not a checkout as cargo keeps one, `$CARGO_HOME/git/checkouts/{ident}/<short id>`"
         )
     };
-    let at = Path::new(at);
+    // Of the system's path of the daemon's name, where it is absolute.
+    let host = blaze_core::platform::path::host(at);
+    let at = host.as_path();
     let short = at.file_name().and_then(|it| it.to_str()).with_context(shape)?;
     let named = at.parent().with_context(shape)?;
     let checkouts = named.parent().with_context(shape)?;
@@ -135,7 +137,7 @@ pub(super) fn cargo_home<'a>(at: &'a str, ident: &str, commit: &str) -> anyhow::
     if short.len() < 7 || !commit.starts_with(&short.to_ascii_lowercase()) {
         bail!("`{at}` is not a checkout of `{commit}`", at = at.display());
     }
-    Ok(home)
+    Ok(home.to_path_buf())
 }
 
 /// Every file under `root`, by its `/`-separated path, none of a `.git` and none under a path

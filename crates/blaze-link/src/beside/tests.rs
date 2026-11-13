@@ -80,7 +80,7 @@ impl DebugProgram {
         let rows = (0..count)
             .map(|row| {
                 let at = (row * 3).min(size as u32 - 1);
-                (at, (seed + row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
+                (at, seed.wrapping_add(row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
             })
             .collect();
         let name = (seed % 7 != 6).then(|| format!("_RNvCs{n}_1f{}", "x".repeat(seed as usize % 3)));

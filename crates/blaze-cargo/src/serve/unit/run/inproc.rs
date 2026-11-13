@@ -228,7 +228,7 @@ impl DevRuns {
             return Ok(Some(env));
         }
         let Some(format) = Format::host() else { return Ok(None) };
-        if reserves(format, std::path::Path::new(path))? {
+        if reserves(format, &blaze_core::platform::path::host(path))? {
             return Err(self.unheld(path));
         }
         Ok(None)
@@ -730,7 +730,7 @@ impl Loaded {
         placed: Option<[u8; 32]>,
     ) -> Result<(Vec<(String, String)>, host::Wrote), String> {
         let command = Command {
-            program: PathBuf::from(path),
+            program: blaze_core::platform::path::host(path),
             // alloc: none, empty: the CLI has the arguments, the environment and the directory
             args: Vec::new(),
             env: Vec::new(),

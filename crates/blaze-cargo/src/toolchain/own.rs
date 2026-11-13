@@ -165,14 +165,14 @@ pub fn host() -> Option<&'static str> {
     })
 }
 
-/// Where this machine keeps blaze's toolchains: `.blaze/toolchains` in the user's home, for
-/// every `BLAZE_HOME`. A release is its pinned bytes, each file checked against its sha256 as
+/// Where this machine keeps blaze's toolchains: `toolchains` in blaze's home as it is without
+/// `BLAZE_HOME` (`~/.blaze`, `%LOCALAPPDATA%\blaze`), for every `BLAZE_HOME`. A release is its pinned bytes, each file checked against its sha256 as
 /// it is downloaded, so every home of the machine reads the one copy: `BLAZE_HOME` moves a
 /// daemon's settings and state, never what it builds with. A home of its own (a harness's, a
 /// CI job's, a second daemon's) neither downloads the release again nor fails for not having
 /// it. [`fetch`]'s lock keeps two processes from laying it out at once.
 pub fn toolchains() -> Option<PathBuf> {
-    Some(blaze_manifest::user_config::user_home()?.join(".blaze").join("toolchains"))
+    Some(blaze_manifest::user_config::machine_home()?.join("toolchains"))
 }
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one

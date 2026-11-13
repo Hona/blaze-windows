@@ -362,7 +362,7 @@ pub(crate) fn check(
     let places = Places {
         package: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
-        target_dir: Path::new(&job.units().target_dir),
+        target_dir: &blaze_core::platform::path::host(&job.units().target_dir),
         program: &unit.script,
         toolchain: &toolchain,
         search: &search,

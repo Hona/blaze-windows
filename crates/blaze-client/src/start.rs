@@ -46,9 +46,8 @@ pub struct Homes {
 
 impl Homes {
     /// Of `home` when one is named (`BLAZE_HOME`'s meaning: the socket and the state are both
-    /// in it), else of the environment `var` reads: the socket as the CLI finds it, the state
-    /// under blaze's root (`$BLAZE_HOME`, else `$XDG_CACHE_HOME/blaze`, else `~/.cache/blaze`,
-    /// as `blaze_manifest::home::root`). An empty variable is unset.
+    /// in it), else of the environment `var` reads: the socket and the state under blaze's root
+    /// as `blaze_core::platform::home` finds them. An empty variable is unset.
     pub fn of(home: Option<&Path>, var: impl Fn(&str) -> Option<OsString>) -> Result<Homes, String> {
         let set = |name: &str| var(name).filter(|it| !it.is_empty()).map(PathBuf::from);
         let absolute = |dir: PathBuf| {
@@ -65,17 +64,12 @@ impl Homes {
                 home: Some(home),
             });
         }
-        let user = set("HOME").or_else(|| set("USERPROFILE"));
-        let Some(user) = user else {
-            return Err(
-                "no BLAZE_HOME or HOME says where blaze's daemon listens and keeps its state".to_owned()
-            );
-        };
-        let runtime = set("XDG_RUNTIME_DIR").map(|it| it.join("blaze"));
-        let cache = set("XDG_CACHE_HOME").map(|it| it.join("blaze"));
-        let socket = runtime.unwrap_or_else(|| user.join(".cache/blaze")).join("v2.sock");
-        let state = cache.unwrap_or_else(|| user.join(".cache/blaze")).join("v2");
-        Ok(Homes { socket: absolute(socket)?, state: absolute(state)?, home: None })
+        let found = blaze_core::platform::home::homes(var)?;
+        Ok(Homes {
+            socket: absolute(found.socket)?,
+            state: absolute(found.root.join("v2"))?,
+            home: None,
+        })
     }
 }
 

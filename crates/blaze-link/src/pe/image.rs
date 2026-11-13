@@ -251,8 +251,11 @@ fn bytes_at<const N: usize>(
 }
 
 /// What the synthetic regions may need, from the counts alone.
-pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
-    let mut regions = Vec::with_capacity(7);
+pub(super) fn synthetic(counts: &Counts, dev_run: bool, delay: bool) -> Vec<(Class, u64)> {
+    let mut regions = Vec::with_capacity(10);
+    if delay {
+        regions.extend(super::delay::synthetic(counts));
+    }
     if counts.libraries > 0 {
         let descriptors = ((counts.libraries + 1) * DESCRIPTOR).next_multiple_of(8);
         let lookup = (counts.imports + counts.libraries) * 8;
@@ -279,7 +282,9 @@ pub(super) fn synthetic(counts: &Counts, dev_run: bool) -> Vec<(Class, u64)> {
     }
     // Every rebased address and the four of a TLS directory the writer makes (five with a dev
     // run's start hook); a block (its header and a pad) per page that has one.
-    let entries = counts.absolute + if dev_run { 5 } else { 4 };
+    // A delay-loaded import's delay IAT cell is one more ([`super::delay`]).
+    let delayed = if delay { counts.imports } else { 0 };
+    let entries = counts.absolute + delayed + if dev_run { 5 } else { 4 };
     let blocks = entries.min(counts.image / PAGE + 64);
     regions.push((Class::Synthetic(RELOC), entries * 2 + blocks * 10));
     regions
@@ -418,9 +423,9 @@ impl Tables {
                         region,
                         |it, _| same_imports(it),
                         |_| {},
-                        || imports(placed, region),
+                        || imports(pe, placed, region),
                     )?,
-                    None => CowBytes::from_vec(imports(placed, region)?),
+                    None => CowBytes::from_vec(imports(pe, placed, region)?),
                 };
                 tables.push_cow(placed, IDATA, bytes)?;
             }
@@ -465,6 +470,12 @@ impl Tables {
         if placed.region(&Class::Synthetic(TLS_INDEX)).is_some() {
             // alloc: once per link: the `_tls_index` region's bytes, `synthesize`'s output
             tables.push(placed, TLS_INDEX, vec![0; 8])?;
+        }
+        if let Some(delay) = super::delay::tables(pe, placed)? {
+            extra.extend(delay.rebase.iter().copied());
+            tables.push(placed, super::delay::DELAY_CODE, delay.code)?;
+            tables.push(placed, super::delay::DELAY_DATA, delay.data)?;
+            tables.push(placed, super::delay::DELAY, delay.rdata)?;
         }
 
         let (image, delta) = (Image::of(placed), placed.delta);
@@ -721,8 +732,9 @@ fn entry_key(&(begin, end, info): &Entry) -> u128 {
     (u128::from(begin) << 64) | (u128::from(end) << 32) | u128::from(info)
 }
 
-/// The GOT's import cells sorted by library then cell: each DLL's IAT.
-fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
+/// The GOT's import cells sorted by library then cell: each DLL's IAT. A delay-loaded DLL's
+/// cells are left out: the delay import tables reach its functions ([`super::delay`]).
+fn iat(pe: &Pe, placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
     let mut cells = Vec::with_capacity(placed.imports.len());
     for cell in placed.got {
         let Holds::Import(import) = cell.holds else { continue };
@@ -740,6 +752,9 @@ fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
                 "`{}` is imported from library {library}, which there isn't",
                 it.name
             )));
+        }
+        if super::delay::delayed(pe, &placed.libraries[library as usize].name) {
+            continue;
         }
         cells.push((library, cell.addr, import));
     }
@@ -793,8 +808,8 @@ pub(super) fn iat_slots(placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkErro
 
 /// The import directory, the lookup tables, the hint/name table and the DLL names. Each DLL's
 /// IAT cells are the core's GOT cells of its imports, consecutive and followed by a zero cell.
-fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
-    let cells = iat(placed)?;
+fn imports(pe: &Pe, placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
+    let cells = iat(pe, placed)?;
     if cells.is_empty() {
         return Ok(Vec::default());
     }
@@ -1793,6 +1808,14 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
     }
     if let Some((_, at, size)) = filled(EDATA)? {
         directories[pe::IMAGE_DIRECTORY_ENTRY_EXPORT] = (at, size);
+    }
+    if let Some((index, at, _)) = filled(super::delay::DELAY)? {
+        let view = placed.view(index);
+        let whole = view.len() - view.len() % 32;
+        let count = view.arrays::<32>(0, whole).position(|it| it.iter().all(|byte| *byte == 0)).ok_or_else(
+            || error("the delay import directory has no null descriptor: its bytes are not in place"),
+        )?;
+        directories[pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] = (at, (count as u32 + 1) * 32);
     }
     if let Some((index, at, _)) = filled(DEBUG)? {
         if placed.view(index).u32(12) != Some(pe::IMAGE_DEBUG_TYPE_CODEVIEW.0) {
