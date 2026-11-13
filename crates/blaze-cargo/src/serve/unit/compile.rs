@@ -2088,10 +2088,6 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
     };
-    if kept.is_none() {
-        let miss = missed(job, reader, unit);
-        lock(slot).misses.push(miss);
-    }
     if let Some(Kept { record, mut puts, profiles }) = kept {
         // The compile record carries the program; the run's cache is independently keyed.
         // A hit for the compiler must still set up this job's proof and look up its runs,
@@ -2146,6 +2142,8 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     }
     let u = job.unit(unit)?;
     if u.mode == Mode::Doctest {
+        let miss = missed(job, reader, unit);
+        lock(slot).misses.push(miss);
         return doctest::names(job, unit, slot);
     }
     let krate = crate_of(job, unit, u)?;
@@ -2209,9 +2207,45 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
         },
     };
+    // No executable or check is required for a dependency script when every run was
+    // served by its purity proof. There is deliberately no compile record in this case:
+    // don't compute its miss explanation, collect its closure's reads, or file an empty
+    // program. A workspace check, a served diagnostic and a requested verification must
+    // still take their usual path.
+    if reached
+        && inert
+        && checking.is_none()
+        && diags.as_ref().is_some_and(Vec::is_empty)
+        && script::pure::built_nothing(job, unit)
+    {
+        if let Some(slot) = job.counted.get(unit) {
+            slot.get_or_init(Box::default);
+        }
+        if let Some(slot) = job.made.get(unit) {
+            slot.get_or_init(Made::default);
+        }
+        let served = Compiled {
+            diagnostics: Vec::new(),
+            ok: true,
+            open: false,
+            why: None,
+            puts: library_puts(job),
+            share: Vec::new(),
+            outputs: Vec::new(),
+            artifact: None,
+            macros: None,
+            gpu_msl: None,
+            links: Vec::new(),
+            misses: Vec::new(),
+        };
+        lock(slot).kept = Some(served);
+        return Ok(());
+    }
+    let miss = missed(job, reader, unit);
     let unmounted =
         diags.as_deref().map_or_else(Vec::new, |diags| unmounted(reader, &job.mounted, diags));
     let mut phases = lock(slot);
+    phases.misses.push(miss);
     phases.does = Some(Does { inert, builds_code });
     (phases.checking, phases.diags, phases.unmounted, phases.items_broken) =
         (checking, diags, unmounted, items_broken);
