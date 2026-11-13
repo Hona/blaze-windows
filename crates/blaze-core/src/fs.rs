@@ -366,14 +366,14 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 }
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
 #[cfg(target_os = "linux")]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     linux::sync_dir(path)
 }
 
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable (`sync_all`
 /// is `F_FULLFSYNC` on Apple's systems).
 #[cfg(all(any(unix, target_os = "wasi"), not(target_os = "linux")))]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     // durable: the effect is the sync its caller asked for.
     File::open(path)?.sync_all()
 }
@@ -382,7 +382,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
 /// writing with backup semantics (a directory opens with no other flag), which commits its
 /// entries' changes (NTFS and ReFS journal them) and flushes the device's cache.
 #[cfg(windows)]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
     /// `FILE_FLAG_BACKUP_SEMANTICS`, as `windows_sys` names it.
     const BACKUP_SEMANTICS: u32 = 0x0200_0000;

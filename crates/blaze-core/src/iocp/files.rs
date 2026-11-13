@@ -19,8 +19,8 @@ use windows_sys::Win32::{
         FILE_ID_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo,
         FileIdInfo,
         GetFileAttributesW, GetFileInformationByHandleEx, GetFileSizeEx,
-        GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
+        GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, DELETE, FILE_RENAME_INFO,
+        FileRenameInfoEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
         SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
     System::{
@@ -134,16 +134,18 @@ pub(super) fn size(handle: HANDLE) -> io::Result<u64> {
 }
 
 fn moved(from: &Path, to: &Path) -> io::Result<()> {
-    let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
-    // SAFETY: two NUL-terminated paths. Write-through: it returns once the new name is on
-    // the disk, which a directory's sync is on Unix.
-    sys::check(unsafe {
-        MoveFileExW(
-            wide_from.as_ptr(),
-            wide_to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    })
+    // A durable rename is one namespace operation. The two-name protocol for a running
+    // NTFS executable is only for replaceable, unsynced build outputs.
+    posix_rename(from, to)?;
+    fn parent(p: &Path) -> &Path {
+        p.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+    }
+    // durable: the new name, and the removal of the old one on a cross-directory move.
+    crate::fs::sync_dir(parent(to))?;
+    if parent(from) != parent(to) {
+        crate::fs::sync_dir(parent(from))?;
+    }
+    Ok(())
 }
 
 /// `bytes` as the whole of `path`: a temporary file next to it, written and flushed, moved
@@ -187,10 +189,34 @@ fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
             _ => aside(from, to),
         };
     }
+    posix_rename(from, to)
+}
+
+fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
     let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
-    // SAFETY: two NUL-terminated paths.
+    // Replace the name, never the backing data of a mapped pack or image. MoveFileExW
+    // can return success but leave an older view faulting zero pages under memory pressure.
+    // SAFETY: a NUL-terminated source; open the name itself, including a directory or link.
+    let file = sys::owned(unsafe {
+        CreateFileW(wide_from.as_ptr(), DELETE, SHARE_ALL, std::ptr::null(), OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
+    })?;
+    let name = &wide_to[..wide_to.len() - 1];
+    let bytes = std::mem::size_of_val(name);
+    // SetFileInformationByHandle resolves the DOS path as a NUL-terminated string even
+    // though FileNameLength excludes the terminator. Keep it *in* the allocated request.
+    let size = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + bytes + size_of::<u16>()).max(size_of::<FILE_RENAME_INFO>());
+    let size = u32::try_from(size).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename target exceeds 4 GiB"))?;
+    // alloc: the kernel's variable-length rename request; usize alignment covers its handle.
+    let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the buffer has room and alignment for the fixed header and every name unit.
+    // RootDirectory is null (absolute path). FileRenameInfoEx takes Flags, not ReplaceIfExists.
     sys::check(unsafe {
-        MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), MOVEFILE_REPLACE_EXISTING)
+        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
+        (*info).FileNameLength = bytes as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast(), name.len());
+        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
     })
 }
 
@@ -227,39 +253,6 @@ fn directory(dir: &Path) -> io::Result<OwnedHandle> {
 const RENAME_REPLACE: u32 = 0x1;
 /// `FILE_RENAME_FLAG_POSIX_SEMANTICS`: the name is taken from a file open elsewhere too.
 const RENAME_POSIX: u32 = 0x2;
-
-/// `from` renamed to `to`, replacing what is there, with POSIX semantics
-/// (`FileRenameInfoEx`): the replaced file may be open, or (on ReFS) running.
-fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_RENAME_INFO, FileRenameInfoEx};
-    let file = plain(from, DELETE, OPEN_EXISTING)?;
-    let name = sys::path(to)?;
-    let name = &name[..name.len() - 1];
-    let size = size_of::<FILE_RENAME_INFO>() + size_of_val(name);
-    // alloc: once per image placed, the rename's information (`u64`s, for its alignment).
-    let mut buffer = vec![0u64; size.div_ceil(8)];
-    let info: *mut FILE_RENAME_INFO = buffer.as_mut_ptr().cast();
-    // SAFETY: `buffer` is `size` bytes, aligned for the struct, which is plain integers and a
-    // trailing name of `name.len()` units that the size leaves room for.
-    unsafe {
-        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
-        (*info).RootDirectory = std::ptr::null_mut();
-        (*info).FileNameLength = size_of_val(name) as u32;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-    }
-    // SAFETY: an open handle with DELETE access and the information of the class named, of
-    // the size given.
-    sys::check(unsafe {
-        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size as u32)
-    })
-    // alloc: an error path.
-    .map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("renaming {} to {}: {error}", from.display(), to.display()),
-        )
-    })
-}
 
 /// The suffix of an image renamed aside ([`aside`]).
 const ASIDE: &str = ".blaze-old-";
@@ -845,6 +838,7 @@ mod image_tests {
             let (w_new, w_at) = (sys::path(&new).unwrap(), sys::path(&at).unwrap());
             // SAFETY: two NUL-terminated paths.
             let refused = unsafe {
+                use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
                 MoveFileExW(w_new.as_ptr(), w_at.as_ptr(), MOVEFILE_REPLACE_EXISTING)
             };
             assert_eq!(refused, 0, "{system}: the control: a plain replace of a running image");

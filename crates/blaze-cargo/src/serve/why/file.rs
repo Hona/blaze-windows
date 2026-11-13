@@ -350,7 +350,7 @@ impl File {
                 write!(it, "{build}").and_then(|()| it.sync_all())
             })
             // durable: the gap file's name survives a restart
-            .and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all()));
+            .and_then(|()| blaze_core::fs::sync_dir(&self.dir));
         match marked {
             Ok(()) => (
                 format!(
@@ -465,7 +465,7 @@ impl File {
         let wrote = wrote.and_then(|()| file.write_all(record)).and_then(|()| file.sync_data());
         let wrote = match len {
             // durable: the append made the ledger: its name survives a crash
-            0 => wrote.and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all())),
+            0 => wrote.and_then(|()| blaze_core::fs::sync_dir(&self.dir)),
             _ => wrote,
         };
         let Err(error) = wrote else {
@@ -558,7 +558,7 @@ fn copy_aside(dir: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, String> {
             it.write_all(bytes).and_then(|()| it.sync_all())
         })
         // durable: the copy's name survives a crash
-        .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()));
+        .and_then(|()| blaze_core::fs::sync_dir(dir));
     if let Err(error) = copied {
         if made {
             _ = fs::remove_file(&to);
@@ -630,7 +630,7 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
         })
         .and_then(|()| fs::rename(&hidden, path).map_err(step("renaming the hidden file over it")))
         // durable: the rename that replaces the ledger survives a crash
-        .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()).map_err(step(SYNC_DIR)));
+        .and_then(|()| blaze_core::fs::sync_dir(dir).map_err(step(SYNC_DIR)));
     written.map_err(|(doing, error)| {
         _ = fs::remove_file(&hidden);
         // alloc: error path
@@ -646,13 +646,13 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
 /// Makes the [`GAP`] file at `gap`, which an earlier process may have made and not synced,
 /// durable: the file synced, then `dir`. The failure names the file and the step.
 fn sync_held(dir: &Path, gap: &Path) -> Result<(), String> {
-    fs::File::open(gap)
+    fs::OpenOptions::new().write(true).open(gap)
         // durable: a gap file an earlier process made and may not have synced
         .and_then(|it| it.sync_all())
         .map_err(|error| format!("syncing the gap file {} already there: {error}", gap.display())) // alloc: error path
         .and_then(|()| {
             // durable: the gap file's name survives a restart
-            fs::File::open(dir).and_then(|it| it.sync_all()).map_err(|error| {
+            blaze_core::fs::sync_dir(dir).map_err(|error| {
                 format!(
                     "syncing {}, the directory of the gap file {} already there: {error}",
                     dir.display(),

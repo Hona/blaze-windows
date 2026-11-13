@@ -40,7 +40,7 @@ use crate::{
     disk::Disks,
     journal::{FromImage, Journal, Loaded, base_of},
     section::Section,
-    store::{Base, FILE, Mapped, NAME_INDEX_KEY, Source, Table, Writer, home},
+    store::{Base, FILE, Mapped, NAME_INDEX_KEY, Table, Writer, home},
     tree::Tree,
 };
 pub use blaze_bytes::Bytes;
@@ -134,6 +134,8 @@ pub enum ImageError {
     /// A file of the image the tree was restored from failed its check, so its bytes are not
     /// there to write. The builder holds part of the VFS's sections: drop it.
     Corrupt(Corrupt),
+    /// The in-memory records would form a tree that restore refuses.
+    Malformed(&'static str),
 }
 
 impl fmt::Display for ImageError {
@@ -146,6 +148,7 @@ impl fmt::Display for ImageError {
             ImageError::Corrupt(corrupt) => {
                 write!(f, "a file of the VFS's image cannot be written to the next: {corrupt}")
             }
+            ImageError::Malformed(reason) => write!(f, "the VFS cannot write its tree: {reason}"),
         }
     }
 }
@@ -234,8 +237,7 @@ impl Vfs {
         if !self.journal.can_stage() {
             return Err(ImageError::Busy);
         }
-        let mark = write_tree(self.tree.table(), self.journal.based_on(), image)
-            .map_err(ImageError::Corrupt)?;
+        let mark = write_tree(self.tree.table(), self.journal.based_on(), image)?;
         // alloc: once per image written.
         let mut disks = Vec::new();
         self.disks.encode(&mut disks);
@@ -299,6 +301,30 @@ impl Vfs {
     pub fn corrupt(&self) -> Option<Corrupt> {
         self.tree.table().mapped().and_then(|it| it.corrupt())
     }
+
+    /// Doctor's eager version of restore: use the same structural checks and read every
+    /// file, including those no build has asked for. A missing or foreign section is unused.
+    pub fn check_image(image: Arc<Image<Mapping>>) -> Result<Option<Refused>, String> {
+        let opened = match open_tree(image) {
+            Ok(tree) => tree,
+            Err(ImageUse::Refused(reason)) => return Ok(Some(reason)),
+            Err(ImageUse::Malformed(reason)) => return Err(format!("the VFS tree: {reason}")),
+            Err(ImageUse::Corrupt(error)) => return Err(error.to_string()),
+            Err(reason) => return Err(format!("the VFS tree: {reason:?}")),
+        };
+        let table = opened.tree.table();
+        for node in 0..table.len() {
+            let shape = table.shape(node);
+            if !shape.is_dir() {
+                table.blob(shape).map_err(|e| e.to_string())?;
+            }
+        }
+        match open_disks(&opened.image) {
+            Ok(_) => Ok(None),
+            Err(DisksUnused::Refused(reason)) => Ok(Some(reason)),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// The smallest index for `count` values at most half full.
@@ -324,7 +350,7 @@ fn write_tree(
     table: &Table,
     based_on: Option<ContentId>,
     image: &mut Builder,
-) -> Result<ImageMark, Corrupt> {
+) -> Result<ImageMark, ImageError> {
     let nodes = table.len() as usize;
     // alloc: the image's columns, built once per image written (the edge); no read does.
     let mut ids: Vec<ContentId> = Vec::with_capacity(nodes);
@@ -346,13 +372,10 @@ fn write_tree(
                 entry_modes.extend_from_slice(entries.modes);
                 continue;
             }
-            let bytes = match table.source(shape) {
-                Source::Heap(bytes) => bytes,
-                Source::Mapped { at, len } => {
-                    let mapped = table.mapped().expect("a file of an image in its table");
-                    mapped.read(at, len)?
-                }
-            };
+            let bytes = table.blob(shape).map_err(ImageError::Corrupt)?;
+            if ContentId::of(crate::FILE_DOMAIN, bytes) != ids[node as usize] {
+                return Err(ImageError::Malformed("a file whose bytes do not match its content ID"));
+            }
             shapes.push([files.len() as u32, FILE]);
             files.push([blobs.bytes(bytes), bytes.len() as u64]);
         }
@@ -393,6 +416,10 @@ fn write_tree(
     }
 
     let mut header = [0u64; WORDS];
+    Base { ids: &ids, shapes: &shapes, entry_names: &entry_names, entry_nodes: &entry_nodes,
+        entry_modes: &entry_modes, files: &files, index: &index, spans: &spans,
+        name_bytes: &name_bytes, name_index: &name_index, name_key: name_key.words() }
+        .check_tree(blobs_len).map_err(ImageError::Malformed)?;
     header[W_MAGIC] = MAGIC;
     header[W_NODES] = nodes as u64;
     header[W_ENTRIES] = entry_names.len() as u64;
@@ -447,11 +474,13 @@ struct Opened {
 /// viewed in place; its blobs not read.
 fn open(file: Mapping) -> Result<Opened, ImageUse> {
     let image = Image::open(file).map_err(ImageUse::Unopened)?;
+    open_tree(Arc::new(image))
+}
+
+fn open_tree(image: Arc<Image<Mapping>>) -> Result<Opened, ImageUse> {
     let tree = image.section(SectionId::VFS_TREE, TREE_SCHEMA).map_err(ImageUse::Refused)?;
     let blobs = image.section(SectionId::VFS_BLOBS, BLOBS_SCHEMA).map_err(ImageUse::Refused)?;
     image.whole(&tree).map_err(ImageUse::Corrupt)?;
-    // alloc: the image, once per start, shared by every file read from it.
-    let image = Arc::new(image);
     let header = image.slice::<u64>(&tree, 0, WORDS as u64).map_err(ImageUse::Corrupt)?;
     if header[W_MAGIC] != MAGIC {
         return Err(ImageUse::Malformed("a VFS tree section without its magic"));
@@ -461,7 +490,7 @@ fn open(file: Mapping) -> Result<Opened, ImageUse> {
     }
     let base = view(&image, &tree, header).map_err(ImageUse::Corrupt)?;
     // alloc: once per start.
-    let mapped = Arc::new(Mapped::new(Arc::clone(&image), blobs));
+    let mapped = Arc::new(Mapped::new(Arc::clone(&image), blobs, tree, header[W_COLUMNS + C_IDS], base.shapes));
     let writer = Writer::restore(mapped, base).map_err(ImageUse::Malformed)?;
     Ok(Opened {
         tree: Tree::over(writer),
