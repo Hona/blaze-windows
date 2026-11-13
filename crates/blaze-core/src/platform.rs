@@ -5,6 +5,7 @@
 //! The effects ([`crate::Effect`]) stay the interface of everything a state machine does; this
 //! is what a driver, the daemon or the command line has to know before it asks for them.
 
+pub mod home;
 pub mod lock;
 pub mod path;
 pub mod volume;
