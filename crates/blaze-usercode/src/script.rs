@@ -509,6 +509,28 @@ mod tests {
         vec![("PATH".into(), path.into()), ("HOME".into(), "/home/u".into())]
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn declared_results_do_not_answer_observed_lookups() {
+        let unit = unit();
+        let env = inherited("/a");
+        let mut place = place();
+        let observed = prepare(&unit, &env, &place).unwrap();
+        place.mode = Mode::Declared { host: ContentId::default(), verify: false };
+        let declared = prepare(&unit, &env, &place).unwrap();
+        assert_ne!(declared.spec.key, observed.spec.key);
+        let mut changed = env;
+        changed.push(("ANOTHER_INPUT".into(), "value".into()));
+        assert_ne!(prepare(&unit, &changed, &place).unwrap().spec.key, declared.spec.key);
+
+        // The record itself, not only its opaque lookup key, identifies the policy.
+        let mut traced = Traced::default();
+        keyed(&declared, &mut traced).unwrap();
+        let shape = crate::index::Shape::of(&traced);
+        let restored = crate::index::Shape::decode(&shape.encode()).unwrap();
+        assert_eq!(restored.untraceable, vec![blaze_core::Untraceable::CargoDeclared]);
+    }
+
     /// A pinned native input's digest is part of the run's key: another archive is another
     /// run, even laid out at the same place; and a script given none keeps the key it had.
     #[test]
