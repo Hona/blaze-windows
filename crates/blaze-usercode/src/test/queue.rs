@@ -144,16 +144,21 @@ impl Binary {
     pub fn whole_runs(self, longest: usize) -> Result<Vec<Binary>, String> {
         let Mode::Threads { args, .. } = &self.mode else { return Ok(vec![self]) };
         // `"program" --exact --test-threads=N --include-ignored`, the user's flags, a space each.
-        let units = |it: &std::ffi::OsStr| it.to_string_lossy().encode_utf16().count();
-        let fixed = units(self.program.as_os_str())
-            + 64
-            + args.iter().map(|it| units(it) + 3).sum::<usize>();
-        // A name is quoted when it has a space or a tab, and each `"` in it escaped.
-        let name = |it: &str| {
-            let quotes = it.contains([' ', '\t']).then_some(2).unwrap_or(0);
-            it.encode_utf16().count() + it.matches('"').count() + quotes + 1
+        use blaze_core::create_process::argument_units;
+        let arg = |it: &std::ffi::OsStr| {
+            #[cfg(windows)]
+            { use std::os::windows::ffi::OsStrExt as _; argument_units(it.encode_wide()) + 1 }
+            #[cfg(not(windows))]
+            { argument_units(it.to_string_lossy().encode_utf16()) + 1 }
         };
-        let room = longest.saturating_sub(fixed);
+        let fixed = self.program.as_os_str().to_string_lossy().encode_utf16().count() + 2
+            + " --exact --test-threads=".len() + self.jobs.len().max(1).to_string().len()
+            + usize::from(self.jobs.iter().any(|it| it.ignore)) * " --include-ignored".len()
+            + args.iter().map(|it| arg(it)).sum::<usize>();
+        let room = longest.checked_sub(fixed).ok_or_else(|| format!(
+            "the fixed arguments for `{}` need {fixed} UTF-16 units, past the limit {longest}", self.name
+        ))?;
+        let name = |it: &str| argument_units(it.encode_utf16()) + 1;
         if self.jobs.iter().map(|it| name(&it.name)).sum::<usize>() <= room {
             return Ok(vec![self]);
         }

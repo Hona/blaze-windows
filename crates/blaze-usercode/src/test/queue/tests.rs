@@ -924,6 +924,44 @@ fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
     assert!(matches!(&fake.results[0].trace, Trace::Unknown(_)));
 }
 
+/// Exercise the actual timeout, IOCP kill and job close, not just the queue's Kill effect.
+/// The child stays asleep for a minute holding stdout: killing only its parent cannot
+/// complete the pipe read by the deadline.
+#[cfg(windows)]
+#[test]
+fn a_timed_out_whole_binary_ends_its_descendants_and_drains_their_output() {
+    let dir = std::env::temp_dir().join(format!("blaze-thread-test-timeout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = || {
+        let mut driver = blaze_core::iocp::Iocp::new(&dir, 1).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let cmd = system.join(r"System32\cmd.exe");
+        let timeout = Duration::from_secs(2);
+        let mut plan = outside("sleeping", vec![job("/d", 1), job("/c", 1), job("tree.cmd", 1)]);
+        // cmd runs tree.cmd with libtest's extra switches as its argv; the file ignores them.
+        std::fs::write(dir.join("tree.cmd"), b"@echo off\r\necho before-timeout\r\n%SystemRoot%\\System32\\ping.exe -n 60 127.0.0.1\r\n").unwrap();
+        plan.dir = dir.clone();
+        plan.program = cmd;
+        plan.env = vec![("SystemRoot".into(), system.into())];
+        plan.mode = Mode::Threads { args: Vec::new(), timeout };
+        let mut effects = Vec::new();
+        let mut q = Queue::new(config(1), vec![plan], driver.now(), &mut effects);
+        let bound = blaze_core::wait::Deadline::after(driver.now(), Duration::from_secs(12));
+        let mut done = Vec::new();
+        while !q.finished() {
+            driver.submit(&mut effects);
+            assert!(!bound.passed(driver.now()), "the process tree still owns stdout");
+            driver.poll(&mut done, bound);
+            for it in done.drain(..) { q.complete(it, driver.now(), &mut effects); }
+        }
+        let result = q.drain().next().unwrap();
+        assert_eq!(result.outcome, Outcome::Failed(Failure::TimedOut(timeout)));
+        assert!(String::from_utf8_lossy(&result.output).contains("before-timeout"));
+    };
+    run();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_cancel_kills_what_runs_and_runs_nothing_more() {
     let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 10), job("b", 0)])]);
@@ -1682,7 +1720,7 @@ fn drive(fork: u64) -> (Vec<Finished>, usize) {
 #[test]
 fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
     let threads = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(9) };
-    let jobs: Vec<Job> = (0..600).map(|n| job(&format!("module::t{n} \"x\""), 1)).collect();
+    let jobs: Vec<Job> = (0..600).map(|n| job(&format!("module::t{n} \\\\\"x😀\\\\"), 1)).collect();
     let whole = || Binary { mode: threads.clone(), ..binary("lib", jobs.clone()) };
     let longest = 4000;
     let runs = whole().whole_runs(longest).unwrap();
@@ -1703,7 +1741,7 @@ fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
                 _ => None,
             })
             .expect("the run is spawned");
-        assert!(line.len() <= longest, "{} > {longest}", line.len());
+        assert!(line.len() - 1 <= longest, "{} > {longest}", line.len() - 1);
     }
     assert_eq!(whole().whole_runs(1 << 20).unwrap().len(), 1);
     assert_eq!(binary("lib", jobs.clone()).whole_runs(10).unwrap().len(), 1, "a fork server's");
