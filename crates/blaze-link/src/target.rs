@@ -439,6 +439,9 @@ fn locate_with<A: Ask>(
     for (path, kind) in runtimes {
         line.push(path, kind)?;
     }
+    if target == Target::Msvc {
+        vc_runtime(output.link.pe.crt_static, libs)?;
+    }
     for CrateLibs { libs, search: own } in libs {
         for lib in *libs {
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
@@ -461,6 +464,44 @@ fn locate_with<A: Ask>(
         line.object(name)?;
     }
     Ok(line.out)
+}
+
+/// MSVC's VC runtime libraries, the dynamic ones (the DLLs' import libraries and their static
+/// start-up code) and the static ones, release and debug, as `.lib` stems.
+const VC_DYNAMIC: &[&str] = &["msvcrt", "msvcrtd", "vcruntime", "vcruntimed", "msvcprt", "msvcprtd"];
+const VC_STATIC: &[&str] = &["libcmt", "libcmtd", "libvcruntime", "libvcruntimed", "libcpmt", "libcpmtd"];
+
+/// That no crate asks for the VC runtime the image does not link: `+crt-static` (`crt_static`)
+/// is the static one, and its absence the dynamic one. The crates ask for it by the cfg the
+/// front end evaluated (`libc`'s `#[link(name = "libcmt", cfg(target_feature = "crt-static"))]`),
+/// so a crate asking for the other one was compiled for another CRT than the link is for:
+/// link.exe's `LNK2038`, which the C objects' `/FAILIFMISMATCH:RuntimeLibrary` would catch only
+/// for C.
+fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError> {
+    let (wrong, flag) = match crt_static {
+        true => (VC_DYNAMIC, "the static one (`-C target-feature=+crt-static`)"),
+        false => (VC_STATIC, "the dynamic one (no `-C target-feature=+crt-static`)"),
+    };
+    for lib in libs.iter().flat_map(|it| it.libs) {
+        let name = lib.name.rsplit(['/', '\\']).next().unwrap_or(&lib.name);
+        let stem = match name.len().checked_sub(4) {
+            Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".lib") => {
+                &name[..at]
+            }
+            _ => name,
+        };
+        if wrong.iter().any(|it| it.eq_ignore_ascii_case(stem)) {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "a crate links the VC runtime library `{}`, and the image's VC runtime is {flag}: \
+                     the crate was compiled for the other C runtime (link.exe: LNK2038)",
+                    lib.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The targets blaze links: those `hir_ty_codegen::v2::toolchain` compiles for whose link

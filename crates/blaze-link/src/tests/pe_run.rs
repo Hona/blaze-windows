@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use blaze_ids::ContentId;
 
+use blaze_codegen::NativeLib;
+
 use super::{Change, Disk, Image, Native, contents, name};
 use crate::{Debug, LinkError, Output, OutputKind};
 
@@ -33,8 +35,14 @@ fn output(dll: Option<&str>, inputs: &[&str]) -> Output {
 }
 
 /// The image `output` links: its link line located as a build locates it, read whole.
-fn link(mut output: Output) -> Result<Vec<u8>, LinkError> {
-    let located = crate::target::locate(&mut output, &[], &[], Path::new("unused"))?;
+fn link(output: Output) -> Result<Vec<u8>, LinkError> {
+    link_with(output, &[])
+}
+
+/// The image `output` links with `libs` after the inputs, as the link arguments' libraries are.
+fn link_with(mut output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkError> {
+    let crates = [crate::target::CrateLibs { libs, search: &[] }];
+    let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused"))?;
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
         .into_iter()
         .map(|it| {
@@ -150,8 +158,9 @@ fn code_built_with_guard_cf_and_gs_runs() {
     assert_eq!(linked_run("cfg", &["cfg.obj"], &[]), (0, "cfg 22 7\n".into()));
 }
 
-/// `output` with link.exe's arguments `args` applied, as a build script gives them.
-fn with_args(mut output: Output, args: &[&str]) -> Output {
+/// `output` with link.exe's arguments `args` applied, as a build script gives them, and the
+/// libraries they add.
+fn with_args(mut output: Output, args: &[&str]) -> (Output, Vec<NativeLib>) {
     let given: Vec<crate::args::GivenArg> = args
         .iter()
         .map(|it| crate::args::GivenArg {
@@ -160,14 +169,15 @@ fn with_args(mut output: Output, args: &[&str]) -> Output {
         })
         .collect();
     let applied = crate::args::apply(&mut output, &[], &given).unwrap();
-    assert!(applied.libs.is_empty() && applied.search.is_empty(), "{applied:?}");
-    output
+    assert!(applied.search.is_empty(), "{applied:?}");
+    (output, applied.libs)
 }
 
 #[test]
 fn a_gui_program_entered_at_main_crt_startup_runs_without_a_console() {
-    let output = with_args(output(None, &["gui.obj"]), &["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]);
-    let bytes = link(output).unwrap();
+    let (output, libs) =
+        with_args(output(None, &["gui.obj"]), &["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]);
+    let bytes = link_with(output, &libs).unwrap();
     has_crt_directories(&bytes);
     let file = object::read::pe::PeFile64::parse(&bytes[..]).unwrap();
     let optional = &file.nt_headers().optional_header;
@@ -176,6 +186,52 @@ fn a_gui_program_entered_at_main_crt_startup_runs_without_a_console() {
     let dir = scratch("gui");
     std::fs::write(dir.join("gui.exe"), &bytes).unwrap();
     assert_eq!(run(&dir.join("gui.exe"), &[]), (0, "gui without a console\n".into()));
+}
+
+/// The DLLs an image imports from, lowercased, in its import directory's order.
+fn dlls(bytes: &[u8]) -> Vec<String> {
+    use object::LittleEndian as LE;
+    let file = object::read::pe::PeFile64::parse(bytes).unwrap();
+    let table = file.import_table().unwrap().expect("an import directory");
+    let mut descriptors = table.descriptors().unwrap();
+    let mut out = Vec::new();
+    while let Some(it) = descriptors.next().unwrap() {
+        out.push(String::from_utf8_lossy(table.name(it.name.get(LE)).unwrap()).to_ascii_lowercase());
+    }
+    out
+}
+
+/// rune-desktop's C runtime: the VC runtime static (`+crt-static`, objects built `/MT`), the
+/// UCRT the system's DLL (`/NODEFAULTLIB:libucrt.lib /DEFAULTLIB:ucrt.lib`). The image imports
+/// the UCRT's API sets and no `VCRUNTIME140.dll`.
+#[test]
+fn the_static_vc_runtime_with_the_dynamic_ucrt_runs() {
+    let mut output = output(None, &["hello_mt.obj"]);
+    output.link.pe.crt_static = true;
+    let (output, libs) = with_args(output, &["/NODEFAULTLIB:libucrt.lib", "/DEFAULTLIB:ucrt.lib"]);
+    let bytes = link_with(output, &libs).unwrap();
+    has_crt_directories(&bytes);
+    let dlls = dlls(&bytes);
+    assert!(dlls.iter().any(|it| it.starts_with("api-ms-win-crt-")), "{dlls:?}");
+    assert!(!dlls.iter().any(|it| it.starts_with("vcruntime")), "{dlls:?}");
+    let dir = scratch("hybrid_crt");
+    std::fs::write(dir.join("hybrid.exe"), &bytes).unwrap();
+    let (code, printed) = run(&dir.join("hybrid.exe"), &[]);
+    assert_eq!((code, printed.as_str()), (42, "hello from nobody, 1 args\npid set\nrelocated yes\n"));
+}
+
+/// A crate asking for the dynamic VC runtime in a `+crt-static` link is refused by name.
+#[test]
+fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
+    let mut output = output(None, &["hello_mt.obj"]);
+    output.link.pe.crt_static = true;
+    let msvcrt = NativeLib {
+        name: "msvcrt".into(),
+        kind: blaze_codegen::NativeLibKind::Dylib,
+        verbatim: false,
+    };
+    let error = link_with(output, &[msvcrt]).unwrap_err();
+    assert!(error.what.contains("`msvcrt`") && error.what.contains("LNK2038"), "{error}");
 }
 
 #[test]

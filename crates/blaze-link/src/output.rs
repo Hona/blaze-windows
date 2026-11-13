@@ -103,6 +103,11 @@ pub struct LinkArgs {
 /// default is an image linked with none: link.exe's defaults, as rustc links one.
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug)] // clone: setup, as `Output`'s
 pub struct PeArgs {
+    /// `-C target-feature=+crt-static`: the VC runtime is the static one (`libcmt.lib`,
+    /// `libvcruntime.lib`), which the crates' `#[link]`s ask for under that cfg. The UCRT may
+    /// still be the DLL's (`/NODEFAULTLIB:libucrt.lib /DEFAULTLIB:ucrt.lib`, as rune-desktop
+    /// links it).
+    pub crt_static: bool,
     /// `/SUBSYSTEM:..,major.minor`: the least Windows version the image runs on.
     pub subsystem_version: Option<(u16, u16)>,
     /// `/DELAYLOAD:dll`, each once in the order given, ASCII case kept: the DLLs whose
