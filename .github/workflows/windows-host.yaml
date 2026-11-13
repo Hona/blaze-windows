@@ -54,3 +54,6 @@ jobs:
           }
       - name: Host, store and linker units
         run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link
+      - name: Portable tool call sites and planted regressions
+        if: '!cancelled()'
+        run: cargo test --locked -p astlog-core --test rules

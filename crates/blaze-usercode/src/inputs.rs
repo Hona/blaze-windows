@@ -193,7 +193,19 @@ const MOST_LINKS: usize = 40;
 /// before the last is missing or unreadable. Cold: on a miss only.
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
+    let path = on_disk(path);
     let mut parts = path.components();
+    #[cfg(windows)]
+    let mut at = {
+        use std::path::Prefix;
+        let Some(Component::Prefix(prefix)) = parts.next() else { return None };
+        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) { return None; }
+        let mut volume = PathBuf::from(prefix.as_os_str());
+        volume.push(r"\");
+        volume
+    };
+    #[cfg(not(windows))]
+    let mut at = PathBuf::from("/"); // alloc: cold, once per first miss
     if parts.next() != Some(Component::RootDir) {
         return None;
     }
@@ -207,7 +219,6 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     }
     left.reverse();
     let mut names = Vec::new(); // alloc: cold, as above
-    let mut at = PathBuf::from("/"); // alloc: cold, as above
     // Bounded: each turn takes one part, and only a link, of which there are at most
     // `MOST_LINKS`, adds any.
     while let Some(part) = left.pop() {
@@ -218,6 +229,10 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
         }
         let name = at.join(&part);
         match std::fs::symlink_metadata(&name) {
+            // Junctions, volume mount points and other reparse tags may reach a different
+            // tree. Until all of those spellings are watched, check these by stamp instead.
+            #[cfg(windows)]
+            Ok(meta) if std::os::windows::fs::MetadataExt::file_attributes(&meta) & 0x400 != 0 => return None,
             Ok(meta) if meta.file_type().is_symlink() => {
                 if names.len() == MOST_LINKS {
                     return None;
@@ -871,7 +886,9 @@ mod tests {
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(now.file(&dir.join("gone")).unwrap(), None);
         assert_eq!(dirs.len(), 1);
-        let roundabout = dir.join("sub").join("..").join("a");
+        // Windows normalizes `..` when joining onto the verbatim path `canonicalize`
+        // returns. Use the original directory to actually exercise a noncanonical name.
+        let roundabout = made.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
         assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());

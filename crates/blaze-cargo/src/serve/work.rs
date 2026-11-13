@@ -887,6 +887,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn apply(&mut self) -> Result<bool, ApiError>;
     /// A write [`Writer::apply`] applied that failed or panicked, taken, one a call.
     fn broke(&mut self) -> Option<Broke>;
+    /// The snapshot for whole-job diagnostics. The last unit's completion can itself
+    /// request a release or queue a write, after the last call to `apply_writes`.
+    fn final_reader(&mut self) -> Result<S::Reader, ApiError> {
+        if !self.apply()? {
+            return Err(ApiError::new("a task still reads the front end after all units ended", None));
+        }
+        if let Some(broke) = self.broke() {
+            return Err(ApiError::new(format!("unit {}: {}: {}", broke.unit, broke.what, broke.how), None));
+        }
+        self.reader().ok_or_else(|| ApiError::new("the front end still has a pending write after its final apply", None))
+    }
     /// On a worker, the writer handed to the tables' task as the front end's last use: its
     /// tables (name, elements, bytes), measured with it exclusive; an
     /// error while a reader of it is alive.

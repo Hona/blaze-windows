@@ -33,6 +33,10 @@ fn config(jobs: usize) -> Config {
     }
 }
 
+fn handed_path(relative: &str) -> OsString {
+    config(1).root.join(relative).into_os_string()
+}
+
 fn job(name: &str, expected_ms: u64) -> Job {
     Job {
         name: name.into(),
@@ -124,7 +128,7 @@ struct Fake {
 impl Fake {
     fn new(config: Config, binaries: Vec<Binary>) -> Fake {
         let mut effects = Vec::new();
-        let queue = Queue::new(config, binaries, Duration::ZERO, &mut effects);
+        let queue = Queue::on_driver(config, binaries, Duration::ZERO, &mut effects, true);
         let mut fake = Fake {
             queue,
             now: Duration::ZERO,
@@ -358,8 +362,8 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
         Fake::new(config(2), vec![binary("lib", vec![job("a", 10), job("b", 50), job("c", 30)])]);
     assert_eq!(fake.records.get(&name("req/1/r0")), Some(&Vec::new()));
     let command = &fake.spawns[0].1;
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
-    assert!(command.env.contains(&(confine::LIVE.into(), "/root/req/1/r0".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t0"))));
+    assert!(command.env.contains(&(confine::LIVE.into(), handed_path("req/1/r0"))));
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     assert!(command.args.is_empty());
     let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else {
@@ -382,7 +386,7 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
         &[
             Line::new(Seen::Read, "", "/lib/libc.so"),
             Line::new(Seen::Env, "", SOCKET),
-            Line::new(Seen::Looked, "", "/root/req/1/t0"),
+            Line::new(Seen::Looked, "", handed_path("req/1/t0").to_str().unwrap()),
             Line::new(Seen::Read, "b", "/ws/b.txt"),
             Line::new(Seen::Read, "c", "/ws/c.txt"),
         ],
@@ -643,7 +647,7 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     assert!(fake.records.is_empty(), "no record is made: {:?}", fake.records);
     let command = &fake.spawns[0].1;
     assert_eq!(command.sandbox, Sandbox::Off);
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t0"))));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE), "{:?}", command.env);
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     let conn = fake.hello(0, &["a", "b", "c"]);
@@ -727,7 +731,7 @@ fn an_outside_and_a_sandboxed_run_of_one_program_each_run_their_own_tests() {
         (command.sandbox.clone(), command.program.clone()),
         (Sandbox::Off, PathBuf::from("/bin/lib"))
     );
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t1".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t1"))));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE));
     assert!(!fake.records.contains_key(&name("req/1/r1")));
     let out = fake.hello(1, &all);
@@ -924,6 +928,44 @@ fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
     assert!(matches!(&fake.results[0].trace, Trace::Unknown(_)));
 }
 
+/// Exercise the actual timeout, IOCP kill and job close, not just the queue's Kill effect.
+/// The child stays asleep for a minute holding stdout: killing only its parent cannot
+/// complete the pipe read by the deadline.
+#[cfg(windows)]
+#[test]
+fn a_timed_out_whole_binary_ends_its_descendants_and_drains_their_output() {
+    let dir = std::env::temp_dir().join(format!("blaze-thread-test-timeout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = || {
+        let mut driver = blaze_core::iocp::Iocp::new(&dir, 1).unwrap();
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let cmd = system.join(r"System32\cmd.exe");
+        let timeout = Duration::from_secs(2);
+        let mut plan = outside("sleeping", vec![job("/d", 1), job("/c", 1), job("tree.cmd", 1)]);
+        // cmd runs tree.cmd with libtest's extra switches as its argv; the file ignores them.
+        std::fs::write(dir.join("tree.cmd"), b"@echo off\r\necho before-timeout\r\n%SystemRoot%\\System32\\ping.exe -n 60 127.0.0.1\r\n").unwrap();
+        plan.dir = dir.clone();
+        plan.program = cmd;
+        plan.env = vec![("SystemRoot".into(), system.into())];
+        plan.mode = Mode::Threads { args: Vec::new(), timeout };
+        let mut effects = Vec::new();
+        let mut q = Queue::new(config(1), vec![plan], driver.now(), &mut effects);
+        let bound = blaze_core::wait::Deadline::after(driver.now(), Duration::from_secs(12));
+        let mut done = Vec::new();
+        while !q.finished() {
+            driver.submit(&mut effects);
+            assert!(!bound.passed(driver.now()), "the process tree still owns stdout");
+            driver.poll(&mut done, bound);
+            for it in done.drain(..) { q.complete(it, driver.now(), &mut effects); }
+        }
+        let result = q.drain().next().unwrap();
+        assert_eq!(result.outcome, Outcome::Failed(Failure::TimedOut(timeout)));
+        assert!(String::from_utf8_lossy(&result.output).contains("before-timeout"));
+    };
+    run();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_cancel_kills_what_runs_and_runs_nothing_more() {
     let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 10), job("b", 0)])]);
@@ -998,7 +1040,7 @@ fn simulated(two_outside: bool) {
         let two =
             Binary { sandboxed: !two_outside, ..binary("two", vec![job("d", 50), job("e", 5)]) };
         let mut effects = Vec::new();
-        let mut queue = Queue::new(config(2), vec![one, two], sim.now(), &mut effects);
+        let mut queue = Queue::on_driver(config(2), vec![one, two], sim.now(), &mut effects, true);
         let mut played: Vec<Played> = [vec!["a", "fails", "c"], vec!["d", "e"]]
             .into_iter()
             .map(|tests| Played {
@@ -1682,7 +1724,7 @@ fn drive(fork: u64) -> (Vec<Finished>, usize) {
 #[test]
 fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
     let threads = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(9) };
-    let jobs: Vec<Job> = (0..600).map(|n| job(&format!("module::t{n} \"x\""), 1)).collect();
+    let jobs: Vec<Job> = (0..600).map(|n| job(&format!("module::t{n} \\\\\"x😀\\\\"), 1)).collect();
     let whole = || Binary { mode: threads.clone(), ..binary("lib", jobs.clone()) };
     let longest = 4000;
     let runs = whole().whole_runs(longest).unwrap();
@@ -1703,7 +1745,7 @@ fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
                 _ => None,
             })
             .expect("the run is spawned");
-        assert!(line.len() <= longest, "{} > {longest}", line.len());
+        assert!(line.len() - 1 <= longest, "{} > {longest}", line.len() - 1);
     }
     assert_eq!(whole().whole_runs(1 << 20).unwrap().len(), 1);
     assert_eq!(binary("lib", jobs.clone()).whole_runs(10).unwrap().len(), 1, "a fork server's");

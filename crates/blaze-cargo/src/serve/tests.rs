@@ -723,6 +723,14 @@ pub(super) struct FakeWriter {
 /// A shared reference to the inputs, as the loop posted a task with it.
 pub(super) struct FakeReader(Arc<FakeInputs>);
 
+#[test]
+fn final_diagnostics_observe_writes_queued_by_the_last_unit() {
+    let mut writer = FakeWriter { inputs: Arc::new(FakeInputs::default()), asked: vec![3], broke: Vec::new() };
+    assert!(writer.reader().is_none());
+    let reader = writer.final_reader().unwrap();
+    assert_eq!(reader.0.runs, [3]);
+}
+
 /// A kept image as the kept images' budget sees it: what it weighs and whether a run maps it.
 /// The fakes' compiles link nothing, so only a test of the budget ([`super::job`]'s `Paths`)
 /// makes one.

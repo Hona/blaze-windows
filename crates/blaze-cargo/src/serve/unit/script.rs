@@ -154,12 +154,19 @@ fn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {
     }
     let units = job.units();
     let Some(u) = units.graph.units.get(compile) else { return Ok(None) };
-    let root = u.target.src_path.to_string_lossy().into_owned();
+    let root = script_root(&u.target.src_path);
     // A root file whose bytes fail their check stopped the job as it was lowered.
-    let Ok(Some((_, _, bytes))) = job.mounted.read(&root) else { return Ok(None) };
+    let Some((_, _, bytes)) = job.mounted.read(&root).map_err(|why| format!("reading build script {root}: {why}"))? else { return Ok(None) };
     let Some(plan) = units.plans.get(compile) else { return Ok(None) };
-    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
-    Ok(script::inert(Path::new(&root), &files, &plan.rustflags))
+    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(root.as_ref()), bytes.to_vec())].into();
+    Ok(script::inert(Path::new(root.as_ref()), &files, &plan.rustflags))
+}
+
+/// A target's `src_path` is a daemon name, but its PathBuf may have acquired a native
+/// separator on the join with the target's relative path. Mounted reads use `/`.
+fn script_root(path: &Path) -> std::borrow::Cow<'_, str> {
+    let root = path.to_string_lossy();
+    if cfg!(windows) && root.contains('\\') { root.replace('\\', "/").into() } else { root }
 }
 
 /// What std's own build script compiled by unit `compile` prints, from blaze's port of it
@@ -173,9 +180,7 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
         units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
     let package = package_of(units, u).map_err(|it| it.what)?;
     let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
-    let root = u.target.src_path.to_string_lossy();
-    // On Windows a `Path::join` puts a `\` in the daemon's `/`-separated names.
-    let root = if cfg!(windows) { root.replace('\\', "/").into() } else { root };
+    let root = script_root(&u.target.src_path);
     let read = |path: &str| match job.mounted.read(path) {
         Ok(Some((_, _, bytes))) => Ok(bytes),
         Ok(None) => Err(format!("{path} is not among the build's files")),
@@ -1530,6 +1535,10 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
             // alloc: once a miss
             .collect();
         let mut miss = blaze_kernel::Miss::of_parts(RUN, subject, item, hasher.finish(), parts);
+        if prepared.spec.mode == blaze_usercode::run::Mode::Unobserved {
+            miss.missed = blaze_kernel::Missed::Always(crate::sandbox::v2::NOT_TRACED_ON_WINDOWS.into());
+            return miss;
+        }
         miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
         miss
     })

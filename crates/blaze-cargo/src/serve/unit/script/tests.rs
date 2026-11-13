@@ -468,6 +468,13 @@ fn a_developer_prompt_is_set_over_the_jobs_environment_once_per_name() {
 }
 #[cfg(windows)]
 #[test]
+fn a_joined_build_script_name_is_a_mounted_name_before_elision() {
+    let path = Path::new("/C:/src").join("build.rs");
+    assert_eq!(super::script_root(&path), "/C:/src/build.rs");
+}
+
+#[cfg(windows)]
+#[test]
 fn fetched_native_inputs_stop_at_the_archive_or_git_revision() {
     let sources = std::path::Path::new(r"D:\sources");
     for (package, payload) in [

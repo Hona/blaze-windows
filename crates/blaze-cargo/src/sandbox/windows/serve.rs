@@ -5,8 +5,8 @@
 //! [`super::super::v2::launch_with`] of [`super::run`] on a thread of its own, which writes the
 //! report as `blaze sandbox --v2` does and then the run's [`Answer`], whole, on standard output.
 //!
-//! What a launcher of one run makes again each time is made once here: the container's and the
-//! well-known SIDs ([`super::kept`]), the session lock's handle, and the read checks
+//! What a launcher of one run makes again each time is made once here: the well-known SIDs
+//! ([`super::kept`]), the session lock's handle, and the read checks
 //! ([`super::reads`]). So a run is one process creation, the program's.
 //!
 //! A fault ends the launcher: a frame it can't read, an answer it can't write, a thread it can't
