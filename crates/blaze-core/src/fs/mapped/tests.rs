@@ -143,7 +143,8 @@ fn a_mapping_keeps_its_length_when_the_file_grows() {
     std::fs::write(&path, pattern(5000, 11)).unwrap();
     // SAFETY: the file is only appended to below, past the mapped length, so no byte under the
     // slice changes; it is never written in place or cut.
-    let mapped = unsafe { Mapped::open(&path) }.unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let mapped = unsafe { Mapped::map(&file) }.unwrap();
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -154,6 +155,23 @@ fn a_mapping_keeps_its_length_when_the_file_grows() {
     assert_eq!(mapped.bytes(), &pattern(5000, 11)[..]);
     assert!(mapped.get(5000).is_none());
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 14_000);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_mapped_generation_excludes_writers_in_both_open_orders() {
+    let path = dir("sealed").join("image");
+    std::fs::write(&path, b"generation").unwrap();
+    let writer = || std::fs::File::options().write(true).open(&path);
+    let write = writer().unwrap();
+    // SAFETY: never write bytes under a view, including if the expected refusal is broken.
+    let map = || unsafe { Mapped::open(&path) };
+    assert_eq!(map().unwrap_err().raw_os_error(), Some(32));
+    drop(write);
+    let read = map().unwrap();
+    assert_eq!(writer().unwrap_err().raw_os_error(), Some(32));
+    drop(read);
+    writer().unwrap();
 }
 
 #[test]

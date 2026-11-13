@@ -8,6 +8,26 @@ mod mapped;
 pub(crate) use mapped::map;
 pub use mapped::{Advice, MapOptions, Mapped};
 
+mod patch;
+pub(crate) use patch::matches_patch;
+#[cfg(windows)]
+pub(crate) use patch::{PATCH_PUBLICATION, PublishStep};
+
+pub(crate) fn sparse_file(path: &Path, len: u64) -> io::Result<()> {
+    let file = making_parent(path, || OpenOptions::new().write(true).create_new(true).open(path))?;
+    #[cfg(windows)]
+    crate::iocp::files::sparse_output(&file)?;
+    file.set_len(len)
+}
+#[cfg(windows)]
+pub(crate) use crate::iocp::files::try_patch;
+
+#[cfg(not(windows))]
+pub(crate) fn try_patch(_: &Path, _: u64, _: &[(u64, Vec<u8>)], _: &[(u64, Vec<u8>)]) -> io::Result<bool> {
+    // Unix advisory locks cannot exclude other writers or existing file mappings.
+    Ok(false)
+}
+
 mod private;
 
 pub(crate) use private::private;

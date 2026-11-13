@@ -40,6 +40,7 @@ pub(crate) mod global_asm;
 pub(crate) mod hashes;
 pub(crate) mod linked;
 mod lowered;
+mod modules;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;

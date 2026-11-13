@@ -6,14 +6,7 @@
 //! there: `const _: () = { #[used] static .. };` is how a constructor is registered.
 
 use base_db::{Crate, Db};
-use hir_def::{
-    AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId,
-    StaticId,
-    attrs::AttrFlags,
-    expr_store::ExpressionStore,
-    nameres::{DefMap, crate_def_map},
-    signatures::{FunctionSignature, StaticFlags, StaticSignature},
-};
+use hir_def::{AssocItemId, AttrDefId, FunctionId, ModuleDefId, StaticId, attrs::AttrFlags};
 
 use crate::{exported_static, exported_symbol, linked_symbol};
 
@@ -27,73 +20,29 @@ pub(super) struct Kept {
 /// Once per crate and revision of it: the standard library's is found once a daemon.
 #[blaze_query::tracked(returns(ref))]
 pub(super) fn kept(db: &Db, krate: Crate) -> Kept {
-    // alloc: once a crate a revision, the memo's lists and the walk's two stacks
+    // alloc: once a crate a revision, the memo's lists
     let (mut functions, mut statics) = (Vec::new(), Vec::new());
-    // alloc: as above
-    let mut bodies = Vec::new();
-    // alloc: as above
-    let mut maps: Vec<&DefMap> = vec![crate_def_map(db, krate)];
-    while let Some(def_map) = maps.pop() {
-        for (_, data) in def_map.modules(db) {
-            let scope = data.scope(db);
-            for def in scope.declarations() {
-                match def {
-                    ModuleDefId::FunctionId(func) => {
-                        if FunctionSignature::of(db, func).has_body() {
-                            bodies.push(DefWithBodyId::FunctionId(func));
-                        }
-                        if keeps_function(db, func) {
-                            functions.push(func);
-                        }
-                    }
-                    ModuleDefId::StaticId(value) => {
-                        if !StaticSignature::of(db, value).flags.contains(StaticFlags::EXTERN) {
-                            bodies.push(DefWithBodyId::StaticId(value));
-                        }
-                        if keeps_static(db, value) {
-                            statics.push(value);
-                        }
-                    }
-                    ModuleDefId::ConstId(it) => bodies.push(DefWithBodyId::ConstId(it)),
-                    ModuleDefId::TraitId(it) => {
-                        for &(_, item) in it.trait_items(db).items.iter() {
-                            assoc_body(db, item, &mut bodies);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for it in scope.unnamed_consts() {
-                bodies.push(DefWithBodyId::ConstId(it));
-            }
-            for imp in scope.impls() {
-                for &(_, item) in imp.impl_items(db).items.iter() {
-                    if let AssocItemId::FunctionId(func) = item
-                        && keeps_function(db, func)
-                    {
-                        functions.push(func);
-                    }
-                    assoc_body(db, item, &mut bodies);
-                }
+    for &module in super::super::modules::declaring_modules(db, krate) {
+        let data = module.def_map(db).module(db, module);
+        let scope = data.scope(db);
+        for def in scope.declarations() {
+            match def {
+                ModuleDefId::FunctionId(func) if keeps_function(db, func) => functions.push(func),
+                ModuleDefId::StaticId(value) if keeps_static(db, value) => statics.push(value),
+                _ => {}
             }
         }
-        for owner in bodies.drain(..) {
-            let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(owner));
-            maps.extend(store.blocks(db).map(|(_, map)| map));
+        for imp in scope.impls() {
+            for &(_, item) in imp.impl_items(db).items.iter() {
+                if let AssocItemId::FunctionId(func) = item
+                    && keeps_function(db, func)
+                {
+                    functions.push(func);
+                }
+            }
         }
     }
     Kept { functions: functions.into(), statics: statics.into() }
-}
-
-fn assoc_body(db: &Db, item: AssocItemId, bodies: &mut Vec<DefWithBodyId>) {
-    match item {
-        AssocItemId::FunctionId(it) if FunctionSignature::of(db, it).has_body() => {
-            bodies.push(DefWithBodyId::FunctionId(it))
-        }
-        AssocItemId::FunctionId(_) => {}
-        AssocItemId::ConstId(it) => bodies.push(DefWithBodyId::ConstId(it)),
-        AssocItemId::TypeAliasId(_) => {}
-    }
 }
 
 /// A generic one is left out, as rustc leaves it (`no_mangle_generic_items`).

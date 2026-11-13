@@ -328,7 +328,12 @@ impl Writing {
                 // clone: the effect owns the name; once per place
                 let file = self.temp.clone();
                 self.span = step_span(&self.to, "cut it to its length", 0);
-                effects.push(Effect::Truncate { file, len: self.len, tag: ask(Step::Cut) });
+                let tag = ask(Step::Cut);
+                effects.push(if self.over || !cfg!(windows) {
+                    Effect::Truncate { file, len: self.len, tag }
+                } else {
+                    Effect::SparseFile { file, len: self.len, tag }
+                });
                 Next::Going
             }
             // alloc: an error, once per place that fails

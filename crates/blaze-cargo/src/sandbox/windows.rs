@@ -4,7 +4,7 @@
 //!
 //! A process in an AppContainer opens a file only where the file's DACL lets its user and also
 //! the container's SID, a capability SID the process holds, or ALL APPLICATION PACKAGES (the
-//! system's own directories) open it. The container is one profile, [`PROFILE`], made once; the
+//! system's own directories) open it. The container has a fresh profile per run; the
 //! reads a spec names are granted to a distinct capability per root, inheritably, and kept. Only
 //! runs which name the root hold its capability. Writes are granted for one run to a capability SID of the run's own, derived from a
 //! random name no other process holds, and taken back as the run ends: a grant a killed launcher
@@ -18,7 +18,7 @@
 //! A run is started by `blaze sandbox --v2`, one process a run, or by the warm launcher
 //! (`blaze sandbox --v2-serve`, [`serve`]), one process a daemon, which runs each on a thread of
 //! its own with the standard handles and the job its driver handed it ([`Given`]). What does not
-//! change from run to run is made once a process: the container's and the well-known SIDs
+//! change from run to run is made once a process: the well-known SIDs
 //! ([`Kept`]) and the session lock's handle; in the warm launcher also the read checks
 //! ([`reads`]).
 //!
@@ -49,7 +49,7 @@ use blaze_usercode::confine::Spec;
 use windows_sys::{
     Win32::{
         Foundation::{
-            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
+            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle,
             ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
             GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
             INVALID_HANDLE_VALUE, LocalFree, STATUS_CONTROL_C_EXIT, WAIT_ABANDONED, WAIT_FAILED,
@@ -63,10 +63,10 @@ use windows_sys::{
                 NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW,
                 SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
             },
-            CONTAINER_INHERIT_ACE, CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+            CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
             DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetAce, GetAclInformation,
             GetLengthSid, INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor,
-            Isolation::{CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName},
+            Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile},
             NO_INHERITANCE, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
             PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
             SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
@@ -116,12 +116,9 @@ use windows_sys::{
             },
         },
     },
-    core::{BOOL, HRESULT},
+    core::BOOL,
 };
 
-/// The AppContainer profile every run is in.
-// Do not inherit the earlier profile's accumulated read grants.
-const PROFILE: &str = "blaze.sandbox.roots";
 
 /// What a read grant gives: open, list, read and run.
 const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
@@ -129,8 +126,6 @@ const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 /// What a write grant gives.
 const WRITE: u32 = FILE_ALL_ACCESS;
 
-/// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)`: the profile was made before.
-const PROFILE_EXISTS: HRESULT = (0x8007_0000 | ERROR_ALREADY_EXISTS) as HRESULT;
 
 /// The lock every launcher of the session holds while it changes a DACL: a change reads the
 /// DACL and writes it whole, and two at once would lose one's entry.
@@ -283,9 +278,9 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     env.push(("TMP".into(), temp.clone().into_os_string()));
     env.push(("TEMP".into(), temp.into_os_string()));
     // Windows makes an AppContainer's process only with `LOCALAPPDATA` in its environment,
-    // which it points at the container's own folder (`Packages\blaze.sandbox\AC`): without it
+    // which it points at the container's own folder (`Packages\<profile>\AC`): without it
     // CreateProcessW fails with ERROR_ENVVAR_NOT_FOUND (203). What the program sees is that
-    // folder, the same for every run, never the user's.
+    // folder, private to the run, never the user's.
     let named = |name: &str| env.iter().any(|(it, _)| it.eq_ignore_ascii_case(name));
     if !named("LOCALAPPDATA") {
         let local = std::env::var_os("LOCALAPPDATA").filter(|it| !it.is_empty()).ok_or_else(|| {
@@ -386,17 +381,17 @@ struct Made {
     _jobs: Box<[HANDLE; 1]>,
     kept: &'static Kept,
     reads: Vec<Capability>,
+    container: Container,
     run: Capability,
     job: Handle,
     standard: [Option<Handle>; 3],
     inherited: Vec<HANDLE>,
 }
 
-/// The SIDs every run of the process shares, made by its first and kept: the container's, ALL
-/// APPLICATION PACKAGES' and the three network capabilities'. Copied into buffers of their own,
+/// The SIDs every run of the process shares, made by its first and kept: ALL
+/// APPLICATION PACKAGES' and the three network capabilities'. Stored in buffers of their own,
 /// so a static holds plain bytes.
 struct Kept {
-    container: SidBuffer,
     any: SidBuffer,
     network: [SidBuffer; 3],
 }
@@ -412,9 +407,7 @@ fn kept() -> Result<&'static Kept, String> {
     if let Some(kept) = KEPT.get() {
         return Ok(kept);
     }
-    let container = Container::open()?;
     let made = Kept {
-        container: copied(container.0, "the sandbox's AppContainer")?,
         any: well_known(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?,
         network: [
             well_known(WinCapabilityInternetClientSid, "the internetClient capability")?,
@@ -431,18 +424,6 @@ fn kept() -> Result<&'static Kept, String> {
     Ok(KEPT.get_or_init(|| made))
 }
 
-/// A copy of `sid` in a buffer of its own.
-fn copied(sid: PSID, what: &str) -> Result<SidBuffer, String> {
-    let mut buffer: SidBuffer = [0; (SECURITY_MAX_SID_SIZE / 4) as usize];
-    // SAFETY: `buffer` is SECURITY_MAX_SID_SIZE bytes, the length the call is told, live and
-    // exclusive for it and aligned for a SID's `u32` fields; `sid` is a valid SID its caller
-    // holds for the call ([`Container`]), which only reads it.
-    if unsafe { CopySid(SECURITY_MAX_SID_SIZE, buffer.as_mut_ptr().cast(), sid) } == 0 {
-        // alloc: the error, once, and the sandbox stops.
-        return Err(failed(format!("copying the SID of {what}"), "CopySid"));
-    }
-    Ok(buffer)
-}
 
 fn make(network: bool, given: Given) -> Result<Made, String> {
     make_with(network, given, Vec::new())
@@ -450,6 +431,7 @@ fn make(network: bool, given: Given) -> Result<Made, String> {
 
 fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made, String> {
     let kept = kept()?;
+    let container = Container::new()?;
     let run = Capability::new()?;
     let enabled = SE_GROUP_ENABLED as u32;
     let mut granted = Vec::with_capacity(1 + kept.network.len() + reads.len());
@@ -462,7 +444,7 @@ fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made
     }
     // alloc: once per sandbox, where the attribute list's pointers into it stay put ([`Made`]).
     let capabilities = Box::new(SECURITY_CAPABILITIES {
-        AppContainerSid: sid(&kept.container),
+        AppContainerSid: container.sid,
         Capabilities: granted.as_mut_ptr(),
         CapabilityCount: granted.len() as u32,
         Reserved: 0,
@@ -522,6 +504,7 @@ fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made
         _jobs: jobs,
         kept,
         reads,
+        container,
         run,
         job,
         standard,
@@ -590,25 +573,16 @@ impl Drop for Handle {
     }
 }
 
-/// The SID of the [`PROFILE`] container, made the first time.
-struct Container(PSID);
+/// One run's profile. A killed launcher may leave its profile behind; no run adopts one.
+struct Container { sid: PSID, name: Vec<u16> }
 
 impl Container {
-    fn open() -> Result<Container, String> {
-        let name = literal(PROFILE);
+    fn new() -> Result<Container, String> {
+        let name = literal(&format!("blaze.run.{:032x}", std::random::random::<u128>(..)));
         let shown = literal("blaze sandbox");
         let mut sid: PSID = null_mut();
-        // The folder CreateAppContainerProfile makes: while it is there the profile is, and the
-        // SID is derived with no registry write. Without it, or without `LOCALAPPDATA` to find
-        // it by, the profile is made (or found) as on a first run, never assumed.
-        let made_already = std::env::var_os("LOCALAPPDATA")
-            .is_some_and(|local| directory(&Path::new(&local).join("Packages").join(PROFILE)));
-        let made = match made_already {
-            true => PROFILE_EXISTS,
-            // SAFETY: `name` and `shown` end in NUL (`literal`) and live in this frame for the
-            // call, which only reads them; a null list of 0 capabilities is read as none; `sid`
-            // is a live PSID for it to set, freed by `Container`'s drop.
-            false => unsafe {
+        // SAFETY: the name and description end in NUL. The SID goes to the sole owner below.
+        let made = unsafe {
                 CreateAppContainerProfile(
                     name.as_ptr(),
                     shown.as_ptr(),
@@ -617,41 +591,28 @@ impl Container {
                     0,
                     &mut sid,
                 )
-            },
         };
-        if made == PROFILE_EXISTS {
-            // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; `sid`, still null
-            // as CreateAppContainerProfile failed, is a live PSID for the call to set.
-            let found =
-                unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
-            if found < 0 {
-                return Err(failed_with(
-                    // alloc: the error, once, and the sandbox stops.
-                    format!("finding the sandbox's AppContainer profile {PROFILE}"),
-                    "DeriveAppContainerSidFromAppContainerName",
-                    found,
-                ));
-            }
-        } else if made < 0 {
+        if made < 0 {
             return Err(failed_with(
                 // alloc: the error, once, and the sandbox stops.
-                format!("making the sandbox's AppContainer profile {PROFILE}"),
+                "making the run's private AppContainer profile",
                 "CreateAppContainerProfile",
                 made,
             ));
         }
-        Ok(Container(sid))
+        Ok(Container { sid, name })
     }
 }
 
 impl Drop for Container {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: `self.0` is the SID CreateAppContainerProfile or
-            // DeriveAppContainerSidFromAppContainerName made (`open`), which both say to free
-            // with FreeSid, and `Container` is never copied, so this frees it once.
-            unsafe { FreeSid(self.0) };
+        // SAFETY: the name is the original NUL-terminated name this run created.
+        let removed = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+        if removed < 0 {
+            eprintln!("blaze: removing the sandbox profile {} failed ({removed:#x})", String::from_utf16_lossy(&self.name[..self.name.len()-1]));
         }
+        // SAFETY: the profile creation returned this SID to its sole owner.
+        unsafe { FreeSid(self.sid) };
     }
 }
 
@@ -1863,7 +1824,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
         let made = make(false, Given::own()).unwrap();
-        let readers = [sid(&made.kept.container), sid(&made.kept.any)];
+        let readers = [made.container.sid, sid(&made.kept.any)];
         for (path, is_dir) in [(&dir, true), (&file, false)] {
             let before = covered(path, &readers, READ, "test").unwrap().unwrap();
             assert_eq!(before.dir, is_dir, "{}", path.display());
@@ -1909,7 +1870,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
         let made = make(false, Given::own()).unwrap();
-        let readers = [sid(&made.kept.container), sid(&made.kept.any)];
+        let readers = [made.container.sid, sid(&made.kept.any)];
         let windows = std::env::var_os("SystemRoot")
             .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         for path in
@@ -2180,7 +2141,7 @@ mod tests {
     }
 
     /// A read grant left on a file must not give it to the next script. Only Windows' token
-    /// access check can establish this; both runs use the same AppContainer profile.
+    /// access check can establish this; the persistent read grant is still on disk.
     #[test]
     fn an_external_input_is_read_only_by_runs_given_that_root() {
         let base = tempfile::tempdir().unwrap();
@@ -2201,6 +2162,22 @@ mod tests {
         assert_eq!(run(&spec, Given::own()), Ok(0));
         spec.read.clear();
         assert_ne!(run(&spec, Given::own()).unwrap(), 0);
+    }
+
+    #[test]
+    fn local_app_data_is_private_to_one_run_even_when_the_next_spec_is_identical() {
+        let base = tempfile::tempdir().unwrap();
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        // This script exits 37 if it inherited any earlier run's marker, and 1 if it could
+        // not create its own. Test the kernel-provided path, not an environment block.
+        std::fs::write(base.path().join("check.cmd"), b"@echo off\r\nif exist \"%LOCALAPPDATA%\\marker\" exit /b 37\r\necho marker>\"%LOCALAPPDATA%\\marker\"\r\nif not exist \"%LOCALAPPDATA%\\marker\" exit /b 1\r\nexit /b 0\r\n").unwrap();
+        let spec = Spec {
+            program: root.join(r"System32\cmd.exe"), args: ["/d", "/c", "check.cmd"].map(Into::into).into(),
+            env: vec![("SystemRoot".into(), root.into())], dir: base.path().into(),
+            read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new(),
+            live: base.path().join("live"), report: base.path().join("report"), not_inputs: Vec::new(), given: None,
+        };
+        for _ in 0..2 { assert_eq!(run(&spec, Given::own()), Ok(0)); }
     }
 
     /// MSVC's C compiler, run in the sandbox as `cc` runs it from a build script: found by the

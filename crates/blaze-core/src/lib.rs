@@ -404,6 +404,21 @@ pub enum Effect {
         bytes: Vec<u8>,
         tag: Tag,
     },
+    /// Publish an edit by taking exclusive custody of its previous file. `whole` is a
+    /// byte-for-byte witness of the result, holes included: no path stamp authenticates
+    /// the base. `Patched(false)` means custody or the base was unavailable, before any
+    /// edit. Once editing begins a failure is an error, never a request to try again.
+    TryPatch {
+        file: FileName,
+        len: u64,
+        delta: Vec<(u64, Vec<u8>)>,
+        whole: std::sync::Arc<Vec<(u64, Vec<u8>)>>,
+        tag: Tag,
+    },
+    /// Create a fresh, exclusive staged output of `len` zero bytes. Holes cost no
+    /// blocks on sparse-capable volumes. Unlike Truncate this never resizes a file
+    /// that another publisher already owns. Completes with Truncated.
+    SparseFile { file: FileName, len: u64, tag: Tag },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
     /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
@@ -803,6 +818,8 @@ impl Effect {
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
             | Effect::WriteUnsynced { tag, .. }
+            | Effect::TryPatch { tag, .. }
+            | Effect::SparseFile { tag, .. }
             | Effect::List { tag, .. }
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
@@ -1127,6 +1144,8 @@ pub enum Done {
     WrittenBack,
     Truncated,
     Written,
+    /// Of TryPatch: published, or not a base the driver can take into custody.
+    Patched(bool),
     Listed(Vec<(FileName, Meta)>),
     Renamed,
     Moded,

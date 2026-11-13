@@ -1140,7 +1140,7 @@ fn repr_hints_read_as_the_string_match_did() {
 fn old_parse_link_tt(
     root: view::Node<'_>,
     tt: &ast::TokenTree,
-) -> Option<(NativeLib, Option<cfg::CfgExpr>)> {
+) -> Option<NativeLib> {
     use syntax::{AstToken, NodeOrToken, SyntaxKind, T, ast::TokenTreeChildren};
 
     let mut lib = NativeLib {
@@ -1151,8 +1151,8 @@ fn old_parse_link_tt(
         bundle: true,
         as_needed: None,
         import_name_type: None,
+        cfg: None,
     };
-    let mut cfg = None;
     let mut named = false;
     let mut children = TokenTreeChildren::new(tt).peekable();
     while let Some(child) = children.next() {
@@ -1162,7 +1162,7 @@ fn old_parse_link_tt(
         }
         match children.peek() {
             Some(NodeOrToken::Node(group)) if key.text() == "cfg" => {
-                cfg = link_cfg(view_of(root, group));
+                lib.cfg = link_cfg(view_of(root, group));
                 children.next();
             }
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
@@ -1206,7 +1206,7 @@ fn old_parse_link_tt(
             _ => (),
         }
     }
-    named.then_some((lib, cfg))
+    named.then_some(lib)
 }
 
 #[test]
@@ -1259,7 +1259,7 @@ fn link_attrs_read_as_the_string_match_did() {
 
 #[test]
 fn link_keeps_what_blaze_cannot_link() {
-    let lib = |attr: &str| parse_link_tt(tt_in(&parse_of(attr))).unwrap().0;
+    let lib = |attr: &str| parse_link_tt(tt_in(&parse_of(attr))).unwrap();
     let other = lib("#[link(name = \"a\", kind = \"link-arg\")]");
     assert_eq!(other.kind, NativeLibKind::Other(Symbol::intern("link-arg")));
     assert_eq!(lib("#[link(name = \"a\")]").as_needed, None);

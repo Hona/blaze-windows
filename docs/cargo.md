@@ -690,7 +690,9 @@ workspace of its own. The machine is read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;
 there is no network but the sandbox's own loopback. Its package's directory, the workspace and
-the target directory are seen as they are, even below `/tmp` or `/dev/shm`. On macOS the
+the target directory are seen as they are, even below `/tmp` or `/dev/shm`; a git dependency's
+script sees its whole repository at the commit (blaze's checkout of it), as cargo's checkout
+lets it read an asset beside its package (`../../packages/fonts/assets`). On macOS the
 per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`, `/var/folders/../C`) is writable
 too: clang's module cache, `xcrun`'s and the Metal compiler's live there, are found by
 `confstr` and not by a variable a private one could be named in, and check what they cache.

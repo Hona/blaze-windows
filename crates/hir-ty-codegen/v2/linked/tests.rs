@@ -10,8 +10,8 @@ use blaze_codegen::{
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
-use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
 use hegel::generators as gs;
+use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
@@ -36,6 +36,37 @@ fn lib(name: &str, kind: NativeLibKind) -> NativeLib {
 
 fn import(symbol: &str, ordinal: Option<u16>, data: bool) -> RawImport {
     RawImport { symbol: symbol.to_owned(), ordinal, data }
+}
+
+/// Native libraries belong to the crate, not to the scope or reachability of their wrapper.
+#[test]
+fn bodies_contribute_their_native_libraries() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+macro_rules! import { () => {
+    #[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" { fn PropVariantClear(p: *mut u8) -> i32; }
+} }
+fn clear(p: *mut u8) -> i32 { import!(); unsafe { PropVariantClear(p) } }
+const _: () = { fn nested() { #[link(name = "other")] extern "C" {} } };
+"#,
+    );
+    let krate = fixture::test_crate(db);
+    let mut libs = frontend.linked(krate, krate).unwrap();
+    libs.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        libs,
+        [
+            NativeLib {
+                name: "ole32.dll".into(),
+                kind: NativeLibKind::RawDylib,
+                verbatim: true,
+                imports: vec![import("PropVariantClear", None, false)],
+            },
+            lib("other", NativeLibKind::Dylib)
+        ]
+    );
 }
 
 /// A `raw-dylib` block's library lists its items as the code names them (a `link_name` over
@@ -64,7 +95,7 @@ extern "system" {
 }
 "#,
     );
-    let mut libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    let mut libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
     for lib in &mut libs {
         lib.imports.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     }
@@ -134,7 +165,7 @@ extern "C" {
 }
 "#,
     );
-    let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+    let error = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
     assert!(error.what.contains("`#[link_ordinal(65536)]` on `far`"), "{}", error.what);
 }
 
@@ -155,7 +186,7 @@ extern "C" {}
 extern "C" {}
 "#,
     );
-    let libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    let libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
     assert_eq!(
         libs,
         [
@@ -170,6 +201,29 @@ extern "C" {}
             },
         ]
     );
+}
+
+/// A `#[link(.., cfg(..))]` is decided by the cfg of the crate that links the program, not of
+/// the crate that names it, as rustc's `relevant_lib` decides it in the linking session: core,
+/// built without `+crt-static`, names `/defaultlib:libcmt` under `cfg(target_feature =
+/// "crt-static")` and `/defaultlib:msvcrt` under its negation, and a program built with
+/// `+crt-static` links the first (it linked the second, and the link refused it as LNK2038).
+#[test]
+fn a_links_cfg_is_the_linking_crates() {
+    let (db, frontend) = frontend(
+        r#"
+//- /dep.rs crate:dep
+#[link(name = "static_crt", cfg(target_feature = "crt-static"))]
+#[link(name = "dynamic_crt", cfg(not(target_feature = "crt-static")))]
+extern "C" {}
+//- /main.rs crate:main deps:dep cfg:target_feature=crt-static
+"#,
+    );
+    let main = fixture::test_crate(&db);
+    let dep = main.data(&*db).dependencies[0].crate_id;
+    assert_eq!(frontend.linked(dep, main).unwrap(), [lib("static_crt", NativeLibKind::Dylib)]);
+    // Control: linked by a crate without the feature, the block's other library.
+    assert_eq!(frontend.linked(dep, dep).unwrap(), [lib("dynamic_crt", NativeLibKind::Dylib)]);
 }
 
 #[test]
@@ -197,7 +251,8 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ),
     ] {
         let (db, frontend) = frontend(text);
-        let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+        let error =
+            frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
         assert!(error.what.contains(named), "{text}: {}", error.what);
     }
 }
@@ -449,12 +504,18 @@ impl Program {
             let owner = DefWithBodyId::FunctionId(func);
             let store = BodyStore::of(db, owner);
             let mut lines = vec![
-                Line { at: 0, span: hashes.span(db, owner, MirSpan::ExprId(store.root_expr())).unwrap() },
+                Line {
+                    at: 0,
+                    span: hashes.span(db, owner, MirSpan::ExprId(store.root_expr())).unwrap(),
+                },
                 Line { at: 1, span: hashes.declaration(db, func).unwrap() },
             ];
             if self.bodies[at].2 {
                 let pat = store.pat_ids().next().expect("the parameter's pattern");
-                lines.push(Line { at: 2, span: hashes.span(db, owner, MirSpan::PatId(pat)).unwrap() });
+                lines.push(Line {
+                    at: 2,
+                    span: hashes.span(db, owner, MirSpan::PatId(pat)).unwrap(),
+                });
             }
             let mut compiled = compiled(0, lines);
             compiled.key = self.key(at);
@@ -519,7 +580,9 @@ fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork
         if given.serial != serial {
             if given.base != Some(serial) {
                 if given.base.is_some() {
-                    return Err(format!("step {step} ({edit:?}): a change of a snapshot never given"));
+                    return Err(format!(
+                        "step {step} ({edit:?}): a change of a snapshot never given"
+                    ));
                 }
                 held.clear();
             }

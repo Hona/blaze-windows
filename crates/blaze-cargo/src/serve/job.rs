@@ -6869,9 +6869,8 @@ impl<S: Steps> Jobs<S> {
     /// the patch where the path's record says it holds that file: the file is looked at
     /// first ([`Own::LookBase`]), since a file changed or removed since it was placed is no
     /// base. Where the record names another value or none, the whole file is placed, and so
-    /// it is wherever the store's volume shares no blocks: a patch is written into a clone of
-    /// the path's file, and there a copy of that file would write as much as the whole file
-    /// does, and read it too.
+    /// it is on unshared volumes without exclusive file custody. On Windows an unshared
+    /// volume can patch the leased file: the driver checks the result's bytes before writing.
     fn place_made(
         &mut self,
         w: &mut World<'_, S>,
@@ -6882,7 +6881,7 @@ impl<S: Steps> Jobs<S> {
         made: Arc<Made>,
     ) {
         let based = match &*made {
-            Made::Patch { .. } if w.store.sharing() == blaze_core::Sharing::Unshared => false,
+            Made::Patch { .. } if !cfg!(windows) && w.store.sharing() == blaze_core::Sharing::Unshared => false,
             Made::Patch { base, .. } => self.paths.placed[path as usize]
                 .as_ref()
                 .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
@@ -6949,6 +6948,9 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let tag = match (made, over) {
+            (Made::Patch { file: patch, whole, .. }, true) if w.store.sharing() == blaze_core::Sharing::Unshared => {
+                w.store.place_edit(file, patch.clone(), whole(), w.effects)
+            }
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
             (Made::Patch { file: patch, .. }, true) => {

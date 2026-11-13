@@ -259,7 +259,9 @@ fn const_promoted<'a>(
             if is_call(ctx, expr) {
                 return true;
             }
-            ctx.store.walk_child_exprs(expr, |it| stack.push(it));
+            if !matches!(ctx.store.expr(expr), Expr::Closure { .. }) {
+                ctx.store.walk_child_exprs(expr, |it| stack.push(it));
+            }
         }
         false
     };
@@ -359,6 +361,7 @@ fn const_promotable(
     let promotable = |it: hir_def::hir::ExprId| const_promotable(ctx, body, it, depth + 1);
     match ctx.store.expr(expr) {
         Expr::Literal(_) => true,
+        Expr::Closure { .. } => ctx.infer.constant_closure_pointer(expr),
         Expr::Path(path) => {
             // Associated constants are resolved by type inference, not value-name lookup.
             if matches!(

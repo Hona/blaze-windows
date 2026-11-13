@@ -69,7 +69,16 @@ impl Locks {
             path.push(file.as_str());
             let path: &Path = path;
             let open = || {
-                OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+                let mut open = OpenOptions::new();
+                open.read(true).write(true).create(true).truncate(false);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt as _;
+                    // OPEN_ALWAYS may create the name; the lock itself needs only read
+                    // access. A postmortem maps the file under this lock, excluding writers.
+                    open.access_mode(windows_sys::Win32::Foundation::GENERIC_READ);
+                }
+                open.open(path)
             };
             fs::making_parent(path, open)
         });

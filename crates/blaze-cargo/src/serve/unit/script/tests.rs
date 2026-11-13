@@ -9,7 +9,7 @@ use blaze_usercode::run::OutFile;
 
 use super::{
     BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing,
-    checkout_without_git, failure, file_name, out_files, rechecks_in, verifies_in, with_reads,
+    checkout_without_git, failure, file_name, git_checkout, out_files, rechecks_in, verifies_in, with_reads,
 };
 
 const RUN: Tag = Tag(5 << 32);
@@ -384,6 +384,26 @@ fn a_package_watch_is_named_and_many_reads_are_folded() {
     assert!(changed[0].starts_with("its other "), "{changed:?}");
 }
 
+/// A git dependency's package is read with its checkout's whole commit, found from the
+/// package's directory in the system's spelling; a registry package or one of the workspace is in
+/// no checkout.
+#[test]
+fn a_git_dependencys_package_is_in_its_checkout_of_the_commit() {
+    let root = "/h/.cache/blaze/sources/git/checkouts/betteroffice-041eea77ca348fb3/ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+    let dir = PathBuf::from(format!("{root}/crates/betteroffice-fonts-intl"));
+    assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    assert_eq!(git_checkout(Path::new(root)), Some(Path::new(root)));
+    let registry = "/h/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f/cc-1.2.0";
+    assert_eq!(git_checkout(Path::new(registry)), None);
+    assert_eq!(git_checkout(Path::new("/w/ed0a3cea5bd24119c4f2e144a978849177e06fcd/app")), None);
+    #[cfg(windows)]
+    {
+        let root = r"C:\Users\u\.blaze\sources\git\checkouts\betteroffice-041eea77ca348fb3\ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+        let dir = PathBuf::from(format!(r"{root}\crates\betteroffice-fonts-intl"));
+        assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    }
+}
+
 /// A script of a git dependency whose `git` found no repository is said to have failed for
 /// blaze's checkout having no `.git`, naming the checkout; any other failure there, and the
 /// same words of a package that is in no checkout, say nothing of it.
@@ -445,4 +465,18 @@ fn a_developer_prompt_is_set_over_the_jobs_environment_once_per_name() {
     folded.sort();
     folded.dedup();
     assert_eq!(folded.len(), names.len(), "{names:?}");
+}
+#[cfg(windows)]
+#[test]
+fn fetched_native_inputs_stop_at_the_archive_or_git_revision() {
+    let sources = std::path::Path::new(r"D:\sources");
+    for (package, payload) in [
+        (r"git\checkouts\font-packs\123abcd\crates\latin", r"git\checkouts\font-packs\123abcd"),
+        (r"registry\src\index\native-src-1.0", r"registry\src\index\native-src-1.0"),
+    ] {
+        assert_eq!(super::fetched_input(sources, &sources.join(package)), Some(sources.join(payload)));
+    }
+    for path in [r"D:\elsewhere", r"D:\sources\git\db\a", r"D:\sources\git\checkouts\x\..\elsewhere"] {
+        assert_eq!(super::fetched_input(sources, std::path::Path::new(path)), None);
+    }
 }

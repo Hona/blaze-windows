@@ -209,6 +209,12 @@ fn work_out(
         // alloc: once per impure script: what the build's report says of it
         hir_ty_pure::Purity::Impure(impure) => return Ok(Purity::Impure(impure.said())),
     };
+    // With no run-time observer, only use a proof whose entire input set is statically
+    // known. In particular an arbitrary READ or PROBE is not an empty set of files, nor
+    // a call to the system clock or RNG a value the Windows launcher supplies.
+    if !crate::sandbox::v2::OBSERVES_READS && !env_only(proved.effects) {
+        return Ok(Purity::Unproved);
+    }
     // A script that asks the time is told the build's `SOURCE_DATE_EPOCH` by its provider
     // (docs/v2/plan/design/determinism.md): the variable is one its key reads. Where a run
     // of it has none, the script is told the system's clock, which nothing can key: it is
@@ -354,6 +360,12 @@ pub(crate) fn check(
     traced: &Traced,
 ) -> Option<Result<Read, String>> {
     let pure = of(job, compile_of(job.units(), run)?)?;
+    if !crate::sandbox::v2::OBSERVES_READS {
+        // `work_out` accepted only an env-only proof. Its environment is keyed by the
+        // complete set of names in the proof, not by names reported by the child. Never
+        // erase a missing observation in order to publish the ordinary sandbox run key.
+        return Some(Ok(Vec::new()));
+    }
     // clone: once per run of a pure script: the two paths its loader reads may come from
     let toolchain = [job.shared.tools.clone(), job.shared.launcher.clone()];
     // The library search path this run was started with, read from its own environment: the
@@ -369,6 +381,28 @@ pub(crate) fn check(
         search: &search,
     };
     Some(pure::check(&unit.package.descr(), &pure.proof, &places, traced).map_err(|it| it.0))
+}
+
+/// Effects a proof can key with no runtime input observer: stdout/stderr, exit, and
+/// reads of its statically enumerated Cargo environment. Unknown future effects refuse.
+fn env_only(effects: hir_ty_pure::Effects) -> bool {
+    use hir_ty_pure::Effects;
+    effects.0 & !Effects::PRINT.union(Effects::EXIT).0 == 0
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::env_only;
+    use hir_ty_pure::Effects;
+
+    #[test]
+    fn an_unobserved_file_lookup_or_external_effect_never_makes_an_env_only_key() {
+        let allowed = Effects::PRINT.union(Effects::EXIT);
+        assert!(env_only(allowed) && env_only(Effects::NONE));
+        for other in [Effects::READ, Effects::PROBE, Effects::WRITE, Effects::SEEDED, Effects::WALL, Effects(128)] {
+            assert!(!env_only(allowed.union(other)));
+        }
+    }
 }
 
 /// Run `run` of a pure script whose pure key found a value verified across checkouts, run

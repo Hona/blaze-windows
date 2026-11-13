@@ -8,13 +8,12 @@ use std::{
     io,
     os::windows::{
         ffi::OsStrExt as _,
-        io::{AsRawHandle as _, AsRawSocket as _, FromRawHandle as _, OwnedHandle},
+        io::{AsRawHandle as _, AsRawSocket, FromRawHandle as _, OwnedHandle},
     },
     path::Path,
     ptr,
 };
 
-use uds_windows::UnixStream;
 use windows_sys::Win32::{
     Foundation::{ERROR_SUCCESS, HANDLE, LocalFree},
     Networking::WinSock::{SIO_AF_UNIX_GETPEERPID, WSAGetLastError, WSAIoctl},
@@ -289,7 +288,7 @@ pub fn only_the_user_opens(path: &Path) -> io::Result<()> {
 /// Turns away a peer that is another user: the socket tells the process at the other end,
 /// and its token the user. A process of another user that this one may not open is turned
 /// away by that.
-pub fn check_peer(stream: &UnixStream) -> io::Result<()> {
+pub fn check_peer(stream: &impl AsRawSocket) -> io::Result<()> {
     let (mut process, mut len) = (0u32, 0u32);
     // SAFETY: the socket is `stream`'s, open for as long as the borrow; `SIO_AF_UNIX_GETPEERPID`
     // writes a `u32`, and `process` is a live `u32` whose size is the length given, so the call
@@ -313,6 +312,9 @@ pub fn check_peer(stream: &UnixStream) -> io::Result<()> {
         // this thread.
         let error = unsafe { WSAGetLastError() };
         return Err(io::Error::from_raw_os_error(error));
+    }
+    if process == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the local socket returned no peer PID"));
     }
     // SAFETY: `OpenProcess` takes no pointer; any `process` is either opened or refused with
     // null. The handle it opens is owned below, so it is closed once.
