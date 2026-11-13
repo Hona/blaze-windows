@@ -1200,8 +1200,20 @@ pub(crate) fn engine(
         blaze_graph::arena::machine_budget(1 << 30, told)
             .context("the memory the daemon's tasks may hold")?,
     );
+    // How outputs get to their paths is the volume's to say, once: a clone where its files
+    // share blocks (ReFS, APFS, Btrfs, XFS with reflinks), their bytes written where they
+    // share none (NTFS, ext4).
+    let sharing_of = |dir: &Path| -> anyhow::Result<blaze_core::Sharing> {
+        let volume = blaze_core::platform::volume(dir)?;
+        tracing::info!(target: "blaze", dir = %dir.display(), system = %volume.system, sharing = volume.sharing.name(), "a store's volume");
+        Ok(volume.sharing)
+    };
+    let store_sharing = sharing_of(&paths.state)?;
+    let std_sharing = sharing_of(&std)?;
     let options = Options {
         state: file_name(&paths.state)?,
+        store_sharing,
+        std_sharing,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,
         sources: file_name(&sources)?,
