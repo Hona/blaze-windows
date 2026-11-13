@@ -994,6 +994,33 @@ fn a_raw_dylib_is_an_import_library_the_link_makes() {
     assert!(error.what.contains("a `raw-dylib` is a Windows DLL"), "{}", error.what);
 }
 
+/// core's `#[link(name = "/defaultlib:msvcrt", modifiers = "+verbatim")]` is the option
+/// link.exe reads it as: a default library, on the line after every library a crate names,
+/// left out by `/NODEFAULTLIB`, and checked against the image's VC runtime. Any other option
+/// is an error naming it.
+#[test]
+fn a_verbatim_defaultlib_is_a_default_library() {
+    let a = temp("verbatim-defaultlib");
+    touch(&a.join("msvcrt.lib"), ARCHIVE);
+    touch(&a.join("foo.lib"), ARCHIVE);
+    let answers = Answers::new().var("LIB", format!("{};", a.display()));
+    let cache = Cache::new();
+    let mut output = executable(&cache, &answers, "x86_64-pc-windows-msvc").unwrap();
+    let verbatim = |name: &str| NativeLib { verbatim: true, ..dylib(name) };
+    let libs = [verbatim("/defaultlib:msvcrt"), dylib("foo")];
+    let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
+    assert_eq!(line(&located), [(a.join("foo.lib"), ARCHIVED), (a.join("msvcrt.lib"), ARCHIVED)]);
+
+    output.link.pe.crt_static = true;
+    let error = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap_err();
+    assert!(error.what.contains("LNK2038"), "{}", error.what);
+    output.link.pe.crt_static = false;
+
+    let error =
+        locate_plain(&cache, &answers, &output, &[verbatim("/merge:.a=.b")], &[]).unwrap_err();
+    assert!(error.what.contains("`/merge:.a=.b` is a linker option"), "{}", error.what);
+}
+
 /// A COFF object whose `.drectve` is `directives`.
 fn coff(directives: &str) -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);

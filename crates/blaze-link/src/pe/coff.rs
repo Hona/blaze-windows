@@ -1362,6 +1362,29 @@ fn default_library(name: &str) -> (&str, &'static str) {
     (name, if file.contains('.') { "" } else { ".lib" })
 }
 
+/// What a `+verbatim` native library named like an option is, as rustc hands its name to
+/// link.exe unchanged and link.exe reads it as an option: the library a `/DEFAULTLIB:NAME`
+/// (or `-defaultlib:NAME`) asks for, named as link.exe names it (`.lib` added when it has no
+/// extension), as core's `#[link(name = "/defaultlib:msvcrt", modifiers = "+verbatim")]`.
+/// `None` for a name that is not an option; an error names any other option.
+pub(crate) fn verbatim_option(name: &str) -> Option<Result<String, String>> {
+    let option = name.strip_prefix(['/', '-'])?;
+    let (option, arg) = option.split_once(':').unwrap_or((option, ""));
+    if !option.eq_ignore_ascii_case("defaultlib") {
+        // alloc: error path
+        return Some(Err(format!(
+            "the `+verbatim` native library `{name}` is a linker option, and blaze's linker \
+             takes only `/DEFAULTLIB:NAME` there"
+        )));
+    }
+    if arg.is_empty() {
+        // alloc: error path
+        return Some(Err(format!("the `+verbatim` native library `{name}` names no library")));
+    }
+    let (stem, extension) = default_library(arg);
+    Some(Ok(join(stem, extension)))
+}
+
 /// The default libraries the members of the COFF archive `bytes` ask for, for finding what a
 /// link takes them with: each member's `/DEFAULTLIB`s less its own `/NODEFAULTLIB`s (none after
 /// a bare one), as `(member, library)` in member order, each library once (the first member
