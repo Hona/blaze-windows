@@ -2096,7 +2096,11 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         // The compile record carries the program; the run's cache is independently keyed.
         // A hit for the compiler must still set up this job's proof and look up its runs,
         // otherwise a script proved pure only finds its result after a *compile miss*.
-        if job.unit(unit)?.target.is_custom_build() && !elided_unbuilt(job, unit)? {
+        // A compiled Windows script also has an independently complete Cargo-rule key.
+        // Rewalking the MIR proof for every already-built program defeats that cache.
+        // Explicit verification still asks both how the run was proved and what it gave.
+        if job.unit(unit)?.target.is_custom_build() && !elided_unbuilt(job, unit)?
+            && (!cfg!(windows) || script::pure::verifies(job)? || script::rechecks(job)?) {
             script::pure::unbuilt(job, reader, unit)?;
         }
         puts.extend(library_puts(job));

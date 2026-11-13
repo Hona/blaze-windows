@@ -30,6 +30,24 @@ use blaze_codegen::InstanceKey;
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
 #[test]
+fn only_immutable_build_scripts_need_no_edit_space() {
+    use super::keeps_patch_room;
+    assert!(!keeps_patch_room(true, false, None)); // crates.io
+    assert!(!keeps_patch_room(true, false, Some("(https://example.org/dep#abc)")));
+    assert!(keeps_patch_room(true, true, None));
+    assert!(keeps_patch_room(true, false, Some("(/C:/dev/path-dep)")));
+    assert!(keeps_patch_room(false, false, None));
+}
+
+#[test]
+fn test_mode_keeps_the_users_entry_without_a_harness() {
+    use super::{Makes, Mode, RootKind, root_kind};
+    let kind = |harness| root_kind(Mode::Test, "printed", &Makes::Executable, false, harness).unwrap();
+    assert_eq!(kind(false), RootKind::Executable);
+    assert_eq!(kind(true), RootKind::Test);
+}
+
+#[test]
 fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
     let target = blaze_lower::target_data(HOST).unwrap();
     let mut workspace = base_db::CrateWorkspaceData {

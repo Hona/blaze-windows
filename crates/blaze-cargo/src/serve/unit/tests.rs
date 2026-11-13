@@ -251,6 +251,8 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
 
     // The dependent's script is told `DEP_Z_INCLUDE`.
     let applied = script::Applied {
+        #[cfg(windows)]
+        result: ContentId::default(),
         package_id: Z.to_owned(),
         links: Some("z".to_owned()),
         output,

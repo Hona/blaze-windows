@@ -2969,6 +2969,8 @@ fn build<'db>(
             unwind_to: None,
             pads: Vec::new_in(frame),
             poison: None,
+            terminate: None,
+            boundary: false,
             exception: None,
             argument_slots: Vec::new_in(frame),
             free_argument_slots: Vec::new_in(frame),
@@ -3830,6 +3832,9 @@ struct FunctionCx<'cx, 'db> {
     /// In an `async` body: the landing pad of what unwinds with nothing to clean up, which
     /// marks the body as panicked.
     poison: Option<ir::Block>,
+    /// The pad that terminates an unwind escaping this function's ABI.
+    terminate: Option<ir::Block>,
+    boundary: bool,
     /// Where the exception is kept while the cleanup blocks run.
     exception: Option<ir::StackSlot>,
     /// The slots the arguments of the calls so far were copied to since the last were
@@ -5782,6 +5787,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn codegen(&mut self) -> Result<()> {
         let body = self.body.expect("MIR body");
+        self.boundary = !self.aborts && !hir_ty_mir::mir::abi_can_unwind(self.abi);
         self.check_bfloat_blocks(body)?;
         let FnAbi { ret, args: mut param_modes } = self.body_abi(body, self.abi)?;
         self.ret_mode = ret;
@@ -11959,11 +11965,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.cg.declare_func_in_func(callee, self.builder.func)
                     }
                 };
-                self.invoke(callee, values)
+                if let InstanceDef::Fn(func) = def && !hir_ty_mir::mir::fn_can_unwind(self.cg.db, func) {
+                    let call = self.builder.ins().call(callee, values);
+                    self.builder.inst_results(call).to_vec() // alloc: the received results
+                } else {
+                    self.invoke(callee, values)
+                }
             }
-            Callee::Pointer(pointer, ..) => {
+            Callee::Pointer(pointer, abi, _) => {
                 let sig = self.builder.import_signature(sig);
-                self.invoke_indirect(sig, pointer, values)
+                if hir_ty_mir::mir::abi_can_unwind(abi) {
+                    self.invoke_indirect(sig, pointer, values)
+                } else {
+                    let call = self.builder.ins().call_indirect(sig, pointer, values);
+                    self.builder.inst_results(call).to_vec() // alloc: the received results
+                }
             }
         };
         self.receive(ret_mode, &mut results.into_iter(), dst, ret_layout);
@@ -15393,7 +15409,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self.guarded_call(pad, false, |builder| builder.ins().call(callee, args));
+            return self.guarded_call(pad, self.boundary, |builder| builder.ins().call(callee, args));
         }
         let sig = self.builder.func.dfg.ext_funcs[callee].signature;
         let (table, after) = self.exception_table(sig, pad);
@@ -15409,7 +15425,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self.guarded_call(pad, false, |builder| {
+            return self.guarded_call(pad, self.boundary, |builder| {
                 builder.ins().call_indirect(sig, pointer, args)
             });
         }
@@ -15439,6 +15455,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.inner_pad;
         }
         let Some(target) = self.unwind_to else {
+            if self.boundary {
+                return Some(*self.terminate.get_or_insert_with(|| {
+                    let pad = self.builder.create_block();
+                    self.builder.append_block_param(pad, self.cg.target.pointer());
+                    self.builder.set_cold_block(pad);
+                    pad
+                }));
+            }
             // rustc's coroutine transform has every call that unwinds out of an `async` body
             // unwind to a block that poisons it, so that polling it again panics.
             self.suspended.as_ref()?;
@@ -15475,7 +15499,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let normal = self.builder.func.dfg.block_call(after, &results);
         let unwound = self.builder.func.dfg.block_call(cleanup, &[ir::BlockArg::TryCallExn(0)]);
-        let tag = ir::ExceptionTag::with_number(unwind::CLEANUP).expect("a small tag");
+        let tag = ir::ExceptionTag::with_number(if self.boundary { unwind::CATCH } else { unwind::CLEANUP }).expect("a small tag");
         let table = self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
             sig,
             normal,
@@ -15519,6 +15543,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Fills in the landing pads of a body in `MirPhase::Runtime`: each keeps the exception
     /// and goes on to its cleanup block, which ends in `UnwindResume`.
     fn emit_pads(&mut self) -> Result<()> {
+        if let Some(pad) = self.terminate.take() {
+            self.builder.switch_to_block(pad);
+            self.cannot_unwind()?;
+        }
         for (target, pad) in std::mem::replace(&mut self.pads, Vec::new_in(self.frame)) {
             self.builder.switch_to_block(pad);
             let exception = self.builder.block_params(pad)[0];
@@ -15702,6 +15730,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
+        if self.boundary {
+            return self.cannot_unwind();
+        }
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let resume = if self.cg.target.exception_in_register() {
@@ -15712,6 +15743,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let resume = self.cg.import(resume, &sig)?;
         let resume = self.cg.declare_func_in_func(resume, self.builder.func);
         self.builder.ins().call(resume, &[exception]);
+        self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
+        Ok(())
+    }
+
+    fn cannot_unwind(&mut self) -> Result<()> {
+        let cleaning = std::mem::replace(&mut self.in_cleanup, true);
+        self.call_panic(&["panicking", "panic_cannot_unwind"], &[])?;
+        self.in_cleanup = cleaning;
         self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
         Ok(())
     }

@@ -759,6 +759,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// function's own where its ABI is not Rust's, and each foreign function's it calls. Code
     /// outside the program may make or take objects of them.
     fn edge(&mut self, body: &'db MirBody<'db>, abi: ExternAbi) -> Result<(), String> {
+        if !hir_ty_mir::mir::abi_can_unwind(abi) && self.fx.interner.lang_items().PanicCannotUnwind.is_some() {
+            self.panic(&["panicking", "panic_cannot_unwind"])?;
+        }
         let db = self.fx.cg.db;
         let (infcx, env) = (&self.fx.infcx, self.fx.env.param_env);
         let facts = &mut self.found.facts;

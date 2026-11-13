@@ -473,14 +473,14 @@ pub(super) fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut B
 
 /// rustc's `fn_can_unwind` where panics unwind: whether a panic may unwind out of `func`
 /// rather than abort.
-pub(crate) fn fn_can_unwind(db: &Db, func: hir_def::FunctionId) -> bool {
+pub fn fn_can_unwind(db: &Db, func: hir_def::FunctionId) -> bool {
     !hir_def::attrs::AttrFlags::query(db, func.into())
         .contains(hir_def::attrs::AttrFlags::RUSTC_NOUNWIND)
         && abi_can_unwind(hir_def::signatures::FunctionSignature::of(db, func).abi)
 }
 
 /// Whether a function of `abi` may unwind: every Rust ABI, and the others' `-unwind` forms.
-pub(crate) fn abi_can_unwind(abi: rustc_abi::ExternAbi) -> bool {
+pub fn abi_can_unwind(abi: rustc_abi::ExternAbi) -> bool {
     use rustc_abi::ExternAbi;
     match abi {
         ExternAbi::Rust

@@ -1237,6 +1237,36 @@ pub fn holds(x: u32) -> u32 {
 }
 "#;
 
+/// On Windows the ABI boundary itself must claim a panic. A cleanup-only pad is never
+/// entered if there is no handler farther up the stack (a C main or a foreign thread).
+#[test]
+fn a_windows_c_boundary_catches_a_call_that_can_unwind() {
+    let (db, frontend) = frontend(r#"
+//- target: x86_64-pc-windows-msvc
+//- minicore: sized
+#[inline(never)] pub fn may_panic() { loop {} }
+pub extern "C" fn boundary() { may_panic(); }
+pub extern "C-unwind" fn transparent() { may_panic(); }
+"#);
+    let target = crate::Target::of("x86_64-pc-windows-msvc").unwrap();
+    let catches = |name, panic| {
+        let root = frontend.root(function(db, name));
+        frontend.with(|db| {
+            let build = Build::of(&Spec { panic, ..spec() });
+            let super::Built::Ir(code) = built(db, &root, target, false, build).unwrap() else {
+                panic!("{name} has an IR body")
+            };
+            let func = &code.func;
+            func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).any(|i| {
+                crate::unwind::seh::is_catching(func.srcloc(i))
+            })
+        })
+    };
+    assert!(catches("boundary", Panic::Unwind));
+    assert!(!catches("transparent", Panic::Unwind));
+    assert!(!catches("boundary", Panic::Abort));
+}
+
 /// One function built under two units' settings in one database gives two IRs, and neither
 /// build reuses the other's: the settings are an argument of the compile and the key of every
 /// body it reads (`MirStage::compiled`'s options), never state on the thread, which a fiber

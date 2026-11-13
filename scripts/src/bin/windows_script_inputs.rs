@@ -37,12 +37,15 @@ fn main() {
         inputs.join("optional").try_exists().unwrap(), names.join(","),
         String::from_utf8(cc.stdout).unwrap().trim());
     fs::write(Path::new(&env::var_os("OUT_DIR").unwrap()).join("answer"), result).unwrap();
+    fs::write(Path::new(&env::var_os("OUT_DIR").unwrap()).join("run-profile"), env::var("LOCALAPPDATA").unwrap()).unwrap();
 }
 "#;
 
 const ENV_ONLY: &str = r#"
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_KeySpelling");
+    // This write precludes a pure-MIR shortcut; test a real confined script run.
+    std::fs::write(std::path::Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("run-profile"), std::env::var("LOCALAPPDATA").unwrap()).unwrap();
     if std::env::var_os("CARGO_KeySpelling").unwrap() == "one" {
         println!("cargo:rustc-cfg=first_value");
     } else {
@@ -105,6 +108,7 @@ impl Matrix {
         fs::write(inputs.join("external.h"), "#define VALUE header_one\n")?;
         fs::write(inputs.join("direct"), "one")?;
         fs::write(inputs.join("members/a"), "")?;
+        let mut profile = String::new();
         for (label, edit, expected) in [
             ("initial", None, "one;false;a;header_one"),
             ("unchanged", None, "one;false;a;header_one"),
@@ -123,11 +127,31 @@ impl Matrix {
             let row = self.build(label, native)?;
             let out = row["out_dir"].as_str().ok_or("no out_dir in script result")?;
             let actual = fs::read_to_string(Path::new(out).join("answer"))?;
+            let now = fs::read_to_string(Path::new(out).join("run-profile"))?;
+            if (label == "unchanged") != (now == profile) {
+                return Err(format!("{label}: wrong cache decision (compared run-local profile IDs)").into());
+            }
+            profile = now;
             if actual != expected {
                 return Err(format!("{label}: expected {expected}, got {actual}").into());
             }
             println!("{label}: {actual}");
         }
+        // A newly resolved PATH tool changes the key even with identical declarations,
+        // env and grants. The sentinel is never executed and receives no read grant.
+        let bindir = self.root.join("bin");
+        fs::create_dir(&bindir)?;
+        let path = self.env.iter().find(|(n, _)| n.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).ok_or("no PATH")?;
+        self.env.retain(|n, _| !n.eq_ignore_ascii_case("PATH"));
+        self.env.insert("PATH".into(), format!("{};{path}", bindir.display()));
+        let stamp = |matrix: &Self, label| -> Result<String> {
+            let row = matrix.build(label, native)?;
+            Ok(fs::read_to_string(Path::new(row["out_dir"].as_str().ok_or("missing OUT_DIR")?).join("run-profile"))?)
+        };
+        let before = stamp(self, "tool-absent")?;
+        fs::write(bindir.join("zig.exe"), b"stamp only")?;
+        let after = stamp(self, "tool-added")?;
+        if before == after || after != stamp(self, "tool-warm")? {return Err("tool identity did not invalidate exactly once".into());}
         for (label, value, cfg) in [
             ("env-first", "one", "first_value"),
             ("env-changed", "two", "second_value"),
@@ -135,10 +159,43 @@ impl Matrix {
         ] {
             self.env.insert("CARGO_KEYSPELLING".into(), value.into());
             let row = self.build(label, env_only)?;
+            let now = fs::read_to_string(Path::new(row["out_dir"].as_str().ok_or("missing OUT_DIR")?).join("run-profile"))?;
+            if (label == "env-warm") != (now == profile) { return Err(format!("{label}: wrong cache decision").into()); }
+            profile = now;
             if row["cfgs"] != serde_json::json!([cfg]) {
                 return Err(format!("{label}: expected {cfg}, got {}", row["cfgs"]).into());
             }
             println!("{label}: {cfg}");
+        }
+        // No env changes between the builds of each fixture. Only cl.exe opens the
+        // header. Exercise both Cargo rules and deliberately pin the declared-only limit.
+        for (name, directive, after) in [
+            ("default-header", "", "two"),
+            ("declared-header", "println!(\"cargo:rerun-if-changed=include/h.h\");", "two"),
+            ("declared-directory", "println!(\"cargo:rerun-if-changed=include\");", "two"),
+            ("undeclared-header", "println!(\"cargo:rerun-if-changed=unit.c\");", "one"),
+        ] {
+            let script = format!(
+                r#"fn main() {{
+                {directive}
+                let cc = std::process::Command::new("cl.exe").args(["/nologo", "/EP", "/TC", "unit.c"]).output().unwrap();
+                assert!(cc.status.success());
+                println!("cargo:rustc-cfg={{}}", String::from_utf8(cc.stdout).unwrap().trim());
+            }}"#
+            );
+            package(&self.root, name, &script)?;
+            let dir = self.root.join(name);
+            fs::create_dir(dir.join("include"))?;
+            fs::write(dir.join("unit.c"), "#include \"include/h.h\"\nVALUE\n")?;
+            for (value, expected) in [("one", "one"), ("two", after)] {
+                fs::write(dir.join("include/h.h"), format!("#define VALUE {value}\n"))?;
+                let label = format!("{name}-{value}");
+                let row = self.build(&label, name)?;
+                if row["cfgs"] != serde_json::json!([expected]) {
+                    return Err(format!("{label}: expected {expected}, got {}", row["cfgs"]).into());
+                }
+                println!("{label}: {expected}");
+            }
         }
         Ok(())
     }

@@ -665,7 +665,9 @@ one place a run is made. A script is given the command's whole environment with 
 sets for scripts over it (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), as cargo
 gives it (`script.rs`, `inherited`). The variables are the command's, not those of whoever
 started the daemon: `SDK_DIR=/opt/sdk blaze build` gives the script `SDK_DIR` with a daemon
-started without it. What the run read, its files and its variables, the sandbox traces, and the run is kept in
+started without it. On Windows the AppContainer enforces read grants and blaze uses
+[Cargo's rerun rules](#windows-build-script-reuse). On Linux and macOS, what the run
+read, its files and its variables, the sandbox traces, and the run is kept in
 the store by its code, what it was given and what it read (`blaze_usercode::run`), so a
 command whose inputs to it are as they were finds it there and runs nothing. On Linux and
 macOS the variables passed through from the command (all but what cargo sets) are lent to the
@@ -689,8 +691,8 @@ The root manifest is the one of the workspace built, also for a path dependency 
 workspace of its own. The machine is read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;
-there is no network but the sandbox's own loopback. Its package's directory, the workspace and
-the target directory are seen as they are, even below `/tmp` or `/dev/shm`; a git dependency's
+there is no network but the sandbox's own loopback. On Unix its package's directory, the workspace
+and the target directory are seen as they are, even below `/tmp` or `/dev/shm`; a git dependency's
 script sees its whole repository at the commit (blaze's checkout of it), as cargo's checkout
 lets it read an asset beside its package (`../../packages/fonts/assets`). On macOS the
 per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`, `/var/folders/../C`) is writable
@@ -1780,3 +1782,19 @@ What is not done:
 - Ported in part, each file saying what it leaves out: `needless_borrow` (a receiver, a callee
   or a field's base, and chains of `&` and `*`), `map_clone` (`Clone::clone` as a path),
   `needless_borrows_for_generic_args` (bounds through projections or other parameters).
+
+### Windows build-script reuse
+
+On Windows a successful confined script reruns when Cargo would: a `rerun-if-changed`
+file or directory tree changes, a `rerun-if-env-changed` variable changes, or (with
+neither directive) the package changes. A missing declared path is not a reusable
+result. When a script declares other paths, an **undeclared** read within the package,
+including one made by its native compiler, is not observed. Declare that header or its
+directory. This is Cargo-level freshness, not a filesystem read trace.
+
+Blaze also keys the executable, build environment (Windows name comparison), resolved
+tools, mutable external grants and dependency outputs. For mutable workspace files
+outside the script's own package, grant just the sibling inputs with `BLAZE_SCRIPT_READ`.
+A read grant remains read-only;
+a link-search permission is not a filesystem grant. Neither the script nor a child gets
+the invoking user's unrestricted filesystem access. The sandbox-off path is not cached.

@@ -196,9 +196,10 @@ What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 wi
   pad that catches claims an exception in the search pass; cleanup pads run in the unwind pass.
 - Thread-local destructors, threads, `i128`, C varargs (`snprintf` from
   `legacy_stdio_definitions`, as under rustc), a 64 KiB frame (stack probes), SSE intrinsics.
-- Not done: a structured exception that is not a C++ one (an access violation) and a C++
-  `throw;` rethrow run no Rust cleanup pad; a Rust panic out of an `extern "C"` function with
-  no catcher above ends as an unhandled exception, not the "cannot unwind" abort.
+- A Rust panic escaping an `extern "C"` boundary terminates with `panic in a function that
+  cannot unwind`, including when no handler exists above the boundary. A non-C++ structured
+  exception caught above a Rust `extern "C-unwind"` frame runs no Rust drop, as on the pinned
+  MSVC Rust toolchain. Cleanup through a C++ `throw;` rethrow remains unverified.
 
 ### v2 output placement on Windows
 
@@ -226,13 +227,16 @@ read access. For example, `GHOSTTY_VT_LIB` can name the prebuilt Ghostty archive
 parent must also be allowed as a `build-script-link-dirs` entry. This does not grant
 write access to the user's cache or let the script download a missing archive.
 
-Windows does not yet trace every filesystem read. A script can be reused when its MIR
-proof shows its only inputs are a fixed list of Cargo environment variables. Those values
-and its code form the key. Names are case-insensitive, as in the child process: a script
-that reads `CARGO_Key` must rerun when `CARGO_KEY` changes. Results from the older,
-case-sensitive pure key are not reused on Windows. Other executed scripts are not reused: `rerun-if-changed`
-alone cannot prove an undeclared file is unchanged. Inert scripts that Blaze proves
-print only constants still need not run.
+Windows has two ways to reuse a script. Blaze can prove that it prints constants or
+depends only on known Cargo variables. Otherwise a successful AppContainer run is keyed
+by **Cargo's rerun rules**, not by a claim that Windows observed the process tree. A
+declared directory covers its descendants. With neither a file nor an environment
+directive, the package's files are inputs. With other directives, an undeclared read in
+the package (including a compiler's header) can go unseen, exactly as with Cargo.
+AppContainer still restricts the script and its children; Cargo does not. Explicit mutable
+read grants, native tools, dependency outputs and the script's logical environment are
+additional inputs. The launcher's private temporary/profile paths are run-local scratch,
+not external caches. See `docs/cargo.md`.
 
 For an external input, set `BLAZE_SCRIPT_READ` in the shell invoking blaze, to absolute
 paths separated by `;`. Use the individual executable for a portable tool on `PATH`, or
