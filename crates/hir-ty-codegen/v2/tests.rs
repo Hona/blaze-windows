@@ -4104,6 +4104,54 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
     });
 }
 
+/// The invariant: after a literal edit the plain and closed walk still support the same
+/// world. Changing the graph to reach another closure does not validate that checkpoint.
+#[test]
+fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
+    use blaze_codegen::backend::Frontend as _;
+    let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
+    let fixture = fixture::db(DYN_FN_BUILT_IN);
+    let file = fixture.file_at("/main.rs");
+    let mut db = fixture.into_db();
+    let file = file.file_id(&db);
+    let krate = fixture::test_crate(&db);
+    let policy = policy(OptLevel::O3);
+    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default()).with_policy(policy);
+        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
+        f
+    }
+    let (kept, view) = {
+        let f = front(&db, &policy, krate);
+        let view = f.view().unwrap();
+        for closed in [true, false] {
+            let root = f.root(function(&db, "roots"));
+            let origin = f.with(|db| f.origin(db, krate));
+            let mut reached = Vec::new();
+            let mut queue = vec![(root,origin)];
+            while let Some((i,o)) = queue.pop() {
+                if reached.contains(&(i.clone(),o)) { continue; }
+                let d = f.describe(&i,&o).unwrap();
+                for r in d.refs { if let FrontRef::Function(callee) = r { queue.push((callee,d.origin)); } }
+                reached.push((i,o));
+            }
+            assert_eq!(f.closed(&reached,&[]).unwrap(),closed);
+        }
+        (f.kept_world().unwrap(),view)
+    };
+    db.set_file_text(file,&source.replace("y * 3", "y * 4"));
+    let since = {
+        let f = front(&db,&policy,krate);
+        assert!(f.resume_world(&kept,view));
+        assert!(f.devirt.world().is_some());
+        f.abandon_resumed_world();
+        assert!(f.devirt.world().is_none());
+        f.view().unwrap()
+    };
+    db.set_file_text(file, &source.replace("dep::resize::<K>(x, &|y| y * 3)", "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)"));
+    assert!(!front(&db,&policy,krate).resume_world(&kept,since));
+}
+
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at
 /// each `ub_checks()` branch, and less where they are off, which the cost model discounts
 /// (rustc's `CostChecker` at `UbChecks`): a unit with debug assertions calls it, a unit

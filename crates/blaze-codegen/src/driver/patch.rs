@@ -135,7 +135,8 @@ pub(super) struct Keep<I, S> {
 }
 
 /// The walk kept of one program: its inputs, its result, and its [`Keep`].
-pub(super) struct Walked<I, S> {
+pub(super) struct Walked<I, S, W> {
+    world: Option<W>,
     roots_in: Vec<(I, Origin)>,
     static_roots_in: Vec<S>,
     check_in: Vec<CheckRoot<I, S>>,
@@ -434,9 +435,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         let Some(walked) = kept.take_walk(program) else {
             return Err("no walk of this program is kept");
         };
-        if walked.keep.takes_world {
-            return Err("a kept function takes the program's dyn facts");
-        }
         if walked.roots_in != roots
             || walked.static_roots_in != static_roots
             || walked.check_in != check
@@ -444,7 +442,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         {
             return Err("the kept walk is of other roots or another policy");
         }
-        if walked.view != view {
+        // A front end with a changed set covers all writes, including durable ones.
+        // Re-loading the macro unit, for example, publishes a HIGH input even if not
+        // one library describe changes. The durable epoch alone proves no such change.
+        if walked.view != view && walked.seen.is_none() {
             return Err("a durable input was written since the kept walk");
         }
         if self.frontend.stopped() {
@@ -463,6 +464,12 @@ impl<'a, B: Prepare> Build<'a, B> {
         // build is refused with the front end's reason (`refused`; rule no-fallback), and
         // the kept walk goes back as it was, so the refusal stands until its cause is gone.
         let seen = walked.seen;
+        if walked.keep.takes_world && !walked.world.as_ref().zip(seen).is_some_and(|(world, since)| {
+            self.frontend.resume_world(world, since)
+        }) {
+            return Err("the kept program's dyn facts were not validated");
+        }
+        let describe_round = usize::from(walked.keep.takes_world);
         let named = match seen {
             Some(seen) => match self.frontend.changed_since(seen) {
                 Changed::Unknown(why) => {
@@ -548,7 +555,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Ok(Some(now)) => {
                         // alloc: once per describe, shared by the walk's node and the walk kept
                         let now = Arc::new(now);
-                        kept.keep(0, &it.asked, now.clone()); // clone: a reference count
+                        kept.keep(describe_round, &it.asked, now.clone()); // clone: a reference count
                         Some(now)
                     }
                     Err(_) => return Err("a describe failed"),
@@ -631,7 +638,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             work.described += 1;
             redescribed += 1;
-            if now.takes_world {
+            if now.takes_world && !keep.takes_world {
                 return Err("a changed function takes the program's dyn facts");
             }
             if !same_frame(&was, &now) {
@@ -716,7 +723,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // The functions an edit brought in: a few, run here where that is cheaper.
             static NEW: par::Small = par::Small::new("codegen walk: describe new functions");
             let described = par::map_small(&NEW, &functions, |(_, asked)| {
-                let described = self.described(asked, 0, &counts)?;
+                let described = self.described(asked, describe_round, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));
                 let each_build = self.frontend.each_build(&asked.0, &asked.1);
@@ -777,6 +784,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             structural = true;
         }
         self.frontend.reached(&told, &[]);
+
+        if keep.takes_world && (structural || recount) {
+            return Err("the closed walk's reachability changed");
+        }
 
         // What the roots reach now.
         let visited = keep.graph.visited;
@@ -1371,6 +1382,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     ) {
         let Some(kept) = self.kept else { return };
         let walked = Walked {
+            world: self.frontend.kept_world(),
             // clone: per build that keeps its walk, its roots
             roots_in: roots.to_vec(),
             static_roots_in: static_roots.to_vec(), // clone: as above

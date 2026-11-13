@@ -304,6 +304,7 @@ fn static_item(id: u32) -> ItemKey {
 }
 
 impl Frontend for Program {
+    type World = ();
     type Instance = u32;
     type Static = u32;
 

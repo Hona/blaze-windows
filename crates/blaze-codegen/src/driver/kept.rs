@@ -44,13 +44,13 @@ const ROUNDS: usize = 2;
 /// program walked over it: two programs that reach one instance share its describe. Shared by
 /// the builds of a job, which walk at once: a describe is lent by one lookup and kept by one
 /// insert, with nothing held between.
-pub struct Kept<I, S> {
+pub struct Kept<I, S, W = ()> {
     /// Each round's describes, by the instance and whose code asked for it.
     rounds: [SharedMap<(I, Origin), Arc<Described<I, S>>>; ROUNDS],
     /// Each program's last walk whole ([`Walked`]), by [`program`] of its inputs, which the
     /// walk itself holds and a build compares: taken by the build that patches it, so a
     /// locked map.
-    walks: Lock<std::collections::HashMap<u64, Walked<I, S>>>,
+    walks: Lock<std::collections::HashMap<u64, Walked<I, S, W>>>,
     /// What each program's last build gave, by [`program`] of every input of the build: its
     /// ID and its entries, which the next build's [`super::Delta`] is made against. Of a
     /// build that is not kept by row (`lists`): a lazy one, one with a folded or release
@@ -64,7 +64,7 @@ pub struct Kept<I, S> {
     let_go: bool,
 }
 
-impl<I: Eq + Hash, S> Default for Kept<I, S> {
+impl<I: Eq + Hash, S, W> Default for Kept<I, S, W> {
     fn default() -> Self {
         Kept {
             let_go: false,
@@ -78,7 +78,7 @@ impl<I: Eq + Hash, S> Default for Kept<I, S> {
     }
 }
 
-impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
+impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync, W> Kept<I, S, W> {
     /// Nothing kept: what the first walk over a database begins with.
     pub fn new() -> Self {
         Kept::default()
@@ -179,12 +179,12 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
 
     /// Takes the walk kept of `program`, if one is: a build that patches it owns it, and
     /// keeps the patched one in its place when it ends well.
-    pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S>> {
+    pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S, W>> {
         self.walks.lock().remove(&program)
     }
 
     /// Keeps `walked` as the walk of `program`.
-    pub(super) fn keep_walk(&self, program: u64, walked: Walked<I, S>) {
+    pub(super) fn keep_walk(&self, program: u64, walked: Walked<I, S, W>) {
         self.walks.lock().insert(program, walked);
     }
 }

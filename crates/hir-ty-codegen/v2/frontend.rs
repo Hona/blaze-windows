@@ -353,7 +353,7 @@ impl Facing {
     /// A front end of these facts over `db`: it describes as the one they were read from
     /// does. Its hashes are asked what the build calls no file: [`described_memo`] describes
     /// through it only a body that names none ([`names_files`]).
-    fn front<'db>(self, db: &'db Db) -> Result<HirFrontend<'db>, String> {
+    pub(super) fn front<'db>(self, db: &'db Db) -> Result<HirFrontend<'db>, String> {
         let hashes = match self.by_id {
             true => by_id_hashes()?,
             false => HashSource::Items(super::hashes::ItemHashes::new(Box::new(unnamed))),
@@ -501,7 +501,8 @@ fn described_static_memo(db: &Db, value: HirStatic, facing: Facing) -> MemoedSta
 const KEPT_WALKS: usize = 8;
 
 /// The walks kept, each with the database and facts it is of, the last asked for last.
-static KEPT: Lock<Vec<(base_db::Nonce, Facing, Arc<Kept<HirInstance, HirStatic>>)>> =
+pub type KeptProgram = Kept<HirInstance, HirStatic, super::DynCheckpoint>;
+static KEPT: Lock<Vec<(base_db::Nonce, Facing, Arc<KeptProgram>)>> =
     Lock::new("codegen.frontend.kept", Vec::new());
 
 /// Lets go of every kept walk ([`HirFrontend::kept`]): each function's describe, each
@@ -616,7 +617,7 @@ impl<'db> HirFrontend<'db> {
     /// caller's overflow checks (core's `#[inline] #[rustc_inherit_overflow_checks]` operator
     /// impls) reached through other bodies their user compiles (`impl Add<&u8> for u8`,
     /// `impl Sum<&u8> for u8`) takes the user's.
-    fn compiled_for(&self, db: &Db, instance: &HirInstance, requester: &Origin) -> Origin {
+    pub(super) fn compiled_for(&self, db: &Db, instance: &HirInstance, requester: &Origin) -> Origin {
         match crate_of(db, &instance.0) {
             Some(krate) if !user_compiled(db, &instance.0) => self.origin(db, krate),
             _ => *requester,
@@ -705,7 +706,7 @@ impl<'db> HirFrontend<'db> {
 
     /// What describing reads of this front end beside the database, for an instance whose
     /// body is walked against `world`.
-    fn facing(&self, world: Option<DevirtWorld>) -> Facing {
+    pub(super) fn facing(&self, world: Option<DevirtWorld>) -> Facing {
         let by_id = match &self.hashes {
             HashSource::Items(_) => false,
             #[cfg(test)]
@@ -752,7 +753,7 @@ impl<'db> HirFrontend<'db> {
     /// (`fresh`). Every describe taken from it is checked against the database's memo first
     /// ([`Frontend::redescribe`]), so which walk it is given decides only how much is kept,
     /// never what is built.
-    pub fn kept(&self) -> Arc<Kept<HirInstance, HirStatic>> {
+    pub fn kept(&self) -> Arc<KeptProgram> {
         let (database, _) = self.databases.db.nonce_and_revision();
         let facing = self.facing(None);
         let mut kept = KEPT.lock();
@@ -1054,7 +1055,7 @@ impl<'db> HirFrontend<'db> {
 
     /// Whose a static is for a dependency image: its crate's, by [`Self::workspace`], as a
     /// function of that crate is.
-    fn static_owner(&self, db: &Db, value: &HirStatic) -> Owner {
+    pub(super) fn static_owner(&self, db: &Db, value: &HirStatic) -> Owner {
         if self.workspace(db, value.0.krate(db)) { Owner::Workspace } else { Owner::Dependency }
     }
 
@@ -1098,6 +1099,15 @@ impl<'db> HirFrontend<'db> {
 }
 
 impl Frontend for HirFrontend<'_> {
+    type World = super::DynCheckpoint;
+
+    fn kept_world(&self) -> Option<Self::World> { self.devirt.checkpoint() }
+
+    fn resume_world(&self, world: &Self::World, since: u64) -> bool {
+        self.devirt.resume(self, world, since)
+    }
+
+    fn abandon_resumed_world(&self) { self.devirt.abandon(); }
     type Instance = HirInstance;
     type Static = HirStatic;
 
@@ -1314,7 +1324,7 @@ const SHIM_BODY_DOMAIN: &str = "blaze v2 recursion shim body 2";
 /// engine's changed set names a function by ([`Frontend::changed_since`]). The unit argument
 /// makes the key an interned one, as an instance is no ID, and gives the query `arguments`.
 #[blaze_query::tracked(returns(copy))]
-fn counted_memo(db: &Db, instance: HirInstance, _alone: ()) -> Counted {
+pub(super) fn counted_memo(db: &Db, instance: HirInstance, _alone: ()) -> Counted {
     counted(db, &instance.0)
 }
 
@@ -1966,7 +1976,7 @@ fn generic(kind: &Kind) -> bool {
 
 /// Marks the `asm!` functions among the references of code of `owner` as the image's when
 /// the image holds that code ([`Kind::Asm`]'s flag), so an `asm!` function is its asker's.
-fn asked_by(owner: Owner, refs: &mut [FrontRef<HirInstance, HirStatic>]) {
+pub(super) fn asked_by(owner: Owner, refs: &mut [FrontRef<HirInstance, HirStatic>]) {
     if owner == Owner::Dependency {
         for it in refs {
             if let FrontRef::Function(HirInstance(Kind::Asm(_, image))) = it {
