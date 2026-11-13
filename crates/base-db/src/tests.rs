@@ -1433,6 +1433,30 @@ fn disk_module_runs() -> usize {
 }
 
 #[test]
+fn rechecking_outside_inputs_applies_only_changed_reads_in_path_order() {
+    let dir = std::env::temp_dir().join(format!("blaze-includes-batch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut db = Db::new(); // probe through the same pool as a daemon request
+    let mut moved = Vec::new();
+    for (name, new) in [("b", None), ("c", Some(&b"old"[..])), ("a", Some(&b"new"[..]))] {
+        let host = dir.join(name);
+        let name = blaze_core::platform::path::daemon(&host).unwrap();
+        let path = AbsPathBuf::try_from(name.as_str()).unwrap();
+        db.set_included_file(&path, std::sync::Arc::from(&b"old"[..]));
+        if let Some(bytes) = new {
+            std::fs::write(&host, bytes).unwrap();
+        }
+        if new != Some(&b"old"[..]) {
+            moved.push(path);
+        }
+    }
+    moved.sort();
+    assert_eq!(db.reload_included_files(Trigger::named("test changes")), moved);
+    assert!(db.reload_included_files(Trigger::named("test no-op")).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn an_outside_include_and_its_record_lookup_read_the_same_host_file() {
     let host = std::env::temp_dir().join(format!("blaze-included-record-{}.rs", std::process::id()));
     let named = blaze_core::platform::path::daemon(&host).unwrap();
