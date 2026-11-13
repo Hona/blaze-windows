@@ -948,11 +948,19 @@ fn uplifted_on_windows() {
             format!("{dest}/foo.dll.lib"),
             format!("{out}/foo.dll.exp"),
             format!("{dest}/foo.dll.exp"),
-            format!("{out}/foo.pdb"),
-            format!("{dest}/foo.pdb"),
+            format!("{out}/foo.dll.pdb"),
+            format!("{dest}/foo.dll.pdb"),
             format!("{out}/foo.d"),
         ]
     );
+    // A cdylib and a bin of one package share a crate name: the DLL's PDB is named for the
+    // DLL, so the two PDBs are two paths (INTEGRATION I45: cargo's `foo.pdb` for both).
+    let cdylib = TargetKind::Lib(vec![CrateType::Cdylib, CrateType::Rlib]);
+    let lib = files(msvc, hash::CompileMode::Build, &cdylib, "luau-panel", None, true);
+    let bin = files(msvc, hash::CompileMode::Build, &TargetKind::Bin, "luau-panel", None, true);
+    assert!(lib.contains(&format!("{dest}/luau_panel.dll.pdb")), "{lib:?}");
+    assert!(bin.contains(&format!("{dest}/luau_panel.pdb")), "{bin:?}");
+    assert!(lib.iter().all(|it| !bin.contains(it) || it.ends_with(".d")), "{lib:?} {bin:?}");
     let gnu = "x86_64-pc-windows-gnu";
     let gnu_out = format!("/w/build/{gnu}/debug/build/app/{H}/out");
     assert_eq!(
