@@ -218,6 +218,17 @@ fn corosenseis_trampolines_assemble_to_an_object_defining_them() {
     }
 }
 
+#[cfg(feature = "llvm")]
+#[test]
+fn a_body_local_module_contributes_its_assembly() {
+    let text = format!(
+        "//- /lib.rs crate:nested\n{BUILTINS}\nfn outer() {{ mod local {{ global_asm!(\".globl nested\", \"nested:\", \"ret\"); }} }}"
+    );
+    let object = assembled("x86_64-pc-windows-msvc", &text).unwrap().unwrap();
+    let file = object::File::parse(&*object.bytes).unwrap();
+    assert!(file.symbols().any(|it| it.name() == Ok("nested") && it.is_definition()));
+}
+
 /// The line of `text`'s file, from 1, that is `line`.
 fn line_of(text: &str, line: &str) -> usize {
     let file = text.split_once('\n').unwrap().1;
