@@ -433,6 +433,9 @@ fn compiled(
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
         }
+        if alone.is_some() {
+            coff_own_section(&module, target)?;
+        }
         if dump.as_deref() == Some("after") {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }
@@ -484,6 +487,23 @@ fn own_comdat<'ctx>(
     }
     function.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
     Ok(())
+}
+
+/// Puts the function compiled alone ([`OWN`]) in a COMDAT of its own on COFF. COFF puts a
+/// function's jump tables in a section of their own only for a function in a COMDAT (LLVM's
+/// `getSectionForJumpTable`); else they share `.rdata` with the module's tables of addresses,
+/// a section `emitted` can take neither as the function's (its addresses) nor as a data
+/// object (the jump table's offsets into the code).
+pub(super) fn coff_own_section(
+    module: &Module<'_>,
+    target: &super::Target,
+) -> Result<(), Unhandled> {
+    match module.get_function(OWN) {
+        Some(own) if target.object_format == super::ObjectFormat::Coff => {
+            own_comdat(module, target, own)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Leaves `function`, whose body could not be lowered, a declaration of the same name and
@@ -2459,9 +2479,11 @@ define i32 @"blaze.own"() {
         sig.params.push(AbiParam::new(I64));
         sig.returns.push(AbiParam::new(I64));
         // Two functions of one unit, each with its tables, so each is a section of its own.
+        let arms: Vec<_> =
+            (0..8).map(|at| wants.func(FuncTarget::Symbol(format!("arm{at}")), &sig)).collect();
         let picks = [0, 1].map(|at| {
             let request = wants.func(FuncTarget::Symbol(format!("pick{at}")), &sig);
-            (request, picking(&**isa, &sig, &datas, at))
+            (request, picking(&**isa, &wants, &sig, &datas, &arms, at))
         });
         let members = picks.each_ref().map(|(request, func)| Member {
             func,
@@ -2475,16 +2497,23 @@ define i32 @"blaze.own"() {
                 panic!("{}: {error}", target.triple());
             }
         }
+        // A function compiled alone: on COFF its jump table is in a section of its own only
+        // when the function is in a COMDAT, else beside the table of addresses in `.rdata`.
+        if let Err(error) = emit(&mut wants, &[], &picks[0].1, optimized_level(), None, &[]) {
+            panic!("{} alone: {error}", target.triple());
+        }
     }
 
     /// A function that returns the address of `datas[i]` for `i` up to their number and,
-    /// past them, one of eight values it computes (`salt` changes them): a table of addresses
+    /// past them, what one of eight functions it calls returns (`salt` changes what it passes): a table of addresses
     /// and a jump table into its code, after LLVM's optimizations.
     // dyn: cranelift's API takes `&dyn TargetIsa`
     fn picking(
         isa: &dyn cranelift_codegen::isa::TargetIsa,
+        wants: &Wants,
         sig: &ir::Signature,
         datas: &[cranelift_module::DataId],
+        calls: &[cranelift_module::FuncId],
         salt: i64,
     ) -> ir::Function {
         use cranelift_codegen::ir::{InstBuilder, UserFuncName, types::I64};
@@ -2506,6 +2535,8 @@ define i32 @"blaze.own"() {
                 })
             })
             .collect();
+        let callees: Vec<_> =
+            calls.iter().map(|&it| wants.declare_func_in_func(it, &mut func)).collect();
         let mut context = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut func, &mut context);
         let entry = builder.create_block();
@@ -2541,10 +2572,9 @@ define i32 @"blaze.own"() {
         table.emit(&mut builder, index, last);
         for (at, &arm) in arms.iter().enumerate() {
             builder.switch_to_block(arm);
-            let at = at as i64 + salt;
-            let scaled = builder.ins().imul_imm(index, at * 7 + 3);
-            let rotated = builder.ins().rotl_imm(scaled, at + 1);
-            let value = builder.ins().bxor_imm(rotated, at * 1_000_003);
+            let scaled = builder.ins().imul_imm(index, at as i64 * 7 + 3 + salt);
+            let call = builder.ins().call(callees[at], &[scaled]);
+            let value = builder.inst_results(call)[0];
             builder.ins().jump(done, &[value.into()]);
         }
         builder.switch_to_block(last);
