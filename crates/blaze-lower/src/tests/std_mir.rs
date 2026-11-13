@@ -24,6 +24,16 @@ fn read(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
 #[test]
 #[ignore = "profiles the pinned library from a checkout"]
 fn optimize_fmaf128() {
+    fmaf128_for("x86_64-pc-windows-msvc");
+}
+
+#[test]
+#[ignore = "same MIR profile, with the Linux std cfg and target layout"]
+fn optimize_linux_fmaf128() {
+    fmaf128_for("x86_64-unknown-linux-gnu");
+}
+
+fn fmaf128_for(target_tuple: &str) {
     hir_ty_pure::facts::linked_here();
     let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library");
     let mut files = Vec::new();
@@ -40,7 +50,7 @@ fn optimize_fmaf128() {
     let root = view(&tree);
     let lib = tree.root(&files.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect::<Vec<_>>());
     let mut config = config(root, lib);
-    config.host = "x86_64-pc-windows-msvc".to_owned();
+    config.host = target_tuple.to_owned();
     let mut units = units();
     units.graph.units.truncate(1);
     units.plans.truncate(1);
@@ -73,24 +83,25 @@ fn optimize_fmaf128() {
     let db = lowered.db();
     blaze_query::db::attach(db, || {
         let mut module = crate_def_map(db, lowered.krate(1).unwrap()).root_module_id();
-        for segment in ["math", "full_availability", "fmaf128"] {
+        for segment in ["math", "full_availability"] {
             let data = module.to_db(db).def_map(db).module(db, module);
             let found = data.name_in_scope(db, &Name::new_symbol_root(Symbol::intern(segment)));
-            if let Some(ModuleDefId::ModuleId(child)) = found.take_types() {
-                module = child;
-            } else if let Some(ModuleDefId::FunctionId(f)) = found.take_values() {
-                let body = db
-                    .optimized_mir_body(
-                        f.into(),
-                        MirOptions { inline: true, ..MirOptions::at(MirOptLevel::Release) },
-                    )
-                    .unwrap();
-                assert!(!body.basic_blocks.is_empty());
-                return;
-            } else {
-                panic!("no `{segment}` in {module:?}");
-            }
+            let Some(ModuleDefId::ModuleId(child)) = found.take_types() else {
+                panic!("no module `{segment}` in {module:?}");
+            };
+            module = child;
         }
-        panic!("fmaf128 is not a function");
+        let data = module.to_db(db).def_map(db).module(db, module);
+        let found = data.name_in_scope(db, &Name::new_symbol_root(Symbol::intern("fmaf128")));
+        let Some(ModuleDefId::FunctionId(f)) = found.take_values() else {
+            panic!("no function `fmaf128` in {module:?}");
+        };
+        let body = db
+            .optimized_mir_body(
+                f.into(),
+                MirOptions { inline: true, ..MirOptions::at(MirOptLevel::Release) },
+            )
+            .unwrap();
+        assert!(!body.basic_blocks.is_empty());
     });
 }
