@@ -36,8 +36,6 @@ use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What};
 use crate::symbols::{SymKey, Symbols};
 use crate::{DevRun, Format, LinkError, OutOfReach, Refusal};
 
-/// The patch regions' least room: what an edit session's new code and data may take.
-const PATCH: u64 = 64 << 20;
 /// The patch regions' most room. Each is as large as the image's code (or data), so an edit
 /// that compiles most of it again still fits, but no larger than this: past it a stage is
 /// refused for want of room ([`Refusal::NoRoom`]) and the image is linked from scratch, which
@@ -50,9 +48,11 @@ const PATCH_MAX: u64 = 1 << 30;
 const ROOM: u64 = 64 << 10;
 
 /// The room of a patch region of an image with `size` bytes of code (or data): as large, at
-/// least [`PATCH`], at most [`PATCH_MAX`], a whole number of pages.
+/// least one growing region's [`ROOM`], at most [`PATCH_MAX`], a whole number of pages.
+/// Even a small program can be rewritten in full once; do not give every build script
+/// 128 MiB of file-backed room for code and data it never had.
 pub(crate) fn patch_room(size: u64, page: u64) -> u64 {
-    align_up_u64(size.clamp(PATCH, PATCH_MAX), page)
+    align_up_u64(size.clamp(ROOM, PATCH_MAX), page)
 }
 
 /// The first region, by address, whose room ends more than `window` bytes past `base`, and

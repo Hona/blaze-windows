@@ -100,7 +100,7 @@ fn main() {
         let applied = blaze_link::args::apply(&mut output, &[], &given).unwrap_or_else(|e| panic!("{e}"));
         let mut all = libs.clone();
         all.extend(applied.libs);
-        let crates = [CrateLibs { libs: &all, search: &[] }];
+        let crates = [CrateLibs { name: out, libs: &all, search: &[] }];
         let located = blaze_link::target::locate(&mut output, &crates, &applied.search, Path::new("unused"))
             .unwrap_or_else(|e| panic!("{e}"));
         let located_at = started.elapsed();

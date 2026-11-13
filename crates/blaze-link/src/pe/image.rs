@@ -269,7 +269,7 @@ pub(super) fn synthetic(counts: &Counts, dev_run: bool, delay: bool) -> Vec<(Cla
         let names = counts.export_names + counts.exports + NAME_ROOM + 1;
         regions.push((Class::Synthetic(EDATA), EXPORT_DIRECTORY + tables + names));
     }
-    regions.push((Class::Synthetic(DEBUG), DEBUG_DIRECTORY + CODEVIEW + NAME_ROOM + 1));
+    regions.push((Class::Synthetic(DEBUG), DEBUG_DIRECTORY + CODEVIEW + NAME_ROOM + PDB.len() as u64 + 1));
     // The directory and a callback list holding only its terminator; a dev run's holds the
     // start hook first when there is no CRT's.
     regions.push((Class::Synthetic(TLS_DIR), TLS_DIRECTORY + if dev_run { 16 } else { 8 }));
@@ -971,10 +971,11 @@ fn exports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     Ok(out.0)
 }
 
-/// The PDB a debugger looks for is the image's name with `.pdb` for its extension: this stem
-/// and [`PDB`].
+/// A DLL can sit beside an executable of the same stem. Keep its extension in the PDB's
+/// name so placing either image cannot overwrite the other's debug info.
 pub(crate) fn pdb_stem(name: &str) -> &str {
     match name.rsplit_once('.') {
+        Some((_, ext)) if ext.eq_ignore_ascii_case("dll") => name,
         Some((stem, _)) if !stem.is_empty() => stem,
         _ => name,
     }
