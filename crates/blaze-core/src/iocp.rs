@@ -2195,8 +2195,7 @@ impl Iocp {
         // they come (5% of 90,000 waiting reads under a storm of writes, and 0 of 958,000 that
         // do not wait, measured on Windows 11 26100 by a program of its own), having read nothing, so the cursor stays and the next
         // read, which does not wait, reads them.
-        let rang = journal.waits() && code == Some(ERROR_INVALID_USER_BUFFER);
-        if (hurried && code == Some(ERROR_OPERATION_ABORTED)) || rang {
+        if journal_drain_due(journal.waits(), hurried, code) {
             journal.set_hurry(true);
             let request = self.request(tag, Op::Journal(journal));
             if let Some(journaling) = self.journals.get_mut(&tag) {
@@ -2464,6 +2463,10 @@ fn failed(tag: Tag, why: impl fmt::Display) -> Completion {
     Completion { tag, done: Done::Failed(IoError(why.to_string())) }
 }
 
+fn journal_drain_due(waiting: bool, hurried: bool, code: Option<u32>) -> bool {
+    (waiting && code == Some(ERROR_INVALID_USER_BUFFER)) || (hurried && code == Some(ERROR_OPERATION_ABORTED))
+}
+
 fn watched_already(tag: Tag) -> io::Error {
     // alloc: an error path.
     io::Error::other(format!("something is watched as {tag:?} already"))
@@ -2655,6 +2658,14 @@ fn no_connection(conn: Conn) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_journal_doorbell_treats_1784_as_a_wake() {
+        let code = Some(ERROR_INVALID_USER_BUFFER);
+        assert!(journal_drain_due(true, false, code));
+        assert!(!journal_drain_due(false, false, code));
+        assert!(!journal_drain_due(false, true, code));
+        assert!(!journal_drain_due(true, false, Some(ERROR_OPERATION_ABORTED)));
+    }
     #[test]
     fn a_panicking_worker_reports_its_request_and_accepts_more_work() {
         let worker = std::thread::spawn(|| {
