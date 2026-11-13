@@ -149,6 +149,12 @@ pub(crate) fn static_ref(db: &Db, id: StaticId) -> Result<Ref, String> {
     }
     // alloc: the error's message, where the crate's target did not load
     match static_link_name(db, id).map_err(|e| e.to_string())? {
+        // A DLL's static is reached through its import address table cell, `__imp_X`, which
+        // the code loads its address from (`Recorder::declare_data_in_func`).
+        Some(symbol) if crate::dll_imported(db, id) => {
+            // alloc: the cell's symbol, which the reference owns
+            Ok(FrontRef::Extern(format!("__imp_{symbol}")))
+        }
         Some(symbol) => Ok(FrontRef::Extern(symbol)),
         None => Ok(FrontRef::Static(HirStatic(id))),
     }
