@@ -961,6 +961,24 @@ whole environment on its first call, and asks the host one variable at a time (t
 `env_var`). So `env::var` keys an expansion by the variables it read, and a per-run variable it
 never reads (`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all.
 
+On Windows the daemon names a path `/C:/a` (`blaze_core::platform::path`), which is also how
+wasi-libc names it, and a macro walks and is keyed by that name. A path cargo gives a crate
+(`CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_TARGET_TMPDIR`,
+`CARGO_BIN_EXE_*`) reaches the program as Windows names it, `C:\a`, as cargo gives it to rustc:
+from `env!` and `option_env!`, and from a macro's `env::var` (`base_db::given_value`). A macro
+may name a file in either spelling (`C:\a\b`, `C:\a/b`, `/C:/a/b`, and `C:\a` after its working
+directory, as wasi-libc hands a path it takes for relative): each is the one walked name
+(`src/os/host.rs`). `include!`, `include_str!` and `include_bytes!` of such a path resolve at
+the daemon's name (`base_db::named_path`).
+
+A source file with CRLF line endings is read as rustc reads it: each `\r\n` is a `\n` in a
+string, byte string or C string literal (a `\` before the line's end continues it), in a doc
+comment's attribute, and in what a proc macro or `macro_rules!` is handed; `line!`, `column!` and
+a diagnostic's line and column count no `\r`. `include_str!` and `include_bytes!` read the file's
+bytes as they are. The text blaze keeps, hashes and gives spans into is the file's own bytes:
+the reading happens where text becomes a value (`parser::cook::as_read`,
+`syntax_bridge::doc_text_as_read`).
+
 Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and a
 memory budget. The instance runs on a kept expansion thread, never on a fiber, because a
 Wasmtime activation lives in its thread's locals and a fiber moves threads when it waits

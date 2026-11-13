@@ -469,6 +469,18 @@ fn locate_with<A: Ask>(
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
                 continue;
             }
+            if target == Target::Msvc
+                && lib.verbatim
+                && let Some(library) = crate::pe::verbatim_option(&lib.name)
+            {
+                let library = library.map_err(fail)?;
+                line.default(&library).map_err(|it| LinkError {
+                    // alloc: error path
+                    what: format!("the native library `{}`: {}", lib.name, it.what),
+                    ..it
+                })?;
+                continue;
+            }
             let own: &[PathBuf] = match lib.kind {
                 NativeLibKind::Static { bundle: true, .. } => own,
                 _ => &[],
@@ -557,7 +569,12 @@ fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError>
         false => (VC_STATIC, "the dynamic one (no `-C target-feature=+crt-static`)"),
     };
     for lib in libs.iter().flat_map(|it| it.libs) {
-        let name = lib.name.rsplit(['/', '\\']).next().unwrap_or(&lib.name);
+        let asked = match lib.verbatim {
+            true => crate::pe::verbatim_option(&lib.name).and_then(Result::ok),
+            false => None,
+        };
+        let name = asked.as_deref().unwrap_or(&lib.name);
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
         let stem = match name.len().checked_sub(4) {
             Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".lib") => {
                 &name[..at]
@@ -2004,10 +2021,7 @@ impl Line<'_> {
             self.output.arch,
         )?;
         for (member, library) in asked.iter() {
-            if self.output.link.pe.no_default_libs.excludes(library) {
-                continue;
-            }
-            let path = self.default_library(library).map_err(|it| LinkError {
+            self.default(library).map_err(|it| LinkError {
                 // alloc: error path
                 what: match member.is_empty() {
                     true => format!(
@@ -2021,10 +2035,24 @@ impl Line<'_> {
                 },
                 ..it
             })?;
-            let pe = self.output.format == Format::Pe;
-            if !self.defaulted.iter().any(|it| *it == path || (pe && it.as_os_str().eq_ignore_ascii_case(path.as_os_str()))) {
-                self.defaulted.push(path);
-            }
+        }
+        Ok(())
+    }
+
+    /// `library`, a `/DEFAULTLIB` of a member or of a crate (a `+verbatim` native library
+    /// named `/defaultlib:NAME`), among the default libraries [`Line::flush_defaults`] puts
+    /// on the line, once, unless the link's `/NODEFAULTLIB` takes it out.
+    fn default(&mut self, library: &str) -> Result<(), LinkError> {
+        if self.output.link.pe.no_default_libs.excludes(library) {
+            return Ok(());
+        }
+        let path = self.default_library(library)?;
+        let pe = self.output.format == Format::Pe;
+        let known = self.defaulted.iter().any(|it| {
+            *it == path || (pe && it.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+        });
+        if !known {
+            self.defaulted.push(path);
         }
         Ok(())
     }

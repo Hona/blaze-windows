@@ -414,6 +414,39 @@ fn dynamic_libraries_on_windows() {
     );
 }
 
+/// Windows names a variable whatever its case (cmd and PowerShell have `Path`): the library
+/// path cargo sets is the inherited one with the unit's directories first, and the script gets
+/// that one variable, never `Path` and `PATH` both (which would leave which a process reads to
+/// the order of its environment block). Any other variable cargo sets replaces an inherited one
+/// of another case too; on Unix the cases are two names.
+#[test]
+fn a_windows_variable_is_one_whatever_its_case() {
+    let mut unit = bar();
+    unit.host = "x86_64-pc-windows-msvc".into();
+    unit.target = "x86_64-pc-windows-msvc".into();
+    unit.dylib_search.host_root = Some(r"C:\p\target\debug".into());
+    unit.dylib_search.host_deps = vec![r"C:\p\target\debug\deps".into()];
+    unit.dylib_search.sysroot_libdir = PathBuf::new();
+    let inherited =
+        os(&[("Path", r"C:\Windows;C:\tools"), ("Out_Dir", r"C:\elsewhere"), ("ComSpec", "cmd")]);
+    let env = env(&unit, &inherited).unwrap();
+    let named = |name: &str| -> Vec<(&str, &str)> {
+        env.vars
+            .iter()
+            .filter(|(it, _)| it.eq_ignore_ascii_case(name))
+            .map(|(it, value)| (it.to_str().unwrap(), value.to_str().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        named("PATH"),
+        [("PATH", r"C:\p\target\debug;C:\p\target\debug\deps;C:\Windows;C:\tools")]
+    );
+    assert_eq!(named("OUT_DIR"), [("OUT_DIR", "/p/foo/target/debug/build/bar-2/out")]);
+    assert_eq!(named("COMSPEC"), [("ComSpec", "cmd")], "what cargo does not set is passed through");
+    let on_linux = super::env(&bar(), &os(&[("Path", "/x")])).unwrap();
+    assert_eq!(var(&on_linux, "Path"), Some("/x"), "two names on Unix");
+}
+
 /// A path cargo cannot join fails as cargo's run does.
 #[test]
 fn a_path_with_the_separator() {
