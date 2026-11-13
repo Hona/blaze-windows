@@ -65,3 +65,29 @@ pub(crate) fn matches_patch(
     }
     Ok(true)
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::{fs, io::Write as _, os::windows::fs::MetadataExt as _};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+
+    #[test]
+    fn a_fresh_output_is_holes_and_never_truncates_someone_elses_file() {
+        let path = std::env::temp_dir().join(format!("blaze-output-holes-{}", std::process::id()));
+        super::super::sparse_file(&path, 64 << 20).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 64 << 20);
+        if matches!(crate::platform::volume(&path).unwrap().system.as_str(), "NTFS" | "ReFS") {
+            assert_ne!(meta.file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+        }
+        let mut f = fs::File::options().write(true).open(&path).unwrap();
+        f.write_all(b"written").unwrap();
+        assert_eq!(
+            super::super::sparse_file(&path, 0).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(f.metadata().unwrap().len(), meta.len());
+        drop(f);
+        fs::remove_file(path).unwrap();
+    }
+}

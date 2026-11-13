@@ -415,6 +415,10 @@ pub enum Effect {
         whole: std::sync::Arc<Vec<(u64, Vec<u8>)>>,
         tag: Tag,
     },
+    /// Create a fresh, exclusive staged output of `len` zero bytes. Holes cost no
+    /// blocks on sparse-capable volumes. Unlike Truncate this never resizes a file
+    /// that another publisher already owns. Completes with Truncated.
+    SparseFile { file: FileName, len: u64, tag: Tag },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
     /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
@@ -815,6 +819,7 @@ impl Effect {
             | Effect::Write { tag, .. }
             | Effect::WriteUnsynced { tag, .. }
             | Effect::TryPatch { tag, .. }
+            | Effect::SparseFile { tag, .. }
             | Effect::List { tag, .. }
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }

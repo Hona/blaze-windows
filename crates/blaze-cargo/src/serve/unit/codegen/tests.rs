@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 
+#[test]
+fn debug_outputs_use_daemon_names_for_native_and_foreign_targets() {
+    use blaze_link::Format;
+    let (file, plist) = super::side_paths(Format::Pe, "/C:/out/app.exe", "app.pdb");
+    assert_eq!(file, "/C:/out/app.pdb");
+    assert_eq!(plist, None);
+    let (file, plist) = super::side_paths(Format::MachO, "/root/app", "ignored");
+    assert_eq!(file, "/root/app.dSYM/Contents/Resources/DWARF/app");
+    assert_eq!(plist.as_deref(), Some("/root/app.dSYM/Contents/Info.plist"));
+}
+
 use std::collections::HashMap;
 
 use blaze_codegen::{plan::OptLevel, settings::Sanitize};

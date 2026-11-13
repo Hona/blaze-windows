@@ -199,6 +199,18 @@ What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 wi
   `throw;` rethrow run no Rust cleanup pad; a Rust panic out of an `extern "C"` function with
   no catcher above ends as an unhandled exception, not the "cannot unwind" abort.
 
+### v2 output placement on Windows
+
+On ReFS, blaze can clone the previous output's blocks and patch the clone. On NTFS,
+a new linker output starts as a sparse file: unused patch room consumes no clusters.
+For an edit, blaze verifies the prospective result against the linker's bytes while
+holding the previous file exclusively. It removes the public name and syncs its directory
+before changing bytes, then flushes the file and publishes the complete result. A crash
+during the patch can leave a missing output, not an accepted partial one. A running,
+mapped, multiply linked or externally changed file is not a patch base; blaze places
+a new file instead. Less data written need not mean a shorter edit: the profile names
+the wait to open an executable exclusively, separate from validation and flushes.
+
 ### v2 build scripts on Windows
 
 A script runs inside an AppContainer with its own job. The token has one read capability
@@ -206,10 +218,11 @@ for each input root; the filesystem keeps its read grant, but another run withou
 capability does not gain access. Granting a directory includes its contents. The script
 can write its `OUT_DIR` and temporary directory, not the inputs.
 
-Windows does not yet trace every filesystem read. A script that actually runs is therefore
-not reused from the build-script cache or its purity proof. Cargo's `rerun-if-changed`
-list alone cannot prove that an undeclared file is unchanged. Inert scripts that Blaze
-proves print only constants still need not run.
+Windows does not yet trace every filesystem read. A script can be reused when its MIR
+proof shows its only inputs are a fixed list of Cargo environment variables. Those values
+and its code form the key. Other executed scripts are not reused: `rerun-if-changed`
+alone cannot prove an undeclared file is unchanged. Inert scripts that Blaze proves
+print only constants still need not run.
 
 For an external input, set `BLAZE_SCRIPT_READ` in the shell invoking blaze, to absolute
 paths separated by `;`. Use the individual executable for a portable tool on `PATH`, or
