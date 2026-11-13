@@ -1055,6 +1055,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::write_unsynced(path, &bytes)?;
             Ok(Done::Written)
         }),
+        Effect::TryPatch { file, len, delta, whole, .. } => at(root, &file, |path| {
+            fs::try_patch(path, len, &delta, &whole).map(Done::Patched)
+        }),
         Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
             fs::write_at(path, offset, &bytes)?;
             Ok(Done::Written)

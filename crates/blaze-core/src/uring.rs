@@ -2401,6 +2401,7 @@ impl Driver for Uring {
             }
             self.in_flight += 1;
             let started = match effect {
+                Effect::TryPatch { .. } => Ok(Some(Done::Patched(false))),
                 Effect::Write { file, bytes, .. } => {
                     self.write(tag, file, bytes, 0).map(|()| None)
                 }

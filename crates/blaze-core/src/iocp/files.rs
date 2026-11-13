@@ -193,7 +193,7 @@ fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
-    let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
+    let wide_from = sys::path(from)?;
     // Replace the name, never the backing data of a mapped pack or image. MoveFileExW
     // can return success but leave an older view faulting zero pages under memory pressure.
     // SAFETY: a NUL-terminated source; open the name itself, including a directory or link.
@@ -201,6 +201,11 @@ fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
         CreateFileW(wide_from.as_ptr(), DELETE, SHARE_ALL, std::ptr::null(), OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
     })?;
+    rename_handle(file.as_raw_handle(), to, RENAME_REPLACE | RENAME_POSIX)
+}
+
+fn rename_handle(file: HANDLE, to: &Path, flags: u32) -> io::Result<()> {
+    let wide_to = sys::path(to)?;
     let name = &wide_to[..wide_to.len() - 1];
     let bytes = std::mem::size_of_val(name);
     // SetFileInformationByHandle resolves the DOS path as a NUL-terminated string even
@@ -213,12 +218,15 @@ fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
     // SAFETY: the buffer has room and alignment for the fixed header and every name unit.
     // RootDirectory is null (absolute path). FileRenameInfoEx takes Flags, not ReplaceIfExists.
     sys::check(unsafe {
-        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
+        (*info).Anonymous.Flags = flags;
         (*info).FileNameLength = bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast(), name.len());
-        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
+        SetFileInformationByHandle(file, FileRenameInfoEx, info.cast(), size)
     })
 }
+
+mod patch;
+pub(crate) use patch::try_patch;
 
 /// Whether a file named `path` may be an image a process maps to run: an executable or a
 /// library Windows loads (`.exe`, `.dll`, and the `.pyd` and `.node` modules other runtimes

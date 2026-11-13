@@ -514,6 +514,7 @@ impl Kqueue {
             | Effect::Truncate { .. }
             | Effect::Write { .. }
             | Effect::WriteUnsynced { .. }
+            | Effect::TryPatch { .. }
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
             | Effect::RenameUnsynced { .. }

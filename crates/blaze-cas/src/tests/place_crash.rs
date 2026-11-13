@@ -23,6 +23,36 @@ use blaze_core::sim::SECTOR;
 
 use super::*;
 
+/// The invariant: an eligible edit writes its delta only. A file edited by another
+/// writer (same length) or absent after an interrupted lease is replaced whole; the
+/// same tag answers exactly once with the independent reference bytes in every case.
+#[hegel::test(test_cases = 64)]
+fn exclusive_edits_never_accept_a_wrong_base(tc: TestCase) {
+    let mut sim = Sim::new(tc.draw(gs::integers()), quiet());
+    let mut store = open_with(&mut sim, sharing_config(Sharing::Unshared));
+    let to = name("out/app");
+    let mode = tc.draw(gs::integers::<u8>().max_value(2));
+    if mode != 2 {
+        sim.change(&to, if mode == 0 { b"abcde" } else { b"abcdf" });
+    }
+    let x = tc.draw(gs::integers::<u8>());
+    let want = vec![b'a', x, b'c', b'd', b'e'];
+    let mut effects = Vec::new();
+    let tag = store.place_edit(to.clone(), Sparse { len: 5, runs: vec![(1, vec![x])] },
+        Sparse { len: 5, runs: vec![(0, want.clone())] }, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed.len(), 1);
+    assert_eq!(placed[0].tag, tag);
+    assert_eq!(placed[0].result, Ok(()));
+    assert_eq!(placed[0].bytes.copied, if mode == 0 { 1 } else { 5 });
+    assert_eq!(sim.contents(&to), want);
+    if mode == 0 {
+        sim.crash();
+        assert_eq!(sim.contents(&to), want, "a published lease is durable");
+    }
+}
+
 /// How long a derived value's file is, against its base's.
 #[derive(Clone, Copy, Debug)]
 enum Len {

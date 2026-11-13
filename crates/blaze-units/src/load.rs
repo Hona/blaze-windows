@@ -289,11 +289,16 @@ const NO_CARGO_HOME: &str = "/@blaze-no-cargo-home";
 const NO_SOURCES: &str = "/@blaze-no-sources";
 
 fn foreign_spec(ask: &ForeignAsk) -> Spec {
-    let config = ConfigOf::Fixed {
-        mounts: ask.mounts.clone(),
-        cwd: ask.cwd.clone(),
-        env: vec![("CARGO_HOME".to_owned(), NO_CARGO_HOME.to_owned())],
-    };
+    let mut env = vec![("CARGO_HOME".to_owned(), NO_CARGO_HOME.to_owned())];
+    // The target's rustflags reach the foreign workspace's units for the target as cargo's
+    // `-Zbuild-std` passes the build's to std's: by its configuration, so its plan gives each
+    // unit for `ask.triple` the flags (`-C target-feature=+crt-static`: `core`'s
+    // `#[link(name = "/defaultlib:libcmt", cfg(target_feature = "crt-static"))]`) and its host
+    // units (std's build scripts) none, as `host_cfg` is probed with none.
+    if !ask.rustflags.is_empty() {
+        env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), ask.rustflags.join("\x1f")));
+    }
+    let config = ConfigOf::Fixed { mounts: ask.mounts.clone(), cwd: ask.cwd.clone(), env };
     Spec {
         workspace: WorkspaceKey { manifest: Some(ask.manifest.clone()), config },
         select: Select::Packages(ask.specs.clone()),
@@ -362,7 +367,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 10");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 11");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -470,7 +475,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 8");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 9");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 
