@@ -706,6 +706,8 @@ dependencies = [
  "serde",
  "sonic-rs",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2102,6 +2104,8 @@ dependencies = [
  "blaze-report",
  "libc",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

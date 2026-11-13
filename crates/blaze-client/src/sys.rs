@@ -5,11 +5,81 @@
 
 use std::{
     io,
-    os::{
-        fd::{AsRawFd as _, RawFd},
-        unix::net::UnixStream,
+    os::fd::{AsRawFd as _, RawFd},
+};
+
+use blaze_core::wait::{self, Deadline, Monotonic, WaitError, Waited};
+pub(crate) use std::os::unix::net::UnixStream;
+use std::{
+    io::{Read as _, Write as _},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
+
+#[derive(Debug)]
+pub struct Waker {
+    pipe: io::PipeWriter,
+    pending: Arc<AtomicBool>,
+}
+impl Waker {
+    pub fn wake(&self) -> io::Result<()> {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            (&self.pipe).write_all(&[1])?;
+        }
+        Ok(())
+    }
+}
+#[derive(Debug)]
+pub(crate) struct Readiness {
+    reader: io::PipeReader,
+    wake: Waker,
+}
+impl Readiness {
+    pub(crate) fn new(stream: &UnixStream) -> io::Result<Self> {
+        no_sigpipe(stream)?;
+        let (reader, pipe) = io::pipe()?;
+        Ok(Self { reader, wake: Waker { pipe, pending: Arc::new(AtomicBool::new(false)) } })
+    }
+    pub(crate) fn waker(&self) -> io::Result<Waker> {
+        Ok(Waker { pipe: self.wake.pipe.try_clone()?, pending: self.wake.pending.clone() })
+    }
+    pub(crate) fn wait(
+        &mut self,
+        socket: Option<(&UnixStream, bool)>,
+        deadline: Deadline,
+        clock: &Monotonic,
+    ) -> Result<Waited<(bool, bool)>, WaitError> {
+        let mut watched = [
+            libc::pollfd { fd: self.reader.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: -1, events: 0, revents: 0 },
+        ];
+        if let Some((s, writes)) = socket {
+            watched[1].fd = s.as_raw_fd();
+            watched[1].events = libc::POLLIN | if writes { libc::POLLOUT } else { 0 };
+        }
+        match wait::readable(
+            "a client wake or its socket",
+            &mut watched[..1 + usize::from(socket.is_some())],
+            deadline.finite(),
+            clock,
+        )? {
+            Waited::Ready(_) => {
+                let wake = watched[0].revents != 0;
+                if wake {
+                    let _ = self.reader.read(&mut [0; 1]);
+                    self.wake.pending.store(false, Ordering::Release);
+                }
+                Ok(Waited::Ready((
+                    wake,
+                    watched[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
+                )))
+            }
+            Waited::Deadline => Ok(Waited::Deadline),
+        }
+    }
+}
 
 /// Has a write to `stream` whose peer is gone fail with `EPIPE` and raise no signal, where
 /// that is the socket's to say (`SO_NOSIGPIPE`, macOS and the BSDs); on Linux each
