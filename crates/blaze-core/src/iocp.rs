@@ -2488,6 +2488,16 @@ struct Kept {
     paths: sys::Paths,
 }
 
+/// A worker owns one outstanding request. Unwinding must give that request its terminal
+/// completion too: otherwise the driver and every flush behind it wait for a dead worker.
+fn guarded_work<T>(what: &str, run: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|panic| {
+        let why = panic.downcast_ref::<String>().map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-text panic");
+        Err(io::Error::other(format!("the IOCP worker panicked {what}: {why}")))
+    })
+}
+
 fn work_on(
     root: &Path,
     queue: &Receiver<Work>,
@@ -2507,24 +2517,24 @@ fn work_on(
             Work::File(effect) => {
                 let tag = effect.tag();
                 #[cfg(test)]
-                let (done, used) = blaze_alloc_count::measure(|| file(root, effect, &mut kept));
+                let (done, used) = blaze_alloc_count::measure(|| guarded_work("on a file request", || file(root, effect, &mut kept)));
                 #[cfg(test)]
                 counted.fetch_add(used.allocations, std::sync::atomic::Ordering::Relaxed);
                 #[cfg(not(test))]
-                let done = file(root, effect, &mut kept);
+                let done = guarded_work("on a file request", || file(root, effect, &mut kept));
                 // alloc: an error path.
                 let done = done.unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
                 back.send(Back::Done(Completion { tag, done }))
             }
             Work::Connect { tag, at } => {
-                let made = net::connect_blocking(root, &at);
+                let made = guarded_work("connecting to a local socket", || net::connect_blocking(root, &at));
                 back.send(Back::Connected { tag, at, made })
             }
             Work::Open { tag, dir, since } => {
-                let opened = usn::Journal::open(root, &dir, since).and_then(|(journal, first)| {
+                let opened = guarded_work("opening a USN journal", || usn::Journal::open(root, &dir, since).and_then(|(journal, first)| {
                     port.associate(journal.raw())?;
                     Ok((journal, first))
-                });
+                }));
                 let (journal, taken) = match opened {
                     Ok((journal, batch)) => {
                         let read = Some(journal.reached(false));
@@ -2538,12 +2548,15 @@ fn work_on(
                 back.send(Back::Journal { tag, journal, taken })
             }
             Work::Took { tag, mut journal, result } => {
-                let taken = journal.take(result);
+                let taken = guarded_work("naming a USN record", || Ok(journal.take(result)))
+                    .unwrap_or_else(|why| usn::Taken {
+                        batch: None, end: Some(format!("the watch of {}: {why}", journal.shown())), read: None,
+                    });
                 let journal = taken.end.is_none().then_some(journal);
                 back.send(Back::Journal { tag, journal, taken })
             }
             Work::Mark { journal, flush, querier } => {
-                let mark = usn::mark(&querier);
+                let mark = guarded_work("marking a USN flush", || usn::mark(&querier));
                 back.send(Back::Marked { journal, flush, mark })
             }
         };
@@ -2639,6 +2652,15 @@ fn no_connection(conn: Conn) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_panicking_worker_reports_its_request_and_accepts_more_work() {
+        let worker = std::thread::spawn(|| {
+            let error = super::guarded_work::<()>("naming a USN record", || panic!("planted")).unwrap_err();
+            assert!(error.to_string().contains("naming a USN record: planted"));
+            super::guarded_work("marking a USN flush", || Ok(37)).unwrap()
+        });
+        assert_eq!(worker.join().unwrap(), 37);
+    }
     use std::{
         collections::BTreeMap,
         ffi::OsString,
