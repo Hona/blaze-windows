@@ -1521,6 +1521,10 @@ pub(crate) struct Job {
     pub(crate) layout: OnceLock<Result<Option<layout::Profiles>, String>>,
     /// `blaze test --ub`'s tests, selected once on a worker, read by every evaluation.
     pub(crate) ub: OnceLock<test::UbTests>,
+    /// The Visual Studio tools and Windows SDK its sandboxed build scripts are started with a
+    /// developer prompt's variables for ([`script::started_in`]), found the first time one runs.
+    #[cfg(windows)]
+    pub(crate) msvc: OnceLock<Result<blaze_core::platform::msvc::Developer, String>>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
     /// The dependency crates checked this build, kept with the front end until the head's next
@@ -1588,6 +1592,8 @@ impl Job {
             lint_profiles: Default::default(),
             layout: Default::default(),
             ub: Default::default(),
+            #[cfg(windows)]
+            msvc: Default::default(),
             began: Instant::now(),
             later: Lock::new("serve.unit.later", Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Lock::new("serve.unit.seeds", Vec::new()),

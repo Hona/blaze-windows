@@ -407,3 +407,42 @@ fn a_git_dependencys_script_that_found_no_repository_names_blazes_checkout() {
     let cause = format!("{:?}", cause.text);
     assert!(cause.contains(root) && cause.contains("has no `.git`"), "{cause}");
 }
+
+/// The invariant: a developer prompt's variables replace the job's of any case, the job's
+/// `Path` (as Windows names it) is the prompt's `PATH` tail and keeps its name, nothing else of
+/// the job's changes, and the environment stays sorted by name with no name twice in any case.
+#[cfg(windows)]
+#[test]
+fn a_developer_prompt_is_set_over_the_jobs_environment_once_per_name() {
+    use std::ffi::OsString;
+    let developer = blaze_core::platform::msvc::Developer {
+        install: PathBuf::from(r"C:\VS"),
+        tools: "14.44.35207".to_owned(),
+        kits: PathBuf::from(r"C:\Kits\10"),
+        sdk: "10.0.26100.0".to_owned(),
+    };
+    let mut env: Vec<(OsString, OsString)> = [
+        ("CARGO_PKG_NAME", "z-sys"),
+        ("Include", r"C:\old"),
+        ("Path", r"C:\Windows;C:\bin"),
+        ("TARGET", "x86_64-pc-windows-msvc"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.into(), value.into()))
+    .collect();
+    super::prompted(&mut env, &developer, "x64", "x64").unwrap();
+    let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, it)| it.to_str().unwrap());
+    assert_eq!(get("CARGO_PKG_NAME"), Some("z-sys"));
+    assert_eq!(get("TARGET"), Some("x86_64-pc-windows-msvc"));
+    assert_eq!(get("Include"), None, "the job's INCLUDE is the prompt's, under the prompt's name");
+    assert!(get("INCLUDE").unwrap().starts_with(r"C:\VS\VC\Tools\MSVC\14.44.35207\include;"));
+    assert_eq!(get("PATH"), None);
+    assert!(get("Path").unwrap().ends_with(r"\x64;C:\Windows;C:\bin"), "{:?}", get("Path"));
+    assert_eq!(get("VCINSTALLDIR"), Some(r"C:\VS\VC\"));
+    let names: Vec<String> = env.iter().map(|(it, _)| it.to_str().unwrap().to_owned()).collect();
+    assert!(names.is_sorted(), "{names:?}");
+    let mut folded: Vec<String> = names.iter().map(|it| it.to_ascii_uppercase()).collect();
+    folded.sort();
+    folded.dedup();
+    assert_eq!(folded.len(), names.len(), "{names:?}");
+}
