@@ -514,7 +514,9 @@ impl IncludedFile {
         // Read from the disk every time, and counted as a look at it: no watch vouches for
         // the file (`blaze_vfs::outside::looks`).
         blaze_vfs::outside::looked(path);
-        std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
+        // `path` is the daemon's name (`/C:/a` on Windows), read at the system's path of it.
+        let host = blaze_core::platform::path::host(&path.to_string_lossy());
+        std::fs::read(host).map(Into::into).map_err(|it| ReadError::of(&it))
     }
 
     /// [`IncludedFile::content`] of the file at `path` as it is on disk now
