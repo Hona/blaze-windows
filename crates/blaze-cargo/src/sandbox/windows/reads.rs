@@ -1,5 +1,5 @@
 //! The read checks the warm launcher keeps ([`super::serve`]): a path seen covered for the
-//! sandbox's readers (the container's SID and ALL APPLICATION PACKAGES, with [`READ`]) is not
+//! sandbox's readers (the root's capability and ALL APPLICATION PACKAGES, with [`READ`]) is not
 //! checked again until a watch of its volume says it may have changed, so a run whose reads were
 //! all granted before makes no call for them. `blaze sandbox --v2` keeps none: it runs once.
 //!
@@ -141,9 +141,12 @@ impl Reads {
     ) -> Result<Option<Seen>, String> {
         fold_into(key, path.as_os_str().encode_wide());
         let hash = hash(key);
+        // Watch notifications use the folded name, but a capability is for the exact root
+        // spelling. Never skip its access check on the strength of another spelling's grant.
+        let reader = FixedState.hash_one(path.as_os_str()) << PENDING;
         if let Some(slot) = self.paths.find(hash, key) {
             let state = slot.state.load(Ordering::Acquire);
-            if state & COVERED != 0 {
+            if state & !DIR == reader | COVERED {
                 return Ok(Some(Seen { dir: state & DIR != 0, covered: true }));
             }
         }
@@ -153,7 +156,7 @@ impl Reads {
         let seen = inspect(&file, path, readers, READ, GRANTING_READ)?;
         if let Some((slot, token, root)) = pending {
             let to = match seen.covered {
-                true => COVERED | u64::from(seen.dir),
+                true => reader | COVERED | u64::from(seen.dir),
                 false => 0,
             };
             slot.publish(token, to, &root.dead);

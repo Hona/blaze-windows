@@ -26,6 +26,8 @@ will build: what blaze cannot build fails the build with the reason.
 
 ## Toolchain
 
+For v2 on Windows, see [build scripts on Windows](platforms.md#v2-build-scripts-on-windows).
+
 One toolchain: the dated nightly in `harness/toolchain`, `nightly-2026-10-25` today, which
 says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a, LLVM
 23.1.4). blaze links against what rustc built, so it must agree with that rustc on symbol

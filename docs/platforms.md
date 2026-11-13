@@ -177,6 +177,22 @@ not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0
 - Not done: CFG tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a
   `.res` manifest works).
 
+### v2 build scripts on Windows
+
+A script runs inside an AppContainer with its own job. The token has one read capability
+for each input root; the filesystem keeps its read grant, but another run without that
+capability does not gain access. Granting a directory includes its contents. The script
+can write its `OUT_DIR` and temporary directory, not the inputs.
+
+For an external input, set `BLAZE_SCRIPT_READ` in the shell invoking blaze, to absolute
+paths separated by `;`. Use the individual executable for a portable tool on `PATH`, or
+its dedicated installation directory if it also needs DLLs. `PATH` is not permission
+to read everything under each entry. For a linked worktree, include the trusted main
+repository's `.git` directory (including its `worktrees` subdirectory). Blaze does not
+treat paths supplied by a checkout's `.git` file or Cargo `[env]` as permission. All
+build scripts of that invocation can read the inputs you list; do not list a profile,
+a credentials directory or a repository whose history you cannot share with them.
+
 ## macOS arm64
 
 Runs on `macos-latest` in CI under both backends, with `worktrees.py` in all three of its

@@ -536,6 +536,44 @@ fn a_program_with_no_hash_in_its_name_is_made_once() {
     assert_eq!(artifact::made(&lib).len(), 2);
 }
 
+/// The invariant (I19): an MSVC `cdylib` is one image made, its DLL; the import library cargo
+/// plans beside it is the DLL's, at both its paths, and listed after it as cargo lists it; the
+/// export file is no output blaze makes or lists. The control, the by-products not told
+/// apart: three images, two under a by-product's name.
+#[test]
+fn an_msvc_cdylib_is_one_image_and_its_import_library_is_beside_it() {
+    let deps = "/w/target/debug/deps";
+    let outputs = [
+        format!("{deps}/rune_www-89ab.dll"),
+        format!("{deps}/rune_www-89ab.dll.lib"),
+        format!("{deps}/rune_www-89ab.dll.exp"),
+        format!("{deps}/rune_www-89ab.pdb"),
+        "/w/target/debug/rune_www.dll".to_owned(),
+        "/w/target/debug/rune_www.dll.lib".to_owned(),
+    ];
+    let it = plan("-89ab", &outputs.iter().map(String::as_str).collect::<Vec<_>>());
+    let dll = format!("{deps}/rune_www-89ab.dll");
+    assert_eq!(artifact::made(&it), [dll.as_str()]);
+    assert_eq!(artifact::import_library(&dll, &it), Some(format!("{dll}.lib").as_str()));
+    assert_eq!(
+        artifact::uplifted(&format!("{dll}.lib"), &it),
+        Some("/w/target/debug/rune_www.dll.lib")
+    );
+    assert_eq!(artifact::import_library("/w/target/debug/deps/p-89ab.exe", &it), None);
+    let lib = unit(P, target("rune_www", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    assert_eq!(
+        artifact::filenames(&lib, &it),
+        ["/w/target/debug/rune_www.dll", "/w/target/debug/rune_www.dll.lib"]
+    );
+    let control: Vec<&str> = it
+        .outputs
+        .iter()
+        .map(String::as_str)
+        .filter(|it| artifact::listed(it) && it.starts_with(deps) && !it.ends_with(".pdb"))
+        .collect();
+    assert_eq!(control.len(), 2, "the control: the DLL and its import library both images");
+}
+
 #[test]
 fn a_build_scripts_artifact_is_cargos() {
     let script =

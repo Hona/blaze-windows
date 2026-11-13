@@ -2032,6 +2032,8 @@ pub(crate) enum LinkStep {
     Bytes,
     /// Making the image's debug side file.
     Debug,
+    /// Making a DLL's import library.
+    Import,
 }
 
 impl LinkStep {
@@ -2043,6 +2045,7 @@ impl LinkStep {
             LinkStep::Stage => "staging the change",
             LinkStep::Bytes => "writing the image",
             LinkStep::Debug => "making the debug side file",
+            LinkStep::Import => "making the import library",
         }
     }
 }
@@ -2283,6 +2286,11 @@ fn link_at(
         Ok(_) => debug_side(job, unit, path, &mut linked),
         Err(_) => Ok(Vec::new()), // alloc: none, empty
     };
+    // A DLL's import library, beside it: written from its exports as committed.
+    let import = match &made {
+        Ok(_) => import_side(job, unit, path, &linked),
+        Err(_) => Ok(Vec::new()), // alloc: none, empty
+    };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
         Ok(_) => linked
@@ -2355,7 +2363,8 @@ fn link_at(
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let side = debug?;
+    let mut side = debug?;
+    side.extend(import?);
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -3306,3 +3315,38 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
     Ok(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 
+
+/// The import library planned beside the DLL `path` (`foo.dll.lib`, cargo's output of a
+/// `cdylib` on MSVC, [`super::artifact::import_library`]), written from the DLL's exports as
+/// this link committed them (`Image::import_library`, link.exe's `/IMPLIB`), at that path and
+/// at its uplifted copy: none for any other image. A DLL planned with one whose link makes
+/// none is an error naming both: nothing is placed in its stead.
+fn import_side(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    linked: &Linked,
+) -> Result<Vec<SideFile>, LinkCause> {
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    let Some(lib) = super::artifact::import_library(path, plan) else {
+        return Ok(Vec::new()); // alloc: none, empty
+    };
+    let _span = tracing::info_span!(target: "blaze", "link import library", unit = %path).entered();
+    let bytes = linked
+        .image
+        .import_library()
+        .map_err(|error| LinkCause::Linker { step: LinkStep::Import, error })?
+        .ok_or_else(|| {
+            LinkCause::Given(format!(
+                "{lib} is planned beside {path}, and its link makes no import library: it is no DLL"
+            ))
+        })?;
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve import library", &bytes));
+    let file = blaze_cas::Sparse { len: bytes.len() as u64, runs: vec![(0, bytes)] };
+    let file = Arc::new(Made::Whole(file)); // alloc: once per import library, shared by its paths
+    Ok(std::iter::once(lib)
+        .chain(super::artifact::uplifted(lib, plan))
+        // clone: a refcount; alloc: once per import library, a path or two
+        .map(|at| SideFile { path: at.to_owned(), key, file: Arc::clone(&file) })
+        .collect())
+}
