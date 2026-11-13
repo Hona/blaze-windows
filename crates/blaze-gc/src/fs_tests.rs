@@ -64,6 +64,15 @@ fn a_recreated_lease_is_not_renamed() {
     drop(Lease::hold(&dir).unwrap_or_else(|why| panic!("{why}")));
     let mut old = std::fs::File::open(lease::lease_of(&dir)).unwrap();
     assert_eq!(lease::verified(&mut old, &dir).unwrap(), lease::Check::Own);
+    // Windows refuses to rename a directory while a file under it is open, so the race this
+    // guards against cannot happen there: the refusal is what holds.
+    if cfg!(windows) {
+        let refused = std::fs::rename(&dir, area.join("away")).unwrap_err();
+        assert!(fs::refused_for_an_open_file(&refused), "{refused}");
+        drop(old);
+        std::fs::remove_dir_all(&area).unwrap();
+        return;
+    }
     std::fs::rename(&dir, area.join("away")).unwrap();
     drop(Lease::hold(&dir).unwrap_or_else(|why| panic!("{why}")));
     assert!(
@@ -282,6 +291,18 @@ fn a_tree_that_cannot_go_back_stays_in_trash_and_is_not_unlinked_while_leased() 
             std::fs::write(dir.join("new"), b"made again").unwrap();
         }
     });
+    // On Windows the build's lease file, open inside the tree, makes the system refuse the
+    // rename: the tree never moves, and the refusal names the build dir.
+    if cfg!(windows) {
+        assert_eq!(swept, Swept::NestedLeased { dir: inner.to_string_lossy().into_owned() });
+        assert!(!to.exists() && inner.join(lease::LEASE).is_file());
+        holder.expect("the child ran").release();
+        assert_eq!(fs::trash(&dir, &to, Class::Workspace, None), Swept::Moved);
+        fs::unlink(&to, Vec::new()).unwrap_or_else(|why| panic!("{why}"));
+        assert!(!to.exists());
+        std::fs::remove_dir_all(&area).unwrap();
+        return;
+    }
     let Swept::LeftInTrash { why } = &swept else { panic!("{swept:?}") };
     assert!(why.contains("not back") && why.contains(&to.display().to_string()), "{why}");
     assert!(to.is_dir() && dir.join("new").is_file());

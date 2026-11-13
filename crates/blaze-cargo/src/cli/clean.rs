@@ -43,7 +43,12 @@
 //!    locked a lease inside it meanwhile loses its files: what is left stays until that build
 //!    ends. What a clean killed mid-removal left beside a directory is removed by the next clean
 //!    of it, once its pid no longer runs and every lease in it is taken exclusively
-//!    ([`sweep_leftovers`], review N6).
+//!    ([`sweep_leftovers`], review N6). On Windows, which refuses to rename or remove a
+//!    directory while a file under it is open (its own leases' too), the locks are let go just
+//!    before the rename, and the refusal is the lock: a build that took a lease meanwhile holds
+//!    its file open, so the rename fails and the clean says which build dir is in use
+//!    ([`blaze_gc::fs::let_go_before_moving`], [`blaze_gc::fs::held_open`]); the renamed tree's
+//!    leases are taken again, then let go before the unlink.
 
 use std::{
     ffi::OsString,
@@ -506,9 +511,17 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
                 u64::from(std::process::id()),
                 &dir.to_string_lossy(),
             ));
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             match blaze_gc::fs::rename_into_trash(&dir, &to) {
                 blaze_gc::plan::Swept::Moved => {}
                 blaze_gc::plan::Swept::Failed(why) => return Err(why),
+                blaze_gc::plan::Swept::Leased => return Err(in_use(&dir)),
+                blaze_gc::plan::Swept::NestedLeased { dir: inner } => {
+                    return Err(refused(blaze_gc::fs::Nested::Held {
+                        tree: dir.clone(),
+                        dir: PathBuf::from(inner),
+                    }));
+                }
                 _ => return Err(changed(&dir)),
             }
             // A lease a build took inside between the walk and the lock: the tree goes back,
@@ -525,9 +538,20 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
             }
             // Beside it, on its own file system: the rename is atomic, and nothing else is named so.
             let to = parent.join(format!(".{name}{REMOVING}{}-{now:020}", std::process::id()));
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             match blaze_gc::fs::rename_no_replace(&dir, &to) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(changed(&dir)),
+                Err(error) if blaze_gc::fs::refused_for_an_open_file(&error) => {
+                    return Err(match blaze_gc::fs::held_open(&dir, &error) {
+                        blaze_gc::plan::Swept::Leased => in_use(&dir),
+                        blaze_gc::plan::Swept::NestedLeased { dir: inner } => {
+                            refused(blaze_gc::fs::Nested::Held { tree: dir.clone(), dir: PathBuf::from(inner) })
+                        }
+                        blaze_gc::plan::Swept::Failed(why) => why,
+                        other => format!("renaming {} to {}: {error} ({other:?})", dir.display(), to.display()),
+                    });
+                }
                 Err(error) => {
                     return Err(format!("renaming {} to {}: {error}", dir.display(), to.display()));
                 }
@@ -536,6 +560,7 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
             // named (review round 7, C1); one it could not move back is left, and the next clean
             // of it sweeps it once that build ends.
             blaze_gc::fs::recheck_renamed(&dir, &to, &mut locks).map_err(refused)?;
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             blaze_gc::fs::remove_tree(&to).map_err(|why| {
                 format!(
                     "removing {} (renamed from {}): {why}; what is left can be removed by hand",
@@ -641,6 +666,7 @@ fn sweep_leftovers(parent: &Path, name: &str) -> Vec<String> {
                 continue;
             }
         }
+        blaze_gc::fs::let_go_before_moving(&mut locks);
         if let Err(why) = blaze_gc::fs::remove_tree(&left) {
             problems.push(format!(
                 "removing {}, left by a clean that ended (pid {pid}): {why}",
