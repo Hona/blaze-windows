@@ -6857,7 +6857,10 @@ impl<S: Steps> Jobs<S> {
     /// ([`Jobs::place_made_as`]). A patch of the file before it ([`Made::Patch`]) goes as
     /// the patch where the path's record says it holds that file: the file is looked at
     /// first ([`Own::LookBase`]), since a file changed or removed since it was placed is no
-    /// base. Where the record names another value or none, the whole file is placed.
+    /// base. Where the record names another value or none, the whole file is placed, and so
+    /// it is wherever the store's volume shares no blocks: a patch is written into a clone of
+    /// the path's file, and there a copy of that file would write as much as the whole file
+    /// does, and read it too.
     fn place_made(
         &mut self,
         w: &mut World<'_, S>,
@@ -6868,6 +6871,7 @@ impl<S: Steps> Jobs<S> {
         made: Arc<Made>,
     ) {
         let based = match &*made {
+            Made::Patch { .. } if w.store.sharing() == blaze_core::Sharing::Unshared => false,
             Made::Patch { base, .. } => self.paths.placed[path as usize]
                 .as_ref()
                 .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
