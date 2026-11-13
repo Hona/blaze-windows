@@ -359,6 +359,21 @@ fn source_view_of_every_def() {
 }
 
 #[test]
+fn a_replaced_item_resolves_its_attribute_to_the_exported_proc_macro() {
+    let fx = fixture::db("//- proc_macros: identity\n//- /main.rs crate:main\n#[proc_macros::identity] fn f() {}\n");
+    let file = fx.file_at("/main.rs");
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let sema = Semantics::new(&db);
+        let item = sema.parse(file).syntax().descendants().find_map(view::Item::cast).unwrap();
+        let called = sema.resolve_attr_macro_call(item).unwrap();
+        assert!(called.is_proc_macro());
+        assert_eq!(called.name(&db).symbol().as_str(), "identity");
+        assert_ne!(called.module(&db).krate(&db), sema.file_to_module_def(file.file_id(&db)).unwrap().krate(&db));
+    });
+}
+
+#[test]
 fn a_file_only_a_block_declares_is_a_module_whose_paths_resolve() {
     // No crate def map lists `m.rs`: only `main`'s block's def map has the module `m`.
     let fx = fixture::db(
