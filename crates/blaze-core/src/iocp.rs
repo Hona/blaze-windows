@@ -48,6 +48,7 @@
 pub(crate) mod files;
 mod net;
 mod observe;
+mod pressure;
 mod process;
 mod rundirs;
 mod stamp;
@@ -90,7 +91,7 @@ use windows_sys::Win32::{
 
 use self::{
     rundirs::RunDirs,
-    sys::{BUFFER, Buffer, Buffers, Head, KEY_DOORBELL, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
+    sys::{BUFFER, Buffer, Buffers, Head, KEY_DOORBELL, KEY_EXIT, KEY_IO, KEY_JOB, KEY_PRESSURE, KEY_WAKE, KEY_WARM, Port},
 };
 use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
@@ -590,6 +591,8 @@ pub struct Iocp {
     timers: Wheel<Tag>,
     watches: HashMap<Tag, Id, Global>,
     journals: HashMap<Tag, Journaling, Global>,
+    /// The [`Effect::Pressure`] watches, each its thread's.
+    pressures: HashMap<Tag, pressure::Watch, Global>,
     listens: HashMap<Tag, Id, Global>,
     spawns: Slab<Spawned>,
     spawning: HashMap<Tag, SpawnId, Global>,
@@ -690,6 +693,7 @@ impl Iocp {
             timers: Wheel::try_new(wheel::MAX_TIMERS).map_err(mem)?,
             watches: reserved(),
             journals: reserved(),
+            pressures: reserved(),
             listens: reserved(),
             spawns: Slab::new(SPAWNS, MemTag::Io).map_err(mem)?,
             spawning: reserved(),
@@ -1075,13 +1079,13 @@ impl Iocp {
                 Ok(())
             }
             Effect::Hangup { conn, tag } => self.hangup(conn, tag),
-            // Not yet: `CreateMemoryResourceNotification` is the source to wait on here. Until
-            // then it ends at once, naming why, and the daemon runs without it.
-            Effect::Pressure { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the IOCP driver watches no memory pressure yet \
-                 (CreateMemoryResourceNotification is not waited on)",
-            )),
+            // The machine's commit and physical memory, looked at by a thread of the watch's,
+            // which posts the tag to the port while memory is short.
+            Effect::Pressure { tag } => {
+                let watch = pressure::Watch::start(Arc::clone(&self.port), tag)?;
+                self.pressures.insert(tag, watch);
+                Ok(())
+            }
             Effect::Kill { .. } | Effect::Unwatch { .. } | Effect::Unlisten { .. } => {
                 unreachable!("taken where they are submitted")
             }
@@ -2075,6 +2079,14 @@ impl Iocp {
                 KEY_DOORBELL => {
                     self.rang(Tag(entry.lpOverlapped as usize as u64), entry.dwNumberOfBytesTransferred)
                 }
+                // A watch let go of since posts nothing the asker hears.
+                KEY_PRESSURE => {
+                    let tag = Tag(entry.lpOverlapped as usize as u64);
+                    if self.pressures.contains_key(&tag) {
+                        let critical = entry.dwNumberOfBytesTransferred != 0;
+                        self.ready.push(Completion { tag, done: Done::Pressed { critical } });
+                    }
+                }
                 KEY_EXIT => {
                     let id = SpawnId::from_bits(entry.lpOverlapped as usize as u64);
                     let Some(spawned) = self.spawns.get_mut(id) else { continue };
@@ -2408,6 +2420,11 @@ impl Driver for Iocp {
                 // The end of the watch or listen, in flight since it was asked for, comes with
                 // its request's completion: after every change it heard. A journal on the
                 // threads ends as they hand it back.
+                Effect::Unwatch { tag } if self.pressures.contains_key(&tag) => {
+                    // Its thread stopped as the watch is dropped: nothing of it is posted after.
+                    self.pressures.remove(&tag);
+                    self.ready.push(Completion { tag, done: Done::Unwatched });
+                }
                 Effect::Unwatch { tag } if self.journals.contains_key(&tag) => {
                     let journaling = self.journals.get_mut(&tag).expect("looked up above");
                     journaling.stopping = true;
@@ -2482,7 +2499,7 @@ impl Driver for Iocp {
             .filter(|it| {
                 !matches!(
                     it.done,
-                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+                    Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. } | Done::Pressed { .. }
                 )
             })
             .count();
@@ -3904,6 +3921,36 @@ mod tests {
                 assert_eq!(slab.len(), map.len());
             }
         }
+    }
+
+    /// The invariant: a pressure watch stays in flight, its tellings never end it, and its
+    /// unwatch ends it with `Unwatched`, after which nothing of it is heard. A telling its
+    /// thread posts is a `Pressed`, critical as its byte count says; one posted after the
+    /// unwatch is dropped. The control: before this the driver failed the watch at once.
+    #[test]
+    fn a_pressure_watch_is_told_while_it_runs_and_ends_at_its_unwatch() {
+        let root = dir("pressure");
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        driver.submit(&mut vec![Effect::Pressure { tag: Tag(3) }]);
+        assert_eq!(driver.in_flight(), 1);
+        assert!(driver.ready.iter().all(|it| it.tag != Tag(3)), "the watch failed: {:?}", driver.ready);
+        driver.port.post(KEY_PRESSURE, 1, 3).unwrap();
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // The machine may be short of memory as the test runs: the watch's own tellings come too.
+        let told = |out: &[Completion]| out.iter().any(|it| it.tag == Tag(3) && it.done == Done::Pressed { critical: true });
+        while !told(&out) && Instant::now() < deadline {
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(10)));
+        }
+        assert!(told(&out), "{out:?}");
+        assert_eq!(driver.in_flight(), 1, "a telling does not end the watch");
+        let seen = run(&mut driver, vec![Effect::Unwatch { tag: Tag(3) }]);
+        assert_eq!(seen[&3], Done::Unwatched);
+        assert_eq!(driver.in_flight(), 0);
+        driver.port.post(KEY_PRESSURE, 0, 3).unwrap();
+        let mut late = Vec::new();
+        driver.poll(&mut late, Deadline::after(driver.now(), Duration::from_millis(50)));
+        assert!(late.is_empty(), "a telling after the unwatch was heard: {late:?}");
     }
 
     /// A packet of a request that has ended, come after its slot was given to another, names

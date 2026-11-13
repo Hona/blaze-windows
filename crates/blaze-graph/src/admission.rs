@@ -250,7 +250,10 @@ pub struct Pressure {
     /// purged chunks (10 GiB after a burst of frames), a release said "blaze held 48.74 GiB" with
     /// the process at 43.8. coord-111 (memcap5): counting what mimalloc ever committed, which a
     /// purge never lowers, every one of 29 releases said "0.00 freed" and "blaze held 59.21 GiB"
-    /// with the process at 47.28.
+    /// with the process at 47.28. On Windows the system's count is the commit charge
+    /// (`PrivateUsage`), committed pages touched or not, which is what Windows refuses memory by;
+    /// the machine's commit left is watched as pressure (`blaze_core::Effect::Pressure`), which
+    /// holds admission at what the daemon holds before the machine's limit is reached.
     pub held: u64,
     /// [`limit`].
     pub limit: u64,

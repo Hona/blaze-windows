@@ -2524,6 +2524,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     tracing::info_span!(target: "blaze", "memory pressure", critical, release)
                         .entered();
                 if release {
+                    crate::serve::said::logged!(INFO,
+                        "blaze serve: the system says memory is short{}: admission is held at what the daemon \
+                         holds until it stops saying so, and the front ends are asked to let go",
+                        if critical { ", critically" } else { "" }
+                    );
                     self.jobs.pressed();
                 }
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
