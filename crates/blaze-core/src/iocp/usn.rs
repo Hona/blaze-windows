@@ -409,7 +409,8 @@ impl Names {
     fn forget_all(&mut self) {
         self.dirs.retain(|_, place| matches!(place, Place::Outside | Place::Gone));
         self.dirs.insert(self.root, Place::Under(0));
-        self.paths.truncate(1);
+        // A record still holds its parent's Place while this forgets a moved directory.
+        // Path indices stay valid throughout the read; read_done alone compacts the arena.
     }
 
     /// One record, with its name's bytes where the read gave it one.
@@ -1165,6 +1166,16 @@ mod tests {
 
     fn files(names: &[&str]) -> Vec<FileName> {
         names.iter().map(|it| name(it)).collect()
+    }
+
+    #[test]
+    fn forgetting_an_unknown_renamed_directory_keeps_the_records_parent_until_reported() {
+        let mut names = Names::new(name("w"), ROOT);
+        let mut system = Fake::default().at(2, "w/src");
+        // No filename in an unprivileged journal read and no cached name of the child.
+        let moved = record(9, 2, USN_REASON_RENAME_OLD_NAME, DIR);
+        let (_, lost) = run(&mut names, &mut system, &[(moved, None)]);
+        assert_eq!(lost, [(name("w/src"), Lost::Unnamed)]);
     }
 
     #[test]
