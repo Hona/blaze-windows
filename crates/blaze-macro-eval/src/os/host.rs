@@ -36,10 +36,34 @@ pub(crate) fn guest_path(path: &str) -> Cow<'_, str> {
     // A drive-relative path (`C:a`) and a rooted one with no drive (`\a`) depend on a current
     // directory per drive, which a macro's process has none of: `\` read as `/`, the first is
     // relative to the working directory and the second to `/`.
-    match blaze_core::platform::path::daemon(Path::new(path)) {
-        Ok(name) => Cow::Owned(name),
-        Err(_) if path.contains('\\') => Cow::Owned(path.replace('\\', "/")),
-        Err(_) => Cow::Borrowed(path),
+    //
+    // wasi-libc takes `C:\a` for a relative path and hands the host its working directory
+    // before it (`ws/C:\a`). No Windows name has a `:`, so a part that is a drive starts the
+    // path the macro meant, from there on.
+    let slashed = match path.contains('\\') {
+        true => Cow::Owned(path.replace('\\', "/")),
+        false => Cow::Borrowed(path),
+    };
+    let drive =
+        |part: &str| matches!(part.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
+    let mut at = 0;
+    let mut from = None;
+    for part in slashed.split('/') {
+        if drive(part) && at > 0 {
+            from = Some(at);
+        }
+        at += part.len() + 1;
+    }
+    match from {
+        None => match blaze_core::platform::path::daemon(Path::new(path)) {
+            Ok(name) => Cow::Owned(name),
+            Err(_) => slashed,
+        },
+        // alloc: a path a macro named across its working directory, once per name
+        Some(from) => {
+            let letter = char::from(slashed.as_bytes()[from].to_ascii_uppercase());
+            Cow::Owned(format!("/{letter}{}", &slashed[from + 1..]))
+        }
     }
 }
 
