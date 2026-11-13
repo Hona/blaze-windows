@@ -583,6 +583,8 @@ struct Solver<'a, 'db> {
     models: HashMap<hir_def::FunctionId, Option<Model>, Global>,
     /// The locals whose address a `&mut` or a raw pointer took.
     exposed: Vec<bool>,
+    /// The locals whose address any borrow took: read through it past their own last read.
+    addressed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
     predecessors: Vec<Vec<u32>>,
@@ -597,6 +599,13 @@ struct Solver<'a, 'db> {
     made: u32,
     /// Estimated fact/implication visits for the profile, not an input to a proof.
     visits: std::cell::Cell<u64>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most implications a joined state of this thread's proofs held, for the test that a
+    /// join forgets those of values gone (`tests/reach_oracle.rs`).
+    pub(crate) static MOST_IMPLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The widest range a term's value is kept in.
@@ -646,6 +655,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             variants: Vec::new(), // alloc: the variants the body names, few
             models: HashMap::new_in(Global),
             exposed: Vec::new(),
+            addressed: Vec::new(),
             cyclic,
             predecessors,
             joined: vec![Vec::new(); count], // alloc: one list per block, once per proof
@@ -655,7 +665,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             made: 0,
             visits: std::cell::Cell::new(0),
         };
-        solver.exposed = solver.exposed_locals();
+        (solver.exposed, solver.addressed) = solver.exposed_locals();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
         for (_, local) in body.binding_locals.iter() {
             named[local_index(*local)] = true;
@@ -1295,10 +1305,11 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// The locals a `&mut` borrow or a raw pointer was made of: what a write through a pointer
     /// or an unknown call may change. A shared borrow counts too when the body casts a
-    /// reference to a raw pointer anywhere.
-    fn exposed_locals(&self) -> Vec<bool> {
+    /// reference to a raw pointer anywhere. Then the locals any borrow was made of.
+    fn exposed_locals(&self) -> (Vec<bool>, Vec<bool>) {
         let mut exposed = vec![false; self.body.locals.len()]; // alloc: one flag per local, once per proof
         let mut shared = vec![false; self.body.locals.len()]; // alloc: as above
+        let mut addressed = vec![false; self.body.locals.len()]; // alloc: as above
         let mut cast_to_raw = false;
         for block in self.blocks {
             for statement in &block.statements {
@@ -1315,6 +1326,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                         }
                         let raw = matches!(self.place_ty(to).kind(), TyKind::RawPtr(..));
                         let slot = local_index(place.local);
+                        addressed[slot] = true;
                         if raw || matches!(kind, BorrowKind::Mut { .. }) {
                             exposed[slot] = true;
                         } else {
@@ -1338,7 +1350,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 exposed[slot] |= shared;
             }
         }
-        exposed
+        (exposed, addressed)
     }
 
     fn place_ty(&self, place: &StoredPlace) -> Ty<'db> {
@@ -2094,7 +2106,89 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
         }
+        self.forget_dead_implications(block, &mut state);
+        #[cfg(test)]
+        MOST_IMPLICATIONS.set(MOST_IMPLICATIONS.get().max(state.imps.len()));
         Some(state)
+    }
+
+    /// Drops the implications whose premise no later question can reach: a premise that names
+    /// unknowns, none of which a local read past `block` holds (or a local whose address was
+    /// taken, the epoch), a fact names, or a kept implication can conclude something of. Such
+    /// a premise is about values gone for good: the joined `bool`s of earlier joins once they
+    /// are written again (a drop flag). Without this every join's implications rode along to
+    /// the end of the body: 18,570 in one state of rune's `dispatch_action`, each re-asked
+    /// at every `assume` (INTEGRATION I49). Forgetting only proves less.
+    fn forget_dead_implications(&self, block: u32, state: &mut State) {
+        if state.imps.is_empty() {
+            return;
+        }
+        let epoch = self.epoch_slot();
+        // alloc: the unknowns still reachable, once per join
+        let mut live: blaze_hash::HashSet<TermId, Global> = blaze_hash::HashSet::new_in(Global);
+        for slot in 0..state.vals.len() {
+            if slot == epoch || self.addressed[slot] || self.read.contains(block as usize, slot) {
+                self.unknowns(state.vals[slot], &mut |it| { live.insert(it); });
+            }
+        }
+        for fact in &state.facts {
+            self.unknowns(fact.a, &mut |it| { live.insert(it); });
+            self.unknowns(fact.b, &mut |it| { live.insert(it); });
+        }
+        let reaches = |live: &blaze_hash::HashSet<TermId, Global>, atom: Atom| {
+            let (mut any, mut reached) = (false, false);
+            for side in [atom.a, atom.b] {
+                self.unknowns(side, &mut |it| {
+                    any = true;
+                    reached |= live.contains(&it);
+                });
+            }
+            reached || !any
+        };
+        let mut kept = vec![false; state.imps.len()]; // alloc: a flag per implication, once per join
+        loop {
+            let mut grew = false;
+            for (at, imp) in state.imps.iter().enumerate() {
+                if kept[at] || !reaches(&live, imp.premise) {
+                    continue;
+                }
+                kept[at] = true;
+                grew = true;
+                for side in [imp.then.a, imp.then.b] {
+                    self.unknowns(side, &mut |it| { live.insert(it); });
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut at = 0;
+        state.imps.retain(|_| {
+            at += 1;
+            kept[at - 1]
+        });
+    }
+
+    /// Calls `found` with each unknown `term` is made of.
+    fn unknowns(&self, term: TermId, found: &mut impl FnMut(TermId)) {
+        match &self.terms[term as usize] {
+            Term::Const(_) => {}
+            Term::Unknown(_) => found(term),
+            Term::Len(a)
+            | Term::Discr(a)
+            | Term::Field(a, _)
+            | Term::Payload(a, _, _)
+            | Term::Not(a)
+            | Term::RefTo(a)
+            | Term::Deref(a)
+            | Term::Wrap(a, _) => self.unknowns(*a, found),
+            Term::Cmp(_, a, b) | Term::DerefAt(a, b) | Term::MutRef(_, a, b) => {
+                self.unknowns(*a, found);
+                self.unknowns(*b, found);
+            }
+            Term::Agg(_, fields) => fields.iter().for_each(|&it| self.unknowns(it, found)),
+            Term::Lin(parts, _) => parts.iter().for_each(|&(it, _)| self.unknowns(it, found)),
+        }
     }
 
     /// How many fields the aggregates all of `incoming` hold in `slot` have, when they are
