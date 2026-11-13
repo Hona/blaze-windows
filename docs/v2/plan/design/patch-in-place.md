@@ -122,7 +122,8 @@ since the last link".
 ## The patch room (2026-11-11; written, not built or run)
 
 Hello world's dev executable is 162,021,720 bytes long, and at least 134,217,728 of them are
-the room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`).
+the room of `Class::Patch` and `Class::PatchData` (sized for the image's code and data,
+64 KiB to 1 GiB each, `place.rs` `patch_room`).
 
 **The design chosen, for ELF, Mach-O and PE alike: the room is a hole.** Addresses, the order
 of regions and `offset = addr - base` stay, so the room has file offsets (a splice writes the

@@ -140,6 +140,18 @@ fn a_c_console_program_with_the_dynamic_crt_runs() {
     assert_eq!((code, printed.as_str()), (42, "hello from x, 2 args\npid set\nrelocated yes\n"));
 }
 
+/// An editable small native image has room for edits, not two 64 MiB reservations on disk.
+#[test]
+fn a_small_incremental_executable_stays_small_and_runs() {
+    let mut output = output(None, &["hello_md.obj"]);
+    output.incremental = true;
+    let bytes = link(output).unwrap();
+    assert!(bytes.len() < 4 << 20, "small C program: {} bytes", bytes.len());
+    let exe = scratch("small_edit").join("small_edit.exe");
+    std::fs::write(&exe, bytes).unwrap();
+    assert_eq!(run(&exe, &[]).0, 42);
+}
+
 #[test]
 fn a_c_console_program_with_the_static_crt_runs() {
     let (code, printed) = linked_run("hello_mt", &["hello_mt.obj"], &[]);

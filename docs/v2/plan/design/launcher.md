@@ -9,7 +9,7 @@ date: 2026-11-11
 
 | Piece | Where | What it does, and what is wrong with it for `edit` |
 |---|---|---|
-| Patch room and the splice | `blaze-link/src/place.rs:54` `patch_room` (the code's size, 64 MiB to 1 GiB, per patch region); `lib.rs:200` `Refusal::NoRoom`, `:227` `NoThunk`; [patch-in-place.md](patch-in-place.md) | New code goes into room the image kept, never where old code was. A change with no room, or an AArch64 branch out of reach, is a link from scratch. Promotion of a whole program fills the room ([tiers.md](tiers.md), "Promotion"). |
+| Patch room and the splice | `blaze-link/src/place.rs` `patch_room` (the code's size, 64 KiB to 1 GiB, per patch region); `lib.rs:200` `Refusal::NoRoom`, `:227` `NoThunk`; [patch-in-place.md](patch-in-place.md) | New code goes into room the image kept, never where old code was. A change with no room, or an AArch64 branch out of reach, is a link from scratch. Promotion of a whole program fills the room ([tiers.md](tiers.md), "Promotion"). |
 | The dev run | `blaze-inproc/src/lib.rs:1-70`; `library/blaze_inproc_rt/src/sys/macos.rs:1-16` | The program is already its own process, started by the kernel from a linked file. A start hook lays the daemon's memory object over the image: writable in the daemon, executable in the run. The daemon holds every dev program's code in its own memory. On macOS the pages are unsigned and run only without `CS_ENFORCEMENT` (`check_unsigned_code`, `:642`). |
 | The live runtime | `blaze-live/src/slots.rs:1-22`, `slots/switch.rs:1-40`; stubs `blaze-link/src/table.rs:50-110` | A call loads a cell, then a slot of the table it names (two dependent loads, 16 or 24 bytes of stub). A patch stores one cell, so it is atomic across slots; 64 generations and a pool of tables are kept for that. Only a live image's members are called through slots (`blaze-codegen/src/plan.rs:492` `patchable = live && member`); every other call is `Target::Direct` (`blaze-codegen/src/lib.rs:438`; `:436` is `Target::Function`, the call through a slot). |
 | Fences | `library/blaze_inproc_rt/src/fence.rs:1-29`, `runtime.rs:354` `quiesce`; `blaze-inproc/src/lib.rs:515` `retire`, `:528` `collect` | A thread at a quiescent point loads the epoch, walks at most 512 frames and reports the oldest retired range it returns into. Sound, and the base of this design. A thread that never reports holds every range (`tests.rs:871`); only `Live::poll` reports (`slots.rs:329`); a forking process stops all collection (`lib.rs:533`). |
@@ -260,7 +260,7 @@ moved; the daemon keeps `function -> tests` to find them. This replaces the arme
 
 ### What the patch room costs on disk (measured 2026-11-11, lane disk-1111)
 
-Hello-world's `edit` executable on arm64 macOS is 158.5 MB long and holds 23.2 MB on disk:
+Before patch room was sized from 64 KiB rather than 64 MiB, hello-world's `edit` executable on arm64 macOS was 158.5 MB long and held 23.2 MB on disk:
 `__TEXT` is 83.67 MiB (19.7 MiB of code and its patch region), `__DATA` 64.73 MiB (0.7 MiB and
 its patch region), `__LINKEDIT` 2.57 MiB. The two patch regions are 128 MiB of the file, all
 holes. Each is sized by `blaze-link/src/place.rs` as the image's own code (or data) clamped to
