@@ -316,6 +316,10 @@ impl Writer for Pe {
         own_section(class)
     }
 
+    fn searched_roots(&self) -> &'static [&'static str] {
+        &["_load_config_used"]
+    }
+
     fn prot(&self, class: &Class) -> Prot {
         if let Class::Named { write, exec, .. } = class {
             return Prot { read: true, write: *write, exec: *exec };

@@ -14,5 +14,10 @@ int main(int argc, char **argv) {
     printf("hello from %s, %d args\n", argc > 1 ? argv[1] : "nobody", argc);
     DWORD pid = GetCurrentProcessId();
     printf("pid %s\n", pid != 0 ? "set" : "zero");
+    // ASLR: the loader put the image elsewhere than its base and applied its relocations
+    // (the pointer in `greeting` is one).
+    static const char *const greeting[] = {"relocated"};
+    ULONG_PTR base = (ULONG_PTR)GetModuleHandleW(NULL);
+    printf("%s %s\n", greeting[0], base != 0x140000000 ? "yes" : "no");
     return copied("seven!!") * 6;
 }

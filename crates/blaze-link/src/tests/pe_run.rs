@@ -88,9 +88,30 @@ fn run(exe: &Path, args: &[&str]) -> (i32, String) {
     (code, printed)
 }
 
+/// The image's data directories, `(rva, size)` by index.
+fn directories(bytes: &[u8]) -> Vec<(u32, u32)> {
+    use object::LittleEndian as LE;
+    let file = object::read::pe::PeFile64::parse(bytes).unwrap();
+    file.data_directories().iter().map(|it| (it.virtual_address.get(LE), it.size.get(LE))).collect()
+}
+
+/// That an image the CRT links has what link.exe gives it: the CRT's load configuration (the
+/// loader's security cookie, the guard's fields), whose directory size is the size its first
+/// field states, and the exception directory.
+fn has_crt_directories(bytes: &[u8]) {
+    let dirs = directories(bytes);
+    let (config, exceptions) =
+        (dirs[object::pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG], dirs[object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION]);
+    assert!(config.0 != 0 && config.1 >= 0x94, "the load configuration: {config:x?}");
+    let stated = u32::from_le_bytes(bytes[config.0 as usize..][..4].try_into().unwrap());
+    assert_eq!(stated, config.1, "the load configuration's own size");
+    assert!(exceptions.1 > 0 && exceptions.1 % 12 == 0, "the exception directory: {exceptions:x?}");
+}
+
 /// Links `inputs` into an executable, writes it in its own directory and runs it.
 fn linked_run(test: &str, inputs: &[&str], args: &[&str]) -> (i32, String) {
     let bytes = link(output(None, inputs)).unwrap_or_else(|e| panic!("{test}: {e}"));
+    has_crt_directories(&bytes);
     let dir = scratch(test);
     let exe = dir.join(format!("{test}.exe"));
     std::fs::write(&exe, &bytes).unwrap();
@@ -100,13 +121,13 @@ fn linked_run(test: &str, inputs: &[&str], args: &[&str]) -> (i32, String) {
 #[test]
 fn a_c_console_program_with_the_dynamic_crt_runs() {
     let (code, printed) = linked_run("hello_md", &["hello_md.obj"], &["x"]);
-    assert_eq!((code, printed.as_str()), (42, "hello from x, 2 args\npid set\n"));
+    assert_eq!((code, printed.as_str()), (42, "hello from x, 2 args\npid set\nrelocated yes\n"));
 }
 
 #[test]
 fn a_c_console_program_with_the_static_crt_runs() {
     let (code, printed) = linked_run("hello_mt", &["hello_mt.obj"], &[]);
-    assert_eq!((code, printed.as_str()), (42, "hello from nobody, 1 args\npid set\n"));
+    assert_eq!((code, printed.as_str()), (42, "hello from nobody, 1 args\npid set\nrelocated yes\n"));
 }
 
 #[test]
@@ -133,6 +154,8 @@ fn code_built_with_guard_cf_and_gs_runs() {
 fn an_executable_runs_with_the_dll_it_imports_from() {
     let dll = link(output(Some("runlib.dll"), &["dll.obj"])).unwrap();
     let exe = link(output(None, &["usedll.obj", "runlib.lib"])).unwrap();
+    has_crt_directories(&dll);
+    has_crt_directories(&exe);
     let dir = scratch("usedll");
     std::fs::write(dir.join("runlib.dll"), &dll).unwrap();
     std::fs::write(dir.join("usedll.exe"), &exe).unwrap();

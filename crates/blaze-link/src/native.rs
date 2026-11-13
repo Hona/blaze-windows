@@ -3623,6 +3623,10 @@ impl<'a> Stage<'a> {
             let slot = b.slot(self.symbols.sym_name(name));
             b.flag(slot, LOOSE);
         }
+        for name in self.writer.searched_roots() {
+            let slot = b.slot(self.symbols.sym_name(name));
+            b.flag(slot, PULL | LOOSE);
+        }
 
         // Load: the line's objects and whole archives, then members for what is strongly
         // undefined, round by round.

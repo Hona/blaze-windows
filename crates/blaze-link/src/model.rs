@@ -1406,6 +1406,14 @@ pub(crate) trait Writer: Send + Sync {
         false
     }
 
+    /// Names the link searches the archives for and keeps when one defines them, without
+    /// anything referring to them, and without an error when none does: PE's
+    /// `_load_config_used`, which link.exe always looks for (the CRT's load configuration:
+    /// the security cookie the loader initializes, the guard's fields). None by default.
+    fn searched_roots(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// How far from the base the image's regions may reach, their room included (a dev run's
     /// reservations, which hold no bytes, aside): checked on the laid-out addresses before
     /// anything is written (`Stage::check_reach`). `None` where the format sets no such limit
@@ -1554,6 +1562,10 @@ impl Writer for Formats {
     #[inline]
     fn own_pages(&self, class: &Class) -> bool {
         each!(self, it => it.own_pages(class))
+    }
+
+    fn searched_roots(&self) -> &'static [&'static str] {
+        each!(self, it => it.searched_roots())
     }
 
     fn window(&self) -> Option<Window> {
