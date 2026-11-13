@@ -114,19 +114,19 @@ pub(crate) fn wasm_macro(job: &Job, unit: usize) -> bool {
 /// whose roots are its glue's exports, kept by name as a `cdylib`'s are; a proc macro built for
 /// the host is no build's (every build plans wasm macros, and [`super::compile`]'s `macros`
 /// refuses one), so asking for its roots is an error naming it.
-fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String> {
+fn root_kind(mode: Mode, name: &str, makes: &Makes, wasm: bool, harness: bool) -> Result<RootKind, String> {
     Ok(match makes {
         // A doctest's programs as tests: a `test_harness` example's crate has `cfg(test)` and
         // its harness, as rustdoc's `--test` builds it; any other program's roots are its
         // `main`, as a test crate's without `cfg(test)` are.
-        Makes::Executable if matches!(unit.mode, Mode::Test | Mode::Doctest) => RootKind::Test,
+        Makes::Executable if mode == Mode::Doctest || (mode == Mode::Test && harness) => RootKind::Test,
         Makes::Executable => RootKind::Executable,
         Makes::Shared { proc_macro: true } if wasm => RootKind::Shared,
         Makes::Shared { proc_macro: true } => {
             return Err(format!(
                 "proc macro `{}` is built for the host, not as a wasm module, yet its codegen was asked for: \
                  a build runs proc macros only as wasm32-wasip1 modules",
-                unit.target.name
+                name
             ));
         }
         Makes::Shared { proc_macro: false } => RootKind::Shared,
@@ -1153,7 +1153,9 @@ pub(crate) fn generate<'db>(
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
     };
-    let roots = match frontend.roots(krate, root_kind(u, makes, wasm_macro(job, unit))?) {
+    let harness = job.plan(unit).map_err(|it| it.what)?.harness;
+    let kind = root_kind(u.mode, &u.target.name, makes, wasm_macro(job, unit), harness)?;
+    let roots = match frontend.roots(krate, kind) {
         Ok(it) => it,
         Err(error) => return Ok(Err(refused(reader, mounted.root(), vec![error]))),
     };
