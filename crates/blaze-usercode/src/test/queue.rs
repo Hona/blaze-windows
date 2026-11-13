@@ -730,6 +730,18 @@ impl Queue {
         now: Duration,
         effects: &mut Vec<Effect>,
     ) -> Queue {
+        Self::on_driver(config, binaries, now, effects, cfg!(unix))
+    }
+
+    /// The driver supplies fork servers on Unix. A simulated driver can supply them on
+    /// any host: run the protocol and timeout oracles there, not a different queue.
+    fn on_driver(
+        config: Config,
+        binaries: Vec<Binary>,
+        now: Duration,
+        effects: &mut Vec<Effect>,
+        has_fork: bool,
+    ) -> Queue {
         // Every column at the size the run needs, made once: a unit per test (per binary run
         // whole), and per core an attempt, its two timers and its tags.
         let count: usize = binaries
@@ -822,7 +834,7 @@ impl Queue {
                 continue;
             }
             match queue.bins[b].plan.mode {
-                Mode::Process if !cfg!(unix) => {
+                Mode::Process if !has_fork => {
                     let why = format!(
                         // alloc: error path
                         "{}: this platform has no fork, so no fork server: its package must run its tests as libtest's threads",
