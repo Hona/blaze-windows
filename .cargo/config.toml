@@ -5,6 +5,9 @@ lint = "clippy --all-targets -- --cap-lints warn"
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
+# The pinned LLVM is built against the static C runtime (/MT, .github/scripts/llvm.py), and its
+# objects ask for libcpmt and refuse a /MD object beside them: blaze links the CRT statically too.
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.arm-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc-8"
