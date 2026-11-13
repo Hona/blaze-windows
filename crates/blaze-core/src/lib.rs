@@ -996,6 +996,8 @@ pub enum Untraceable {
     Network,
     /// A file read through a descriptor the sandbox did not see opened.
     Descriptor,
+    /// A confined build-script run keyed by Cargo declarations, not by observed reads.
+    CargoDeclared,
 }
 
 /// How a spawned process ended.

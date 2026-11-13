@@ -137,6 +137,13 @@ pub fn prepare(
         .with(Role::OutDir, &unit.out_dir);
     let view = roots.view();
     let mut given = Given::new(RunKind::BuildScript);
+    if let Mode::Declared { host, .. } = place.mode {
+        given.part("Windows declared inputs v2", &host.0);
+        // Include even previously absent/pass-through and run-only names. Never expose values
+        // in explanations. `env_keyed` sorts stably and keeps the last value like CreateProcess.
+        let names: Vec<_> = env.vars.iter().map(|(n, _)| blaze_core::platform::env::os_name(n)).collect(); // alloc: once per prepared run
+        given.env_keyed(names.iter().zip(&env.vars).map(|(n, (_, v))| (n.as_encoded_bytes(), v.as_encoded_bytes())));
+    }
     // The roots a given string still holds once ported (`-L/ws/p/lib`, a root after a path
     // byte): its key is then this checkout's string, and the run is kept here alone.
     let mut bound = RoleSet::default();
@@ -323,6 +330,12 @@ fn shown(value: Option<&OsStr>) -> String {
 /// another value, or misses one, would be kept under a key no check makes again, and is an
 /// error naming the variable rather than a run that is never found.
 pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
+    if matches!(prepared.spec.mode, Mode::Declared { .. }) {
+        // The launcher has no trusted read trace. The caller reported it as such; only
+        // the host-computed given key and CargoRule may contribute to the persisted shape.
+        *traced = Traced { untraceable: vec![blaze_core::Untraceable::CargoDeclared], ..Traced::default() };
+        return Ok(());
+    }
     traced.env.retain(|(name, _)| !run_only(name) && !prepared.given.contains(name));
     for (name, value) in &mut traced.env {
         if make_flag(name) {
