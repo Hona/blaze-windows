@@ -244,6 +244,18 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     Some(names)
 }
 
+/// Where the system opens `path`, a name a trace holds: a daemon name of a Windows path
+/// (`/C:/a`, which a proc macro's reads are noted by) at [`blaze_core::platform::path::host`]'s,
+/// any other as it is. The name stays the key.
+fn on_disk(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str() {
+        Some(name) if cfg!(windows) && name.starts_with('/') => {
+            std::borrow::Cow::Owned(blaze_core::platform::path::host(name))
+        }
+        _ => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 impl Files {
     pub fn new() -> Files {
         Files::watched_by(blaze_vfs::outside::dirs())
@@ -347,7 +359,8 @@ impl Files {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        let meta = match std::fs::metadata(path) {
+        let disk = on_disk(path);
+        let meta = match std::fs::metadata(&disk) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok((None, true)),
             Err(error) => return Err(unreadable(error)),
@@ -366,10 +379,10 @@ impl Files {
         if let Some(found) = self.stamped.find(&key) {
             return Ok((Some(*self.stamped.get(found)), true));
         }
-        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let file = std::fs::File::open(&disk).map_err(unreadable)?;
         let hash = hash_reader(file).map_err(unreadable)?;
         // A file changed while it was read is hashed again at its next check.
-        let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
+        let after = std::fs::metadata(&disk).map(|it| Stamp::of(&it)).ok();
         let settled = after == Some(stamp);
         if settled {
             self.stamped.intern(key, || hash);
@@ -392,7 +405,8 @@ impl Files {
         }
         // Looked at on the disk every time: no watch vouches for an entry.
         blaze_vfs::outside::looked(path);
-        let meta = match std::fs::symlink_metadata(path) {
+        let disk = on_disk(path);
+        let meta = match std::fs::symlink_metadata(&disk) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
             Err(error) => return Err(unreadable(error)),
@@ -402,7 +416,7 @@ impl Files {
             return Ok(Entry::Dir);
         }
         if kind.is_symlink() {
-            let target = std::fs::read_link(path).map_err(unreadable)?;
+            let target = std::fs::read_link(&disk).map_err(unreadable)?;
             #[cfg(unix)]
             let id = ContentId::of(
                 blaze_vfs::FILE_DOMAIN,
@@ -435,12 +449,12 @@ impl Files {
         if let Some(found) = self.stamped.find(&key) {
             return Ok(Entry::File(ContentId(*self.stamped.get(found)), mode));
         }
-        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let file = std::fs::File::open(&disk).map_err(unreadable)?;
         let mut hasher = Hasher::new(blaze_vfs::FILE_DOMAIN);
         read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
         let id = hasher.finish();
         // A file changed while it was read is hashed again at its next check.
-        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp) {
+        if std::fs::symlink_metadata(&disk).is_ok_and(|it| Stamp::of(&it) == stamp) {
             self.stamped.intern(key, || id.0);
         }
         Ok(Entry::File(id, mode))
