@@ -377,3 +377,18 @@ fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
         assert!(walks < blocks + 100, "{walks} walks of {blocks} blocks");
     });
 }
+
+#[test]
+fn iterating_recursive_effects_proves_the_instance_sites_only_once() {
+    let source = format!("{MINICORE}//- /lib.rs crate:kernel\nfn probe(n: u32) -> u32 {{ if n > 0 {{ next(n - 1) }} else {{ 0 }} }}\nfn next(n: u32) -> u32 {{ probe(n) }}");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let probe = fn_named(&db, krate, "probe");
+        reach::COUNT_BODY.set(Some(probe.into()));
+        reach::COUNT_PROOFS.set(0);
+        crate::fn_purity_generic(&db, probe);
+        reach::COUNT_BODY.set(None);
+        assert_eq!(reach::COUNT_PROOFS.get(), 1);
+    });
+}

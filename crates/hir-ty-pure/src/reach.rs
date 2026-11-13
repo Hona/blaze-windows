@@ -199,6 +199,18 @@ struct Imp {
     premise: Atom,
 }
 
+/// Scratch for the questions of one saturation, on one state's facts and implications.
+/// The solver is only borrowed during saturation (term ranges cannot change). Implications
+/// stay fixed. Adding a fact invalidates both successes and failures: even the bounded
+/// linear search may choose a different set of paths on the next question.
+#[derive(Default)]
+struct Questions {
+    facts: usize,
+    answers: HashMap<(Atom, u8), bool, Global>,
+    bounds: HashMap<TermId, (i128, i128), Global>,
+    known: Option<Vec<Form>>,
+}
+
 /// What is known at a point: each slot's value (the locals, then the epoch), the atoms that
 /// hold and the implications between atoms. Sorted, so equal states are equal values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -487,6 +499,10 @@ pub fn prove<'db>(
     body: &MirBody<'db>,
     explain: &[u32],
 ) -> Reach {
+    #[cfg(test)]
+    if let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner && COUNT_BODY.get() == Some(def) {
+        COUNT_PROOFS.set(COUNT_PROOFS.get() + 1);
+    }
     if body.coroutine.is_some() {
         return Reach::refused("it is a coroutine");
     }
@@ -591,6 +607,8 @@ struct Out {
 #[cfg(test)]
 thread_local! {
     pub(crate) static PROOF_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static COUNT_BODY: std::cell::Cell<Option<DefWithBodyId>> = const { std::cell::Cell::new(None) };
+    pub(crate) static COUNT_PROOFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct Solver<'a, 'db> {
@@ -949,13 +967,12 @@ impl<'a, 'db> Solver<'a, 'db> {
     }
 
     /// Whether the state entails `atom` by linear reasoning ([`Self::lin_le`]).
-    fn linear(&self, state: &State, atom: Atom) -> bool {
+    fn linear(&self, state: &State, atom: Atom, known: &[Form]) -> bool {
         let (a, b) = (self.form(atom.a), self.form(atom.b));
-        let known = self.known(state);
         let mut fuel = LINEAR_FUEL;
         let mut le = |left: &Form, right: &Form, limit: i128| {
             form_add(left, right, -1).is_some_and(|form| {
-                self.lin_le(state, &form, limit, &known, LINEAR_DEPTH, &mut fuel)
+                self.lin_le(state, &form, limit, known, LINEAR_DEPTH, &mut fuel)
             })
         };
         match atom.rel {
@@ -1131,7 +1148,16 @@ impl<'a, 'db> Solver<'a, 'db> {
     }
 
     /// Whether `state` entails `atom`, following at most `depth` facts or implications.
-    fn holds(&self, state: &State, atom: Atom, depth: u8) -> bool {
+    fn holds(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
+        if let Some(result) = memo.as_ref().and_then(|q| q.answers.get(&(atom, depth))) {
+            return *result;
+        }
+        let result = self.search(state, atom, depth, memo);
+        if let Some(q) = memo { q.answers.insert((atom, depth), result); }
+        result
+    }
+
+    fn search(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
         let Atom { rel, a, b } = atom;
         if a == b {
             return matches!(rel, Rel::Le | Rel::Eq);
@@ -1148,7 +1174,11 @@ impl<'a, 'db> Solver<'a, 'db> {
         if stated {
             return true;
         }
-        let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
+        let mut bounds = |term| match memo {
+            Some(q) => *q.bounds.entry(term).or_insert_with(|| self.bounds(state, term)),
+            None => self.bounds(state, term),
+        };
+        let ((low_a, high_a), (low_b, high_b)) = (bounds(a), bounds(b));
         let bounded = match rel {
             Rel::Lt => high_a < low_b,
             Rel::Le => high_a <= low_b,
@@ -1170,14 +1200,14 @@ impl<'a, 'db> Solver<'a, 'db> {
                 match self.terms[term as usize] {
                     Term::Cmp(rel, x, y) => {
                         let inner = Atom { rel, a: x, b: y };
-                        if self.holds(state, if truth { inner } else { inner.not() }, depth) {
+                        if self.holds(state, if truth { inner } else { inner.not() }, depth, memo) {
                             return true;
                         }
                     }
                     Term::Not(inner) if depth > 0 => {
                         let want = self.ids.get(&Term::Const(i128::from(!truth)));
                         if let Some(&want) = want
-                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1)
+                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1, memo)
                         {
                             return true;
                         }
@@ -1188,8 +1218,13 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // Adding facts up: `i + 1 < n` gives `i < n`, `k <= n` gives `0 <= n - k`. Once, at
         // the top: the steps below ask about single facts.
-        if depth >= 2 && self.linear(state, atom) {
-            return true;
+        if depth >= 2 {
+            let known;
+            let forms = match memo {
+                Some(q) => q.known.get_or_insert_with(|| self.known(state)),
+                None => { known = self.known(state); &known }
+            };
+            if self.linear(state, atom, forms) { return true; }
         }
         if depth == 0 {
             return false;
@@ -1198,11 +1233,11 @@ impl<'a, 'db> Solver<'a, 'db> {
         self.visit(state.facts.len() + concluding.len());
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
         for fact in &state.facts {
-            let through = |mid: TermId, strict: bool| -> bool {
+            let mut through = |mid: TermId, strict: bool| -> bool {
                 match rel {
-                    Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1),
-                    Rel::Lt => self.holds(state, Atom::new(Rel::Lt, mid, b), depth - 1),
-                    Rel::Le => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1),
+                    Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
+                    Rel::Lt => self.holds(state, Atom::new(Rel::Lt, mid, b), depth - 1, memo),
+                    Rel::Le => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
                     Rel::Eq | Rel::Ne => false,
                 }
             };
@@ -1210,16 +1245,16 @@ impl<'a, 'db> Solver<'a, 'db> {
                 Rel::Lt if fact.a == a && fact.b != b => through(fact.b, true),
                 Rel::Le if fact.a == a && fact.b != b => through(fact.b, false),
                 Rel::Eq if fact.a == a && fact.b != b => {
-                    self.holds(state, Atom::new(rel, fact.b, b), depth - 1)
+                    self.holds(state, Atom::new(rel, fact.b, b), depth - 1, memo)
                 }
                 Rel::Eq if fact.b == a && fact.a != b => {
-                    self.holds(state, Atom::new(rel, fact.a, b), depth - 1)
+                    self.holds(state, Atom::new(rel, fact.a, b), depth - 1, memo)
                 }
                 Rel::Eq if fact.a == b && fact.b != a => {
-                    self.holds(state, Atom::new(rel, a, fact.b), depth - 1)
+                    self.holds(state, Atom::new(rel, a, fact.b), depth - 1, memo)
                 }
                 Rel::Eq if fact.b == b && fact.a != a => {
-                    self.holds(state, Atom::new(rel, a, fact.a), depth - 1)
+                    self.holds(state, Atom::new(rel, a, fact.a), depth - 1, memo)
                 }
                 _ => false,
             };
@@ -1227,11 +1262,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 return true;
             }
         }
-        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1))
+        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1, memo))
     }
 
     fn entails(&self, state: &State, atom: Atom) -> bool {
-        self.holds(state, atom, 2)
+        self.holds(state, atom, 2, &mut None)
     }
 
     /// Adds `atom` to `state`: false when the state then has no run (the atom contradicts it).
@@ -1280,7 +1315,14 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// Writes down what the state's implications give: the conclusion of each whose premise
     /// holds. False when one contradicts the state. Each implication fires at most once.
     fn saturate(&self, state: &mut State) -> bool {
-        saturate(state, |state, atom| self.entails(state, atom))
+        let mut memo = (state.imps.len() >= 16).then(Questions::default);
+        saturate(state, |state, atom| {
+            if let Some(q) = &mut memo && q.facts != state.facts.len() {
+                q.answers.clear(); q.bounds.clear(); q.known = None;
+                q.facts = state.facts.len();
+            }
+            self.holds(state, atom, 2, &mut memo)
+        })
     }
 
     // The state.
