@@ -25,3 +25,4 @@ foreach ($def in 'runlib', 'nosuch') {
     Remove-Item "$def.exp"
 }
 cl_ @common /MT /Fonatives.obj natives.c
+cl_ @common /MD /Fopdb.obj pdb.c
