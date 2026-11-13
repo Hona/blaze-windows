@@ -319,7 +319,7 @@ mod native {
         };
         // A slow empty answer is still the thin client's. The first response that needs
         // the engine (including the daemon's progress notice) triggers handover immediately.
-        let until = daemon.within(Duration::from_secs(60));
+        let until = daemon.within(blaze_thin::handover::AFTER);
         let mut plain = Plain::new();
         loop {
             match daemon.next(until, "the daemon's answer to the request") {
