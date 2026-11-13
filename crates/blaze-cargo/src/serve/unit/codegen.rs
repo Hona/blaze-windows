@@ -2115,6 +2115,14 @@ fn link_at(
     }
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
+    // `#![windows_subsystem = "windows"]` of the crate linked: rustc's `/SUBSYSTEM:WINDOWS`,
+    // entered at `mainCRTStartup` as before (the output's entry). Link arguments after it
+    // (`/SUBSYSTEM:CONSOLE`) win, as on rustc's link line.
+    if output.format == blaze_link::Format::Pe
+        && matches!(output.kind, blaze_link::OutputKind::Executable { .. })
+    {
+        output.windows_subsystem = generated.frontend.windows_subsystem(krate);
+    }
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
         // Each crate's libraries and assembly, asked of the front end; then where each

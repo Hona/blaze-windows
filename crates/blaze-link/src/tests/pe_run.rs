@@ -46,7 +46,10 @@ fn link_with(mut output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkErro
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
         .into_iter()
         .map(|it| {
-            let bytes: Arc<[u8]> = std::fs::read(&it.path).unwrap().into();
+            let bytes: Arc<[u8]> = match it.made {
+                Some((_, made)) => made,
+                None => std::fs::read(&it.path).unwrap().into(),
+            };
             (it.name, bytes, it.kind)
         })
         .collect();
@@ -188,6 +191,51 @@ fn a_gui_program_entered_at_main_crt_startup_runs_without_a_console() {
     assert_eq!(run(&dir.join("gui.exe"), &[]), (0, "gui without a console\n".into()));
 }
 
+/// Two `.res` files of a GUI program merged into its resources, which it reads back as the
+/// loader and the shell do (`pe_run/res.c`): the manifest's common controls 6 and per-monitor
+/// DPI, the icon, data by name and number, a string in the second file's language, the version.
+/// Without the resources it fails every check (`res.c` exits 127), as link.exe's does.
+#[test]
+fn resources_of_two_res_files_are_the_programs_and_its_manifest_is_applied() {
+    let (gui, libs) = with_args(
+        output(None, &["res.obj"]),
+        &[&fixture("app.res").to_string_lossy(), &fixture("more.res").to_string_lossy(), "/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"],
+    );
+    let bytes = link_with(gui, &libs).unwrap();
+    let dirs = directories(&bytes);
+    assert!(dirs[object::pe::IMAGE_DIRECTORY_ENTRY_RESOURCE].1 > 0, "{dirs:x?}");
+    let dir = scratch("res");
+    std::fs::write(dir.join("res.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("res.exe"), &[]), (0, "res 0\n".into()));
+
+    // The same program without them: the checks fail, so they read what the link put there.
+    let bytes = link(output(None, &["res.obj"])).unwrap();
+    std::fs::write(dir.join("bare.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("bare.exe"), &[]), (127, "res 127\n".into()));
+}
+
+/// `/DELAYLOAD` of three DLLs with `delayimp.lib` (`pe_run/delay.c`): none in the import
+/// directory, each loaded by its first call, and the helper's exception for one not there
+/// unwinds through the tail merge to the program's `__except`.
+#[test]
+fn delay_loaded_dlls_load_on_first_call_and_a_missing_one_raises() {
+    let (delayed, libs) = with_args(
+        output(None, &["delay.obj", "nosuch.lib"]),
+        &["/DELAYLOAD:comctl32.dll", "/DELAYLOAD:version.dll", "/DELAYLOAD:NOSUCH.dll", "delayimp.lib"],
+    );
+    let bytes = link_with(delayed, &libs).unwrap();
+    has_crt_directories(&bytes);
+    let dlls = dlls(&bytes);
+    for it in ["comctl32.dll", "version.dll", "nosuch.dll"] {
+        assert!(!dlls.contains(&it.to_owned()), "{it} is imported at load: {dlls:?}");
+    }
+    let dirs = directories(&bytes);
+    assert_eq!(dirs[object::pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].1, 4 * 32, "{dirs:x?}");
+    let dir = scratch("delay");
+    std::fs::write(dir.join("delay.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("delay.exe"), &[]), (0, "delay 0\n".into()));
+}
+
 /// The DLLs an image imports from, lowercased, in its import directory's order.
 fn dlls(bytes: &[u8]) -> Vec<String> {
     use object::LittleEndian as LE;
@@ -229,6 +277,7 @@ fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
         name: "msvcrt".into(),
         kind: blaze_codegen::NativeLibKind::Dylib,
         verbatim: false,
+        imports: Vec::new(),
     };
     let error = link_with(output, &[msvcrt]).unwrap_err();
     assert!(error.what.contains("`msvcrt`") && error.what.contains("LNK2038"), "{error}");

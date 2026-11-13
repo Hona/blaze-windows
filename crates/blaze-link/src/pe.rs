@@ -22,7 +22,9 @@
 //! always there, no base relocation lands in code and there is no CFG.
 
 mod coff;
+pub(crate) mod delay;
 mod image;
+pub(crate) mod rsrc;
 pub(crate) mod raw_dylib;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -96,11 +98,6 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
         return Err(error(format_args!(
             "a PE image for {:?}: blaze links PE for x86_64-pc-windows-msvc only",
             output.arch
-        )));
-    }
-    if let Some(dll) = output.link.pe.delay_load.first() {
-        return Err(error(format_args!(
-            "`/DELAYLOAD:{dll}`: blaze's PE writer writes no delay-import directory yet"
         )));
     }
     if output.dev_run.is_some() && !matches!(output.kind, OutputKind::Executable { .. }) {
@@ -214,6 +211,7 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Patch => (Segment::Text, 1, ""),
         Class::Stubs => (Segment::Text, 2, ""),
         Class::Plt => (Segment::Text, 3, ""),
+        Class::Synthetic(delay::DELAY_CODE) => (Segment::Text, 4, ""),
         Class::Named { name, exec: true, .. } => (Segment::Text, 5, name),
         // The import address table, first in `.rdata` as link.exe lays it: once it has bound
         // the cells, the loader makes the pages the IAT directory spans read-only, whatever
@@ -234,6 +232,7 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Named { name, write: false, .. } => (Segment::Rdata, 8, name),
         Class::Data => (Segment::Data, 0, ""),
         Class::Table => (Segment::Data, 1, ""),
+        Class::Synthetic(delay::DELAY_DATA) => (Segment::Data, 2, ""),
         Class::PatchData => (Segment::Data, 3, ""),
         Class::InitArray => (Segment::Data, 4, ""),
         // ELF's alone: `image::sections` refuses one.
@@ -401,7 +400,7 @@ impl Writer for Pe {
     }
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
-        image::synthetic(counts, self.dev_run())
+        image::synthetic(counts, self.dev_run(), !self.output.link.pe.delay_load.is_empty())
     }
 
     fn apply(
@@ -436,7 +435,13 @@ impl Writer for Pe {
     }
 
     fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
-        image::iat_slots(placed)
+        let mut slots = image::iat_slots(placed)?;
+        // A delay-loaded function's GOT cell holds its stub's address ([`delay`]).
+        if let Some(delay) = delay::tables(self, placed)? {
+            slots.extend(delay.cells);
+            radix::sort_by_key(&mut slots, |it: &(u64, u64)| it.0);
+        }
+        Ok(slots)
     }
 
     fn shared_entry(&self) -> Option<&'static str> {

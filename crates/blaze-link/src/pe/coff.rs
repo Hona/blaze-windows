@@ -209,6 +209,13 @@ fn member<'a>(
     name: Input<'_>,
     bytes: &'a [u8],
 ) -> Result<Parsed<'a>, String> {
+    if super::rsrc::is_res(bytes) {
+        return Err(fail(
+            name,
+            "a compiled resource file (.res) read as an object: the link merges the .res files on \
+             its line into one object of their resources (`target::locate`)",
+        ));
+    }
     if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0)
         && u16_at(bytes, 2) == Some(0xffff)
     {

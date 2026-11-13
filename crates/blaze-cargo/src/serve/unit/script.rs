@@ -1679,15 +1679,11 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
-        // The front end keys the run by its `OUT_DIR` as the daemon names it (the plan's
-        // `/C:/a/out`), not as the script was given it (`C:\a\out` on Windows).
-        let named = match job.plan(self.unit).map(|plan| plan.out_dir.clone()) {
-            Ok(Some(named)) => named,
-            Ok(None) => {
-                let what = format!("the build script run of unit {} has no OUT_DIR", self.unit);
-                return self.error(what, out);
-            }
-            Err(error) => return self.error(error.what, out),
+        // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
+        // the plan's; the script ran at the system's path of it.
+        let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
+            let what = format!("the build script run of unit {} has no OUT_DIR in its plan", self.unit);
+            return self.error(what, out);
         };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),

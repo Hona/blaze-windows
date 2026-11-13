@@ -116,6 +116,12 @@ impl HirFrontend<'_> {
         self.with(|db| linked(db, krate).clone()).map_err(error)
     }
 
+    /// Whether `krate` is a GUI program on Windows: `#![windows_subsystem = "windows"]`
+    /// ([`AttrFlags::windows_subsystem`]), which the PE link gives the GUI subsystem.
+    pub fn windows_subsystem(&self, krate: Crate) -> bool {
+        self.with(|db| AttrFlags::windows_subsystem(db, krate))
+    }
+
     /// What the code of a live image built from `krate` assumes of its items, by key, sorted:
     /// each function's signature and each type's layout ([`Assumed`]). Only a workspace
     /// crate's code is patched (`Described::editable`), so another crate assumes nothing: an
