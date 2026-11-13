@@ -271,6 +271,147 @@ fn raw_dylib_imports_are_delay_loaded_too() {
     assert_eq!(run(&dir.join("delay.exe"), &[]), (0, "delay 0\n".into()));
 }
 
+/// The first file under `build` (cargo's `target\debug\build`) at `<crate>-<hash>\out\<file>`.
+fn built(build: &Path, krate: &str, file: &str) -> PathBuf {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(build)
+        .unwrap_or_else(|e| panic!("{}: {e}", build.display()))
+        .filter_map(|it| it.ok().map(|it| it.path()))
+        .filter(|it| {
+            it.file_name().and_then(|it| it.to_str()).is_some_and(|it| {
+                it.strip_prefix(krate).and_then(|rest| rest.strip_prefix('-')).is_some_and(|hash| {
+                    hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            })
+        })
+        .map(|it| it.join("out").join(file))
+        .filter(|it| it.is_file())
+        .collect();
+    dirs.sort();
+    dirs.into_iter().next().unwrap_or_else(|| panic!("no {krate}-*\\out\\{file} under {}", build.display()))
+}
+
+/// rune-desktop's native libraries as cargo built them (`BLAZE_RUNE_NATIVES` names its
+/// `target\debug\build`; Ghostty's is `GHOSTTY_VT_LIB`, else the build script's cache in
+/// `%LOCALAPPDATA%\seer\ghostty-vt`), linked as the desktop is: `+crt-static` with the UCRT's
+/// DLL, its 13 `/DELAYLOAD`s and `delayimp.lib`, `/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup`, its
+/// `.res`, with an entry that calls into each (`pe_run/natives.c`): SQLite, Luau's C++ with a
+/// Lua error thrown as a C++ exception, mimalloc on a second thread, zstd, ring's and BLAKE3's
+/// assembly, Ghostty's VT. Then run. Without `BLAZE_RUNE_NATIVES` it says so and checks nothing:
+/// the libraries are a build's, outside the repository.
+#[test]
+fn rune_desktops_native_libraries_link_and_run() {
+    let Some(build) = std::env::var_os("BLAZE_RUNE_NATIVES").map(PathBuf::from) else {
+        eprintln!(
+            "skipped: BLAZE_RUNE_NATIVES is not set (rune-desktop's target\\debug\\build after a cargo build)"
+        );
+        return;
+    };
+    let ghostty = match std::env::var_os("GHOSTTY_VT_LIB") {
+        Some(it) => PathBuf::from(it),
+        None => {
+            let cache = Path::new(&std::env::var_os("LOCALAPPDATA").unwrap()).join("seer").join("ghostty-vt");
+            std::fs::read_dir(&cache)
+                .unwrap_or_else(|e| panic!("{}: {e}", cache.display()))
+                .filter_map(|it| it.ok().map(|it| it.path().join("ghostty-vt-static.lib")))
+                .find(|it| it.is_file())
+                .unwrap_or_else(|| panic!("no ghostty-vt-static.lib in {}", cache.display()))
+        }
+    };
+    let luau = built(&build, "mlua-sys", "luau-build\\luauvm.lib");
+    let luau = luau.parent().unwrap();
+    let mut libs: Vec<PathBuf> = vec![
+        built(&build, "libsqlite3-sys", "sqlite3.lib"),
+        built(&build, "libmimalloc-sys", "mimalloc.lib"),
+        built(&build, "zstd-sys", "zstd.lib"),
+        built(&build, "ring", "ring_core_0_17_14_.lib"),
+        built(&build, "blake3", "blake3_sse2_sse41_avx2_assembly.lib"),
+        ghostty,
+    ];
+    for it in ["luauvm", "luaucompiler", "luauast", "luaucommon", "luaubytecode", "luauconfig", "luaurequire", "luaucustom", "luauinliner"] {
+        libs.push(luau.join(format!("{it}.lib")));
+    }
+    let res = built(&build, "opencode-desktop", "main_res.res");
+    let mut args: Vec<String> = libs.iter().map(|it| it.to_string_lossy().into_owned()).collect();
+    args.push(res.to_string_lossy().into_owned());
+    for it in ["/NODEFAULTLIB:libucrt.lib", "/DEFAULTLIB:ucrt.lib", "/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"] {
+        args.push(it.into());
+    }
+    for dll in [
+        "comctl32", "uiautomationcore", "wintrust", "crypt32", "setupapi", "ws2_32", "winmm", "oleaut32", "ole32",
+        "shell32", "dwrite", "dxgi", "psapi",
+    ] {
+        args.push(format!("/DELAYLOAD:{dll}.dll"));
+    }
+    for it in ["delayimp.lib", "userenv.lib", "ntdll.lib", "bcrypt.lib", "advapi32.lib"] {
+        args.push(it.into());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut desktop = output(None, &["natives.obj"]);
+    desktop.link.pe.crt_static = true;
+    let (desktop, libs) = with_args(desktop, &args);
+    let bytes = link_with(desktop, &libs).unwrap_or_else(|e| panic!("{e}"));
+    has_crt_directories(&bytes);
+    let dlls = dlls(&bytes);
+    assert!(!dlls.iter().any(|it| it == "comctl32.dll" || it == "ws2_32.dll" || it.starts_with("vcruntime")), "{dlls:?}");
+    let dir = scratch("rune_natives");
+    std::fs::write(dir.join("natives.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("natives.exe"), &[]), (0, "natives 0\n".into()));
+}
+
+/// A library a member asks for (`/DEFAULTLIB`) goes on the line after every library the link
+/// names, as link.exe searches them: Ghostty's Zig-built archive defines `_fltused`, and so does
+/// LIBCMT, which an earlier library's members ask for; found right after the first, LIBCMT's
+/// was taken too and the link failed with a duplicate (`rune_desktops_native_libraries_link_and_run`).
+#[test]
+fn default_libraries_are_searched_after_the_named_ones() {
+    use object::write::{Object as Builder, Symbol as Def, SymbolSection};
+    use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+    let object = |defines: &str, directives: &str| {
+        let mut b = Builder::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+        let text = b.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+        let at = b.append_section_data(text, &[0xc3], 16);
+        b.add_symbol(Def {
+            name: defines.as_bytes().to_vec(),
+            value: at,
+            size: 1,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        let drectve = b.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
+        b.append_section_data(drectve, directives.as_bytes(), 1);
+        b.write().unwrap()
+    };
+    let dir = scratch("default_order");
+    let write = |file: &str, defines: &str, directives: &str| {
+        let member = object(defines, directives);
+        let bytes = super::natives::archive(&[(&format!("{defines}.obj"), &member, &[defines])]);
+        std::fs::write(dir.join(file), bytes).unwrap();
+        dir.join(file).to_string_lossy().into_owned()
+    };
+    let first = write("first.lib", "first_fn", " /DEFAULTLIB:dflt.lib");
+    let second = write("second.lib", "second_fn", "");
+    write("dflt.lib", "dflt_fn", "");
+    let lib = |name: &str| NativeLib {
+        name: name.into(),
+        kind: blaze_codegen::NativeLibKind::Static { whole: false, bundle: false },
+        verbatim: true,
+        imports: Vec::new(),
+    };
+    let mut output = output(None, &[]);
+    let libs = [lib(&first), lib(&second)];
+    let search = [dir.clone()];
+    let crates = [crate::target::CrateLibs { libs: &libs, search: &[] }];
+    let located = crate::target::locate(&mut output, &crates, &search, Path::new("unused")).unwrap();
+    let files: Vec<String> = located
+        .iter()
+        .map(|it| it.path.file_name().unwrap().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    assert_eq!(files, ["first.lib", "second.lib", "dflt.lib"]);
+}
+
 /// The DLLs an image imports from, lowercased, in its import directory's order.
 fn dlls(bytes: &[u8]) -> Vec<String> {
     use object::LittleEndian as LE;

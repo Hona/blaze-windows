@@ -1043,8 +1043,8 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let libs = [dylib("msvcrt"), dylib("kernel32")];
     let expected = [
         (vc.join("msvcrt.lib"), ARCHIVED),
-        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("kernel32.lib"), ARCHIVED),
+        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("ucrt.lib"), ARCHIVED),
         (vc.join("oldnames.lib"), ARCHIVED),
     ];
@@ -1052,7 +1052,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     assert_eq!(
         line(&located),
         expected,
-        "each after the library that asked, each once, libcmt taken out by its asker"
+        "after every library the link names, in the order asked, each once, libcmt taken out by its asker"
     );
     let read = cache.asked.lock().len();
     assert_eq!(read, 3, "msvcrt.lib, vcruntime.lib and the empty archives' one content");
