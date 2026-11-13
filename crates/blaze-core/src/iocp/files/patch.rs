@@ -105,22 +105,37 @@ fn apply(
         rename_handle(raw, path, 0)?;
         return Ok(false);
     }
-    // durable: the old public name must not roll back over partially changed sectors.
-    crate::lock::io_wait("persist detached name", &name, || crate::fs::sync_dir(dir))?;
-    phase("detached");
-    file.set_len(len)?;
-    for (at, bytes) in delta {
-        file.seek(SeekFrom::Start(*at))?;
-        file.write_all(bytes)?;
-        phase("range");
+    for step in crate::fs::PATCH_PUBLICATION {
+        use crate::fs::PublishStep::*;
+        match step {
+            HideDurably => {
+                // durable: the old public name cannot roll back over changed sectors.
+                crate::lock::io_wait("persist detached name", &name, || crate::fs::sync_dir(dir))?;
+                phase("detached");
+            }
+            Edit => {
+                file.set_len(len)?;
+                for (at, bytes) in delta {
+                    file.seek(SeekFrom::Start(*at))?;
+                    file.write_all(bytes)?;
+                    phase("range");
+                }
+            }
+            SyncBytes => {
+                // durable: publication cannot outrun any byte of the result.
+                crate::lock::io_wait("persist patched bytes", &name, || file.sync_all())?;
+                phase("synced");
+            }
+            Show => {
+                disposition(false)?;
+                crate::lock::io_wait("return patched file", &name, || rename_handle(raw, path, 0))?;
+            }
+            SyncName => {
+                crate::lock::io_wait("persist returned name", &name, || crate::fs::sync_dir(dir))?;
+                phase("published");
+            }
+        }
     }
-    // durable: publication cannot outrun any byte of the result.
-    crate::lock::io_wait("persist patched bytes", &name, || file.sync_all())?;
-    phase("synced");
-    disposition(false)?;
-    crate::lock::io_wait("return patched file", &name, || rename_handle(raw, path, 0))?;
-    crate::lock::io_wait("persist returned name", &name, || crate::fs::sync_dir(dir))?;
-    phase("published");
     Ok(true)
 }
 

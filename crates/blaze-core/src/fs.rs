@@ -10,6 +10,8 @@ pub use mapped::{Advice, MapOptions, Mapped};
 
 mod patch;
 pub(crate) use patch::matches_patch;
+#[cfg(windows)]
+pub(crate) use patch::{PATCH_PUBLICATION, PublishStep};
 
 pub(crate) fn sparse_file(path: &Path, len: u64) -> io::Result<()> {
     let file = making_parent(path, || OpenOptions::new().write(true).create_new(true).open(path))?;
