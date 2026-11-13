@@ -229,6 +229,7 @@ fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
         name: "msvcrt".into(),
         kind: blaze_codegen::NativeLibKind::Dylib,
         verbatim: false,
+        imports: Vec::new(),
     };
     let error = link_with(output, &[msvcrt]).unwrap_err();
     assert!(error.what.contains("`msvcrt`") && error.what.contains("LNK2038"), "{error}");
