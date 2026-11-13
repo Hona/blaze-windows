@@ -1873,12 +1873,29 @@ impl<'db> Recorder<'db> {
             namespace: 1,
             index: id.as_u32(),
         });
-        func.create_global_value(ir::GlobalValueData::Symbol {
+        // A DLL's static: the request is its import address table cell (`places::static_ref`),
+        // which holds its address.
+        let imported = match request {
+            DataRequest::Static(id) => super::dll_imported(self.db, *id),
+            _ => false,
+        };
+        let symbol = func.create_global_value(ir::GlobalValueData::Symbol {
             name: ir::ExternalName::user(name),
             offset: ir::immediates::Imm64::new(0),
             // Only a static can be another object's.
             colocated: self.within_image() || !matches!(request, DataRequest::Static(_)),
             tls,
+        });
+        if !imported {
+            return symbol;
+        }
+        let flags = ir::MemFlagsData::trusted().with_readonly().with_can_move();
+        let flags = func.dfg.mem_flags.insert(flags).expect("room for one more set of flags");
+        func.create_global_value(ir::GlobalValueData::Load {
+            base: symbol,
+            offset: 0.into(),
+            global_type: self.target.pointer(),
+            flags,
         })
     }
 }

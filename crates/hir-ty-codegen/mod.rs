@@ -2528,6 +2528,20 @@ fn static_link_name(db: &Db, id: StaticId) -> Result<Option<String>> {
     Ok(static_link_name_for(db, target_of_crate(db, id.krate(db))?, id))
 }
 
+/// Whether a static of an `extern` block is a DLL's, which a PE image reaches only through its
+/// import address table cell (`__imp_X`): one of a block whose first `#[link]` is a `dylib`
+/// (or of no kind) or a `raw-dylib`, on a COFF target, as rustc's `is_dllimport` has it. A
+/// static of a `static` library, or of a block that names none, is the image's own.
+pub(crate) fn dll_imported(db: &Db, id: StaticId) -> bool {
+    let ItemContainerId::ExternBlockId(block) = id.lookup(db).container else { return false };
+    let coff = target_of_crate(db, id.krate(db))
+        .is_ok_and(|target| target.object_format == ObjectFormat::Coff);
+    coff && AttrFlags::native_libs(db, block).first().is_some_and(|lib| {
+        use hir_def::attrs::NativeLibKind as Kind;
+        matches!(lib.kind, Kind::Unspecified | Kind::Dylib | Kind::RawDylib)
+    })
+}
+
 /// [`static_link_name`] on `target`, the target of the code that names the static.
 fn static_link_name_for(db: &Db, target: &Target, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
