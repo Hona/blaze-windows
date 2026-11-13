@@ -15,7 +15,7 @@ use std::{
 use blaze_usercode::trace::Seen;
 
 use super::{
-    Answer, Done, Noted, Os, fail, fail_null, ok,
+    Answer, Done, Noted, Os, fail, fail_null, host, ok,
     target::{DIRENT_MAX, Errno, Kind, STAT_MAX, STATX_SIZE, Stat, Target},
 };
 use crate::guest::{Guest, Stop, put_word};
@@ -237,7 +237,14 @@ pub(super) fn walk(
         let parent = out.len();
         out.push('/');
         out.push_str(&rest[part]);
-        let meta = match fs::symlink_metadata(&*out) {
+        // A path that names nothing on this host (a first part that is no drive, on Windows)
+        // is missing, as a name no directory has.
+        let meta = match host::on_host(out).map(fs::symlink_metadata) {
+            Some(Ok(meta)) => Ok(meta),
+            Some(Err(error)) => Err(error),
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+        let meta = match meta {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 // The whole path that is missing, so that it is the one keyed and checked
@@ -262,13 +269,14 @@ pub(super) fn walk(
             if links > MAX_LINKS {
                 return Err(Fail::Errno(Errno::Loop));
             }
-            let target = fs::read_link(&*out).map_err(Fail::Io)?;
-            let Some(target) = target.to_str() else { return Err(Fail::NotUtf8) };
+            let host = host::on_host(out).ok_or_else(|| Fail::Io(io::ErrorKind::NotFound.into()))?;
+            let target = fs::read_link(&host).map_err(Fail::Io)?;
+            let Some(target) = host::link_target(&target) else { return Err(Fail::NotUtf8) };
             out.truncate(parent);
             if target.starts_with('/') {
                 out.clear();
             }
-            rest.replace_range(..at, target);
+            rest.replace_range(..at, &target);
             at = 0;
             continue;
         }
@@ -318,12 +326,13 @@ impl<'a> Os<'a> {
         let mut passed = Vec::new();
         for (dir, name) in dirs.iter_mut().zip([MANIFEST_DIR, OUT_DIR]) {
             let Some((_, value)) = self.env.iter().find(|it| it.0 == name) else { continue };
+            let value = host::guest_path(value);
             if !value.starts_with('/') {
                 continue;
             }
             // A root that is not there is walked as far as it is, so that a path below it
             // is the same path a walk of the path itself makes.
-            if walk(value, true, None, &mut self.real, &mut self.rest, Some(&mut passed)).is_ok() {
+            if walk(&value, true, None, &mut self.real, &mut self.rest, Some(&mut passed)).is_ok() {
                 // alloc: setup, once per expansion that reads a path
                 *dir = Some(self.real.clone());
             }
@@ -338,10 +347,10 @@ impl<'a> Os<'a> {
         if self.cwd_real.is_some() {
             return;
         }
-        let dir = self.cwd;
+        let dir = host::guest_path(self.cwd);
         let real = match dir.starts_with('/') {
             // A directory that is not there is walked as far as it is, as a root is.
-            true => match walk(dir, true, None, &mut self.real, &mut self.rest, None) {
+            true => match walk(&dir, true, None, &mut self.real, &mut self.rest, None) {
                 // alloc: once per expansion that names a relative path or asks its directory
                 Ok(_) => Some(self.real.clone()),
                 Err(_) => None,
@@ -372,6 +381,9 @@ impl<'a> Os<'a> {
     /// `path` made absolute from the directory `at` names, in [`Os::given`].
     fn absolute(&mut self, at: At, path: &str) -> Result<Result<(), Errno>, Stop> {
         self.given.clear();
+        // A Windows host reads a path as Windows spells it too (`C:\a` is the walk's `/C:/a`).
+        let path = host::guest_path(path);
+        let path = &*path;
         if !path.starts_with('/') {
             if let At::Cwd = at {
                 self.find_cwd();
@@ -599,7 +611,9 @@ impl<'a> Os<'a> {
                 slot.listed = false;
                 if kind == Kind::File {
                     let _span = tracing::info_span!(target: "blaze", "proc macro reads a file", subject = %self.real).entered();
-                    let read = fs::File::open(&self.real)
+                    let read = host::on_host(&self.real)
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+                        .and_then(fs::File::open)
                         .and_then(|mut file| file.read_to_end(&mut slot.bytes));
                     if let Err(error) = read {
                         let path = std::mem::take(&mut self.real);
@@ -953,7 +967,10 @@ impl<'a> Os<'a> {
             Err(errno) => return Ok(Err(errno)),
         }
         // alloc: the link's target, as std reads it
-        match fs::read_link(&self.real) {
+        let target = host::on_host(&self.real)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            .and_then(fs::read_link);
+        match target {
             Ok(target) => Ok(Ok(target)),
             Err(error) => {
                 let path = std::mem::take(&mut self.real);
@@ -1082,7 +1099,8 @@ impl<'a> Os<'a> {
             path.push(b'/');
         }
         let dir = path.len();
-        for entry in fs::read_dir(&slot.path)? {
+        let host = host::on_host(&slot.path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        for entry in fs::read_dir(host)? {
             let entry = entry?;
             let kind = entry.file_type()?;
             let kind = if kind.is_dir() {

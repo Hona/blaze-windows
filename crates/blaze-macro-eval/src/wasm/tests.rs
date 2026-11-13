@@ -140,8 +140,9 @@ impl Workspace {
     }
 
     fn path(&self, rel: &str) -> String {
-        let top = self.0.to_str().unwrap();
-        if rel.is_empty() { top.to_owned() } else { format!("{top}/{rel}") }
+        // The walk's name of it, as the daemon names paths (`/C:/...` on Windows).
+        let top = crate::os::host::guest_path(self.0.to_str().unwrap());
+        if rel.is_empty() { top.into_owned() } else { format!("{top}/{rel}") }
     }
 
     /// The member's variables: its package and an `OUT_DIR` that is not there.
