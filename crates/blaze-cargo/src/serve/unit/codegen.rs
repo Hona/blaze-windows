@@ -1398,6 +1398,12 @@ pub struct Linked {
 }
 
 impl Linked {
+    /// A file-only link with the same inputs can keep the last generation. Whether the
+    /// image has room to *patch* changed inputs is immaterial when none changed.
+    fn keeps_file(&self, given: ContentId) -> bool {
+        self.given == Some(given) && self.output.dev_run.is_none() && self.output.live.is_none()
+    }
+
     /// The image's tables as the linker counts them, each with its elements and bytes
     /// ([`blaze_api::Response::Tables`]): `relocation` and the rest.
     pub(crate) fn tables(&self) -> Vec<(&'static str, u64, u64)> {
@@ -2786,14 +2792,10 @@ fn relink(
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
     let given = linked.rows.given(built.id, &native_ids);
-    // Nothing to link: every row kept, the same names, natives and span tables, and a file
-    // patched in place (no code memory, no slots). Staging it would make a new generation
-    // whose file differs only in its build id, so an image whose inputs did not change (a
-    // doctest example beside an edited one) keeps the file it has, byte for byte.
-    let unchanged = linked.given == Some(given)
-        && linked.output.incremental
-        && linked.output.dev_run.is_none()
-        && linked.output.live.is_none()
+    // No patch room is needed to keep the file we already have. This matters for a
+    // fetched build script: even if its compile record missed, staging identical link
+    // inputs would change the PE build id and make its run miss on the executable.
+    let unchanged = linked.keeps_file(given)
         && removed.is_empty()
         && added_keys.is_empty()
         && gone_statics.is_empty()
