@@ -1796,6 +1796,9 @@ impl Line<'_> {
             self.output.arch,
         )?;
         for (member, library) in asked.iter() {
+            if self.output.link.pe.no_default_libs.excludes(library) {
+                continue;
+            }
             let path = self.default_library(library).map_err(|it| LinkError {
                 // alloc: error path
                 what: match member.is_empty() {

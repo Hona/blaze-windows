@@ -97,6 +97,11 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
             output.arch
         )));
     }
+    if let Some(dll) = output.link.pe.delay_load.first() {
+        return Err(error(format_args!(
+            "`/DELAYLOAD:{dll}`: blaze's PE writer writes no delay-import directory yet"
+        )));
+    }
     if output.dev_run.is_some() && !matches!(output.kind, OutputKind::Executable { .. }) {
         return Err(error(
             "a dev run of a DLL: only an executable has a start hook and a code memory",
@@ -143,7 +148,11 @@ impl Pe {
     }
 
     pub(crate) fn base(&self) -> u64 {
-        if self.dll() { DLL_BASE } else { EXE_BASE }
+        match self.output.link.pe.base {
+            Some(base) => base,
+            None if self.dll() => DLL_BASE,
+            None => EXE_BASE,
+        }
     }
 
     pub(crate) fn dev_run(&self) -> bool {

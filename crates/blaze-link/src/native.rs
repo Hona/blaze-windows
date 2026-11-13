@@ -496,7 +496,7 @@ fn line_has(names: &HashSet<&str, std::alloc::Global>, wanted: &str) -> bool {
 
 /// Whether `a` and `b` name one library as link.exe matches a `/DEFAULTLIB`: by file name,
 /// case-insensitively, with or without `.lib`.
-fn same_library(a: &str, b: &str) -> bool {
+pub(crate) fn same_library(a: &str, b: &str) -> bool {
     fn stem(it: &str) -> &str {
         let file = it.rsplit(['/', '\\']).next().unwrap_or(it);
         match file.len().checked_sub(4) {
@@ -511,10 +511,18 @@ fn same_library(a: &str, b: &str) -> bool {
 
 /// link.exe's default libraries: every `/DEFAULTLIB` of the objects and archive members
 /// `graph` loaded is on the line (`inputs`), but those a loaded one's `/NODEFAULTLIB` takes
-/// out, and none after a bare `/NODEFAULTLIB`. The linker reads no file itself:
+/// out, and none after a bare `/NODEFAULTLIB`, nor those the link arguments' `/NODEFAULTLIB`s
+/// take out (`given`). The linker reads no file itself:
 /// [`crate::target::locate`] puts them on the line, so one missing is an error naming it and
 /// the member that asked.
-fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
+fn default_libraries(
+    graph: &Graph,
+    inputs: &[Input],
+    given: &crate::output::NoDefaultLibs,
+) -> Result<(), LinkError> {
+    if *given == crate::output::NoDefaultLibs::All {
+        return Ok(());
+    }
     let mut left_out: SmallVec<[&str; 4]> = SmallVec::new();
     for load in &graph.loads {
         for directive in &load.parsed.object().directives {
@@ -533,6 +541,7 @@ fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
             }
             checked.push(library);
             if left_out.iter().any(|it| same_library(it, library))
+                || given.excludes(library)
                 || inputs.iter().any(|it| same_library(&it.name, library))
             {
                 continue;
@@ -3627,6 +3636,11 @@ impl<'a> Stage<'a> {
             let slot = b.slot(self.symbols.sym_name(name));
             b.flag(slot, PULL | LOOSE);
         }
+        // link.exe's `/INCLUDE:symbol` given as a link argument, as a `.drectve`'s is.
+        for name in &output.link.pe.include {
+            let slot = b.slot(self.symbols.sym_name(name));
+            b.flag(slot, PULL | REQUIRED | ROOT);
+        }
 
         // Load: the line's objects and whole archives, then members for what is strongly
         // undefined, round by round.
@@ -3714,7 +3728,7 @@ impl<'a> Stage<'a> {
             }
         }
         match output.format {
-            Format::Pe => default_libraries(&b.graph, &inputs)?,
+            Format::Pe => default_libraries(&b.graph, &inputs, &output.link.pe.no_default_libs)?,
             Format::MachO => linker_options(&b.graph, &inputs)?,
             Format::Elf | Format::Wasm => {}
         }

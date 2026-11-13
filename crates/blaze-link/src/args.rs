@@ -20,6 +20,7 @@
 //! `-C linker`, ...) are read by [`rustflags`], and [`apply`] takes or refuses their `-C`
 //! options alike.
 
+mod msvc;
 pub mod rustflags;
 #[cfg(test)]
 mod tests;
@@ -118,8 +119,34 @@ pub enum LinkOption {
     HeaderPadMaxInstallNames,
     /// ld64 `-undefined error|dynamic_lookup`, ELF `-z defs`.
     Undefined(Undefined),
-    /// ld64 `-stack_size SIZE` of an executable: `LC_MAIN`'s stack size.
-    StackSize(u64),
+    /// ld64 `-stack_size SIZE` and link.exe `/STACK:reserve[,commit]` of an executable: the
+    /// main thread's stack (`LC_MAIN`'s, the PE optional header's), and what of it a PE image
+    /// commits.
+    Stack { reserve: u64, commit: Option<u64> },
+    /// link.exe `/SUBSYSTEM:WINDOWS|CONSOLE[,major[.minor]]`: a GUI program with no console
+    /// ([`crate::Output::windows_subsystem`]) or a console one, and the least Windows version
+    /// it runs on.
+    Subsystem { windows: bool, version: Option<(u16, u16)> },
+    /// link.exe `/ENTRY:symbol` of an executable.
+    Entry(String),
+    /// link.exe `/DELAYLOAD:dll`.
+    DelayLoad(String),
+    /// link.exe `/NODEFAULTLIB[:lib]`: `None` is every default library.
+    NoDefaultLib(Option<String>),
+    /// link.exe `/HEAP:reserve[,commit]`.
+    Heap { reserve: u64, commit: Option<u64> },
+    /// An input file: link.exe's bare `foo.obj`, `foo.o`, `foo.res`.
+    Input(PathBuf),
+    /// link.exe `/INCLUDE:symbol`.
+    Include(String),
+    /// link.exe `/BASE:address`.
+    Base(u64),
+    /// link.exe `/DYNAMICBASE:NO` and the rest: a property blaze sets turned off.
+    PeOff(crate::output::PeFlag),
+    /// link.exe `/VERSION:major[.minor]`.
+    ImageVersion { major: u16, minor: u16 },
+    /// link.exe `/DEF:file` of a DLL: its `EXPORTS` are exports.
+    Def(PathBuf),
     /// ld64 `-exported_symbol NAME` of a shared library: one more export, by the core's name
     /// (the Mach-O name without its leading `_`).
     Export(String),
@@ -334,7 +361,8 @@ pub fn parse(
         let read = match spelling {
             Spelling::Ld64 => ld64(word, value, kind),
             Spelling::Gnu => gnu(word, value, kind),
-            Spelling::Msvc | Spelling::WasmLd => Err(why::NO_DRIVER),
+            Spelling::Msvc => msvc::read(word, kind),
+            Spelling::WasmLd => Err(why::NO_DRIVER),
         };
         match read {
             Ok((option, took)) => {
@@ -359,7 +387,12 @@ pub fn parse(
                 while words.get(at).is_some_and(|it| it.at == word.at) {
                     at += 1;
                 }
-                if last && words.get(at).is_some_and(|it| !it.text.is_empty() && !it.text.starts_with('-')) {
+                // link.exe takes no value apart: a bare word after a refused option is an
+                // input file of its own.
+                if spelling != Spelling::Msvc
+                    && last
+                    && words.get(at).is_some_and(|it| !it.text.is_empty() && !it.text.starts_with('-'))
+                {
                     at += 1;
                 }
             }
@@ -474,7 +507,7 @@ fn ld64(word: Word<'_>, value: Option<&str>, kind: Kind) -> Read {
             if size % 0x1000 != 0 {
                 return Err(why::STACK_PAGES);
             }
-            (LinkOption::StackSize(size), 1)
+            (LinkOption::Stack { reserve: size, commit: None }, 1)
         }
         "-exported_symbol" if !shared => return Err(why::EXPORT_DYNAMIC),
         "-exported_symbol" => match next()?.strip_prefix('_') {
@@ -783,7 +816,85 @@ pub fn apply(
             LinkOption::HeaderPad(size) => output.link.headerpad = size,
             LinkOption::HeaderPadMaxInstallNames => output.link.headerpad_max_install_names = true,
             LinkOption::Undefined(undefined) => output.link.undefined = undefined,
-            LinkOption::StackSize(size) => output.stack = Some(size),
+            LinkOption::Stack { reserve, commit } => {
+                output.stack = Some(reserve);
+                output.link.pe.stack_commit = commit;
+            }
+            LinkOption::Subsystem { windows, version } => {
+                output.windows_subsystem = windows;
+                output.link.pe.subsystem_version = version;
+            }
+            LinkOption::Entry(entry) => {
+                if let OutputKind::Executable { entry: was } = &mut output.kind {
+                    *was = entry;
+                }
+            }
+            LinkOption::DelayLoad(dll) => {
+                let pe = &mut output.link.pe;
+                if !pe.delay_load.iter().any(|it| it.eq_ignore_ascii_case(&dll)) {
+                    pe.delay_load.push(dll);
+                }
+            }
+            LinkOption::NoDefaultLib(library) => {
+                let it = &mut output.link.pe.no_default_libs;
+                *it = match (std::mem::take(it), library) {
+                    (_, None) | (crate::output::NoDefaultLibs::All, _) => {
+                        crate::output::NoDefaultLibs::All
+                    }
+                    (crate::output::NoDefaultLibs::None, Some(library)) => {
+                        crate::output::NoDefaultLibs::Some(vec![library])
+                    }
+                    (crate::output::NoDefaultLibs::Some(mut them), Some(library)) => {
+                        them.push(library);
+                        crate::output::NoDefaultLibs::Some(them)
+                    }
+                };
+            }
+            LinkOption::Heap { reserve, commit } => output.link.pe.heap = Some((reserve, commit)),
+            LinkOption::Input(path) => output.link.inputs.push(path),
+            LinkOption::Include(name) => {
+                if !output.link.pe.include.contains(&name) {
+                    output.link.pe.include.push(name);
+                }
+            }
+            LinkOption::Base(base) => output.link.pe.base = Some(base),
+            LinkOption::PeOff(flag) => {
+                if !output.link.pe.off.contains(&flag) {
+                    output.link.pe.off.push(flag);
+                }
+            }
+            LinkOption::ImageVersion { major, minor } => {
+                output.link.pe.image_version = Some((major, minor));
+            }
+            LinkOption::Def(path) => {
+                let failed = |why: String| LinkError {
+                    function: None,
+                    // alloc: error path
+                    what: format!("the module-definition file {} (`/DEF`): {why}", path.display()),
+                    refusal: None,
+                };
+                // alloc: error path
+                let text = std::fs::read_to_string(&path).map_err(|e| failed(e.to_string()))?;
+                let (library, names) = msvc::def_exports(&text).map_err(failed)?;
+                if let OutputKind::Shared { exports, name: dll } = &mut output.kind {
+                    if let Some(library) = library {
+                        let stem = |it: &str| {
+                            let it = it.rsplit(['/', '\\']).next().unwrap_or(it);
+                            it.strip_suffix(".dll").or_else(|| it.strip_suffix(".DLL")).unwrap_or(it).to_owned()
+                        };
+                        if !stem(&library).eq_ignore_ascii_case(&stem(dll)) {
+                            return Err(failed(format!(
+                                "it names the DLL {library}, and the crate's is {dll}"
+                            )));
+                        }
+                    }
+                    for name in names {
+                        if !exports.contains(&name) {
+                            exports.push(name);
+                        }
+                    }
+                }
+            }
             LinkOption::Export(name) => {
                 if let OutputKind::Shared { exports, .. } = &mut output.kind
                     && !exports.contains(&name)

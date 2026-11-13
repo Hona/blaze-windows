@@ -94,6 +94,69 @@ pub struct LinkArgs {
     /// in the order given: [`crate::target::locate`] puts them on the line after the crates'
     /// libraries, each read by what it is.
     pub inputs: Vec<std::path::PathBuf>,
+    /// What link.exe's arguments ask of a PE image ([`PeArgs`]).
+    pub pe: PeArgs,
+}
+
+/// What link.exe's arguments ask of a PE image beyond its kind, entry, stack and subsystem
+/// (which are [`Output::kind`], [`Output::stack`] and [`Output::windows_subsystem`]). The
+/// default is an image linked with none: link.exe's defaults, as rustc links one.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)] // clone: setup, as `Output`'s
+pub struct PeArgs {
+    /// `/SUBSYSTEM:..,major.minor`: the least Windows version the image runs on.
+    pub subsystem_version: Option<(u16, u16)>,
+    /// `/DELAYLOAD:dll`, each once in the order given, ASCII case kept: the DLLs whose
+    /// imports load on first call (`delayimp.lib`'s `__delayLoadHelper2`).
+    pub delay_load: Vec<String>,
+    /// `/NODEFAULTLIB[:lib]`: default libraries (`/DEFAULTLIB`s of the inputs) not linked.
+    pub no_default_libs: NoDefaultLibs,
+    /// `/INCLUDE:symbol`: names the link must define and keep, as a `.drectve`'s are.
+    pub include: Vec<String>,
+    /// `/STACK:..,commit`: the main thread's committed stack.
+    pub stack_commit: Option<u64>,
+    /// `/HEAP:reserve[,commit]`: the process heap's sizes.
+    pub heap: Option<(u64, Option<u64>)>,
+    /// `/BASE:address`: where the image asks to be loaded.
+    pub base: Option<u64>,
+    /// `/DYNAMICBASE:NO`, `/HIGHENTROPYVA:NO`, ...: what is turned off of what blaze's PE
+    /// writer sets on every image, each once.
+    pub off: Vec<PeFlag>,
+    /// `/VERSION:major[.minor]`: the image's version fields.
+    pub image_version: Option<(u16, u16)>,
+}
+
+/// What `/NODEFAULTLIB` takes out.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
+pub enum NoDefaultLibs {
+    #[default]
+    None,
+    /// These libraries, as given (`libcmt`, `libcmt.lib`).
+    Some(Vec<String>),
+    /// A bare `/NODEFAULTLIB`: every one.
+    All,
+}
+
+impl NoDefaultLibs {
+    /// Whether the default library `library` is taken out, its `.lib` and ASCII case aside.
+    pub fn excludes(&self, library: &str) -> bool {
+        match self {
+            NoDefaultLibs::None => false,
+            NoDefaultLibs::All => true,
+            NoDefaultLibs::Some(them) => them.iter().any(|it| crate::native::same_library(it, library)),
+        }
+    }
+}
+
+/// A property blaze's PE writer sets on every image, which a `:NO` link argument turns off.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PeFlag {
+    /// `/DYNAMICBASE` (`/FIXED` turns it off too).
+    DynamicBase,
+    HighEntropyVa,
+    NxCompat,
+    LargeAddressAware,
+    /// `/TSAWARE`, an executable's.
+    TerminalServerAware,
 }
 
 /// What a symbol nothing on the link line defines becomes.

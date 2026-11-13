@@ -150,6 +150,34 @@ fn code_built_with_guard_cf_and_gs_runs() {
     assert_eq!(linked_run("cfg", &["cfg.obj"], &[]), (0, "cfg 22 7\n".into()));
 }
 
+/// `output` with link.exe's arguments `args` applied, as a build script gives them.
+fn with_args(mut output: Output, args: &[&str]) -> Output {
+    let given: Vec<crate::args::GivenArg> = args
+        .iter()
+        .map(|it| crate::args::GivenArg {
+            arg: (*it).to_owned(),
+            from: crate::args::ArgFrom::BuildScript { package: "run 0.0.0".into() },
+        })
+        .collect();
+    let applied = crate::args::apply(&mut output, &[], &given).unwrap();
+    assert!(applied.libs.is_empty() && applied.search.is_empty(), "{applied:?}");
+    output
+}
+
+#[test]
+fn a_gui_program_entered_at_main_crt_startup_runs_without_a_console() {
+    let output = with_args(output(None, &["gui.obj"]), &["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]);
+    let bytes = link(output).unwrap();
+    has_crt_directories(&bytes);
+    let file = object::read::pe::PeFile64::parse(&bytes[..]).unwrap();
+    let optional = &file.nt_headers().optional_header;
+    use object::read::pe::ImageOptionalHeader as _;
+    assert_eq!(optional.subsystem(), object::pe::IMAGE_SUBSYSTEM_WINDOWS_GUI);
+    let dir = scratch("gui");
+    std::fs::write(dir.join("gui.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("gui.exe"), &[]), (0, "gui without a console\n".into()));
+}
+
 #[test]
 fn an_executable_runs_with_the_dll_it_imports_from() {
     let dll = link(output(Some("runlib.dll"), &["dll.obj"])).unwrap();
