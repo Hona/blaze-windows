@@ -365,12 +365,16 @@ fn entries_that_leave_the_package_are_refused_by_name() {
         assert!(error.what.contains(named), "{named}: {}", error.what);
         assert_eq!(error.at.as_deref(), Some(SERDE));
     };
-    refused(Entry::File("../x", b"", 0o644), "\"../x\"");
-    refused(Entry::File("/x", b"", 0o644), "\"/x\"");
-    refused(Entry::File("serde-1.0.218/x", b"", 0o644), "\"serde-1.0.218/x\"");
-    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "\"serde-1.0.219/../x\"");
-    refused(Entry::File("serde-1.0.219/./x", b"", 0o644), "\"serde-1.0.219/./x\"");
-    refused(Entry::File("serde-1.0.219//x", b"", 0o644), "\"serde-1.0.219//x\"");
+    // Named as blaze-fetch's one set of name rules names an entry (`unpack::UnpackRefused`).
+    refused(Entry::File("../x", b"", 0o644), "`../x`");
+    refused(Entry::File("/x", b"", 0o644), "`/x`");
+    refused(Entry::File("serde-1.0.218/x", b"", 0o644), "`serde-1.0.218/x`");
+    refused(Entry::File("serde-1.0.219/../x", b"", 0o644), "`serde-1.0.219/../x`");
+    // A `.` or an empty part names nothing more, as cargo's unpack takes them: the file is `x`.
+    for spelled in ["serde-1.0.219/./x", "serde-1.0.219//x"] {
+        let source = fetch_crate(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644), Entry::File(spelled, b"", 0o644)]).unwrap();
+        assert!(source.files.iter().any(|it| it.path == "x"), "{spelled}");
+    }
     refused(Entry::Link("serde-1.0.219/etc", "../../etc"), "\"serde-1.0.219/etc\"");
 }
 
@@ -381,14 +385,14 @@ fn a_path_twice_is_refused() {
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\" twice"), "{}", error.what);
+    assert!(error.what.contains("`src/lib.rs` is in the archive twice"), "{}", error.what);
 
     let error = fetch_crate(&[
         Entry::File("serde-1.0.219/src", b"a", 0o644),
         Entry::File("serde-1.0.219/src/lib.rs", b"b", 0o644),
     ])
     .unwrap_err();
-    assert!(error.what.contains("\"serde-1.0.219/src/lib.rs\""), "{}", error.what);
+    assert!(error.what.contains("`src` is in the archive as a directory and as a file"), "{}", error.what);
 }
 
 fn index_fetch() -> Fetch {

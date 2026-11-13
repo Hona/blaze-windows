@@ -2012,11 +2012,34 @@ mod tests {
         // SAFETY: both handles are open and owned for the call, which reads no memory.
         assert_ne!(unsafe { AssignProcessToJobObject(job.0, parent.as_raw_handle()) }, 0);
         parent.wait().unwrap();
-        assert_eq!(listed(&job).unwrap().1, 1, "the child runs on in the job");
+        // Where the test has no console of its own (CI's runner, a service), `cmd` was given a
+        // console host, `conhost.exe`, which is in the job too and lives as long as the child.
+        let (list, count) = listed(&job).unwrap();
+        let ids = (0..count.min(LISTED)).map(|at| if at == 0 { list.head.ProcessIdList[0] } else { list.more[at - 1] });
+        let hosts = ids.filter(|&id| image_of(id as u32).is_some_and(|it| it.eq_ignore_ascii_case("conhost.exe"))).count();
+        assert_eq!(count - hosts, 1, "the child runs on in the job");
         let started = Instant::now();
         end(&job, 7);
         assert!(started.elapsed() < ENDING / 10, "ended after {:?}", started.elapsed());
         assert_eq!(listed(&job).unwrap().1, 0);
+    }
+
+    /// The file name of process `id`'s image, `None` where it can't be asked.
+    fn image_of(id: u32) -> Option<String> {
+        use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+        // SAFETY: OpenProcess takes no memory of ours; a null handle is its failure.
+        let process = Handle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) });
+        if process.0.is_null() {
+            return None;
+        }
+        let mut name = [0u16; 1024];
+        let mut len = name.len() as u32;
+        // SAFETY: an open handle, a buffer of `len` units, and `len` for the call to set.
+        if unsafe { QueryFullProcessImageNameW(process.0, 0, name.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&name[..len as usize]);
+        path.rsplit('\\').next().map(str::to_owned)
     }
 
     #[test]

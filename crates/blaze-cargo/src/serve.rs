@@ -54,7 +54,7 @@ pub(crate) mod said;
 pub mod settings;
 pub(crate) mod signals;
 mod still;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 mod stop;
 #[cfg(test)]
 mod tests;
@@ -1433,7 +1433,9 @@ fn listen(
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     // windows: no stop guard yet. `serve::stop` blocks on the signal pipe of `signals`; Windows
     // needs it on an event that a console control handler and `stop_begun` set, so a stuck stop
-    // or a stuck turn and the memory ceiling are not watched here.
+    // or a stuck turn are not watched here. The memory ceiling is, by a thread of its own.
+    #[cfg(windows)]
+    stop::watch_ceiling()?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
     #[cfg(unix)]

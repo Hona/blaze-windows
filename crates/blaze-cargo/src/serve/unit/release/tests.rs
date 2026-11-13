@@ -286,12 +286,12 @@ fn the_query_storage_s_largest_holders_are_said_with_their_rows_made_and_used() 
         usage("dependency edges", 10_000_000, 10_000_000, 3 << 29, 0),
         usage("Crate", 950, 950, 1 << 26, 0),
     ]);
-    assert_eq!(holders.total, 3_012_558_848, "every holder, the ninth not said included");
+    assert_eq!(holders.total, 3_012_558_848, "every holder");
     assert_eq!(
         holders.to_string(),
         "the query storage holds 2.81 GiB: dependency edges 1.50 (10.00M rows), infer 0.50 (2.0k rows made, 1.5k used), \
          source_place 0.50 (3.19M rows made, 400.0k used), dependency nodes 0.19 (4.00M rows), Crate 0.06 (950 rows), \
-         captured reads 0.03 (0 rows), a 0.02 (1.0k rows made, 3 used), b 0.01 (1.0k rows)"
+         captured reads 0.03 (0 rows), a 0.02 (1.0k rows made, 3 used), b 0.01 (1.0k rows), c 0.00 (1 rows)"
     );
 }
 

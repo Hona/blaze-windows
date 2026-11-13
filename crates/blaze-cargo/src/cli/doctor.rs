@@ -362,7 +362,9 @@ mod tests {
         assert!(image_file(dir.path()).exists());
         let said = text(&report);
         assert!(said.starts_with("1 fault in the persisted state under "), "{said}");
-        assert!(said.contains(&format!("  blaze stop && mv {db} {db}.suspect-1762850000\n")), "{said}");
+        // Quoted as a shell needs it: a Windows path's `\` and `:` are.
+        let command = format!("  blaze stop && mv {} {}\n", quoted(Path::new(&db)), quoted(Path::new(&aside)));
+        assert!(said.contains(&command), "{said}");
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["checks"][0]["verdict"], "fault");

@@ -164,6 +164,14 @@ pub fn exit_now(exit: blaze_core::exit::Exit) -> ! {
     unsafe { libc::_exit(exit.code()) }
 }
 
+/// [`exit_now`] on Windows: the process ends at once, with no destructor run, as `_exit` ends it.
+#[cfg(windows)]
+pub fn exit_now(exit: blaze_core::exit::Exit) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: the calling process's pseudo handle, which needs no closing; the call ends it.
+    unsafe { TerminateProcess(GetCurrentProcess(), exit.code() as u32) };
+    unreachable!("TerminateProcess of the calling process returned")
+}
 /// Turns SIGUSR1 into [`dump_asked`].
 #[cfg(unix)]
 fn catch_dump() {

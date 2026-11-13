@@ -450,7 +450,8 @@ fn no_unit_reads_how_its_client_is_shown_diagnostics_but_to_draw_them() {
     let mut found = Vec::new();
     let mut the_one = 0;
     for file in files {
-        let name = file.strip_prefix(&unit).unwrap().to_string_lossy().into_owned();
+        // `/`-separated on every system, as the names below are written.
+        let name = file.strip_prefix(&unit).unwrap().to_string_lossy().replace('\\', "/");
         if name.ends_with("tests.rs") || name.contains("/tests/") {
             continue;
         }
