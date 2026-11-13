@@ -1068,7 +1068,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let located =
         locate_plain(&cache, &answers, &output, &libs, std::slice::from_ref(&mine)).unwrap();
     assert_eq!(
-        line(&located)[1],
+        line(&located)[2],
         (mine.join("vcruntime.lib"), ARCHIVED),
         "the link's directories before LIB's"
     );
