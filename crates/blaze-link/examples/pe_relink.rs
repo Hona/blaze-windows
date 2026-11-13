@@ -50,10 +50,13 @@ fn words(text: &str) -> Vec<String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(line), Some(out)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: pe_relink <linker-arguments> <out.exe> [runs]");
+        eprintln!("usage: pe_relink <linker-arguments> <out.exe> [runs] [links of nothing changed] [incremental]");
         std::process::exit(2);
     };
     let runs: usize = args.get(3).map_or(1, |it| it.parse().expect("runs"));
+    let agains: usize = args.get(4).map_or(1, |it| it.parse().expect("links of nothing changed"));
+    // A dev build's image keeps room to grow, as the daemon links one; a release build's does not.
+    let incremental = args.get(5).is_some_and(|it| it == "incremental");
     let text = std::fs::read(line).expect("the line");
     // rustc writes the file UTF-16 with a BOM for link.exe.
     let text = if text.starts_with(&[0xff, 0xfe]) {
@@ -86,7 +89,7 @@ fn main() {
     }
     for run in 0..runs {
         let started = Instant::now();
-        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, Debug::None, false)
+        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, Debug::None, incremental)
             .expect("the output");
         // rustc names the static VC runtime (`/defaultlib:libcmt`) on a `+crt-static` line.
         output.link.pe.crt_static =
@@ -135,5 +138,19 @@ fn main() {
             written_at.as_secs_f64(),
             file.len() as f64 / 1e6,
         );
+        // A link of the same image that changes nothing: what every edit's link pays for the
+        // native inputs it did not change.
+        for _ in 0..agains {
+        let again = Instant::now();
+        let staged = image.stage(Change::default()).unwrap_or_else(|e| panic!("{e}"));
+        let staged_at = again.elapsed();
+        let file = image.bytes(staged).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "run {run} again, nothing changed: stage {:.3} s, bytes {:.3} s; {:.1} MB out",
+            staged_at.as_secs_f64(),
+            (again.elapsed() - staged_at).as_secs_f64(),
+            file.len() as f64 / 1e6
+        );
+        }
     }
 }
