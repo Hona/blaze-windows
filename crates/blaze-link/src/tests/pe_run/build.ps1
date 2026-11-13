@@ -13,6 +13,14 @@ cl_ @common /MD /Fodll.obj dll.c
 cl_ @common /MD /Fousedll.obj usedll.c
 cl_ @common /MD /guard:cf /Focfg.obj cfg.c
 cl_ @common /MD /Fogui.obj gui.c
-& lib.exe /nologo /machine:x64 /def:runlib.def /out:runlib.lib
-if ($LASTEXITCODE -ne 0) { throw 'lib' }
-Remove-Item runlib.exp
+cl_ @common /MD /Fores.obj res.c
+& rc.exe /nologo /fo app.res app.rc
+if ($LASTEXITCODE -ne 0) { throw 'rc app' }
+& rc.exe /nologo /fo more.res more.rc
+if ($LASTEXITCODE -ne 0) { throw 'rc more' }
+cl_ @common /MD /Fodelay.obj delay.c
+foreach ($def in 'runlib', 'nosuch') {
+    & lib.exe /nologo /machine:x64 /def:$def.def /out:$def.lib
+    if ($LASTEXITCODE -ne 0) { throw "lib $def" }
+    Remove-Item "$def.exp"
+}

@@ -380,6 +380,8 @@ pub struct Image {
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
+    /// Whether the image's volume can clone it ([`Image::set_sharing`]).
+    sharing: blaze_core::Sharing,
 }
 
 impl Image {
@@ -497,7 +499,17 @@ impl Image {
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
             beside: beside::Kept::new(),
+            sharing: blaze_core::Sharing::Blocks,
         })
+    }
+
+    /// Whether the volume the image is written on can clone it ([`blaze_core::platform::volume`]
+    /// of its directory): with [`blaze_core::Sharing::Blocks`] (the default) a commit of a stage
+    /// that placed into the room the image kept clones the image and writes what changed; with
+    /// [`blaze_core::Sharing::Unshared`] (NTFS) no clone exists, and every commit and rollback
+    /// writes the whole file. A commit never asks for a clone the volume refuses.
+    pub fn set_sharing(&mut self, sharing: blaze_core::Sharing) {
+        self.sharing = sharing;
     }
 
     /// Places and relocates what `change` says, in parallel, into address space not yet
@@ -774,6 +786,12 @@ impl Image {
     ) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
+        // On a volume whose files share no blocks there is no clone of the image to patch: the
+        // file is written whole, and the history undoes it whole ([`Image::set_sharing`]).
+        if !staged.writes.full && self.sharing == blaze_core::Sharing::Unshared {
+            staged.writes.writes = file::whole(&staged.state);
+            staged.writes.full = true;
+        }
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
         let revert = self.take(staged.state, full, staged.undo);
