@@ -1056,6 +1056,26 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
 }
 
+/// A file outside the VFS is named as the daemon names it (`/C:/a/b.rs` on Windows) and read
+/// at the system's path of that name: on Windows `std::fs::read("/C:/..")` is os error 123,
+/// and every `include_str!(concat!(env!("X"), ".."))` of rune-desktop's font packs and plugin
+/// spec failed so. Control: read at the name as written, it fails on Windows.
+#[test]
+fn an_included_file_is_read_at_the_system_path_of_its_name() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-named-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("included.txt");
+    std::fs::write(&file, b"included").unwrap();
+    let named = blaze_core::platform::path::daemon(&file.canonicalize().unwrap()).unwrap();
+    let read = crate::IncludedFile::read_now(std::path::Path::new(&named));
+    assert_eq!(read.as_deref().ok(), Some(&b"included"[..]), "{named}: {read:?}");
+    if cfg!(windows) {
+        assert!(named.starts_with('/'), "the premise: a daemon name, {named}");
+        assert!(std::fs::read(&named).is_err(), "the name itself is no system path");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
 /// contents, some of which are not UTF-8.
 fn seeded_view(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
