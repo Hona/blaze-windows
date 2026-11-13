@@ -176,10 +176,11 @@ fn debuginfo(debuginfo: &DebugInfo) -> u32 {
     }
 }
 
-/// Whether `path` is a file cargo's `filenames` leaves out: dep-info, and the debug info
-/// beside an image (`FileFlavor::DebugInfo`: `.dSYM`, `.pdb`, `.dwp`).
+/// Whether `path` is a file cargo's `filenames` leaves out: dep-info, the debug info beside
+/// an image (`FileFlavor::DebugInfo`: `.dSYM`, `.pdb`, `.dwp`), and an MSVC DLL's export file
+/// (`.dll.exp`), which link.exe writes for its own use and nothing reads after.
 pub(crate) fn listed(path: &str) -> bool {
-    ![".d", ".dSYM", ".pdb", ".dwp"].iter().any(|it| path.ends_with(it))
+    ![".d", ".dSYM", ".pdb", ".dwp", ".dll.exp"].iter().any(|it| path.ends_with(it))
 }
 
 fn file_name(path: &str) -> &str {
@@ -255,19 +256,43 @@ pub(crate) fn uplifted<'a>(path: &str, plan: &'a UnitPlan) -> Option<&'a str> {
 }
 
 /// The files the unit itself makes, by the path rustc writes them at (the copies cargo makes
-/// are the same bytes), dep-info and debug info left out.
+/// are the same bytes), dep-info and debug info left out, and what a link makes beside its
+/// image: an MSVC DLL's import library (`foo.dll.lib`, [`import_library`]) and export file
+/// (`foo.dll.exp`), which cargo plans as outputs of a `cdylib` and link.exe writes beside the
+/// DLL. Each of these is an image to link ([`super::compile`]'s loop): a by-product linked as
+/// a DLL of its own name was three links of one DLL, two of them at the wrong names (I19).
 pub(crate) fn made(plan: &UnitPlan) -> Vec<&str> {
     plan.outputs
         .iter()
         .map(String::as_str)
-        .filter(|it| listed(it) && rustc_writes(it, plan))
+        .filter(|it| listed(it) && rustc_writes(it, plan) && !by_product(it))
         .collect()
 }
 
+/// Whether `path` is what a link writes beside a DLL rather than an image of its own: its
+/// import library or its export file.
+fn by_product(path: &str) -> bool {
+    path.ends_with(".dll.lib") || path.ends_with(".dll.exp")
+}
+
+/// The import library planned beside the DLL `dll` (`foo.dll.lib`, written from the DLL's
+/// exports as its link commits them: `blaze_link::Image::import_library`), none for any
+/// other image.
+pub(crate) fn import_library<'a>(dll: &str, plan: &'a UnitPlan) -> Option<&'a str> {
+    plan.outputs
+        .iter()
+        .map(String::as_str)
+        .find(|it| it.strip_suffix(".lib").is_some_and(|it| it == dll) && dll.ends_with(".dll"))
+}
+
 /// cargo's `filenames`: each output's uplifted copy where there is one, else its own path
-/// (`OutputFile::bin_dst`).
+/// (`OutputFile::bin_dst`); a DLL's import library after it, as cargo lists it.
 pub(crate) fn filenames(_unit: &Unit, plan: &UnitPlan) -> Vec<String> {
-    made(plan).into_iter().map(|it| uplifted(it, plan).unwrap_or(it).to_owned()).collect()
+    made(plan)
+        .into_iter()
+        .flat_map(|it| std::iter::once(it).chain(import_library(it, plan)))
+        .map(|it| uplifted(it, plan).unwrap_or(it).to_owned())
+        .collect()
 }
 
 /// cargo's `executable`: the program a unit that makes one makes (a binary, an example, a test
