@@ -609,6 +609,7 @@ mod tests {
 
     /// S2 (round 3): the `--http` page, which holds the serve token, is written through
     /// `PrivateDir`: a 0600 regular file, the link in it, in a new 0700 directory of its own.
+    #[cfg(unix)]
     #[test]
     fn the_explorer_page_is_written_private() {
         use std::os::unix::fs::PermissionsExt as _;
