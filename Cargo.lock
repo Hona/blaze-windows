@@ -4020,6 +4020,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
  "blaze-query",

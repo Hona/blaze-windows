@@ -78,6 +78,8 @@ rsasm = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# Measure the item store's real classifier at the describe query boundary, not a copy of its rules.
+blaze-item-hash.workspace = true
 # The code identity, held to what rustc says each of the code generator's crates read
 # (`toolchain/tests.rs`).
 blaze-codegen-code.workspace = true

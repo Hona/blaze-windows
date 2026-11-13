@@ -425,18 +425,28 @@ pub(crate) enum Memoed {
 // so they stay interned and are never verified.
 #[blaze_query::tracked(returns(ref))]
 fn described_memo(db: &Db, instance: HirInstance, requester: Origin, facing: Facing) -> Memoed {
+    fresh_describe(db, &instance, requester, facing)
+}
+
+// Keep the census inside the same query boundary as a prospective durable offer. Capturing a
+// call *to* described_memo would see just one edge to the memo, not the inputs of the answer.
+fn fresh_describe(db: &Db, instance: &HirInstance, requester: Origin, facing: Facing) -> Memoed {
     if names_files(db, &instance.0) {
         return Memoed::NamesFiles;
     }
     let front = match facing.front(db) {
         Ok(front) => front,
         Err(what) => {
-            let named = super::Named(db, &instance);
+            let named = super::Named(db, instance);
             return Memoed::Described(Err(undescribed(db, &named, None, what)));
         }
     };
-    Memoed::Described(front.described(db, &instance, &requester, facing.world))
+    Memoed::Described(front.described(db, instance, &requester, facing.world))
 }
+
+#[cfg(test)]
+#[path = "describe_reads.rs"]
+mod describe_reads;
 
 /// Whether the value of `value` holds what the build calls a file: a `file!()` path, alone
 /// or in a text, among the data its initializer asks for. Exactly when placing its requests
