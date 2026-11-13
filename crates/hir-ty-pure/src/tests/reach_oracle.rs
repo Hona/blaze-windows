@@ -346,3 +346,19 @@ fn a_join_forgets_the_implications_of_values_gone() {
     assert!(few > 0, "the shape makes no implications to forget");
     assert_eq!(few, many, "the implications grew with the joins: {few} for 2, {many} for 24");
 }
+
+/// A body with no loop has each block walked once, after all paths into it.
+#[test]
+fn a_body_with_no_loop_walks_each_block_once() {
+    let source = dispatch_source(24);
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers").basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
+    });
+}

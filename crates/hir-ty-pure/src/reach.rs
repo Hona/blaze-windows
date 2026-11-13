@@ -639,6 +639,8 @@ thread_local! {
     /// The most implications a joined state of this thread's proofs held, for the test that a
     /// join forgets those of values gone (`tests/reach_oracle.rs`).
     pub(crate) static MOST_IMPLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread's proofs walked a block.
+    pub(crate) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The widest range a term's value is kept in.
@@ -2305,6 +2307,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                 continue;
             }
             entries[block] = joined.clone(); // clone: kept as the block's entry, walked below
+            #[cfg(test)]
+            WALKS.set(WALKS.get() + 1);
             let out = match joined {
                 Some(mut state) => self.transfer(block as u32, &mut state).edges,
                 None => Vec::new(),
