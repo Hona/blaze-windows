@@ -171,6 +171,11 @@ impl Side<'_> {
             .env("BLAZE_HOME", self.root.join("home"))
             .env("CARGO_TARGET_DIR", self.root.join("target"))
             .env("CARGO_NET_OFFLINE", "true");
+        // BLAZE_HOME alone still shares std with LOCALAPPDATA/blaze on the same volume.
+        // A cold sample owns both; leave cargo's prefetched registry/toolchain unchanged.
+        if self.blaze {
+            cmd.env("LOCALAPPDATA", self.root.join("local"));
+        }
         cmd
     }
     fn stop(&self) -> Result<()> {
