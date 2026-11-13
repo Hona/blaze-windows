@@ -2442,8 +2442,7 @@ define i32 @"blaze.own"() {
     }
 
     fn table_of_constants(target: &'static crate::Target) {
-        use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::I64};
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+        use cranelift_codegen::ir::{AbiParam, types::I64};
 
         use super::super::fragment::FuncTarget;
 
@@ -2459,8 +2458,39 @@ define i32 @"blaze.own"() {
         let mut sig = ir::Signature::new(isa.default_call_conv());
         sig.params.push(AbiParam::new(I64));
         sig.returns.push(AbiParam::new(I64));
-        let request = wants.func(FuncTarget::Symbol("pick".into()), &sig);
-        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig);
+        // Two functions of one unit, each with its tables, so each is a section of its own.
+        let picks = [0, 1].map(|at| {
+            let request = wants.func(FuncTarget::Symbol(format!("pick{at}")), &sig);
+            (request, picking(&**isa, &sig, &datas, at))
+        });
+        let members = picks.each_ref().map(|(request, func)| Member {
+            func,
+            named: &[],
+            pointees: &[],
+            request: request.as_u32(),
+        });
+        let unit = emit_unit(&mut wants, &members, optimized_level(), &[]).unwrap();
+        for code in &unit.members {
+            if let Err(error) = code {
+                panic!("{}: {error}", target.triple());
+            }
+        }
+    }
+
+    /// A function that returns the address of `datas[i]` for `i` up to their number and,
+    /// past them, one of eight values it computes (`salt` changes them): a table of addresses
+    /// and a jump table into its code, after LLVM's optimizations.
+    // dyn: cranelift's API takes `&dyn TargetIsa`
+    fn picking(
+        isa: &dyn cranelift_codegen::isa::TargetIsa,
+        sig: &ir::Signature,
+        datas: &[cranelift_module::DataId],
+        salt: i64,
+    ) -> ir::Function {
+        use cranelift_codegen::ir::{InstBuilder, UserFuncName, types::I64};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+
+        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig.clone());
         let globals: Vec<_> = datas
             .iter()
             .map(|&it| {
@@ -2511,9 +2541,10 @@ define i32 @"blaze.own"() {
         table.emit(&mut builder, index, last);
         for (at, &arm) in arms.iter().enumerate() {
             builder.switch_to_block(arm);
-            let scaled = builder.ins().imul_imm(index, at as i64 * 7 + 3);
-            let rotated = builder.ins().rotl_imm(scaled, at as i64 + 1);
-            let value = builder.ins().bxor_imm(rotated, at as i64 * 1_000_003);
+            let at = at as i64 + salt;
+            let scaled = builder.ins().imul_imm(index, at * 7 + 3);
+            let rotated = builder.ins().rotl_imm(scaled, at + 1);
+            let value = builder.ins().bxor_imm(rotated, at * 1_000_003);
             builder.ins().jump(done, &[value.into()]);
         }
         builder.switch_to_block(last);
@@ -2523,15 +2554,8 @@ define i32 @"blaze.own"() {
         builder.ins().return_(&[value]);
         builder.seal_all_blocks();
         builder.finalize(isa.frontend_config());
-        let members =
-            [Member { func: &func, named: &[], pointees: &[], request: request.as_u32() }];
-        let unit = emit_unit(&mut wants, &members, optimized_level(), &[]).unwrap();
-        let [code] = &unit.members[..] else { panic!("one member") };
-        if let Err(error) = code {
-            panic!("{}: {error}", target.triple());
-        }
+        func
     }
-
     fn reads_back_a_unit_of_two(target: &'static crate::Target) {
         use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

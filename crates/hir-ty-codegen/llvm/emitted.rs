@@ -99,8 +99,29 @@ pub(super) fn read<S: Borrow<Signature>>(
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
     let read = read_all(object, functions, recorder, Instrumented::default())?;
+    if read.iter().any(Result::is_err) {
+        keep_refused(object, functions.first().map_or("", |it| it.0));
+    }
     // alloc: the result, one per function
     Ok(read.into_iter().map(|it| it.map(|(code, ..)| code)).collect())
+}
+
+/// `BLAZE_KEEP_REFUSED_OBJECTS=<dir>` keeps each object LLVM made whose code is refused, as
+/// `<dir>/<its first function>.o`, for `llvm-objdump`/`dumpbin` to say what it holds; unset
+/// (as always but while one is looked into), nothing is written. What the build does is the
+/// same either way.
+fn keep_refused(object: &[u8], first: &str) {
+    let Some(dir) = std::env::var_os("BLAZE_KEEP_REFUSED_OBJECTS") else { return };
+    // alloc: once per refused object kept, its file's name
+    let name: String = first
+        .chars()
+        .map(|it| if it.is_ascii_alphanumeric() || it == '.' { it } else { '_' })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("{name}.o"));
+    // A copy kept for a person: what fails to be written is said, and the build goes on.
+    if let Err(error) = std::fs::write(path, object) {
+        tracing::warn!(target: "blaze", %error, "keeping a refused object");
+    }
 }
 
 /// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
