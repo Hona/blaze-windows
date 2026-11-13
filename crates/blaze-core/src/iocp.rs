@@ -1865,11 +1865,14 @@ impl Iocp {
                         Ok(_) => {
                             let port = &self.port;
                             let taken = accepting.take().and_then(|socket| {
-                                port.associate(net::raw(&socket) as HANDLE)?;
+                                if let Some(allowed) = &socket {
+                                    port.associate(net::raw(allowed) as HANDLE)?;
+                                }
                                 Ok(socket)
                             });
                             match taken {
-                                Ok(socket) => {
+                                Ok(None) => {} // refused and closed; accept the next peer
+                                Ok(Some(socket)) => {
                                     let conn = adopt(&mut self.conns, socket);
                                     self.ready
                                         .push(Completion { tag, done: Done::Accepted { conn } });

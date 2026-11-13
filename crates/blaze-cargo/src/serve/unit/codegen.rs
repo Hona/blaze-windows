@@ -1557,9 +1557,10 @@ fn natives(
             true => Some(krate),
             false => job.crates.krate(at as usize),
         };
-        if let Some(krate) = crate_of {
-            libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
-            assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
+        // Each crate's `#[link(.., cfg(..))]`s as the linked program's crate decides them.
+        if let Some(of) = crate_of {
+            libs.extend(frontend.linked(of, krate).map_err(|it| it.what)?);
+            assembled.extend(frontend.global_asm(of, triple).map_err(|it| it.what)?);
         }
         if !libs.is_empty() {
             let mut search = search_dirs(&flags.search);

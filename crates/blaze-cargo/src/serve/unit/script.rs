@@ -312,8 +312,20 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     };
     let target = triple_of(unit, of.host).to_owned();
     let config_env = native_env(of, &package.name, &target, &unit.features)?;
-    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
-    let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
+    // The run's kind's rustflags, as its plan gives them to the script (cargo's
+    // `CARGO_ENCODED_RUSTFLAGS`; a run compiles nothing, so its plan's own `rustflags` are
+    // none), and the cfg cargo's probe of the kind gives with them (`TargetInfo`'s `--print
+    // cfg`, which asks as for a proc macro too): `CARGO_CFG_TARGET_FEATURE` has `crt-static`
+    // when the flags turn it on, so `cc` compiles with `/MT`.
+    let run_flags: Vec<String> = var(plan, "CARGO_ENCODED_RUSTFLAGS")
+        .filter(|it| !it.is_empty())
+        .map(|it| it.split('\x1f').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&run_flags)?;
+    let target_cfgs = blaze_units::stdlib::target::target_cfg(
+        &target,
+        &blaze_units::stdlib::target::CfgArgs { proc_macro: true, ..cfg_args },
+    )?;
     let profile = &unit.profile;
     let release = var(plan, "PROFILE").ok_or_else(|| {
         UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string()
@@ -390,7 +402,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         target,
         host: of.host.to_owned(),
         target_cfgs,
-        rustflags: plan.rustflags.clone(),
+        rustflags: run_flags,
         jobs,
         script: of.program.clone(),
         out_dir: blaze_core::platform::path::host(&out_dir),
@@ -514,6 +526,11 @@ pub(crate) fn started_in(
     #[cfg(windows)]
     if sandboxed {
         developer_prompt(job, unit, &mut env)?;
+        // The stand-in is a link under the daemon's state directory, not beside its std
+        // sources; the AppContainer also has its own LOCALAPPDATA. Give it the daemon's std.
+        let std = crate::toolchain::library::found()?;
+        env.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::toolchain::library::VAR));
+        env.push((crate::toolchain::library::VAR.into(), std.dir.as_os_str().to_owned()));
     }
     #[cfg(not(windows))]
     let _ = unit;
@@ -783,14 +800,21 @@ fn checkout_without_git(dir: &Path, stderr: &[u8]) -> Option<PathBuf> {
     if !stderr.windows(SAID.len()).any(|it| it == SAID) {
         return None;
     }
-    let root = dir.ancestors().find(|root| {
+    let root = git_checkout(dir)?;
+    (!root.join(".git").exists()).then(|| root.to_owned())
+}
+
+/// The root of blaze's checkout of a git dependency that the package directory `dir` is in:
+/// `<sources>/git/checkouts/<ident>/<commit>`, the commit's whole tree
+/// ([`crate::serve::fetch::keep_on_disk`]).
+fn git_checkout(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|root| {
         let commit = root.file_name().and_then(|it| it.to_str()).is_some_and(|it| {
             matches!(it.len(), 40 | 64) && it.bytes().all(|it| it.is_ascii_hexdigit())
         });
         commit
             && root.parent().and_then(Path::parent).is_some_and(|it| it.ends_with("git/checkouts"))
-    })?;
-    (!root.join(".git").exists()).then(|| root.to_owned())
+    })
 }
 
 /// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact
@@ -880,7 +904,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
+        How::Sandboxed(prepared) if prepared.spec.mode != blaze_usercode::run::Mode::Normal => {
             false
         }
         How::Sandboxed(prepared) => {
@@ -1069,6 +1093,41 @@ pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
         .with(Role::OutDir, &unit.out_dir)
 }
 
+/// The source payload containing `package`, if Blaze fetched it. A Git dependency's
+/// payload is its checkout: a member may read assets beside it. A registry package is
+/// one archive. Never walk up looking for `.git` on disk or leave the verified payload.
+#[cfg(windows)]
+fn fetched_input(sources: &Path, package: &Path) -> Option<PathBuf> {
+    use std::path::Component::Normal;
+    let mut parts = package.strip_prefix(sources).ok()?.components();
+    let (Some(Normal(kind)), Some(Normal(sub)), Some(Normal(index)), Some(Normal(revision))) =
+        (parts.next(), parts.next(), parts.next(), parts.next()) else { return None };
+    if parts.any(|p| !matches!(p, Normal(_))) { return None; }
+    ((kind == "git" && sub == "checkouts") || (kind == "registry" && sub == "src"))
+        .then(|| sources.join(kind).join(sub).join(index).join(revision))
+}
+
+/// Bundled native sources may live in a build-dependency: its code, inside the script,
+/// opens files relative to its own compile-time CARGO_MANIFEST_DIR (e.g. luau0-src).
+#[cfg(windows)]
+fn script_inputs(job: &Job, compile: usize, read: &mut Vec<PathBuf>) -> Result<(), ApiError> {
+    let units = job.units();
+    let sources = blaze_core::platform::path::host(&job.input.config.sources);
+    let mut seen = vec![false; units.graph.units.len()]; // alloc: visit each compiled dependency once
+    let mut pending = vec![compile]; // alloc: the script's dependency walk
+    while let Some(index) = pending.pop() {
+        let unit = job.unit(index)?;
+        if std::mem::replace(&mut seen[index], true) { continue; }
+        let package = package_of(units, unit)?;
+        let dir = manifest_dir(&package.name, &package.manifest_path)?;
+        if let Some(input) = fetched_input(&sources, &dir) { read.push(input); }
+        pending.extend(unit.dependencies.iter().map(|dep| dep.index));
+    }
+    let std = crate::toolchain::library::found().map_err(|why| ApiError::new(why, None))?;
+    read.push(std.dir.clone()); // clone: the launch spec owns its roots
+    Ok(())
+}
+
 /// Run `run` ready to begin; none while its script is not built.
 fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let units = job.units();
@@ -1121,6 +1180,15 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // A git dependency's script reads its repository at the commit, as cargo's checkout (the
+    // whole repository) lets it: an asset beside its package (betteroffice-fonts-intl reads
+    // `../../packages/fonts-intl/assets`). The tree is the commit's, fixed by it, and in
+    // blaze's sources, which every checkout of the build shares ([`build_roots`]).
+    if let Some(root) = git_checkout(&unit.package.manifest_dir) {
+        read.push(root.to_owned());
+    }
+    #[cfg(windows)]
+    if !outside(job, run) { script_inputs(job, compile, &mut read)?; }
     #[cfg(windows)]
     if let Some((_, paths)) = job.input.config.invocation.env.iter().find(|(name, _)| name == "BLAZE_SCRIPT_READ") {
         // A checkout cannot choose these via a gitfile, PATH or Cargo's [env]. This is the
@@ -1144,6 +1212,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
         })
         .collect();
+    read.sort_unstable();
     read.dedup();
     let place = Place {
         code,
@@ -1152,6 +1221,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         network: false,
         memory: None,
         mode: match rechecks(job)? {
+            _ if !crate::sandbox::v2::OBSERVES_READS => blaze_usercode::run::Mode::Unobserved,
             true => blaze_usercode::run::Mode::Verify,
             false => blaze_usercode::run::Mode::Normal,
         },

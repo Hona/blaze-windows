@@ -44,6 +44,13 @@ jobs:
       - name: Bootstrap the engine
         run: cargo build --locked -p blaze-engine --bin blaze
       - name: Check the bootstrap binary
-        run: ./target/debug/blaze.exe --version
+        run: |
+          ./target/debug/blaze.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $headers = dumpbin /nologo /headers target/debug/blaze.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not ($headers -match '^\s*800000 size of stack reserve\s*$')) {
+            throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
+          }
       - name: Host, store and linker units
         run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link

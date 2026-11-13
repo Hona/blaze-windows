@@ -159,9 +159,10 @@ pub(super) fn reached(job: &Job, waits: &Waits, loaded: &[u32], ready: &[u32]) -
     written
 }
 
-/// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check
-/// of one (`cargo check --tests`).
+/// Whether a test (or a check of one) has a generated main. An integration test with
+/// `harness = false` gets `cfg(test)` too, but supplies its own main and has no root alias.
 fn tested(job: &Job, unit: usize) -> bool {
-    job.unit(unit).is_ok_and(|it| it.mode == Mode::Test)
-        || job.plan(unit).is_ok_and(|it| it.checked_as_test)
+    job.plan(unit).is_ok_and(|plan| {
+        plan.harness && (plan.checked_as_test || job.unit(unit).is_ok_and(|it| it.mode == Mode::Test))
+    })
 }

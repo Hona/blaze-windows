@@ -2536,7 +2536,9 @@ pub(crate) fn dll_imported(db: &Db, id: StaticId) -> bool {
     let ItemContainerId::ExternBlockId(block) = id.lookup(db).container else { return false };
     let coff = target_of_crate(db, id.krate(db))
         .is_ok_and(|target| target.object_format == ObjectFormat::Coff);
-    coff && AttrFlags::native_libs(db, block).first().is_some_and(|lib| {
+    let cfg = id.krate(db).cfg_options(db);
+    let first = AttrFlags::native_libs(db, block).iter().find(|lib| lib.linked_under(cfg));
+    coff && first.is_some_and(|lib| {
         use hir_def::attrs::NativeLibKind as Kind;
         matches!(lib.kind, Kind::Unspecified | Kind::Dylib | Kind::RawDylib)
     })

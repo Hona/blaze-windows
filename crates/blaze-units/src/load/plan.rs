@@ -97,22 +97,21 @@ pub(crate) struct PlanOutput {
     pub finished: String,
 }
 
-/// The rustflags of every unit for `triple` in a build for `target`.
+/// The rustflags of every unit of `kind` (`None` the host's, `Some` the target's) in a build
+/// for `target`. The kind is named, never found from a triple: with `--target` of the host's
+/// own triple the host's units (build scripts, proc macros, their std) get none of the
+/// target's flags, as cargo's `extra_args` gives them none.
 pub(crate) fn platform_rustflags<F: Files>(
     config: &Config<F>,
-    triple: &str,
     host: &str,
     target: Option<&str>,
+    kind: Option<&str>,
 ) -> Result<Vec<String>, LoadError> {
-    let kind = match target {
-        Some(target) if target == triple => Some(triple),
-        _ if triple == host => None,
-        _ => {
-            return Err(error(format!(
-                "a build for {target:?} on `{host}` has no units for `{triple}`"
-            )));
-        }
-    };
+    if let Some(kind) = kind
+        && Some(kind) != target
+    {
+        return Err(error(format!("a build for {target:?} on `{host}` has no units for `{kind}`")));
+    }
     Ok(flags::kind_info(config, host, target, kind)?.rustflags)
 }
 
