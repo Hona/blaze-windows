@@ -304,8 +304,17 @@ pub(crate) fn units(
             )));
         }
     };
+    // An explicit directory may come from the host environment or a config file. It
+    // enters the graph (including OUT_DIR) in the same namespace as mounted sources.
+    let target_dir = match build_path(target_dir) {
+        Ok(path) => path,
+        Err(error) => return Ok(fail(error.into())),
+    };
     let build_dir = match config.build_dir(ws.root_manifest()) {
-        Ok(Some(dir)) => dir,
+        Ok(Some(dir)) => match build_path(dir) {
+            Ok(path) => path,
+            Err(error) => return Ok(fail(error.into())),
+        },
         Ok(None) => target_dir.clone(),
         Err(error) => return Ok(fail(error)),
     };
@@ -609,6 +618,13 @@ pub(crate) fn units(
         sandboxed_tests: opt_out.sandboxed_tests,
         native,
     }))
+}
+
+fn build_path(path: PathBuf) -> Result<PathBuf, blaze_core::platform::path::PathError> {
+    if cfg!(windows) && path.is_absolute() {
+        return blaze_core::platform::path::daemon(&path).map(PathBuf::from);
+    }
+    Ok(path)
 }
 
 /// What a build says of each `strip` it accepts and does not honour yet (ledger D44): one note

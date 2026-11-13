@@ -286,6 +286,20 @@ fn roots_named(units: &Units) -> Vec<String> {
 
 const A: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
 
+#[cfg(windows)]
+#[test]
+fn an_external_target_dir_names_generated_sources_in_the_mount_namespace() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/build.rs", "fn main() {}"), ("ws/src/lib.rs", "")];
+    let env = [("CARGO_TARGET_DIR", "c:/external/target")];
+    let units = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&files) })));
+    assert_eq!(units.target_dir, "/C:/external/target");
+    let run = units.graph.units.iter().position(|u| !u.is_std && u.mode == Mode::RunCustomBuild).unwrap();
+    let out = units.plans[run].out_dir.as_deref().unwrap();
+    assert!(out.starts_with("/C:/external/target/"), "{out}");
+    assert!(units.plans.iter().any(|p| p.env.iter().any(|(k,v)| k == "OUT_DIR" && v == out)));
+}
+
 #[test]
 fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     let fixture = Fixture::new();
