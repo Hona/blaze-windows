@@ -687,6 +687,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The stall watchdog ([`Daemon::watch`]): of pool jobs ended, queries completed and tasks
     /// and unit's steps ended, all at once, at [`Options::stall`].
     watchdog: Watchdog,
+    /// While over the admission budget only finishing work counts, not occupying a worker.
+    pressure_watch: Watchdog,
     /// Of the same, at half that bound: what every thread is inside is written to the log once
     /// a quiet stretch, and nothing fails.
     dump_watch: Watchdog,
@@ -1071,14 +1073,22 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let resident = crate::raw::memory::footprint(std::process::id());
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let resident = None;
+    let said = memory_line(memory, resident);
+    // logged: the info event below
+    eprintln!("blaze serve: {said}");
+    tracing::info!(target: "blaze", "{said}");
+}
+
+fn memory_line(memory: &blaze_mem::tag::Snapshot, resident: Option<u64>) -> String {
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
     let chunks = blaze_mem::chunks::cached();
     let stacks = blaze_query::db::stack_high_water();
-    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
-    // logged: the info event below
-    eprintln!("blaze serve: {said}");
-    tracing::info!(target: "blaze", "{said}");
+    MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string() // alloc: one line each MEMORY_LOG_EVERY and at stop
+}
+
+fn budget_stall(watch: &mut Watchdog, now: u64, busy: bool, settled: u64, held: u64, limit: u64) -> Option<blaze_profile::watchdog::Quiet> {
+    watch.tick(now, Progress { steps: settled, ..Progress::default() }, busy && held > limit)
 }
 
 /// Why a start's database is empty.
@@ -1749,6 +1759,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             state,
             observe,
             watchdog: Watchdog::new(options.stall),
+            pressure_watch: Watchdog::new(options.stall),
             dump_watch: Watchdog::new(options.stall / 2),
             step_watch: Watchdog::new(LONG_STEP),
             stillness: Stillness::default(),
@@ -2385,11 +2396,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 BuildsWaited(self.session.building(), self.jobs.waited_on())
             );
         }
-        let Some(quiet) = self.watchdog.tick(now, progress, busy) else { return };
+        let held = self.plane.held();
+        let limit = self.plane.budget().map_or(u64::MAX, |budget| budget.bytes);
+        let pressure = budget_stall(&mut self.pressure_watch, now, busy, self.settled, held, limit);
+        let ordinary = self.watchdog.tick(now, progress, busy);
+        let Some(quiet) = pressure.or(ordinary) else { return };
         let stall = blaze_profile::watchdog::stall(quiet, running);
+        // Unlike the ordinary watchdog this guard may fire with a worker inside a task.
+        let cause = if pressure.is_some() {
+            format!("admission budget exceeded: {held} bytes held, limit {limit}, {} bytes granted; no task settled for {:.1} s; {}", self.plane.granted(), quiet.for_ns as f64 / 1e9, memory_line(&blaze_mem::tag::snapshot(), crate::raw::memory::own_footprint()))
+        } else {
+            stall.to_string()
+        };
         // alloc: a stall, once
         let said = format!(
-            "{stall}; {}; {}; {}{}",
+            "{cause}; {}; {}; {}{}",
             blaze_graph::sched::waits_now(),
             RunningTasks(&self.plane),
             BuildsWaited(self.session.building(), self.jobs.waited_on()),
@@ -3378,6 +3399,18 @@ mod tests {
         assert_eq!(stalled_ms(5, 5 + STEP_BOUND_NS + 1), Some(20));
         assert_eq!(stalled_ms(0, 735_000_000), Some(735));
         assert_eq!(stalled_ms(10, 3), None, "a clock read out of order is no stall");
+    }
+
+    #[test]
+    fn admission_over_budget_requires_completions_not_just_a_running_worker() {
+        let mut watch = Watchdog::new(Duration::from_nanos(10));
+        let mut tick = |now, held, settled| budget_stall(&mut watch, now, true, settled, held, 74);
+        assert!(tick(0, 84, 2996).is_none());
+        assert!(tick(9, 85, 2997).is_none(), "one more task finished");
+        assert!(tick(18, 74, 2997).is_none(), "pressure cleared");
+        assert!(tick(19, 84, 2997).is_none());
+        assert!(tick(28, 86, 2997).is_none());
+        assert_eq!(tick(29, 84, 2997).unwrap().for_ns, 10);
     }
 
     fn corrupt(section: SectionId) -> Corrupt {
