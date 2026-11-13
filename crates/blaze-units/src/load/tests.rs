@@ -170,7 +170,12 @@ impl Fixture {
     pub(crate) fn open(&self, ask: &Ask<'_>) -> ViewId {
         let files: Vec<(&str, &[u8])> =
             ask.files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
-        let mut env: Vec<(String, String)> = vec![("HOME".to_owned(), "/home/u".to_owned())];
+        // The home as each system names it: cargo's home is `.cargo` under `USERPROFILE` on
+        // Windows, under `HOME` elsewhere, so the fixture's is one on every host.
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".to_owned(), "/home/u".to_owned()),
+            ("USERPROFILE".to_owned(), "/home/u".to_owned()),
+        ];
         env.extend(ask.env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
         env.sort();
         let mut mounts = vec![mount(WS, "ws"), library_mount(self.library, COMMIT)];
