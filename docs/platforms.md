@@ -196,9 +196,10 @@ What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 wi
   pad that catches claims an exception in the search pass; cleanup pads run in the unwind pass.
 - Thread-local destructors, threads, `i128`, C varargs (`snprintf` from
   `legacy_stdio_definitions`, as under rustc), a 64 KiB frame (stack probes), SSE intrinsics.
-- Not done: a structured exception that is not a C++ one (an access violation) and a C++
-  `throw;` rethrow run no Rust cleanup pad; a Rust panic out of an `extern "C"` function with
-  no catcher above ends as an unhandled exception, not the "cannot unwind" abort.
+- A Rust panic escaping an `extern "C"` boundary terminates with `panic in a function that
+  cannot unwind`, including when no handler exists above the boundary. A non-C++ structured
+  exception caught above a Rust `extern "C-unwind"` frame runs no Rust drop, as on the pinned
+  MSVC Rust toolchain. Cleanup through a C++ `throw;` rethrow remains unverified.
 
 ### v2 output placement on Windows
 
