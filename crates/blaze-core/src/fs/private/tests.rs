@@ -102,3 +102,39 @@ mod unix {
         assert_eq!(private(&dir, &name).unwrap(), Some((file, Access::OthersWrite)));
     }
 }
+
+#[cfg(windows)]
+mod windows {
+    use std::path::Path;
+
+    use super::{private, store};
+    use crate::{Access, FileName};
+
+    /// `dir`'s list made to let every user (`Everyone`, S-1-1-0) modify it and what is made in
+    /// it, as a drive's root lets every signed-in user.
+    fn open_to_everyone(dir: &Path) {
+        let done = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)M"])
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stdout));
+    }
+
+    /// The invariant: a store made under a directory every user may write is the user's alone,
+    /// as Unix makes it 0o700 under any parent. The cause, held: the same store made as a plain
+    /// `create_dir_all` makes it (what blaze did before) inherits the list and is refused, left
+    /// as it is (the integration wall I6: a `BLAZE_HOME` under `D:\`).
+    #[test]
+    fn a_store_made_under_a_directory_others_write_is_the_users_alone() {
+        let (dir, _) = store("open-parent");
+        open_to_everyone(dir.parent().unwrap());
+        assert_eq!(private(&dir.join("deep"), &FileName::new("store/deep").unwrap()).unwrap(), None);
+        let (inherited, name_of) = store("open-parent-control");
+        open_to_everyone(inherited.parent().unwrap());
+        std::fs::create_dir_all(&inherited).unwrap();
+        assert_eq!(private(&inherited, &name_of).unwrap(), Some((name_of.clone(), Access::OthersWrite)));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(inherited.parent().unwrap()).unwrap();
+    }
+}
