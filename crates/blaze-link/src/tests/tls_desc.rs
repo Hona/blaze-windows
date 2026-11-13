@@ -186,6 +186,7 @@ fn an_executables_tls_descriptors_are_relaxed_and_it_reads_its_thread_locals() {
     let program = dir.join("app");
     std::fs::write(&program, &bytes).unwrap();
     std::fs::write(dir.join("libtv.so"), &library[..]).unwrap();
+    // `host` is an AArch64 Linux test run: only there is the program run.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
