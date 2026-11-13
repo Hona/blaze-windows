@@ -126,6 +126,9 @@ const READ: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 /// What a write grant gives.
 const WRITE: u32 = FILE_ALL_ACCESS;
 
+/// What a declared cache's kept write grant is said as.
+const GRANTING_CACHE: &str = "granting the sandbox a declared cache";
+
 
 /// The lock every launcher of the session holds while it changes a DACL: a change reads the
 /// DACL and writes it whole, and two at once would lose one's entry.
@@ -226,7 +229,15 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     // clone: once per sandbox, the directory it takes its grant back from.
     let mut granted = Granted { sid: made.run.sid(), writes, temp: temp.clone() };
     let mut found = Vec::with_capacity(spec.write.len());
+    // A root both read and written is a declared cache (`BLAZE_SCRIPT_CACHES`): kept across runs,
+    // so it is written through its root's own capability, granted once and kept as a read root's
+    // is, never granted to the run's SID and taken back, which would rewrite the inherited
+    // entries of every file under it twice a run (20,280 files in rune-desktop's Ghostty cache).
+    let kept: Vec<&Path> = spec.write.iter().filter(|it| spec.read.contains(it)).map(PathBuf::as_path).collect(); // alloc: a run's few caches
     for dir in &spec.write {
+        if kept.contains(&dir.as_path()) {
+            continue;
+        }
         match writable.make_dir_all(dir) {
             // Made here with the grant in it; it stays, so the grant is taken back at the end.
             // clone: once per sandbox and directory, as above.
@@ -245,7 +256,7 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     // Once per sandbox, the key each read path is looked up by in the kept checks.
     let mut key = Vec::with_capacity(if checks.is_some() { 260 } else { 0 });
     let mut missing = Vec::with_capacity(spec.read.len() + 2);
-    for (path, cap) in roots.into_iter().zip(&made.reads) {
+    for (&path, cap) in roots.iter().zip(&made.reads) {
         let readers = [cap.sid(), sid(&made.kept.any)];
         let seen = match checks {
             Some(checks) => checks.covered(path, &readers, &mut key)?,
@@ -258,10 +269,19 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
             missing.push((path, seen.dir, readers));
         }
     }
-    if !missing.is_empty() || !found.is_empty() {
+    let mut caches = Vec::with_capacity(kept.len()); // alloc: a run's few caches
+    for (path, cap) in roots.iter().zip(&made.reads) {
+        if kept.contains(path) && !covered(path, &[cap.sid()], WRITE, GRANTING_CACHE)?.is_some_and(|it| it.covered) {
+            caches.push((*path, cap.sid()));
+        }
+    }
+    if !missing.is_empty() || !found.is_empty() || !caches.is_empty() {
         let _lock = Lock::take()?;
         for (path, dir, readers) in missing {
             grant(path, dir, readers[0], &readers, READ, GRANTING_READ)?;
+        }
+        for (path, sid) in caches {
+            grant(path, true, sid, &[sid], WRITE, GRANTING_CACHE)?;
         }
         for dir in found {
             if grant(dir, true, granted.sid, &[granted.sid], WRITE, "granting the sandbox write")? {
@@ -2180,6 +2200,37 @@ mod tests {
         for _ in 0..2 { assert_eq!(run(&spec, Given::own()), Ok(0)); }
     }
 
+    /// The invariant: a root both read and written (a declared cache) is written by every run
+    /// given it and kept across runs, through its root's capability, granted once: a second run
+    /// finds the first's file and adds no entry to the directory's DACL, and no run's own SID is
+    /// left in it. A root written alone (`OUT_DIR`) is granted the run's SID and taken back.
+    #[test]
+    fn a_declared_cache_is_written_by_each_run_and_kept_with_one_grant() {
+        let base = tempfile::tempdir().unwrap();
+        let cache = base.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        // Exit 0 the first time (the cache was empty: fill it), 37 once it holds the first's.
+        std::fs::write(base.path().join("fill.cmd"), b"@echo off\r\nif exist \"%CACHE%\\filled\" exit /b 37\r\necho filled>\"%CACHE%\\filled\"\r\nif not exist \"%CACHE%\\filled\" exit /b 1\r\nexit /b 0\r\n").unwrap();
+        let spec = Spec {
+            program: root.join(r"System32\cmd.exe"), args: ["/d", "/c", "fill.cmd"].map(Into::into).into(),
+            env: vec![("SystemRoot".into(), root.into()), ("CACHE".into(), cache.clone().into())], dir: base.path().into(),
+            read: vec![cache.clone()], write: vec![cache.clone()], network: false, trace: false, services: Vec::new(),
+            live: base.path().join("live"), report: base.path().join("report"), not_inputs: Vec::new(), given: None,
+        };
+        let entries = || {
+            let name = wide(cache.as_os_str(), "test").unwrap();
+            let dacl = Dacl::of(&name, &cache, "test").unwrap();
+            let mut info = ACL_SIZE_INFORMATION::default();
+            // SAFETY: the DACL GetNamedSecurityInfoW gave, live while `dacl` is, and room for the class's record.
+            assert_ne!(unsafe { GetAclInformation(dacl.dacl, (&raw mut info).cast(), size_of_val(&info) as u32, AclSizeInformation) }, 0);
+            info.AceCount
+        };
+        assert_eq!(run(&spec, Given::own()), Ok(0));
+        let after_one = entries();
+        assert_eq!(run(&spec, Given::own()), Ok(37), "the second run finds the first's file");
+        assert_eq!(entries(), after_one, "the cache's grant was made once and kept");
+    }
     /// MSVC's C compiler, run in the sandbox as `cc` runs it from a build script: found by the
     /// variables of the developer prompt blaze starts a sandboxed script with
     /// ([`blaze_core::platform::msvc`]), since the container reads neither `vswhere`'s records
