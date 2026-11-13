@@ -4284,6 +4284,7 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
+ "tracing",
  "triomphe",
 ]
 

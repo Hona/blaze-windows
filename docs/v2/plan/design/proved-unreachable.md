@@ -146,7 +146,12 @@ and the facts held are bounded by the comparisons on the path (tens). It runs on
 a body that has a `blaze::unreachable!()`, a `#[blaze::nopanic]` walk's instance that has a
 panic site, a lint that counts panics; elsewhere the cost is one scan of the body's macro calls
 (O(calls)). A budget (`8 x blocks + 64` visits) ends a body that does not settle with nothing
-proved (rule `bounded-progress`). After an edit, only the edited function's proof is redone
+proved (rule `bounded-progress`). The facts held are not always tens: one entailment question
+walks them to depth 2 and each step's bounds walk them again, so a visit's cost is polynomial
+in them (`compiler_builtins`' `fma_round` on `u128` took 791 s of one `SpendFacts` pass on
+2026-11-13). So a proof also has fuel, 2^26 facts and implications visited over all its
+questions (about a second), past which it is refused with nothing proved; the `reach prove`
+span records each proof's `visits`. After an edit, only the edited function's proof is redone
 (its key is its body): the floor. Not measured yet on reth or tempo.
 
 ## Errors
