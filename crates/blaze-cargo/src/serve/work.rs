@@ -1022,6 +1022,15 @@ pub fn applying_fallible(
     applying(unit, what, write)?.map_err(|error| Broke::failed(unit, what, error))
 }
 
+/// What a worker actually found, not the loop's preflight freshness estimate.
+pub enum PhaseDone {
+    Continue,
+    /// Names installed a validated record. Bodies and codegen now have no work;
+    /// link (macro loading, image adoption) and store (publication) still do.
+    ReplayedNames,
+    Compiled(Compiled),
+}
+
 /// One job's front end, its units lowered: shared by the job's tasks, read only.
 pub trait Front<S: Steps>: Send + Sync + 'static {
     /// On the loop, as unit `unit` (an index into `Units::graph.units`) is about to start:
@@ -1031,7 +1040,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// checked and, unless the job is a [`JobKind::Check`] or the unit is a check, compiled and
     /// linked. Every unit it depends on is done, the runs of build scripts it depends on
     /// applied, and the phases before `phase` ([`Phase`]) are done; what each made waits for
-    /// the next with the front. [`Phase::Store`] gives the compile; every other phase none.
+    /// the next with the front. [`Phase::Store`] gives the compile.
     /// `images` are the kept images at the unit's outputs (`UnitPlan::outputs`), given to
     /// [`Phase::Link`] alone: it takes each it relinks and puts back what it linked.
     fn compile(
@@ -1040,7 +1049,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         unit: usize,
         phase: Phase,
         images: &mut Vec<Image<S>>,
-    ) -> Result<Option<Compiled>, Failed>;
+    ) -> Result<PhaseDone, Failed>;
     /// The error that unit `unit` can't be made, saying `what`: a diagnostic of the unit,
     /// named and rendered as its others are, for a compile that panicked.
     fn refused(&self, unit: usize, what: String) -> Diagnostic;

@@ -564,7 +564,10 @@ fn developer_prompt(
     }
     let host = msvc::arch(std::env::consts::ARCH)
         .ok_or_else(|| format!("blaze runs on {}, which has no MSVC tools", std::env::consts::ARCH))?;
-    let developer = job.msvc.get_or_init(msvc::find).as_ref().map_err(|why| {
+    let developer = job.msvc.get_or_init(|| {
+        let _span = tracing::info_span!(target: "blaze", "build script: discover the MSVC installation").entered();
+        msvc::find()
+    }).as_ref().map_err(|why| {
         format!(
             "the build script of `{}` for {} is started with a Visual Studio developer prompt's \
              variables, as the sandbox can't find Visual Studio on its own, and {why}",

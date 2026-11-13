@@ -63,7 +63,7 @@ use super::{
     files::Mounted,
     graph, reads, say, script,
 };
-use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, Put};
+use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, PhaseDone, Put};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -2019,7 +2019,7 @@ pub(crate) fn compile(
     unit: usize,
     phase: Phase,
     images: &mut Vec<Image>,
-) -> Result<Option<Compiled>, Failed> {
+) -> Result<PhaseDone, Failed> {
     let Some(slot) = job.phases.get(unit) else {
         // alloc: error path
         return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
@@ -2036,13 +2036,13 @@ pub(crate) fn compile(
         Phase::Store => span::UnitStore { krate, unit: unit_name }.open(),
     };
     match phase {
-        Phase::Names => names(job, reader, unit, slot)?,
+        Phase::Names => return names(job, reader, unit, slot),
         Phase::Bodies => bodies(job, reader, unit, slot)?,
         Phase::Codegen => generate(job, reader, unit, slot)?,
         Phase::Link => link(job, reader, unit, &mut lock(slot), images)?,
-        Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(Some),
+        Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(PhaseDone::Compiled),
     }
-    Ok(None)
+    Ok(PhaseDone::Continue)
 }
 
 /// A unit as its phase spans name it in `unit`: its package, the package's version and its
@@ -2083,7 +2083,12 @@ fn lock(slot: &Lock<Phases>) -> LockGuard<'_, Phases> {
 /// [`Phase::Names`]: the unit's record, replayed when the store keeps it; otherwise its
 /// lint flags, its crate's def map, what it does, and its check: served from the store, none
 /// (what a program reaches of the crate is type-checked by its walk), or of every body.
-fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Result<(), Failed> {
+fn names(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    slot: &Lock<Phases>,
+) -> Result<PhaseDone, Failed> {
     let kept = {
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
@@ -2142,11 +2147,11 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             let _ = made.set(record.made);
         }
         lock(slot).kept = Some(compiled);
-        return Ok(());
+        return Ok(PhaseDone::ReplayedNames);
     }
     let u = job.unit(unit)?;
     if u.mode == Mode::Doctest {
-        return doctest::names(job, unit, slot);
+        return doctest::names(job, unit, slot).map(|()| PhaseDone::Continue);
     }
     let krate = crate_of(job, unit, u)?;
     let db = reader.db();
@@ -2215,7 +2220,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     phases.does = Some(Does { inert, builds_code });
     (phases.checking, phases.diags, phases.unmounted, phases.items_broken) =
         (checking, diags, unmounted, items_broken);
-    Ok(())
+    Ok(PhaseDone::Continue)
 }
 
 /// The text of each file `diags` point into that no mount of the build holds (a build script's
