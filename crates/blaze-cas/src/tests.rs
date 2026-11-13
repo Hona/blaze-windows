@@ -773,6 +773,29 @@ fn a_chunk_record_drained_after_its_chunks_home_is_never_written() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// The invariant: a chunk whose copy became its indexed home is not written twice when
+/// the original drains after the index migration. The old delta no longer holds its key.
+#[test]
+fn an_original_chunk_can_drain_after_its_copy_is_only_in_the_index() {
+    let (mut sim, mut store, out, gate, put) =
+        a_chunk_claim_race(47, INDEX_AFTER as u64, output_with_a_short_last_chunk());
+    let last = *chunk_keys(&out).last().unwrap();
+    let home = store.loc_of(&last);
+    gate.wait();
+    let ticket = put.join().unwrap();
+    end_the_migration(&mut store);
+    assert!(store.tiers[0].delta.get(Held::writer(&*store.shared), &last).is_none());
+    flush(&mut sim, &mut store);
+    assert!(store.broken().is_none(), "{:?}", store.broken());
+    assert!(store.durable(ticket));
+    assert_eq!(store.loc_of(&last), home);
+    assert_dead_is_exact(&store);
+    drop(store);
+    sim.crash();
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out));
+}
+
 /// Dead bytes are exact: in every pack not removed, they are the spans of the records no key
 /// finds (`Pack::dead`). Run once every batch's moves are made, or a record drained and not
 /// yet moved to counts as one no key finds.
@@ -1896,7 +1919,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
     let (seed, why) = block_checks::head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        block_checks::missing_committed_bytes(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
@@ -3341,6 +3364,9 @@ fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack()
     let last = bytes.len() - 1;
     bytes[last] = 1;
     sim.change(&pack, &bytes);
+    // The block check precedes the recovery scan. Exercise the padding rule even for a
+    // writer that checksummed these bytes, not just a disk that changed a sector.
+    sim.change(&name("store/checks-000000"), &checks::encode(&checks::of(&bytes)));
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);
@@ -3873,6 +3899,7 @@ fn a_pack_whose_header_names_another_unit_stops_the_store() {
     let mut bytes = sim.contents(&pack);
     bytes[8] = 0;
     sim.change(&pack, &bytes);
+    sim.change(&name("store/checks-000000"), &checks::encode(&checks::of(&bytes)));
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);

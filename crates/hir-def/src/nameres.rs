@@ -943,16 +943,15 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
-        // `empty` runs only inside the queries that build a def map, and the root id goes only
-        // into the `DefMap` that query returns.
-        let root = ModuleIdLt::new(
-            db,
-            krate,
-            block.map(|it| it.block),
-            None,
-            Name::new_symbol_root(sym::__empty),
-        )
-        .to_static();
+        // A frozen crate map and a collected one are two sources of the same modules.
+        // A tracked id made in the decoder belongs to another query; using it as the
+        // parent would change every child id, invalidating live references to them.
+        let root = match block {
+            None => facts::queries::crate_root(db, krate),
+            Some(info) => ModuleIdLt::new(
+                db, krate, Some(info.block), None, Name::new_symbol_root(sym::__empty),
+            ).to_static(),
+        };
         modules.insert(root, module_data);
 
         DefMap {

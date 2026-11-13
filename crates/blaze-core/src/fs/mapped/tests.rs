@@ -88,7 +88,7 @@ fn a_missing_file_is_an_error() {
 
 /// The store and the image replace a mapped file only by renaming another over it: the
 /// mapping keeps the bytes it had.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_mapping_keeps_its_bytes_when_another_file_is_renamed_over_it() {
     let dir = dir("renamed");
@@ -98,10 +98,39 @@ fn a_mapping_keeps_its_bytes_when_another_file_is_renamed_over_it() {
     let mapped = unsafe { Mapped::open(&path) }.unwrap();
     let next = dir.join("image.next");
     std::fs::write(&next, b"second image, longer").unwrap();
-    std::fs::rename(&next, &path).unwrap();
+    crate::fs::rename(&next, &path).unwrap();
     assert_eq!(mapped.bytes(), b"first image");
     // SAFETY: as above.
     assert_eq!(unsafe { Mapped::open(&path) }.unwrap().bytes(), b"second image, longer");
+}
+
+/// Only the kernel can show whether a cold page still has backing after the last name is
+/// replaced. A buffered write would leave the bytes cached even with the broken rename.
+#[cfg(windows)]
+#[test]
+fn replacing_an_image_preserves_even_pages_no_reader_has_faulted_in() {
+    use std::{io::Write as _, os::windows::fs::OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+
+    #[repr(align(4096))]
+    struct Block([u8; 65536]);
+    static OLD: Block = Block([0x57; 65536]);
+    let dir = dir("cold-replace");
+    let path = dir.join("image");
+    let mut file = std::fs::OpenOptions::new().create_new(true).write(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING).open(&path).unwrap();
+    for _ in 0..64 {
+        file.write_all(&OLD.0).unwrap();
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    // SAFETY: the original file is never written again, only replaced by name.
+    let mapped = unsafe { Mapped::open(&path) }.unwrap();
+    crate::fs::write_atomically(&path, b"second image").unwrap();
+    for (page, bytes) in mapped.chunks(4096).enumerate() {
+        assert_eq!(bytes, &OLD.0[..4096], "old mapping page {page}");
+    }
+    assert_eq!(reference(&path), b"second image");
 }
 
 /// The length is the one taken at map time: a file that grows after shows none of what was

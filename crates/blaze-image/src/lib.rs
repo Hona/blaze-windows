@@ -232,6 +232,8 @@ pub struct Corrupt {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cause {
+    /// The page checksums held, but a record does not hash to the content ID stored for it.
+    Content { record: u32 },
     /// The group's bytes are not those its CRC32C was taken of.
     Crc { found: u32, wanted: u32 },
     /// The CRC table's group `table_group` holding this group's CRC is not the one the spine
@@ -248,6 +250,7 @@ impl fmt::Display for Corrupt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Corrupt { section, group, cause } = self;
         match cause {
+            Cause::Content { record } => write!(f, "{section}, record {record} in group {group}, does not match its content ID"),
             Cause::Crc { found, wanted } => write!(
                 f,
                 "{section}, group {group}, is corrupt: its CRC32C is {found:#010x}, not {wanted:#010x}"

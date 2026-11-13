@@ -909,13 +909,10 @@ pub struct Store {
     draining: Batch,
     /// Batches committed whose mappings have not all come, oldest first.
     pending: VecDeque<Batch>,
-    /// Each key a drained record stands in for another's as the home of, while its move waits
-    /// in `draining` or `pending`, with the place the move is from: a copy (`copy_home`), or
-    /// a writer's record of the value another writer's record not yet drained holds the key
-    /// for (`record_home`). The record there, drained after, is a duplicate and never written
-    /// to a pack (`drain_record`). At most one a key: a key stays where it is until a move is
-    /// made, and a second record standing in from there is a duplicate too.
-    copy_homes: ByHash<Key, Seg, Global>, // alloc: the store's own table, for its life
+    /// Undrained originals for which a stand-in has already been written. The original
+    /// may drain before its move, or after the move and several index flips. Track its
+    /// address, not the key's current home; remove it on drain, before the chunk is freed.
+    copy_homes: HashSet<(ChunkRef, u64), Global>, // alloc: the store's own table, for its life
     next_batch: u64,
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
@@ -1935,7 +1932,7 @@ impl Store {
             drains,
             draining: Batch::default(),
             pending: VecDeque::new(),
-            copy_homes: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            copy_homes: HashSet::new_in(Global), // alloc: the store's own table, for its life
             next_batch: 0,
             commit: None,
             flush_wanted: false,
@@ -5064,12 +5061,12 @@ impl Store {
             // the index and a retire's rewrite (`live_records`), which keep only what a key
             // finds, keep it: found only by the scan past the index, it would be lost to the
             // next index write or retire.
-            self.copy_homes.insert(header.key, from);
+            self.copy_homes.insert((from.chunk, from.offset));
         } else {
             if from != here {
                 // A record that is the home of another writer's record of the same value, not
                 // drained yet (`record_home`): that record, drained after, is the duplicate.
-                self.copy_homes.insert(header.key, from);
+                self.copy_homes.insert((from.chunk, from.offset));
             }
             if number != 0 && header.kind.cold() && header.form == Form::Raw {
                 // The store's own puts were sampled as they were put.
@@ -5101,7 +5098,7 @@ impl Store {
     /// A duplicate written for `prev`'s spot would be dropped with it by `end_migration`, and
     /// skipped, the key could be left with no durable record.
     fn record_home(
-        &self,
+        &mut self,
         number: usize,
         at_chunk: ChunkRef,
         at: u64,
@@ -5110,7 +5107,7 @@ impl Store {
         batch: &Batch,
     ) -> Result<Option<Seg>, String> {
         let key = &header.key;
-        if self.copy_homes.get(key) == Some(&here) {
+        if self.copy_homes.remove(&(here.chunk, here.offset)) {
             return Ok(None);
         }
         let held = Held::writer(&*self.shared);
@@ -5144,7 +5141,7 @@ impl Store {
             Place::Segment(other)
                 if first.content == header.content
                     && !self.drained(number, at_chunk, at, other, batch)
-                    && !self.copy_homes.contains_key(key) =>
+                    && !self.copy_homes.contains(&(other.chunk, other.offset)) =>
             {
                 Some(other)
             }
@@ -5173,7 +5170,7 @@ impl Store {
             .chain(&own.prev)
             .find_map(|table| table.get(held, key).map(|(_, spot)| spot.place));
         let Some(Place::Segment(seg)) = place else { return None };
-        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains_key(key))
+        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains(&(seg.chunk, seg.offset)))
             .then_some(seg)
     }
 
@@ -5272,9 +5269,6 @@ impl Store {
                                 });
                             }
                         }
-                    }
-                    if self.copy_homes.get(&it.key) == Some(&it.from) {
-                        self.copy_homes.remove(&it.key);
                     }
                 }
                 if lost.is_some() {

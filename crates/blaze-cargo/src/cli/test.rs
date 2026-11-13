@@ -321,8 +321,13 @@ fn exec_of(artifact: &Artifact, asked: &Invocation, speaking: Speaking<'_>) -> E
     if speaking.quiet && artifact.harness {
         args.push(OsString::from("--quiet"));
     }
-    let executable = PathBuf::from(artifact.executable.as_deref().unwrap_or(&artifact.path));
-    Exec::of(artifact, executable, args, package_root(artifact))
+    // The artifact names its files as the daemon does (`/C:/a` on Windows); the program is
+    // started at the system's paths of them, as `blaze run`'s is.
+    let executable =
+        blaze_core::platform::path::host(artifact.executable.as_deref().unwrap_or(&artifact.path));
+    let root = package_root(artifact);
+    let dir = blaze_core::platform::path::host(&root.to_string_lossy());
+    Exec::of(artifact, executable, args, dir)
 }
 
 /// Runs one, `shown` as the command; what failed, said as cargo's `report_test_error` says it.

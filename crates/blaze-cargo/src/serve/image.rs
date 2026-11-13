@@ -39,7 +39,7 @@ use std::{
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_history::{DecodeError, History, section::HistoryError};
 use blaze_image::{
-    Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
+    Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
     place::{Outcome, Placer, Wrote},
 };
 use blaze_query::{Database, DbError};
@@ -160,7 +160,7 @@ pub enum Unmade {
     /// The VFS's journal is moving to another image and nothing is left in flight to wait on.
     Busy,
     /// A group of the image the VFS was restored from failed its check.
-    Vfs(Corrupt),
+    Vfs(ImageError),
     Db(DbError),
     TooLarge(TooLarge),
     Write(IoError),
@@ -181,8 +181,8 @@ impl fmt::Display for ImageFailed {
         let file = &self.file;
         match &self.why {
             Unmade::Busy => write!(f, "the daemon image /{file}: {}", ImageError::Busy),
-            Unmade::Vfs(corrupt) => {
-                write!(f, "the daemon image /{file}: {}", ImageError::Corrupt(*corrupt))
+            Unmade::Vfs(error) => {
+                write!(f, "the daemon image /{file}: {error}")
             }
             Unmade::Db(error) => {
                 write!(f, "the database's sections of the daemon image /{file}: {error}")
@@ -362,9 +362,9 @@ impl Images {
                 self.state = State::Waiting;
                 return;
             }
-            Err(ImageError::Corrupt(corrupt)) => {
+            Err(error) => {
                 txn.abort();
-                return self.fail(Unmade::Vfs(corrupt));
+                return self.fail(Unmade::Vfs(error));
             }
         };
         let mut live = intern::Live::new();

@@ -3772,6 +3772,22 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         assert_eq!(frozen(), frozen());
     }
 
+    /// A caller can still hold the id of a dependency's module when the next build
+    /// serves that same dependency from its frozen def map. Its code did not change.
+    #[test]
+    fn switching_to_a_frozen_map_keeps_its_modules() {
+        let mut db = fixture::db("//- /lib.rs crate:kernel\npub mod string { pub fn f() {} }").into_db();
+        let krate = crate_named(&db, "kernel");
+        let map = super::super::crate_def_map(&db, krate);
+        let name = Name::new_symbol_root(Symbol::intern("string"));
+        let Some(ModuleDefId::ModuleId(child)) = map.module(&db, map.root).name_in_scope(&db, &name).take_types() else { panic!("no string module"); };
+        let bytes = encode(&db, krate).unwrap();
+        set(&mut db, [(krate, Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve })].into_iter().collect());
+        let served = super::super::crate_def_map(&db, krate);
+        let f = Name::new_symbol_root(Symbol::intern("f"));
+        assert!(served.module(&db, child).name_in_scope(&db, &f).take_values().is_some());
+    }
+
     /// The names `script`'s encoder gives its own root and its dependency's, two crates of one
     /// source root, with `script` at `at`.
     fn names_with_script_at(at: &str) -> [(u32, String); 2] {

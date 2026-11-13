@@ -416,7 +416,7 @@ fn place(vfs: &Vfs, path: &str) -> (u64, u64) {
     let (node, _) = vfs.tree.entry(root, path).unwrap();
     let table = vfs.tree.table();
     match table.source(table.shape(node.0)) {
-        Source::Mapped { at, len } => (at, len),
+        Source::Mapped { at, len, .. } => (at, len),
         Source::Heap(_) => panic!("{path} is not the image's"),
     }
 }
@@ -534,6 +534,30 @@ fn a_corrupt_tree_leaves_the_image_unused_and_says_so() {
     assert!(matches!(found.image, ImageUse::Unopened(_)), "{found:?}");
 }
 
+/// A legacy writer checksummed a damaged mapped page after its backing file had been
+/// replaced. CRCs are all right in the result. The file's ID, not its CRC, is the oracle.
+#[test]
+fn a_whole_image_cannot_lend_or_republish_a_file_under_another_content_id() {
+    let (_, bytes, _, journal) = imaged();
+    let good = Image::open(mapping(&bytes)).unwrap();
+    let mut writer = Builder::with_group_shift(MIN_GROUP_SHIFT);
+    for section in good.sections() {
+        let mut part = good.whole(section).unwrap().to_vec();
+        if section.id == SectionId::VFS_BLOBS { part.fill(0); }
+        writer.add(section.id, section.schema, &part);
+    }
+    let bad = mapping(&writer.finish().unwrap());
+    let image = Arc::new(Image::open(bad.clone()).unwrap());
+    assert!(image.verify().is_empty());
+    assert!(Vfs::check_image(image).unwrap_err().contains("does not match its content ID"));
+    let (mut back, found) = Vfs::restore(file(), 0, &journal, Some(bad));
+    assert!(matches!(found.image, ImageUse::Used { .. }));
+    let root = back.root(back.head("main").unwrap()).unwrap();
+    let error = back.tree.read(root, "dir/big").unwrap_err();
+    assert!(matches!(error.cause, blaze_image::Cause::Content { .. }));
+    assert!(matches!(image_of(&mut back), Err(ImageError::Corrupt(_))));
+}
+
 /// An image written over a journal that starts from none (a stop before the first rewrite)
 /// adds only nodes when paired with another VFS's such journal: its heads are the journal's.
 #[test]
@@ -558,7 +582,8 @@ fn an_image_brings_nodes_and_never_heads() {
 /// restart maps, each look at a bounded number of places, not at every name before them.
 #[test]
 fn names_with_one_old_hash_take_bounded_probes_in_the_tree_and_its_image() {
-    let names = crate::probes::one_old_hash(4000);
+    let mut names = crate::probes::one_old_hash(4000);
+    names.retain(|name| crate::tree::component(name));
     let bound = 16 * names.len() as u64;
     let (mut vfs, mut sim) = start(3);
     let ops: Vec<Op> = names // alloc: a test's ops
