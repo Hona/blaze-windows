@@ -1,5 +1,6 @@
 // A program that asks dbghelp, as std's backtrace does, for the name and line of a function
-// blaze linked from Rust code (`blaze_answer`): what the image's PDB says of it.
+// blaze linked from Rust code (`blaze_answer`), and the name of its own `main`: what the
+// image's PDB says of them.
 #include <windows.h>
 #include <dbghelp.h>
 #include <stdio.h>
@@ -37,5 +38,11 @@ int main(void) {
         return 3;
     }
     printf("%s:%lu\n", line.FileName, line.LineNumber);
+    // C code is named too, by the PDB's publics.
+    if (!SymFromAddr(process, (DWORD64)(ULONG_PTR)&main + 1, &displacement, symbol)) {
+        printf("SymFromAddr main: %lu\n", GetLastError());
+        return 4;
+    }
+    printf("%s+%llu\n", symbol->Name, displacement);
     return 0;
 }

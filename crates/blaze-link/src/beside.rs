@@ -133,6 +133,9 @@ pub(crate) struct Input<'a> {
     pub functions: &'a [Func<'a>],
     pub lines: &'a [Lined<'a>],
     pub given: Given<'a>,
+    /// PE: the native code's functions the image keeps, each `(name, address)`, which a PDB
+    /// names as publics (C has no records of Rust's). Empty for the other formats.
+    pub publics: &'a [(&'a str, u64)],
 }
 
 /// Which functions an [`Input`] holds.
@@ -677,7 +680,7 @@ impl Kept {
             return Ok(None);
         }
         let headers = crate::pe::pdb::Headers::read(exe)?;
-        let bytes = crate::pe::pdb::write(&headers, &input.id, input.functions, input.lines)?;
+        let bytes = crate::pe::pdb::write(&headers, &input.id, input.functions, input.lines, input.publics)?;
         self.encoded = input.functions.len() as u64;
         self.file = Bytes(std::sync::Arc::new(bytes));
         self.id = Some(input.id);

@@ -109,7 +109,7 @@ fn a_pdb_holds_its_functions_names_places_and_lines() {
         Func { key: key(2), addr: 0x1_4000_2000, size: 16, name: None, lines: 2..3 },
     ];
     let id = [7u8; 16];
-    let pdb = write(&headers(&file), &id, &functions, &lines).unwrap();
+    let pdb = write(&headers(&file), &id, &functions, &lines, &[("main", 0x1_4000_1100)]).unwrap();
     assert_eq!(&pdb[GUID_AT..GUID_AT + 16], &id, "the build id at its fixed place");
     let streams = streams(&pdb);
     assert_eq!(streams.len(), STREAMS);
@@ -190,18 +190,18 @@ fn a_pdb_holds_its_functions_names_places_and_lines() {
     // The publics: a record per function, in the address map by place.
     let publics = &streams[usize::from(PUBLICS)];
     let (hash, map) = (u32_at(publics, 0) as usize, u32_at(publics, 4) as usize);
-    assert_eq!(map, 8);
+    assert_eq!(map, 12);
     let records = &streams[usize::from(RECORDS)];
-    let named: Vec<String> = (0..2)
+    let named: Vec<String> = (0..3)
         .map(|n| {
             let at = u32_at(publics, 28 + hash + 4 * n) as usize;
             assert_eq!(u16::from_le_bytes([records[at + 2], records[at + 3]]), S_PUB32);
             name_in(&records[at + 4..], 10)
         })
         .collect();
-    assert_eq!(named, ["app::main", "blaze_fn_140002000"]);
-    // The GSI hash: two records, each the offset of its record plus one.
-    assert_eq!(u32_at(publics, 28 + 8), 16);
+    assert_eq!(named, ["app::main", "main", "blaze_fn_140002000"]);
+    // The GSI hash: three records of 8 bytes.
+    assert_eq!(u32_at(publics, 28 + 8), 24);
 }
 
 /// `hashStringV1`'s values for names LLVM's tests and the format's readers agree on: the
@@ -230,7 +230,7 @@ fn a_pdb_past_an_interval_keeps_its_free_block_maps() {
             lines: (n * 32)..(n * 32 + 32),
         })
         .collect();
-    let pdb = write(&headers(&file), &[1; 16], &functions, &lines).unwrap();
+    let pdb = write(&headers(&file), &[1; 16], &functions, &lines, &[]).unwrap();
     assert!(pdb.len() / BLOCK > BLOCK, "the test needs more than one interval: {} blocks", pdb.len() / BLOCK);
     let streams = streams(&pdb);
     assert_eq!(streams.len(), STREAMS);

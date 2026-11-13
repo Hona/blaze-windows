@@ -19,7 +19,7 @@
 //! - `/names`, the file names.
 //!
 //! The file is written whole by each link. Native code's own debug info (`.debug$S`) is not
-//! merged: its functions are not named.
+//! merged: its functions are publics alone, named as its objects name them.
 
 use std::fmt::Write as _;
 
@@ -303,12 +303,14 @@ struct Placed<'a> {
 }
 
 /// The PDB of the image whose headers are `headers` and build id `id`, of its Rust
-/// `functions` and their `lines`.
+/// `functions` and their `lines`, and of its native code's functions `natives` by name and
+/// address, named by publics alone.
 pub(crate) fn write(
     headers: &Headers,
     id: &[u8; 16],
     functions: &[Func<'_>],
     lines: &[Lined<'_>],
+    natives: &[(&str, u64)],
 ) -> Result<Vec<u8>, String> {
     // alloc: below, once per PDB written: its streams and the file
     let mut placed = Vec::with_capacity(functions.len());
@@ -433,6 +435,16 @@ pub(crate) fn write(
         });
         publics.push((function.name, at));
     }
+    // Native functions: a public each, and no procedure.
+    let mut native = Vec::with_capacity(natives.len());
+    for (name, addr) in natives {
+        let Some((section, offset)) = headers.place(*addr) else { continue };
+        let at = records.len() as u32;
+        record(&mut records, S_PUB32, |out| {
+            out.u32(PUBLIC_FUNCTION).u32(offset).u16(section).string(name);
+        });
+        native.push((section, offset, *name, at));
+    }
     let mut globals = Vec::with_capacity(placed.len());
     for (function, procedure) in placed.iter().zip(&procedures) {
         let at = records.len() as u32;
@@ -442,9 +454,14 @@ pub(crate) fn write(
         globals.push((function.name, at));
     }
     let globals_stream = gsi(&globals);
-    let hash = gsi(&publics);
+    let hash = {
+        let mut all = publics.clone();
+        all.extend(native.iter().map(|it| (it.2, it.3)));
+        gsi(&all)
+    };
     let mut by_address: Vec<(u16, u32, &str, u32)> =
         placed.iter().zip(&publics).map(|(it, public)| (it.section, it.offset, it.name, public.1)).collect();
+    by_address.extend(native.iter().copied());
     by_address.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)).then_with(|| a.2.cmp(b.2)));
     let mut publics_stream = Out::default();
     publics_stream.u32(hash.len() as u32).u32(by_address.len() as u32 * 4);

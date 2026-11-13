@@ -491,7 +491,7 @@ fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
 /// A Rust function's name and line as dbghelp reads them from the image's PDB: the program
 /// (`pdb.c`) asks for `blaze_answer`'s, as std's backtrace asks for each frame's, and the PDB
 /// written beside it (`Image::debug_file`) answers with the name and the row its span table
-/// gives the code at that offset.
+/// gives the code at that offset; the program's C `main` is named by the PDB's publics.
 #[test]
 fn dbghelp_names_a_rust_function_and_its_line_from_the_pdb() {
     use blaze_codegen::{Line, Target};
@@ -548,7 +548,7 @@ fn dbghelp_names_a_rust_function_and_its_line_from_the_pdb() {
     std::fs::write(dir.join("app.pdb"), pdb.apply(crate::Format::Pe, None).unwrap()).unwrap();
     let out = Command::new(dir.join("app.exe")).current_dir(&dir).output().unwrap();
     let printed = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-    assert_eq!((out.status.code(), printed.as_str()), (Some(0), "42 blaze::answer+2\nsrc/answer.rs:8\n"));
+    assert_eq!((out.status.code(), printed.as_str()), (Some(0), "42 blaze::answer+2\nsrc/answer.rs:8\nmain+1\n"));
 }
 
 /// A DLL's import library as blaze writes it (`Image::import_library`, what rustc writes as a

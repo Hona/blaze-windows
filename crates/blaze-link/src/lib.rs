@@ -1215,6 +1215,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
+                publics: &[],
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1227,6 +1228,12 @@ impl Image {
             views.push(piece)?;
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        // A PDB names native code by its objects' names; DWARF's side file does not.
+        let publics = match format {
+            Format::Pe => state.resolved.native_functions(state),
+            // alloc: none, empty
+            _ => Vec::new(),
+        };
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1235,6 +1242,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
+            publics: &publics,
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);
