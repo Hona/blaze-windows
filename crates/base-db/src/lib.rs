@@ -258,6 +258,44 @@ pub fn env_var(db: &Db, krate: Crate, name: &str) -> Option<String> {
     }
 }
 
+/// What a program reads of the variable `name` a crate's environment holds as `value`: a path
+/// cargo gives (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `OUT_DIR`, `CARGO_TARGET_TMPDIR`,
+/// `CARGO_BIN_EXE_<name>`), which the daemon holds by its name of it (`/C:/a` on Windows), is
+/// the system's path ([`blaze_core::platform::path::host`]: `C:\a`), as cargo gives it to rustc
+/// and to a proc macro, so `env!("CARGO_MANIFEST_DIR")` opens at run time. Every other value,
+/// and every value on Unix, is as it is. What `env!`, `option_env!` and a proc macro's
+/// `std::env::var` read: the boundary between the daemon's names and the program's. A path the
+/// program gives back (`include_str!(concat!(env!("OUT_DIR"), "/a"))`) is the daemon's again
+/// where it is resolved.
+pub fn given_value<'v>(name: &str, value: &'v str) -> std::borrow::Cow<'v, str> {
+    let path = matches!(
+        name,
+        "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "OUT_DIR" | "CARGO_TARGET_TMPDIR"
+    ) || name.starts_with("CARGO_BIN_EXE_");
+    let named = value.starts_with('/') && cfg!(windows);
+    match path && named {
+        true => std::borrow::Cow::Owned(
+            // alloc: a path a program reads, once per read
+            blaze_core::platform::path::host(value).to_string_lossy().into_owned(),
+        ),
+        false => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+/// A path a program names a file by (`include!`, `include_str!`, `include_bytes!`) as the
+/// daemon names it: on Windows a path the system calls absolute (`C:\a\b`, `C:\a/b`,
+/// `\\?\C:\a`), as [`given_value`] gives `env!("OUT_DIR")`, is `/C:/a/b`
+/// ([`blaze_core::platform::path::daemon`]); any other as it is.
+pub fn named_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !cfg!(windows) || path.starts_with('/') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    match blaze_core::platform::path::daemon(std::path::Path::new(path)) {
+        Ok(name) => std::borrow::Cow::Owned(name),
+        Err(_) => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 /// The variables a proc macro called from a crate with the variables `env` is given, as rustc
 /// gives them: the crate's, and [`PRIMARY_PACKAGE`] when it is `primary`. One rule for the
 /// front end ([`macro_env`]) and for whoever works an expansion's reads out again with no
