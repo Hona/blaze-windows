@@ -324,17 +324,22 @@ pub fn digest_of(dir: &Path) -> std::io::Result<String> {
     let mut found = Vec::new();
     list(dir, "", &mut found)?;
     blaze_ids::names::sort_by_name(&mut found, |it| it.1.as_bytes());
-    let mut all = blaze_ids::b3::Hasher::new();
-    for (kind, path, full) in found {
+    // File reads are independent, but their contributions to the digest are not. Dispatch
+    // the former on the existing pool, then reduce in the same path order as the installer.
+    let hashes = blaze_graph::par::map(&found, |(kind, _, full)| -> std::io::Result<_> {
         let bytes = match kind {
-            "link" => std::fs::read_link(&full)?.to_string_lossy().into_owned().into_bytes(),
+            &"link" => std::fs::read_link(full)?.to_string_lossy().into_owned().into_bytes(),
             _ => {
                 let mut bytes = Vec::new();
-                std::fs::File::open(&full)?.read_to_end(&mut bytes)?;
+                std::fs::File::open(full)?.read_to_end(&mut bytes)?;
                 bytes
             }
         };
-        let hash = crate::content::hex(&blaze_ids::b3::hash(&bytes));
+        Ok(blaze_ids::b3::hash(&bytes))
+    });
+    let mut all = blaze_ids::b3::Hasher::new();
+    for ((kind, path, _), hash) in found.into_iter().zip(hashes) {
+        let hash = crate::content::hex(&hash?);
         all.update(format!("{kind} {hash} {path}\n").as_bytes());
     }
     Ok(crate::content::hex(&all.finalize()))
@@ -369,6 +374,20 @@ pub fn built_commit() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A first install, no daemon, store, network or prebuilt std in its time; compare the
+    /// same checkout's complete digest after copying it into a new scratch directory.
+    #[test]
+    #[ignore = "copies and verifies the full 3,700-file standard library"]
+    fn measure_first_library_install() {
+        let work = tempfile::tempdir().unwrap();
+        let at = work.path().join("library");
+        let start = std::time::Instant::now();
+        copy_all(&checkout(), &at).unwrap();
+        let copied = start.elapsed();
+        assert_eq!(digest_of(&at).unwrap(), digest());
+        eprintln!("install copy_ms={} verify_ms={}", copied.as_millis(), (start.elapsed() - copied).as_millis());
+    }
 
     #[test]
     fn the_library_is_the_one_its_digest_says() {
