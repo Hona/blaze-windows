@@ -66,3 +66,22 @@ fn a_missing_directory_is_on_its_parents_volume_and_the_question_leaves_nothing(
         assert!(left.is_empty(), "{}: the question left {left:?}", dir.display());
     }
 }
+
+/// A hard link is the file it links (one id), a copy of it is another file, and the volume of
+/// each is the directory's.
+#[test]
+fn a_hard_link_has_its_files_id_and_a_copy_has_its_own() {
+    for dir in dirs() {
+        let scratch = dir.join(format!(".blaze-volume-test-id.{}", std::process::id()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (file, link, copy) = (scratch.join("file"), scratch.join("link"), scratch.join("copy"));
+        std::fs::write(&file, b"blaze").unwrap();
+        std::fs::hard_link(&file, &link).unwrap();
+        std::fs::copy(&file, &copy).unwrap();
+        let ids = [&file, &link, &copy, &scratch].map(|it| file_id(it).unwrap());
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert_eq!(ids[0], ids[1], "{}: a link is its file", dir.display());
+        assert_ne!(ids[0], ids[2], "{}: a copy is a file of its own", dir.display());
+        assert!(ids.iter().all(|it| it.volume == ids[3].volume), "{}: one volume", dir.display());
+    }
+}
