@@ -143,13 +143,24 @@ fn candidates() -> Result<Vec<PathBuf>, String> {
     let mut dirs: Vec<PathBuf> =
         exe.ancestors().skip(1).take(3).map(|it| it.join("share/blaze/library")).collect();
     dirs.extend(own());
+    // Older releases put this verified copy in each named home. Read it in place on
+    // upgrade: don't migrate/delete a library another daemon may still be reading.
+    if let Some(legacy) = blaze_manifest::user_config::home().map(|h| install_at(&h))
+        && !dirs.contains(&legacy) { dirs.push(legacy); }
     Ok(dirs)
 }
 
 /// blaze's own copy of the library: `~/.blaze/library/<digest>/library`, in a directory of
 /// its own, so that every file under the one it is in is the library's.
 fn own() -> Option<PathBuf> {
-    Some(blaze_manifest::user_config::home()?.join("library").join(digest()).join("library"))
+    // Like the pinned toolchain itself: data shared by this user's homes on this machine,
+    // not part of a project's writable outputs. A solitary named home stays self-contained.
+    let home = blaze_manifest::user_config::machine_home().or_else(blaze_manifest::user_config::home)?;
+    Some(install_at(&home))
+}
+
+fn install_at(home: &Path) -> PathBuf {
+    home.join("library").join(digest()).join("library")
 }
 
 /// The library of the checkout this blaze was built in.

@@ -185,7 +185,9 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 
 - `BLAZE_LIBRARY` itself, set by hand to try a changed library (its own `DIGEST` is used);
 - `share/blaze/library` above the program (the Nix package installs it there);
-- `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
+- `library/<digest>/library` under the machine toolchain home (`%LOCALAPPDATA%/blaze` on
+  Windows, `~/.blaze` on Unix), shared across named daemon homes. An existing installation
+  under `BLAZE_HOME` remains readable. Blaze makes the source copy once, beside the toolchain's
   download: copied from the checkout it was built in when that has the same library, else
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
   archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
