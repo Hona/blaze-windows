@@ -167,7 +167,26 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// `from` moved over `to`, replacing it, with no write-through: the new name is in the file
 /// system's cache when it returns, not yet on the disk.
+///
+/// A program or library a process runs (an image: [`image`]) can't be replaced while it runs,
+/// and an output blaze places is often one (an app left running while it is built again).
+/// What Windows allows, measured with a running `.exe` (`notes`, renametest): on ReFS a POSIX
+/// rename over it (`FileRenameInfoEx`, `FILE_RENAME_FLAG_POSIX_SEMANTICS`) replaces it, and the
+/// running process keeps its old image; on NTFS every rename over it is refused (os error 5),
+/// as is its delete, but it may be renamed itself. So an image is placed by its volume's way,
+/// decided by the volume and the name, never by a refusal: on ReFS the POSIX rename; elsewhere
+/// the old file renamed aside (`NAME.blaze-old-N`, beside it), the new one renamed in, and the
+/// old one deleted, which is refused while it runs: then it stays, and the next replace of the
+/// name deletes what of it no longer runs ([`aside`]). Any other file is replaced as before.
 fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
+    if image(to) && std::fs::symlink_metadata(to).is_ok() {
+        let dir = to.parent().ok_or_else(|| io::Error::other("a file with no directory"))?;
+        let (system, _) = file_system(&directory(dir)?)?;
+        return match system.as_str() {
+            "ReFS" => posix_rename(from, to),
+            _ => aside(from, to),
+        };
+    }
     let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
     // Replace the name, never the backing data of a mapped pack or image. MoveFileExW
     // can return success but leave an older view faulting zero pages under memory pressure.
@@ -190,6 +209,134 @@ fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
         (*info).FileNameLength = bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast(), name.len());
         SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
+    })
+}
+
+/// Whether a file named `path` may be an image a process maps to run: an executable or a
+/// library Windows loads (`.exe`, `.dll`, and the `.pyd` and `.node` modules other runtimes
+/// load as libraries).
+fn image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|it| it.to_str())
+        .is_some_and(|it| ["exe", "dll", "pyd", "node"].iter().any(|ext| it.eq_ignore_ascii_case(ext)))
+}
+
+/// A directory opened to ask of its volume.
+fn directory(dir: &Path) -> io::Result<OwnedHandle> {
+    let wide = sys::path(dir)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    // alloc: an error path.
+    sys::owned(handle)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))
+}
+
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` (winbase.h).
+const RENAME_REPLACE: u32 = 0x1;
+/// `FILE_RENAME_FLAG_POSIX_SEMANTICS`: the name is taken from a file open elsewhere too.
+const RENAME_POSIX: u32 = 0x2;
+
+/// `from` renamed to `to`, replacing what is there, with POSIX semantics
+/// (`FileRenameInfoEx`): the replaced file may be open, or (on ReFS) running.
+fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_RENAME_INFO, FileRenameInfoEx};
+    let file = plain(from, DELETE, OPEN_EXISTING)?;
+    let name = sys::path(to)?;
+    let name = &name[..name.len() - 1];
+    let size = size_of::<FILE_RENAME_INFO>() + size_of_val(name);
+    // alloc: once per image placed, the rename's information (`u64`s, for its alignment).
+    let mut buffer = vec![0u64; size.div_ceil(8)];
+    let info: *mut FILE_RENAME_INFO = buffer.as_mut_ptr().cast();
+    // SAFETY: `buffer` is `size` bytes, aligned for the struct, which is plain integers and a
+    // trailing name of `name.len()` units that the size leaves room for.
+    unsafe {
+        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
+        (*info).RootDirectory = std::ptr::null_mut();
+        (*info).FileNameLength = size_of_val(name) as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+    }
+    // SAFETY: an open handle with DELETE access and the information of the class named, of
+    // the size given.
+    sys::check(unsafe {
+        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size as u32)
+    })
+    // alloc: an error path.
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("renaming {} to {}: {error}", from.display(), to.display()),
+        )
+    })
+}
+
+/// The suffix of an image renamed aside ([`aside`]).
+const ASIDE: &str = ".blaze-old-";
+
+/// `from` placed at the image `to` on a volume that can't replace a running image: the older
+/// asides of `to` that no longer run deleted, `to` renamed aside, `from` renamed in, and the
+/// aside deleted, which a running image refuses (os error 5): it stays for the next replace.
+/// A rename in that fails puts `to` back.
+fn aside(from: &Path, to: &Path) -> io::Result<()> {
+    let name = to.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = to.parent().unwrap_or(Path::new("."));
+    let prefix = format!("{name}{ASIDE}");
+    let mut taken = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(left) = entry.file_name().to_str().and_then(|it| it.strip_prefix(&prefix).map(str::to_owned))
+        else {
+            continue;
+        };
+        match delete(&entry.path()) {
+            Ok(()) => {}
+            // It still runs.
+            Err(error) if error.raw_os_error() == Some(5) => taken.push(left),
+            Err(error) => return Err(error),
+        }
+    }
+    let at = (0u32..).find(|it| !taken.contains(&it.to_string())).expect("a free number");
+    let old = dir.join(format!("{prefix}{at}"));
+    posix_rename(to, &old)?;
+    if let Err(error) = posix_rename(from, to) {
+        // Back where it was: the place failed, and the path holds what it held.
+        _ = posix_rename(&old, to);
+        return Err(error);
+    }
+    match delete(&old) {
+        Err(error) if error.raw_os_error() != Some(5) => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// The file at `path` deleted with POSIX semantics: its name goes at once, whoever has it open.
+fn delete(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx,
+    };
+    let file = plain(path, DELETE, OPEN_EXISTING)?;
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: an open handle with DELETE access and the information of the class named, of
+    // its size.
+    sys::check(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
     })
 }
 
@@ -680,3 +827,58 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
 // The whole file mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix. Windows
 // refuses to replace or cut a file a view of which is open.
 pub(crate) use crate::fs::map;
+
+#[cfg(test)]
+mod image_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// The invariant: an image placed over one that runs is in place, on NTFS and ReFS alike
+    /// (each of the system's temporary directory and `BLAZE_TEST_VOLUMES`); on NTFS the running
+    /// one is left aside while it runs and deleted by the next replace once it ended; nothing
+    /// is left aside on ReFS. The control: `MoveFileExW` over the running image is refused.
+    #[test]
+    fn an_image_that_runs_is_replaced_and_its_old_file_goes_once_it_ends() {
+        let mut dirs = vec![std::env::temp_dir()];
+        if let Some(more) = std::env::var_os("BLAZE_TEST_VOLUMES") {
+            dirs.extend(std::env::split_paths(&more).filter(|it| !it.as_os_str().is_empty()));
+        }
+        for base in dirs {
+            let dir = base.join(format!(".blaze-image-test.{}", std::process::id()));
+            _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let (system, _) = file_system(&directory(&dir).unwrap()).unwrap();
+            let ping = Path::new(r"C:\Windows\System32\PING.EXE");
+            let at = dir.join("app.exe");
+            std::fs::copy(ping, &at).unwrap();
+            let mut running = std::process::Command::new(&at)
+                .args(["-n", "60", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let new = dir.join("new.exe");
+            std::fs::write(&new, b"the new image").unwrap();
+            let (w_new, w_at) = (sys::path(&new).unwrap(), sys::path(&at).unwrap());
+            // SAFETY: two NUL-terminated paths.
+            let refused = unsafe {
+                MoveFileExW(w_new.as_ptr(), w_at.as_ptr(), MOVEFILE_REPLACE_EXISTING)
+            };
+            assert_eq!(refused, 0, "{system}: the control: a plain replace of a running image");
+            rename_unsynced(&new, &at).unwrap_or_else(|error| panic!("{system}: {error}"));
+            assert_eq!(std::fs::read(&at).unwrap(), b"the new image", "{system}");
+            let aside = dir.join(format!("app.exe{ASIDE}0"));
+            assert_eq!(aside.exists(), system != "ReFS", "{system}: the old image aside");
+            running.kill().unwrap();
+            running.wait().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::write(&new, b"again").unwrap();
+            rename_unsynced(&new, &at).unwrap();
+            assert_eq!(std::fs::read(&at).unwrap(), b"again");
+            let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name()).collect();
+            assert_eq!(left, ["app.exe"], "{system}: what is left");
+            _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}

@@ -87,6 +87,21 @@ pub const DUCKDB_PINS: &[(&str, Pin)] = &[
             sha256: "cbd6e7d472c33083db32e1e78d71ab9eefb32da872c349423294de370b8f4ca9",
         },
     ),
+    // DuckDB releases its Windows CLI as a zip alone (`duckdb.exe` in it).
+    (
+        "x86_64-windows",
+        Pin {
+            asset: "duckdb_cli-windows-amd64.zip",
+            sha256: "e1428b7114a841626b5054723731cbf45c6df91b42ae1a6c355f88fad1f6dc4c",
+        },
+    ),
+    (
+        "aarch64-windows",
+        Pin {
+            asset: "duckdb_cli-windows-arm64.zip",
+            sha256: "9d0370d085684e1619ecc5efb2656cde930c50f1418380f0ae9d0379ddf06b12",
+        },
+    ),
 ];
 
 impl Pin {
@@ -109,7 +124,8 @@ impl Pin {
     pub fn laid_out(&self, state: &Path) -> PathBuf {
         let short = self.sha256.get(..16).unwrap_or(self.sha256);
         // alloc: once per lookup
-        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join("duckdb")
+        let program = format!("duckdb{}", std::env::consts::EXE_SUFFIX);
+        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join(program)
     }
 }
 
