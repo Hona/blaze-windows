@@ -66,6 +66,9 @@ pub struct Region {
     /// Made by [`Region::reserve_sparse`]: every byte readable and writable from the start, and
     /// `committed` the prefix its owner said it uses.
     sparse: bool,
+    /// What a sparse region's reservation counted committed from the start: all of it for a
+    /// readable one on Windows, which commits it whole; none otherwise.
+    published: usize,
     /// Of a sparse region counted by ranges ([`Region::reuse`], [`Region::evict`]), the bytes
     /// made the process's and not given back since: what its tag holds of it besides
     /// `committed`, which such a region leaves at what its reservation counted.
@@ -154,6 +157,8 @@ impl Region {
         })?;
         tag::reserved(tag, reserved);
         tag::base_pages(reserved);
+        // Windows committed a readable sparse region whole, and counts it so.
+        let published = if cfg!(windows) && kind == Sparse::Readable { reserved } else { 0 };
         let region = Region {
             base,
             reserved,
@@ -162,12 +167,12 @@ impl Region {
             pages: Pages::Base,
             node: None,
             sparse: true,
+            published,
             held: AtomicUsize::new(0),
             tag,
         };
-        // Windows committed a readable sparse region whole, and counts it so.
-        if cfg!(windows) && kind == Sparse::Readable {
-            region.publish(reserved);
+        if published != 0 {
+            region.publish(published);
         }
         Ok(region)
     }
@@ -199,6 +204,7 @@ impl Region {
             pages,
             node,
             sparse: false,
+            published: 0,
             held: AtomicUsize::new(0),
             tag,
         })
@@ -710,11 +716,10 @@ impl Region {
     }
 
     /// Panics unless this sparse region is counted by ranges: nothing committed past what its
-    /// reservation counted (all of it on Windows, none elsewhere).
+    /// reservation counted ([`Region::published`]).
     #[track_caller]
     fn by_ranges(&self, doing: &str) {
-        let initial = if cfg!(windows) { self.reserved } else { 0 };
-        if self.committed() != initial {
+        if self.committed() != self.published {
             self.mixed(doing);
         }
     }
