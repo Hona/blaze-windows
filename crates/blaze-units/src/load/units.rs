@@ -508,16 +508,7 @@ pub(crate) fn units(
         }
     }
     if let Some(ask) = &spec.foreign {
-        let ours = |at: &Path| at.display().to_string();
-        let prefixes = [
-            ours(&Path::new(FOREIGN_TARGET).join(&ask.triple).join(&dir_name)),
-            ours(
-                &Path::new(FOREIGN_TARGET)
-                    .join(super::plan::macro_dir(&ask.triple))
-                    .join(&dir_name),
-            ),
-            ours(&Path::new(FOREIGN_TARGET).join(&dir_name)),
-        ];
+        let prefixes = foreign_prefixes(&ask.triple, &dir_name);
         for plan in &mut plans {
             rebase(plan, &prefixes, &ask.out);
         }
@@ -684,6 +675,25 @@ fn jobs(config: &blaze_manifest::Config<Snap>, asked: Option<u32>) -> anyhow::Re
 /// Where a foreign workspace's plans are made before their directory is put as
 /// [`ForeignAsk::out`].
 const FOREIGN_TARGET: &str = "/@blaze-foreign-target";
+
+/// Prefixes of the virtual output names in the plan, never host filesystem paths.
+fn foreign_prefixes(triple: &str, profile: &str) -> [String; 3] {
+    [
+        format!("{FOREIGN_TARGET}/{triple}/{profile}"),
+        format!("{FOREIGN_TARGET}/{}/{profile}", super::plan::macro_dir(triple)),
+        format!("{FOREIGN_TARGET}/{profile}"),
+    ]
+}
+
+#[cfg(test)]
+mod foreign_names {
+    #[test]
+    fn the_virtual_std_profile_matches_its_planned_artifact() {
+        let artifact = "/@blaze-foreign-target/x86_64-pc-windows-msvc/debug/build/alloc/out/liballoc.rlib";
+        let roots = super::foreign_prefixes("x86_64-pc-windows-msvc", "debug");
+        assert_eq!(artifact.strip_prefix(&roots[0]), Some("/build/alloc/out/liballoc.rlib"));
+    }
+}
 
 /// Each path of `plan` under one of `prefixes` put under `out` instead.
 fn rebase<P: AsRef<str>>(plan: &mut UnitPlan, prefixes: &[P], out: &str) {

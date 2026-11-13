@@ -5,18 +5,15 @@
 
 use std::{
     collections::VecDeque,
-    io::{self, Read as _, Write as _},
-    os::{fd::AsRawFd as _, unix::net::UnixStream},
+    io::{self, Read as _},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::Duration,
 };
 
+pub use crate::sys::Waker;
+use crate::sys::{Readiness, UnixStream};
 use blaze_api::{Rebuilt, Request, Response, Status};
-use blaze_core::wait::{self, Clock as _, Deadline, Monotonic, Waited};
+use blaze_core::wait::{Clock as _, Deadline, Monotonic, Waited};
 
 use crate::{
     Error,
@@ -52,23 +49,6 @@ pub enum Next {
     Deadline,
 }
 
-/// Wakes a [`Client::next`] from another thread.
-#[derive(Debug)]
-pub struct Waker {
-    pipe: io::PipeWriter,
-    /// A wake is in the pipe and not yet read: one byte stands for every wake until then.
-    pending: Arc<AtomicBool>,
-}
-
-impl Waker {
-    pub fn wake(&self) -> io::Result<()> {
-        if self.pending.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        (&self.pipe).write_all(&[1])
-    }
-}
-
 /// A connection to the daemon.
 #[derive(Debug)]
 pub struct Client {
@@ -77,9 +57,7 @@ pub struct Client {
     clock: Monotonic,
     /// Events of other requests that came while [`Client::request`] waited for its own.
     kept: VecDeque<Event>,
-    woken: io::PipeReader,
-    wake: io::PipeWriter,
-    pending: Arc<AtomicBool>,
+    ready: Readiness,
     socket: PathBuf,
     /// What each read reads into.
     buffer: Vec<u8>,
@@ -117,18 +95,14 @@ impl Client {
             }
         };
         stream.set_nonblocking(true).map_err(failed)?;
-        sys::no_sigpipe(&stream).map_err(failed)?;
-        let (woken, wake) = io::pipe().map_err(failed)?;
+        let ready = Readiness::new(&stream).map_err(failed)?;
         Ok(Client {
             stream,
             mux: Mux::new(),
             clock,
             // alloc: none until a request waits while another's events come.
             kept: VecDeque::new(),
-            woken,
-            wake,
-            // alloc: once per connection.
-            pending: Arc::new(AtomicBool::new(false)),
+            ready,
             socket: homes.socket,
             // alloc: once per connection, every read's.
             buffer: vec![0; RECEIVE],
@@ -143,7 +117,7 @@ impl Client {
     /// A handle another thread wakes this client's [`Client::next`] with.
     pub fn waker(&self) -> io::Result<Waker> {
         // clone: the shared flag, once per waker.
-        Ok(Waker { pipe: self.wake.try_clone()?, pending: Arc::clone(&self.pending) })
+        self.ready.waker()
     }
 
     /// Sends `request`, to end within `within`: its id, under which [`Client::next`] tells its
@@ -258,12 +232,8 @@ impl Client {
     /// Waits for a wake alone, with the connection over, within `within`: whether one came.
     pub fn idle(&mut self, within: Duration) -> Result<bool, Error> {
         let until = Deadline::after(self.clock.now(), within);
-        let mut watched = [libc::pollfd { fd: self.woken.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
-        match wait::readable("a wake of the client", &mut watched, until.finite(), &self.clock) {
-            Ok(Waited::Ready(_)) => {
-                self.take_wake();
-                Ok(true)
-            }
+        match self.ready.wait(None, until, &self.clock) {
+            Ok(Waited::Ready(_)) => Ok(true),
             Ok(Waited::Deadline) => Ok(false),
             // alloc: error path, a wait that failed.
             Err(error) => Err(Error::Fault(Fault::Io { what: error.to_string() })),
@@ -325,14 +295,6 @@ impl Client {
                 return Ok(Next::Deadline);
             }
             let deadline = self.mux.next_deadline().map_or(until, |it| it.min(until));
-            let wants = match self.mux.outgoing().is_empty() {
-                true => libc::POLLIN,
-                false => libc::POLLIN | libc::POLLOUT,
-            };
-            let mut watched = [
-                libc::pollfd { fd: self.stream.as_raw_fd(), events: wants, revents: 0 },
-                libc::pollfd { fd: self.woken.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            ];
             let waited = {
                 let _span = tracing::trace_span!(
                     target: "blaze",
@@ -340,33 +302,26 @@ impl Client {
                     requests = self.mux.open(),
                 )
                 .entered();
-                wait::readable("the daemon's socket", &mut watched, deadline.finite(), &self.clock)
+                self.ready.wait(
+                    Some((&self.stream, !self.mux.outgoing().is_empty())),
+                    deadline,
+                    &self.clock,
+                )
             };
             match waited {
-                Ok(Waited::Ready(_)) => {}
+                Ok(Waited::Ready((true, _))) => return Ok(Next::Woken),
+                Ok(Waited::Ready((false, true))) => self.fill(),
+                Ok(Waited::Ready((false, false))) => {}
                 Ok(Waited::Deadline) => continue,
                 Err(error) => {
                     // alloc: error path, a wait that failed.
-                    self.mux.broke(Fault::Io { what: format!("waiting on the daemon's socket: {error}") });
+                    self.mux.broke(Fault::Io {
+                        what: format!("waiting on the daemon's socket: {error}"),
+                    });
                     continue;
                 }
             }
-            if watched[1].revents != 0 {
-                self.take_wake();
-                return Ok(Next::Woken);
-            }
-            if watched[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                self.fill();
-            }
         }
-    }
-
-    /// Reads the wake's byte: the next wake writes another.
-    fn take_wake(&mut self) {
-        let mut byte = [0u8; 8];
-        // The pipe is readable, so the read does not block; what it gives is only a wake.
-        let _ = self.woken.read(&mut byte);
-        self.pending.store(false, Ordering::Release);
     }
 
     /// One read of the daemon's bytes into the mux.
@@ -375,11 +330,15 @@ impl Client {
             Ok(0) => self.mux.hung_up(),
             Ok(read) => self.mux.received(&self.buffer[..read]),
             Err(error)
-                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) if error.kind() == io::ErrorKind::ConnectionReset => self.mux.hung_up(),
             Err(error) => {
                 // alloc: error path, a read that failed.
-                let what = format!("reading the daemon's socket {}: {error}", self.socket.display());
+                let what =
+                    format!("reading the daemon's socket {}: {error}", self.socket.display());
                 self.mux.broke(Fault::Io { what });
             }
         }
@@ -404,8 +363,10 @@ impl Client {
                 }
                 Err(error) => {
                     // alloc: error path, a write that failed.
-                    let what =
-                        format!("writing to the daemon's socket {}: {error}", self.socket.display());
+                    let what = format!(
+                        "writing to the daemon's socket {}: {error}",
+                        self.socket.display()
+                    );
                     return self.mux.broke(Fault::Io { what });
                 }
             }

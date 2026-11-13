@@ -11,7 +11,7 @@ fn an_absolute_path_and_its_daemon_name_round_trip() {
     let cases: &[(&str, &str, &str)] = &[
         (r"C:\Users\a\b.rs", "/C:/Users/a/b.rs", r"C:\Users\a\b.rs"),
         (r"c:\Users\a", "/C:/Users/a", r"C:\Users\a"),
-        ("D:/blaze-win/home", "/D:/blaze-win/home", r"D:\blaze-win\home"),
+        ("D:/scratch/home", "/D:/scratch/home", r"D:\scratch\home"),
         (r"D:\", "/D:/", r"D:\"),
         (r"\\?\C:\a\very\long", "/C:/a/very/long", r"C:\a\very\long"),
         (r"\\server\share\x\y", "/UNC/server/share/x/y", r"\\server\share\x\y"),

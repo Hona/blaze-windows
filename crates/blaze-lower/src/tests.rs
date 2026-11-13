@@ -850,6 +850,18 @@ fn a_run_is_refused_for_what_is_no_run() {
     assert!(built.lowered.macros(MACRO, Ok(Vec::new())).is_ok());
 }
 
+#[test]
+fn a_miss_explains_the_identity_of_its_lookup_after_a_sibling_writes() {
+    let mut built = lowered(&units()).unwrap();
+    let id = built.lowered.identity(LIB).unwrap();
+    built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
+    let parts = built.lowered.identity_parts(LIB, id).unwrap();
+    assert!(!parts.is_empty());
+    let changed = Ran { cfgs: vec!["has_gen".into()], out_dir: OUT_DIR.into(), ..Default::default() };
+    built.lowered.ran(RUN, &changed).unwrap();
+    assert!(matches!(built.lowered.identity_parts(LIB, id), Err(why) if why.contains("changed since its record lookup")));
+}
+
 /// A member proc macro under `blaze check` is two units of one crate: its `Check` unit (the
 /// member checked) and its `Build` unit (the module `b` expands with). Only the `Build` unit
 /// gives the crate expanders: before, both did, and the `Check` unit, which links no module,

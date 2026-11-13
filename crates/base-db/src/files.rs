@@ -1058,7 +1058,14 @@ impl Files {
     }
 
     fn read_included(&self, path: &AbsPath) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        IncludedFile::read_now(&self.on_disk(path.as_ref()))
+        // Apply the view in its namespace before opening the resulting name on the host.
+        // The record lookup does the same conversion. Otherwise a successful include
+        // can be filed by the hash of Windows' ERROR_INVALID_NAME rather than its bytes.
+        let disk = self.on_disk(path.as_ref());
+        match disk.to_str() {
+            Some(name) => IncludedFile::read_now(&blaze_core::platform::path::host(name)),
+            None => IncludedFile::read_now(&disk),
+        }
     }
 
     pub(crate) fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {

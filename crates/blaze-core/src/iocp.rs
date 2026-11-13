@@ -896,6 +896,7 @@ impl Iocp {
             }
             effect @ (Effect::Write { .. }
             | Effect::TryPatch { .. }
+            | Effect::SparseFile { .. }
             | Effect::WriteUnsynced { .. }
             | Effect::Rename { .. }
             | Effect::RenameUnsynced { .. }
@@ -905,6 +906,7 @@ impl Iocp {
                 match &effect {
                     Effect::Write { file, .. }
                     | Effect::TryPatch { file, .. }
+                    | Effect::SparseFile { file, .. }
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::Remove { file, .. } => self.forget(file),
                     Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
@@ -2602,6 +2604,7 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
         Effect::TryPatch { file, len, delta, whole, .. } => {
             files::try_patch(joined(at, root, &file), len, &delta, &whole).map(Done::Patched)
         }
+        Effect::SparseFile { file, len, .. } => crate::fs::sparse_file(joined(at, root, &file), len).map(|()| Done::Truncated),
         Effect::Rename { from, to: into, .. } => {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
         }
@@ -3995,8 +3998,8 @@ mod tests {
             assert_eq!(seen[&n], Done::Read(whole[at..at + 16].to_vec()), "read {n}");
         }
         // The skip's invariant: a read the call ended at once posts no packet, and every other
-        // read posts one. How many end at once is the system's: on Windows 11 26100 here (adais,
-        // Defender on), NTFS and ReFS both pend all 64 of these reads of a cached file on one
+        // read posts one. How many end at once is the system's: on Windows 11 26100 with
+        // Defender on, NTFS and ReFS both pend all 64 of these reads of a cached file on one
         // handle (the system's fast path is not taken; why is open), so their number is not held.
         let (posted, at_once) = (driver.packets - packets, driver.at_once - at_once);
         assert_eq!(posted + at_once, READS, "{posted} posted and {at_once} ended at once");

@@ -30,19 +30,22 @@ fn apply(
     whole: &[(u64, Vec<u8>)],
     mut phase: impl FnMut(&str),
 ) -> io::Result<bool> {
+    let name = path.to_string_lossy();
     let wide = sys::path(path)?;
     // SAFETY: an existing file, opened without following a reparse point. No other
     // data or delete handle can coexist, including a running PE image's writer.
-    let handle = match sys::owned(unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE | DELETE,
-            0,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
+    let handle = match crate::lock::io_wait("open output exclusively", &name, || {
+        sys::owned(unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | DELETE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        })
     }) {
         Ok(h) => h,
         Err(e) if matches!(e.raw_os_error(), Some(2 | 3 | 5 | 32)) => return Ok(false),
@@ -75,36 +78,64 @@ fn apply(
             )
         })
     };
-    match disposition(true) {
-        Ok(()) => disposition(false)?,
+    match crate::lock::io_wait("exclude detached views", &name, || disposition(true)) {
+        Ok(()) => crate::lock::io_wait("clear disposition", &name, || disposition(false))?,
         Err(e) if matches!(e.raw_os_error(), Some(5 | 32 | 1224)) => return Ok(false),
         Err(e) => return Err(e),
     }
-    {
+    if !crate::lock::io_wait("verify prospective bytes", &name, || -> io::Result<bool> {
         // SAFETY: exclusive custody, no writes until the temporary validation view drops.
         let base = unsafe { crate::fs::Mapped::map(&file) }?;
-        if !crate::fs::matches_patch(base.bytes(), len, delta, whole)? {
-            return Ok(false);
-        }
+        crate::fs::matches_patch(base.bytes(), len, delta, whole)
+    })? {
+        return Ok(false);
     }
     let stage = crate::fs::temporary_next_to(path);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    rename_handle(raw, &stage, 0)?; // never overwrite someone else's stage
-    // durable: the old public name must not roll back over partially changed sectors.
-    crate::fs::sync_dir(dir)?;
-    phase("detached");
-    file.set_len(len)?;
-    for (at, bytes) in delta {
-        file.seek(SeekFrom::Start(*at))?;
-        file.write_all(bytes)?;
-        phase("range");
+    crate::lock::io_wait("detach base", &name, || rename_handle(raw, &stage, 0))?;
+    // Hard-link creation is a metadata operation: even a share-zero handle doesn't
+    // exclude it. Keep the detached name delete-pending while any bytes are partial.
+    // Recheck the link count *after* taking that protection, not just at open.
+    disposition(true)?;
+    // SAFETY: the same handle and output as at open, now protected from new names.
+    sys::check(unsafe { GetFileInformationByHandle(raw, &mut info) })?;
+    // Windows excludes the pending name from its count: zero means only our stage.
+    if info.nNumberOfLinks != 0 {
+        disposition(false)?;
+        rename_handle(raw, path, 0)?;
+        return Ok(false);
     }
-    // durable: publication cannot outrun any byte of the result.
-    file.sync_all()?;
-    phase("synced");
-    rename_handle(raw, path, 0)?; // don't replace an interloper during the lease
-    crate::fs::sync_dir(dir)?;
-    phase("published");
+    for step in crate::fs::PATCH_PUBLICATION {
+        use crate::fs::PublishStep::*;
+        match step {
+            HideDurably => {
+                // durable: the old public name cannot roll back over changed sectors.
+                crate::lock::io_wait("persist detached name", &name, || crate::fs::sync_dir(dir))?;
+                phase("detached");
+            }
+            Edit => {
+                file.set_len(len)?;
+                for (at, bytes) in delta {
+                    file.seek(SeekFrom::Start(*at))?;
+                    file.write_all(bytes)?;
+                    phase("range");
+                }
+            }
+            SyncBytes => {
+                // durable: publication cannot outrun any byte of the result.
+                crate::lock::io_wait("persist patched bytes", &name, || file.sync_all())?;
+                phase("synced");
+            }
+            Show => {
+                disposition(false)?;
+                crate::lock::io_wait("return patched file", &name, || rename_handle(raw, path, 0))?;
+            }
+            SyncName => {
+                crate::lock::io_wait("persist returned name", &name, || crate::fs::sync_dir(dir))?;
+                phase("published");
+            }
+        }
+    }
     Ok(true)
 }
 
@@ -155,6 +186,29 @@ mod tests {
                 assert_eq!(fs::read(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
             }
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_partial_stage_cannot_gain_a_public_link() {
+        let root = std::env::temp_dir().join(format!("blaze-patch-stage-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("out");
+        fs::write(&path, b"abc").unwrap();
+        let alias = root.join("alias");
+        let mut checked = false;
+        let delta = [(1, vec![b'z'])];
+        assert!(
+            apply(&path, 3, &delta, &[(0, b"azc".to_vec())], |phase| {
+                if phase == "range" {
+                    let stage = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+                    assert!(fs::hard_link(stage, &alias).is_err());
+                    checked = true;
+                }
+            })
+            .unwrap()
+        );
+        assert!(checked && !alias.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -177,6 +177,40 @@ not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0
 - Not done: CFG tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a
   `.res` manifest works).
 
+### v2 code generation on Windows (2026-11-13, branch `windows/codegen`)
+
+What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 with MSVC 14.52
+(local test programs, not in CI):
+
+- std, with `panic = "abort"` and `"unwind"`: thread-locals reach `_tls_index` (COFF TLS),
+  std's `raw-dylib` imports (`ProcessPrng`, `NtCreateFile`) are an import library the link makes
+  (`blaze-link/src/pe/raw_dylib.rs`), a DLL's static is read through its `__imp_` cell, `f16`
+  and `f128` go to compiler-builtins as Win64 passes them, and core's
+  `#[link(name = "/defaultlib:msvcrt", modifiers = "+verbatim")]` is a default library.
+- Panics are SEH with blaze's own personality (`library/std/src/sys/personality/blaze_seh.rs`):
+  `catch_unwind` four frames down with every frame's drop, XMM6-XMM15 restored into the
+  catching frame, a panic in a thread, nested catches, `resume_unwind`, `#[should_panic]`. A C++
+  exception thrown through a Rust `extern "C-unwind"` frame runs its drop and is caught in C++;
+  a Rust panic through a C++ frame runs its destructor and is caught by `catch_unwind`. Only a
+  pad that catches claims an exception in the search pass; cleanup pads run in the unwind pass.
+- Thread-local destructors, threads, `i128`, C varargs (`snprintf` from
+  `legacy_stdio_definitions`, as under rustc), a 64 KiB frame (stack probes), SSE intrinsics.
+- Not done: a structured exception that is not a C++ one (an access violation) and a C++
+  `throw;` rethrow run no Rust cleanup pad; a Rust panic out of an `extern "C"` function with
+  no catcher above ends as an unhandled exception, not the "cannot unwind" abort.
+
+### v2 output placement on Windows
+
+On ReFS, blaze can clone the previous output's blocks and patch the clone. On NTFS,
+a new linker output starts as a sparse file: unused patch room consumes no clusters.
+For an edit, blaze verifies the prospective result against the linker's bytes while
+holding the previous file exclusively. It removes the public name and syncs its directory
+before changing bytes, then flushes the file and publishes the complete result. A crash
+during the patch can leave a missing output, not an accepted partial one. A running,
+mapped, multiply linked or externally changed file is not a patch base; blaze places
+a new file instead. Less data written need not mean a shorter edit: the profile names
+the wait to open an executable exclusively, separate from validation and flushes.
+
 ### v2 build scripts on Windows
 
 A script runs inside an AppContainer with its own job. The token has one read capability

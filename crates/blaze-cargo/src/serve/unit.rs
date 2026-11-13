@@ -804,8 +804,9 @@ impl UnitReader {
     pub(crate) fn identity_parts(
         &self,
         unit: usize,
+        looked_up: ContentId,
     ) -> Result<Vec<blaze_lower::IdentityPart>, String> {
-        self.front.identity_parts(unit)
+        self.front.identity_parts(unit, looked_up)
     }
 
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
@@ -1140,7 +1141,8 @@ impl Writer<Real> for UnitWriter {
         deps::item_errors(&self.session)?;
         let mut said: Vec<blaze_api::Diagnostic> =
             codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
-        said.extend(configs::report(&self.job, self.reader(), ok, built)?);
+        let job = Arc::clone(&self.job);
+        said.extend(configs::report(&job, || self.final_reader(), ok, built)?);
         Ok(said)
     }
 

@@ -22,14 +22,18 @@
 #![register_tool(blaze)]
 
 pub mod ask;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod driver;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod foreign;
 pub mod mux;
 pub mod place;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod start;
+#[cfg(windows)]
+#[path = "sys_windows.rs"]
+#[expect(unsafe_code, reason = "Winsock readiness and wake events belong to one client connection")]
+mod sys;
 #[cfg(unix)]
 #[expect(unsafe_code, reason = "a send with no SIGPIPE, a descriptor inherited by the daemon, the terminal's width")]
 mod sys;
@@ -39,10 +43,10 @@ use std::{fmt, io, path::PathBuf};
 pub use blaze_api::{ApiError, Request, Response};
 
 pub use self::ask::{Options, Outcome, WhyOptions};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use self::driver::{Client, Connect, Next, Waker};
 pub use self::mux::{End, Event, Fault, Mux};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use self::start::Start;
 
 /// Why a call of the client did not give its answer.
@@ -58,7 +62,7 @@ pub enum Error {
     /// Nothing listens at the socket, and none was to be started.
     NoDaemon { socket: PathBuf },
     /// Nothing listens at the socket, and the daemon could not be started.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Start(start::StartError),
     /// What was asked is no request: the option or the place it names, and why.
     Asked(String),
@@ -73,7 +77,7 @@ impl Error {
             Error::Daemon(_) => 8,
             Error::Connect { .. } => 9,
             Error::NoDaemon { .. } => 10,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Error::Start(_) => 11,
             Error::Asked(_) => 12,
         }
@@ -94,7 +98,7 @@ impl fmt::Display for Error {
             Error::NoDaemon { socket } => {
                 write!(f, "no daemon listens at {}, and none was to be started", socket.display())
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Error::Start(error) => error.fmt(f),
             Error::Asked(what) => f.write_str(what),
         }

@@ -22,7 +22,6 @@ use hir_def::{
     ItemContainerId, Lookup, ModuleDefId,
     attrs::{AttrFlags, NativeLibKind as Written},
     expr_store::Body as BodyStore,
-    nameres::crate_def_map,
     signatures::{FunctionSignature, StaticSignature},
 };
 use hir_ty_mir::mir::MirSpan;
@@ -201,8 +200,7 @@ fn error(what: String) -> CodegenError {
 }
 
 /// [`HirFrontend::linked`], kept by the database: a link asks it of every crate it links, the
-/// standard library's among them, and what it reads is each crate's modules and `extern`
-/// blocks, which an edit of a function's body changes for no crate. Asked as a plain
+/// standard library's among them, including `extern` blocks that a wrapper declares locally. Asked as a plain
 /// function it walked them all again every link (2.8 ms of a one-function edit of hello
 /// world, `link natives`); as a memo, a crate nothing was written in is one check.
 #[blaze_query::tracked(returns(ref))]
@@ -212,10 +210,11 @@ fn linked(db: &Db, krate: Crate, linking: Crate) -> Result<Vec<NativeLib>, Strin
     let named = || format!("crate `{}`", krate.named(db));
     // alloc: per crate linked, its libraries
     let mut libs = Vec::new();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
+    for &module in super::modules::declaring_modules(db, krate) {
+        let scope = module.def_map(db).module(db, module).scope(db);
         // The module's `raw-dylib` libraries, by their block: what its foreign items import.
         let mut raw: SmallVec<[(ExternBlockId, usize); 2]> = SmallVec::new();
-        for block in module.scope(db).extern_blocks() {
+        for block in scope.extern_blocks() {
             // A block's `#[link(wasm_import_module = "..")]` names no library: on wasm its
             // functions are the module's imports from that module (`v2::wasm::imports`), and
             // elsewhere rustc ignores it.
@@ -281,7 +280,7 @@ fn linked(db: &Db, krate: Crate, linking: Crate) -> Result<Vec<NativeLib>, Strin
                 libs.push(NativeLib { name, kind, verbatim: lib.verbatim, imports: Vec::new() });
             }
         }
-        for def in module.scope(db).declarations() {
+        for def in scope.declarations() {
             let (item, container, owner) = match def {
                 ModuleDefId::FunctionId(it) => (
                     FunctionSignature::of(db, it).name.as_str(),

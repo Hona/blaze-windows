@@ -706,6 +706,8 @@ dependencies = [
  "serde",
  "sonic-rs",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2102,6 +2104,8 @@ dependencies = [
  "blaze-report",
  "libc",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4287,6 +4291,7 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
+ "tracing",
  "triomphe",
 ]
 
@@ -6299,6 +6304,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-script",
  "regex",
+ "serde",
  "serde_json",
  "toml",
 ]

@@ -83,9 +83,7 @@ pub fn find(cwd: &Path, manifest_path: Option<&str>) -> Result<Place, String> {
 
 /// A path as the API carries it.
 pub fn utf8(path: &Path) -> Result<String, String> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        format!("the path {} is not UTF-8, which a request to the daemon can't carry", path.display())
-    })
+    blaze_core::platform::path::daemon(path).map_err(|why| why.to_string())
 }
 
 /// Reads `path` onto `files` unless it is not there; a file already among them is not read
@@ -168,7 +166,7 @@ pub fn cargo_home(env: &[(String, String)], cwd: &Path) -> Option<PathBuf> {
 }
 
 /// The columns of the terminal stderr is; `None` when it is none.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn stderr_columns() -> Option<u16> {
     crate::sys::stderr_columns()
 }

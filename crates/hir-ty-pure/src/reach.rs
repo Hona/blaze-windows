@@ -384,6 +384,24 @@ pub fn prove<'db>(
         return Reach::refused("it is a coroutine");
     }
     let count = body.basic_blocks.len();
+    // One span a proof, named for its body: a proof is a fixpoint whose cost the budget bounds
+    // only in rounds, and it ran for minutes under a span that said only `mir SpendFacts`.
+    let span = tracing::info_span!(
+        target: "blaze",
+        "reach prove",
+        function = tracing::field::Empty,
+        blocks = count,
+        visits = tracing::field::Empty,
+    );
+    if !span.is_disabled()
+        && let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner
+    {
+        // alloc: a span's name of the body, once a proof
+        let mut path = String::new();
+        hir_def::span_names::write_body_path(db, def, &mut path);
+        span.record("function", path.as_str());
+    }
+    let _entered = span.enter();
     // alloc: the body's blocks by index, once per proof
     let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
     for block in &blocks {
@@ -410,6 +428,7 @@ pub fn prove<'db>(
     let word = layout.pointer_size().bits() as u32;
     let mut solver = Solver::new(db, infcx, env, body, &blocks, word);
     let Some(entries) = solver.solve() else {
+        span.record("visits", solver.visits.get());
         return Reach::refused("its proof did not settle within the budget");
     };
     // The verdicts, from the settled entry states.
@@ -440,6 +459,7 @@ pub fn prove<'db>(
             explained.push((at as u32, solver.why_reached(at as u32, &entries)));
         }
     }
+    span.record("visits", solver.visits.get());
     sites.sort();
     Reach {
         dead: dead.into_boxed_slice(),
@@ -491,6 +511,8 @@ struct Solver<'a, 'db> {
     /// The statement being walked, and how many unknowns it has made.
     at: (u32, u32),
     made: u32,
+    /// Estimated fact/implication visits for the profile, not an input to a proof.
+    visits: std::cell::Cell<u64>,
 }
 
 /// The widest range a term's value is kept in.
@@ -547,6 +569,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             word,
             at: (0, 0),
             made: 0,
+            visits: std::cell::Cell::new(0),
         };
         solver.exposed = solver.exposed_locals();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
@@ -555,6 +578,10 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         solver.named = named;
         solver
+    }
+
+    fn visit(&self, length: usize) {
+        self.visits.set(self.visits.get().saturating_add(length as u64 + 1));
     }
 
     // Terms.
@@ -714,6 +741,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
     /// `form <= bound`, the form with no constant.
     fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
+        self.visit(state.facts.len());
         let mut known = Vec::with_capacity(state.facts.len()); // alloc: one bound per fact, per proof
         let mut add = |left: &Form, right: &Form, slack: i128| {
             if let Some((parts, constant)) = form_add(left, right, -1)
@@ -763,6 +791,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if depth == 0 {
             return false;
         }
+        self.visit(known.len());
         for (parts, bound) in known {
             let cancels = parts.iter().any(|&(term, coefficient)| {
                 bare.0.iter().any(|&(of, has)| of == term && (has > 0) == (coefficient > 0))
@@ -872,6 +901,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if self.const_of(term).is_some() {
             return (low, high);
         }
+        self.visit(state.facts.len());
         for fact in &state.facts {
             let (left, right) = (fact.a == term, fact.b == term);
             if left == right {
@@ -918,6 +948,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
+        self.visit(state.facts.len());
         for fact in &state.facts {
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
@@ -941,6 +972,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A value ruled out at an end moves the end: at most as many turns as such facts.
         let mut turns = state.facts.len();
         loop {
+            self.visit(state.facts.len());
             let mut moved = false;
             for fact in &state.facts {
                 if fact.rel != Rel::Ne || (fact.a != term && fact.b != term) {
@@ -1029,6 +1061,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if depth == 0 {
             return false;
         }
+        self.visit(state.facts.len() + state.imps.len());
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
         for fact in &state.facts {
             let through = |mid: TermId, strict: bool| -> bool {
