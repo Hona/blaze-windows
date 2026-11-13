@@ -80,8 +80,8 @@ pub use lazy::{LazyPlacer, Slots};
 pub use patch::Patch;
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
-    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
-    Undefined,
+    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, NoDefaultLibs, Output, OutputKind,
+    PeArgs, PeFlag, Platform, Undefined,
 };
 pub use position::{
     COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,

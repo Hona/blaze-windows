@@ -83,7 +83,7 @@ fn mode(kind: std::fs::FileType) -> Option<u32> {
 /// The [`Stamp`] of what `meta` says of a name, not followed through a symlink; unknown where
 /// its kind or a time can't be said. The change time is std's `created`, which on WASI is
 /// `filestat`'s `ctim`, the inode's change time.
-fn stamp_of(meta: &Metadata) -> Stamp {
+pub(super) fn stamp_of(meta: &Metadata) -> Stamp {
     use std::os::wasi::fs::MetadataExt as _;
     let (Some(mode), Some(mtime_ns), Some(ctime_ns)) =
         (mode(meta.file_type()), ns(meta.modified()), ns(meta.created()))

@@ -65,6 +65,7 @@ use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
+use blaze_core::Stamp;
 use blaze_core::lock::Lock;
 use smallvec::SmallVec;
 use std::alloc::Global;
@@ -964,6 +965,11 @@ type Asked = Arc<Vec<(String, String)>>;
 pub(crate) struct Cache {
     found: Lock<Vec<(Key, Arc<Found>)>>,
     asked: Lock<Vec<(ContentId, u32, Asked)>>,
+    /// What each file was read as, by its path, domain, platform and the stamp it had then: a
+    /// file whose stamp is unchanged is not read again (as a sweep takes it,
+    /// [`blaze_core::Stamp`]). A link of rustc's line names 1.8 GB of archives; reading and
+    /// hashing them on every link was 1.8 s of 9.
+    stamped: Lock<Vec<(PathBuf, &'static str, u32, Stamp, Asked)>>,
 }
 
 impl Cache {
@@ -972,6 +978,7 @@ impl Cache {
         Cache {
             found: Lock::new("link.toolchain.found", Vec::new()),
             asked: Lock::new("link.toolchain.asked", Vec::new()),
+            stamped: Lock::new("link.toolchain.stamped", Vec::new()),
         }
     }
 
@@ -1026,16 +1033,38 @@ impl Cache {
         read: impl FnOnce(&[u8]) -> Result<Vec<(String, String)>, String>,
     ) -> Result<Asked, LinkError> {
         // alloc: error path
-        let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
-        let id = ContentId::of(domain, &bytes);
-        if let Some((.., asked)) =
-            self.asked.lock().iter().find(|it| it.0 == id && it.1 == platform)
-        {
+        let stamp = blaze_core::fs::stamp(path).map_err(|error| fail(format!("{name}: {error}")))?;
+        let same = |it: &&(PathBuf, &'static str, u32, Stamp, Asked)| {
+            it.0 == path && it.1 == domain && it.2 == platform && it.3 == stamp
+        };
+        if let Some((.., asked)) = self.stamped.lock().iter().find(same) {
             return Ok(Arc::clone(asked));
         }
-        // alloc: once per process and file content, what it asks for
-        let asked = Arc::new(read(&bytes).map_err(fail)?);
-        self.asked.lock().push((id, platform, Arc::clone(&asked)));
+        // alloc: error path
+        let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
+        let id = ContentId::of(domain, &bytes);
+        let known = self
+            .asked
+            .lock()
+            .iter()
+            .find(|it| it.0 == id && it.1 == platform)
+            .map(|it| Arc::clone(&it.2));
+        let asked = match known {
+            Some(it) => it,
+            None => {
+                // alloc: once per process and file content, what it asks for
+                let asked = Arc::new(read(&bytes).map_err(fail)?);
+                self.asked.lock().push((id, platform, Arc::clone(&asked)));
+                asked
+            }
+        };
+        // A file written while it was read has another stamp after: kept under neither.
+        if blaze_core::fs::stamp(path).is_ok_and(|after| after == stamp) && !stamp.is_unknown() {
+            let mut stamped = self.stamped.lock();
+            stamped.retain(|it| !(it.0 == path && it.1 == domain && it.2 == platform));
+            // alloc: once per file and stamp, its path
+            stamped.push((path.to_owned(), domain, platform, stamp, Arc::clone(&asked)));
+        }
         Ok(asked)
     }
 
