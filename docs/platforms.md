@@ -180,7 +180,7 @@ not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0
 ### v2 code generation on Windows (2026-11-13, branch `windows/codegen`)
 
 What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 with MSVC 14.52
-(programs in `D:\blaze-win\codegen\scratch`, not in CI):
+(local test programs, not in CI):
 
 - std, with `panic = "abort"` and `"unwind"`: thread-locals reach `_tls_index` (COFF TLS),
   std's `raw-dylib` imports (`ProcessPrng`, `NtCreateFile`) are an import library the link makes

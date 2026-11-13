@@ -35,7 +35,7 @@ per crate.
 
 ## Cost, written whole
 
-Measured (`pe::pdb::tests::a_desktop_sized_pdb`, release, adais): 400,000 functions of 10 rows
+Measured (`pe::pdb::tests::a_desktop_sized_pdb`, release, Ryzen 9 9950X3D): 400,000 functions of 10 rows
 in 2,000 files, with names as long as rustc's v0 names, take 0.30 s and make 142 MB with
 room (174 MB before Rust publics were left out). Per function that is about 350 bytes: the
 name twice (procedure, reference), the procedure, the line table with room, the hash. The desktop's rustc objects linked
