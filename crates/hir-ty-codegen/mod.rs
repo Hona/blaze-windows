@@ -2593,10 +2593,11 @@ fn compile_as<'db>(
     let built = tally.step(Step::Translate, || build(&mut cg, env, body, tracked, fill));
     // What the builder made is checked before the passes change it, and what they made of it
     // after: a bad instruction of either is this function's error, never code made from it.
+    let wasm = target.is_wasm();
     let built = built.and_then(|mut ctx| {
-        verified(&ctx.func, isa, "built")?;
+        verified(&ctx.func, isa, wasm, "built")?;
         tally.step(Step::Translate, || settle(&mut ctx, &cg))?;
-        verified(&ctx.func, isa, "settled")?;
+        verified(&ctx.func, isa, wasm, "settled")?;
         Result::Ok(ctx)
     });
     // Back to the caller before anything can return: nothing after the build reads it.
@@ -2674,15 +2675,25 @@ fn compile_as<'db>(
 /// builder `built`, or what [`settle`] `settled` it to. Its errors are the function's
 /// [`CodegenError::InvalidIr`], which its caller names the function in: no backend (the
 /// stencils, LLVM, the wasm lowering) is handed IR whose types or flow are wrong, which none of
-/// them checks and each would make code of. The flags alone, not the ISA: a wasm function's
-/// IR is made under a native ISA's settings with the target's own addresses
-/// ([`Target::frontend_config`]), which the ISA's checks of pointer types would refuse.
-/// Every build runs it, release too: on a cold debug build of regex, serde and serde_json with
-/// std (2026-11-03), its two walks of each function were 0.76 to 0.79 s of 144 to 148 s of CPU.
+/// them checks and each would make code of. A native function is checked against its ISA: the
+/// verifier refuses `get_frame_pointer` (a guarded call's exception slot on Windows,
+/// `unwind::seh`) without one, as fatal, for every such function. A `wasm` function is checked
+/// against the flags alone: its IR is made under a native ISA's settings with the target's own
+/// addresses ([`Target::frontend_config`]), which the ISA's checks of pointer types would
+/// refuse. Every build runs it, release too: on a cold debug build of regex, serde and
+/// serde_json with std (2026-11-03), its two walks of each function were 0.76 to 0.79 s of 144
+/// to 148 s of CPU.
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private
-fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) -> Result<()> {
-    let errors = backend::Tally::global()
-        .step(Step::Verify, || cranelift_codegen::verify_function(func, isa.flags()));
+fn verified(
+    func: &ir::Function,
+    isa: &dyn isa::TargetIsa,
+    wasm: bool,
+    stage: &'static str,
+) -> Result<()> {
+    let errors = backend::Tally::global().step(Step::Verify, || match wasm {
+        true => cranelift_codegen::verify_function(func, isa.flags()),
+        false => cranelift_codegen::verify_function(func, isa),
+    });
     let Err(errors) = errors else { return Ok(()) };
     // alloc: the error's message
     let refused: Vec<&cranelift_codegen::verifier::VerifierError> =
@@ -17370,11 +17381,38 @@ mod tests {
         builder.call_memcpy(ill, to, from, bytes);
         builder.ins().return_(&[]);
         builder.finalize(target.frontend_config(isa));
-        let error = super::verified(&func, isa, "built").expect_err("ill-typed IR verified");
+        let error = super::verified(&func, isa, true, "built").expect_err("ill-typed IR verified");
         let super::CodegenError::InvalidIr { stage, ref errors } = error else { panic!("{error}") };
         assert_eq!(stage, "built");
         assert!(errors.contains("call"), "{errors}");
         assert!(error.to_string().contains("Cranelift's verifier refuses (as built)"), "{error}");
+    }
+
+    /// A native function's `get_frame_pointer` (a guarded call's exception slot on Windows) is
+    /// verified against its ISA, which keeps frame pointers: every function of std with a
+    /// guarded call was refused, `get_frame_pointer`/`get_return_address` require an ISA!, when
+    /// only the flags were given. Control: the flags alone, as a wasm function is checked,
+    /// still refuse it.
+    #[test]
+    fn a_native_functions_frame_pointer_is_verified_against_its_isa() {
+        let target = super::Target::of("x86_64-pc-windows-msvc").unwrap();
+        let isa = &**super::isa_for(target).unwrap();
+        let config = target.frontend_config(isa);
+        let pointer = config.pointer_type();
+        let mut sig = ir::Signature::new(config.default_call_conv);
+        sig.returns.push(AbiParam::new(pointer));
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let frame = builder.ins().get_frame_pointer(pointer);
+        builder.ins().return_(&[frame]);
+        builder.finalize(config);
+        super::verified(&func, isa, false, "built").expect("a native frame pointer verifies");
+        let error = super::verified(&func, isa, true, "built").expect_err("the flags alone");
+        assert!(error.to_string().contains("require an ISA"), "{error}");
     }
 
     /// One of more than 128 bytes stays a call, of `memcpy` named in place.
