@@ -203,7 +203,9 @@ fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
     })?;
     let name = &wide_to[..wide_to.len() - 1];
     let bytes = std::mem::size_of_val(name);
-    let size = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + bytes).max(size_of::<FILE_RENAME_INFO>());
+    // SetFileInformationByHandle resolves the DOS path as a NUL-terminated string even
+    // though FileNameLength excludes the terminator. Keep it *in* the allocated request.
+    let size = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + bytes + size_of::<u16>()).max(size_of::<FILE_RENAME_INFO>());
     let size = u32::try_from(size).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename target exceeds 4 GiB"))?;
     // alloc: the kernel's variable-length rename request; usize alignment covers its handle.
     let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
