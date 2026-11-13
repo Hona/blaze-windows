@@ -19,8 +19,8 @@ use windows_sys::Win32::{
         FILE_ID_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo,
         FileIdInfo,
         GetFileAttributesW, GetFileInformationByHandleEx, GetFileSizeEx,
-        GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
+        GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, DELETE, FILE_RENAME_INFO,
+        FileRenameInfoEx, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
         SetFileAttributesW, SetFileInformationByHandle, SetFileTime,
     },
     System::{
@@ -134,16 +134,16 @@ pub(super) fn size(handle: HANDLE) -> io::Result<u64> {
 }
 
 fn moved(from: &Path, to: &Path) -> io::Result<()> {
-    let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
-    // SAFETY: two NUL-terminated paths. Write-through: it returns once the new name is on
-    // the disk, which a directory's sync is on Unix.
-    sys::check(unsafe {
-        MoveFileExW(
-            wide_from.as_ptr(),
-            wide_to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    })
+    moved_unsynced(from, to)?;
+    fn parent(p: &Path) -> &Path {
+        p.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+    }
+    // durable: the new name, and the removal of the old one on a cross-directory move.
+    crate::fs::sync_dir(parent(to))?;
+    if parent(from) != parent(to) {
+        crate::fs::sync_dir(parent(from))?;
+    }
+    Ok(())
 }
 
 /// `bytes` as the whole of `path`: a temporary file next to it, written and flushed, moved
@@ -169,9 +169,27 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// system's cache when it returns, not yet on the disk.
 fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
     let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
-    // SAFETY: two NUL-terminated paths.
+    // Replace the name, never the backing data of a mapped pack or image. MoveFileExW
+    // can return success but leave an older view faulting zero pages under memory pressure.
+    // SAFETY: a NUL-terminated source; open the name itself, including a directory or link.
+    let file = sys::owned(unsafe {
+        CreateFileW(wide_from.as_ptr(), DELETE, SHARE_ALL, std::ptr::null(), OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
+    })?;
+    let name = &wide_to[..wide_to.len() - 1];
+    let bytes = std::mem::size_of_val(name);
+    let size = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + bytes).max(size_of::<FILE_RENAME_INFO>());
+    let size = u32::try_from(size).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename target exceeds 4 GiB"))?;
+    // alloc: the kernel's variable-length rename request; usize alignment covers its handle.
+    let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the buffer has room and alignment for the fixed header and every name unit.
+    // RootDirectory is null (absolute path). FileRenameInfoEx takes Flags, not ReplaceIfExists.
     sys::check(unsafe {
-        MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), MOVEFILE_REPLACE_EXISTING)
+        (*info).Anonymous.Flags = 1 | 2; // FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+        (*info).FileNameLength = bytes as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast(), name.len());
+        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
     })
 }
 
