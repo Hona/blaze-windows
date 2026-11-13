@@ -294,3 +294,48 @@ fn a_join_forgets_the_implications_of_values_gone() {
     assert!(few > 0, "the shape makes no implications to forget");
     assert_eq!(few, many, "the implications grew with the joins: {few} for 2, {many} for 24");
 }
+
+/// A `match` of `arms` arms, each through `Option::and_then` and a `let .. else`, and a
+/// `bool` read past it: the shape of rune's `dispatch_action`.
+fn dispatch_source(arms: usize) -> String {
+    let mut variants = String::new();
+    let mut fields = String::new();
+    let mut body = String::new();
+    for i in 0..arms {
+        variants += &format!("A{i}(P, bool), ");
+        fields += &format!("h{i}: Option<fn(u32) -> bool>, ");
+        body += &format!(
+            "Action::A{i}(p, b) => {{ let Some(f) = node(s, p.0).and_then(|n| n.h{i}) else {{ return false }}; let k = p.0; if b {{ s.held = {i}; s.keep = Some(p); }} f(k) }}\n"
+        );
+    }
+    format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub enum Action {{ {variants} }}\n\
+         pub struct Node {{ {fields} }}\n\
+         pub struct P(u32);\nimpl Drop for P {{ fn drop(&mut self) {{}} }}\npub struct S {{ nodes: Option<Node>, held: u32, keep: Option<P> }}\n\
+         
+         fn node(s: &S, p: u32) -> Option<&Node> {{ if p == 0 {{ None }} else {{ match &s.nodes {{ Some(n) => Some(n), None => None }} }} }}\n\
+         pub fn probe(s: &mut S, a: Action) -> bool {{\n\
+         let repeat = match a {{ Action::A1(..) => true, _ => false }};\n\
+         let ran = match a {{\n{body}}};\n\
+         ran && !repeat\n}}\n"
+    )
+}
+
+/// The invariant: a body with no loop has each block it reaches walked once, every path into
+/// it walked first. rune's `dispatch_action` (2057 blocks) took over 10,000 walks breadth-first
+/// and hours to prove (INTEGRATION I49).
+#[test]
+fn a_body_with_no_loop_walks_each_block_once() {
+    let source = dispatch_source(24);
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers").basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
+    });
+}

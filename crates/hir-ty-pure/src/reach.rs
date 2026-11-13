@@ -607,6 +607,9 @@ thread_local! {
     /// The most implications a joined state of this thread's proofs held, for the test that a
     /// join forgets those of values gone (`tests/reach_oracle.rs`).
     pub(crate) static MOST_IMPLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread's proofs walked a block, for the test that a body with no
+    /// loop has each block walked once (`tests/reach_oracle.rs`).
+    pub(crate) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The widest range a term's value is kept in.
@@ -2207,6 +2210,49 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// The entry state of every block at the fixed point, none for a block no feasible path
     /// reaches; or none when the walk did not settle within its budget.
+    /// Each block's place in a reverse postorder of the blocks reached from `start` (the blocks
+    /// it does not reach come after, in their order): a block comes after every block that
+    /// leads to it but along a back edge.
+    fn reverse_postorder(&self, start: usize) -> Vec<u32> {
+        let count = self.blocks.len();
+        let successors = |block: usize| -> Vec<usize> {
+            match &self.blocks[block].terminator {
+                // alloc: one block's successors, a few
+                Some(terminator) => terminator.kind.all_successors().map(index).collect(),
+                None => Vec::new(), // alloc: none, empty
+            }
+        };
+        let mut seen = vec![false; count]; // alloc: once per proof
+        let mut post = Vec::with_capacity(count); // alloc: once per proof
+        // alloc: the depth-first walk's stack, once per proof
+        let mut stack: Vec<(usize, Vec<usize>)> = vec![(start, successors(start))];
+        seen[start] = true;
+        while let Some((block, next)) = stack.last_mut() {
+            match next.pop() {
+                Some(to) if !seen[to] => {
+                    seen[to] = true;
+                    let more = successors(to);
+                    stack.push((to, more));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(*block);
+                    stack.pop();
+                }
+            }
+        }
+        let mut order = vec![u32::MAX; count]; // alloc: once per proof
+        for (at, &block) in post.iter().rev().enumerate() {
+            order[block] = at as u32;
+        }
+        let mut after = post.len() as u32;
+        for place in order.iter_mut().filter(|it| **it == u32::MAX) {
+            *place = after;
+            after += 1;
+        }
+        order
+    }
+
     fn solve(&mut self) -> Option<Vec<Option<State>>> {
         let count = self.blocks.len();
         let start = index(self.body.start_block);
@@ -2215,12 +2261,16 @@ impl<'a, 'db> Solver<'a, 'db> {
         let mut edges: Vec<Vec<(u32, State)>> = vec![Vec::new(); count];
         let mut grown = vec![0usize; count]; // alloc: once per proof
         let mut queued = vec![false; count]; // alloc: once per proof
-        let mut queue = std::collections::VecDeque::new(); // alloc: the worklist, once per proof
+        // The worklist takes blocks in reverse postorder, so a block whose paths in have all been
+        // walked is walked once, not again for each of them that comes later: breadth-first,
+        // rune's `dispatch_action` (2057 blocks) took over 10,000 walks.
+        let order = self.reverse_postorder(start);
+        let mut queue = std::collections::BinaryHeap::new(); // alloc: the worklist, once per proof
         let entry = self.entry();
-        queue.push_back(start);
+        queue.push(std::cmp::Reverse((order[start], start)));
         queued[start] = true;
         let mut budget = count * 8 + 64;
-        while let Some(block) = queue.pop_front() {
+        while let Some(std::cmp::Reverse((_, block))) = queue.pop() {
             queued[block] = false;
             if budget == 0 {
                 return None;
@@ -2247,6 +2297,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                 continue;
             }
             entries[block] = joined.clone(); // clone: kept as the block's entry, walked below
+            #[cfg(test)]
+            WALKS.set(WALKS.get() + 1);
             let out = match joined {
                 Some(mut state) => self.transfer(block as u32, &mut state).edges,
                 None => Vec::new(),
@@ -2263,7 +2315,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 for target in targets {
                     if !queued[target as usize] {
                         queued[target as usize] = true;
-                        queue.push_back(target as usize);
+                        queue.push(std::cmp::Reverse((order[target as usize], target as usize)));
                     }
                 }
             }
