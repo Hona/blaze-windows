@@ -1723,7 +1723,8 @@ pub(crate) struct LinkMade {
 /// `split-debuginfo`: beside the image unless the profile says `off`, which puts it inside as
 /// before. `packed` and `unpacked` are both the one side file blaze writes (it has no
 /// per-crate objects to leave debug info in). An image with no debug info has none either
-/// way, and a format blaze writes no side file for (PE, wasm) keeps what it had.
+/// way. A PE image's is its PDB, beside it whatever the profile says; wasm, for which blaze
+/// writes no side file, keeps what it had.
 pub(crate) fn debug_place(
     debug: blaze_link::Debug,
     format: blaze_link::Format,
@@ -1732,6 +1733,9 @@ pub(crate) fn debug_place(
     use blaze_link::{Debug, Format};
     match (debug, split) {
         (Debug::None, _) => Ok(Debug::None),
+        // A PE image's debug info is its PDB, beside it, whatever the profile says: Windows'
+        // debuggers read none inside it.
+        (_, None | Some("off" | "packed" | "unpacked")) if format == Format::Pe => Ok(Debug::Beside),
         (_, Some("off")) => Ok(Debug::Lines),
         (_, None | Some("packed" | "unpacked")) => Ok(match format {
             Format::Elf | Format::MachO => Debug::Beside,
