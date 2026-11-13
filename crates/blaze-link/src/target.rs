@@ -53,6 +53,7 @@
 
 #[cfg(test)]
 mod tests;
+mod coff_requests;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -131,7 +132,14 @@ const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch
                       wasm64-blaze-wasip1";
 
 /// The process's answers of the machine's toolchains.
-static CACHE: Cache = Cache::new();
+static CACHE: Cache<'static> = Cache::new();
+
+/// Bind COFF request records to the daemon's verified store and the code identity covering
+/// its linker. Standalone links need no store. No records are opened until a link asks.
+pub fn keep_coff_requests(store: &'static blaze_cas::Handle, producer: ContentId) -> Result<(), String> {
+    CACHE.records.set(coff_requests::Records { store, producer })
+        .map_err(|_| "the linker's COFF request store was already installed".into())
+}
 
 /// How `triple` links: an executable, or the shared library `shared` names (its file name and
 /// exports) for a `cdylib` or proc macro. `incremental` keeps room to grow in the image, where
@@ -525,7 +533,7 @@ fn locate_with<A: Ask>(
 /// link makes ([`crate::pe::raw_dylib`]) and puts where the DLL is first named. Only PE has
 /// DLLs; the front end refuses a `raw-dylib` for another target, and so does this.
 fn raw_dylib(
-    line: &mut Line<'_>,
+    line: &mut Line<'_, '_>,
     dlls: &mut Vec<(usize, crate::pe::raw_dylib::Dll)>,
     lib: &NativeLib,
 ) -> Result<(), LinkError> {
@@ -981,7 +989,8 @@ type Asked = Arc<Vec<(String, String)>>;
 
 /// The toolchains found, by what each was found from, and what the PE archives read for their
 /// default libraries ask for, by their bytes: a few of each per process, searched in order.
-pub(crate) struct Cache {
+pub(crate) struct Cache<'a> {
+    records: std::sync::OnceLock<coff_requests::Records<'a>>,
     found: Lock<Vec<(Key, Arc<Found>)>>,
     asked: Lock<Vec<(ContentId, u32, Asked)>>,
     /// What each file was read as, by its path, domain, platform and the stamp it had then: a
@@ -991,10 +1000,11 @@ pub(crate) struct Cache {
     stamped: Lock<Vec<(PathBuf, &'static str, u32, Stamp, Asked)>>,
 }
 
-impl Cache {
-    pub(crate) const fn new() -> Cache {
+impl Cache<'_> {
+    pub(crate) const fn new() -> Self {
         // alloc: none, an empty `Vec` holds no buffer
         Cache {
+            records: std::sync::OnceLock::new(),
             found: Lock::new("link.toolchain.found", Vec::new()),
             asked: Lock::new("link.toolchain.asked", Vec::new()),
             stamped: Lock::new("link.toolchain.stamped", Vec::new()),
@@ -1015,9 +1025,15 @@ impl Cache {
             (Format::MachO, _) => AUTOLINKED_AARCH64,
             _ => ASKED,
         };
-        self.read(path, name, (domain, 0), |bytes| match format {
+        self.read(path, name, (domain, 0), |id, bytes| match format {
             Format::MachO => crate::macho::asked_libraries(name, bytes, arch),
-            _ => crate::pe::asked_libraries(name, bytes),
+            _ => {
+                let parse = || crate::pe::asked_libraries(name, bytes);
+                match self.records.get() {
+                    Some(records) => records.requests(name, id, parse),
+                    None => parse(),
+                }
+            }
         })
     }
 
@@ -1035,7 +1051,7 @@ impl Cache {
             Arch::X86_64 => REEXPORTED_X86_64,
             _ => REEXPORTED_AARCH64,
         };
-        self.read(path, name, (domain, platform), |bytes| {
+        self.read(path, name, (domain, platform), |_, bytes| {
             let installs = crate::macho::reexported(name, bytes, arch, platform)?;
             // alloc: once per process and library content, its re-exports
             Ok(installs.into_iter().map(|it| (String::new(), it)).collect())
@@ -1049,7 +1065,7 @@ impl Cache {
         path: &Path,
         name: &str,
         (domain, platform): (&'static str, u32),
-        read: impl FnOnce(&[u8]) -> Result<Vec<(String, String)>, String>,
+        read: impl FnOnce(ContentId, &[u8]) -> Result<Vec<(String, String)>, String>,
     ) -> Result<Asked, LinkError> {
         // alloc: error path
         let stamp = blaze_core::fs::stamp(path).map_err(|error| fail(format!("{name}: {error}")))?;
@@ -1072,7 +1088,7 @@ impl Cache {
             Some(it) => it,
             None => {
                 // alloc: once per process and file content, what it asks for
-                let asked = Arc::new(read(&bytes).map_err(fail)?);
+                let asked = Arc::new(read(id, &bytes).map_err(fail)?);
                 self.asked.lock().push((id, platform, Arc::clone(&asked)));
                 asked
             }
@@ -1658,8 +1674,8 @@ fn wasi(key: &Key) -> Result<Found, LinkError> {
 }
 
 /// A link line as it is found.
-struct Line<'a> {
-    cache: &'a Cache,
+struct Line<'a, 'store> {
+    cache: &'a Cache<'store>,
     output: &'a Output,
     search: &'a [PathBuf],
     found: &'a Found,
@@ -1691,7 +1707,7 @@ fn listing(dir: &Path) -> Option<Listing> {
     Some(names)
 }
 
-impl Line<'_> {
+impl Line<'_, '_> {
     /// Where a library is searched for, and what named each directory: `own`, the directories
     /// of the compile of the crate that names it ([`CrateLibs::search`]), then the link's, then
     /// those the C driver passes its linker, then the toolchain's.
