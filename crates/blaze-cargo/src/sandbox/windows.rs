@@ -1957,7 +1957,7 @@ mod tests {
     /// A process that runs for a minute unless it is ended, put in `job`.
     fn in_job(job: &Handle) -> std::process::Child {
         use std::os::windows::io::AsRawHandle as _;
-        let child = std::process::Command::new("ping")
+        let child = blaze_core::platform::command::command("ping", &std::env::temp_dir())
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -1984,7 +1984,7 @@ mod tests {
         use std::os::windows::io::AsRawHandle as _;
         let job = job().unwrap();
         // A second in, once it is in the job, it starts a ping that runs on after it ends.
-        let mut parent = std::process::Command::new("cmd")
+        let mut parent = blaze_core::platform::command::command("cmd", &std::env::temp_dir())
             .args(["/c", "ping -n 2 127.0.0.1 >nul & start /b ping -n 60 127.0.0.1 >nul"])
             .stdout(std::process::Stdio::null())
             .spawn()

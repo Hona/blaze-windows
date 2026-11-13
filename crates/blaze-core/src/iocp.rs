@@ -2981,7 +2981,7 @@ mod tests {
     /// could not join the job.
     fn hold(job: &OwnedHandle) -> i32 {
         let could_not = crate::exit::Exit::CouldNot.code();
-        let ping = std::process::Command::new(system().join("PING.EXE"))
+        let ping = crate::platform::command::command(system().join("PING.EXE"), &system())
             .args(["-n", "60", "127.0.0.1"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -3606,7 +3606,7 @@ mod tests {
         std::fs::create_dir_all(root.join("a/d")).unwrap();
         std::fs::write(root.join("a/f"), b"hello").unwrap();
         // A junction needs no privilege; a symbolic link needs developer mode or elevation.
-        let made = std::process::Command::new(system().join("cmd.exe"))
+        let made = crate::platform::command::command(system().join("cmd.exe"), &system())
             .args(["/d", "/c", "mklink", "/J"])
             .arg(root.join("a").join("j"))
             .arg(root.join("a").join("d"))

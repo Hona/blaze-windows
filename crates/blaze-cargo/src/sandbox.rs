@@ -1096,7 +1096,8 @@ fn probed(kind: Probe) -> Result<(), String> {
                 Probe::Overlays => Some("--overlays"),
                 Probe::V2 => Some("--v2"),
             };
-            let out = std::process::Command::new(exe)
+            let dir = exe.parent().ok_or("blaze's executable has no parent directory")?;
+            let out = blaze_core::platform::command::command(&exe, dir)
                 .args([COMMAND, "--probe"])
                 .args(flag)
                 .stdin(std::process::Stdio::null())

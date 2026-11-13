@@ -109,8 +109,9 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
 
 /// The browser asked to open `link`: `open` on macOS, `xdg-open` elsewhere.
 fn open(link: &str) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let status = std::process::Command::new(program)
+    let program = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let cwd = std::env::current_dir().map_err(|why| format!("opening the link: {why}"))?;
+    let status = blaze_core::platform::command::command(program, &cwd)
         .arg(link)
         .status()
         .map_err(|error| format!("running `{program}`: {error}"))?;
