@@ -89,8 +89,19 @@ pub fn build_dir(builds: &Path, workspace_root: &Path) -> PathBuf {
     let kept = |it: char| it.is_ascii_alphanumeric() || matches!(it, '-' | '_' | '.');
     let name: String = name.chars().map(|it| if kept(it) { it } else { '_' }).collect();
     match name.is_empty() {
-        true => builds.join(&id[..ID_DIGITS]),
-        false => builds.join(format!("{name}-{}", &id[..ID_DIGITS])),
+        true => joined(builds, &id[..ID_DIGITS]),
+        false => joined(builds, &format!("{name}-{}", &id[..ID_DIGITS])),
+    }
+}
+
+/// `base` joined with one part. A `/`-rooted base (the daemon's name, `/C:/a` on Windows) stays
+/// `/`-separated: `Path::join` would put a `\` in it on Windows.
+fn joined(base: &Path, part: &str) -> PathBuf {
+    match base.to_str() {
+        Some(text) if text.starts_with('/') => {
+            PathBuf::from(format!("{}/{part}", text.trim_end_matches('/')))
+        }
+        _ => base.join(part),
     }
 }
 

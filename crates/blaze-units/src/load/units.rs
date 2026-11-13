@@ -291,7 +291,9 @@ pub(crate) fn units(
         (Some(dir), _) => PathBuf::from(dir),
         (None, Some(dir)) => dir.to_path_buf(),
         (None, None) if spec.foreign.is_some() => PathBuf::from(FOREIGN_TARGET),
-        (None, None) if Path::new(&spec.builds).is_absolute() => {
+        // `has_root`, as for `spec.std` below: on Windows the daemon names `D:\a` as `/D:/a`,
+        // which has no prefix and so is not `is_absolute`.
+        (None, None) if Path::new(&spec.builds).has_root() => {
             blaze_manifest::home::build_dir(Path::new(&spec.builds), ws.root())
         }
         (None, None) => {
