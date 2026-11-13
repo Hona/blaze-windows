@@ -159,6 +159,8 @@ pub fn output(
 /// (the link arguments').
 #[derive(Clone, Copy, Debug)]
 pub struct CrateLibs<'a> {
+    /// The crate whose compile supplied these libraries (the final crate for link arguments).
+    pub name: &'a str,
     pub libs: &'a [NativeLib],
     pub search: &'a [PathBuf],
 }
@@ -460,7 +462,7 @@ fn locate_with<A: Ask>(
     // Each DLL `raw-dylib`s name, and where its import library goes on the line: the place of
     // the first to name it.
     let mut dlls: Vec<(usize, crate::pe::raw_dylib::Dll)> = Vec::new();
-    for CrateLibs { libs, search: own } in libs {
+    for CrateLibs { libs, search: own, .. } in libs {
         for lib in *libs {
             if lib.kind == NativeLibKind::RawDylib {
                 raw_dylib(&mut line, &mut dlls, lib)?;
@@ -568,7 +570,7 @@ fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError>
         true => (VC_DYNAMIC, "the static one (`-C target-feature=+crt-static`)"),
         false => (VC_STATIC, "the dynamic one (no `-C target-feature=+crt-static`)"),
     };
-    for lib in libs.iter().flat_map(|it| it.libs) {
+    for (krate, lib) in libs.iter().flat_map(|it| it.libs.iter().map(|lib| (it.name, lib))) {
         let asked = match lib.verbatim {
             true => crate::pe::verbatim_option(&lib.name).and_then(Result::ok),
             false => None,
@@ -585,7 +587,7 @@ fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError>
             return Err(fail(
                 // alloc: error path
                 format!(
-                    "a crate links the VC runtime library `{}`, and the image's VC runtime is {flag}: \
+                    "crate `{krate}` links the VC runtime library `{}`, and the image's VC runtime is {flag}: \
                      the crate was compiled for the other C runtime (link.exe: LNK2038)",
                     lib.name
                 ),

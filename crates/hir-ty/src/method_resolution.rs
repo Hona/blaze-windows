@@ -1013,11 +1013,9 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
         // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate`
         // writes nothing its files do not, nor does a built-in macro but `include!`, whose
         // files are above.
-        'modules: for (_, module) in def_map.modules(db) {
-            for call in module.scope(db).all_macro_calls() {
-                if unnamed.is_empty() {
-                    break 'modules;
-                }
+        let scan_scope = |unnamed: &mut Vec<_, &Frame>, scope: &ItemScope| {
+            for call in scope.all_macro_calls() {
+                if unnamed.is_empty() { break; }
                 let def = call.loc(db).def;
                 if def.krate == krate
                     || !matches!(
@@ -1028,7 +1026,25 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
                 {
                     continue;
                 }
-                named_in(&mut unnamed, call.parse_macro_expansion(db).value.0.root());
+                named_in(unnamed, call.parse_macro_expansion(db).value.0.root());
+            }
+        };
+        for (_, module) in def_map.modules(db) {
+            if unnamed.is_empty() { break; }
+            scan_scope(&mut unnamed, module.scope(db));
+        }
+        // A macro can emit an impl inside an item-bearing block, as ICU's baked
+        // providers do inside `const _: () = { ... }`. Its method bodies are in
+        // the expansion, not the crate's source files or its module-level scopes.
+        for (_, module) in def_map.modules(db) {
+            if unnamed.is_empty() { break; }
+            for owner in impl_holders(db, frame, krate, module.scope(db)) {
+                if unnamed.is_empty() { break; }
+                for (_, block_map) in Body::of(db, owner).blocks(db) {
+                    for (_, inner) in block_map.modules(db) {
+                        scan_scope(&mut unnamed, inner.scope(db));
+                    }
+                }
             }
         }
         let mut loaded = crate::frame_set(frame);

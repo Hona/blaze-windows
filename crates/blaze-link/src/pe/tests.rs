@@ -185,7 +185,10 @@ impl Fixture {
         let symbol = |name: &str| symbols.iter().find(|it| it.0 == name).map(|it| it.1);
         then(&Placed {
             output: &self.pe.output,
-            name: "app.exe",
+            name: match &self.pe.output.kind {
+                OutputKind::Shared { name, .. } => name,
+                _ => "app.exe",
+            },
             plan: &self.plan,
             regions: &self.regions,
             contents: &contents,
@@ -528,6 +531,7 @@ fn dll_exports_sorted_by_name() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
     assert_ne!(header.characteristics.get(LE).0 & pe::IMAGE_FILE_DLL.0, 0);
+    assert_eq!(file.pdb_info().unwrap().unwrap().path(), b"lib.dll.pdb");
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.image_base(), 0x1_8000_0000);
     assert_eq!(optional.address_of_entry_point(), 0);
@@ -567,7 +571,7 @@ fn dll_exports_sorted_by_name() {
     assert_eq!(by_name, ["alpha", "mid", "zeta"]);
     let directory = table.directory();
     let name = table.name_from_pointer(directory.name.get(LE)).unwrap();
-    assert_eq!(name, b"app.exe");
+    assert_eq!(name, b"lib.dll");
 }
 
 #[test]
@@ -854,7 +858,8 @@ fn encoders() {
     assert!(alignment(16384).is_err());
 
     assert_eq!(pdb_stem("app.exe"), "app");
-    assert_eq!(pdb_stem("lib.v2.dll"), "lib.v2");
+    assert_eq!(pdb_stem("lib.v2.dll"), "lib.v2.dll");
+    assert_eq!(pdb_stem("app.DLL"), "app.DLL");
     assert_eq!(pdb_stem("tool"), "tool");
     assert_eq!(pdb_stem(".hidden"), ".hidden");
 

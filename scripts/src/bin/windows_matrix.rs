@@ -44,6 +44,12 @@ struct Matrix {
     /// A `cargo vendor --locked --versioned-dirs` tree. Prepared outside all timers. Both
     /// tools see the same checkout-relative directory source; never overwrite project config.
     vendor: Option<PathBuf>,
+    /// Cargo's emitted source tables, including pinned git sources, using `bench-vendor`
+    /// as their directory. Existing workspace tables are kept; conflicting sources fail.
+    vendor_config: Option<String>,
+    /// Explicit daemon configuration such as the desktop build script's link directories.
+    /// The same settings are used at every trial; they are included in the result manifest.
+    blaze_config: Option<String>,
     volumes: Vec<PathBuf>,
     out: PathBuf,
     runs: u32,
@@ -277,6 +283,24 @@ fn changed(text: &str, edit: &Edit, tick: u32) -> Result<String> {
     Ok(text.replacen(&edit.before, &after, 1))
 }
 
+fn vendor_config(existing: &str, overlay: &str) -> Result<String> {
+    let base: toml::Table = existing.parse()?;
+    let extra: toml::Table = overlay.parse()?;
+    if extra.len() != 1 || !extra.get("source").is_some_and(toml::Value::is_table) {
+        return Err("vendor_config must contain only cargo vendor's source tables".into());
+    }
+    // Append instead of reserializing project settings. Parse the result to detect a
+    // duplicate source table rather than silently replacing an existing registry setup.
+    let result = format!("{existing}\n{overlay}\n");
+    let merged: toml::Table = result.parse()?;
+    for (key, value) in base {
+        if key != "source" && merged.get(&key) != Some(&value) {
+            return Err(format!("vendor override changed {key}").into());
+        }
+    }
+    Ok(result)
+}
+
 fn trial(
     m: &Matrix,
     volume: &Path,
@@ -303,6 +327,11 @@ fn trial(
                 if let Some(src) = &m.sources {
                     seed(src, &s.root.join("home/sources"))?;
                 }
+                if let Some(config) = &m.blaze_config {
+                    fs::create_dir_all(s.root.join("home"))?;
+                    fs::File::create_new(s.root.join("home/config.toml"))?
+                        .write_all(config.as_bytes())?;
+                }
             }
             output(
                 Command::new("git")
@@ -317,11 +346,23 @@ fn trial(
                 seed(vendor, &dir)?;
                 let cargo = s.project().join(".cargo");
                 fs::create_dir_all(&cargo)?;
-                if cargo.join("config").exists() {
-                    return Err("cannot stage a vendor override over .cargo/config".into());
+                if !cargo.canonicalize()?.starts_with(s.project().canonicalize()?) {
+                    return Err(".cargo points outside the trial checkout".into());
                 }
-                let mut config = fs::File::create_new(cargo.join("config.toml"))?;
-                config.write_all(b"[source.crates-io]\nreplace-with = 'bench-vendor'\n[source.bench-vendor]\ndirectory = 'bench-vendor'\n")?;
+                let file = if cargo.join("config").exists() {
+                    cargo.join("config")
+                } else {
+                    cargo.join("config.toml")
+                };
+                let before = if file.try_exists()? {
+                    edit_path(&s.project(), &file)?;
+                    fs::read_to_string(&file)?
+                } else {
+                    String::new()
+                };
+                let overlay=m.vendor_config.as_deref().unwrap_or("[source.crates-io]\nreplace-with = 'bench-vendor'\n[source.bench-vendor]\ndirectory = 'bench-vendor'");
+                let config = vendor_config(&before, overlay)?;
+                fs::write(file, config)?;
             }
         }
         for (k, &(kind, verb)) in CASES.iter().enumerate() {
@@ -409,6 +450,9 @@ fn main() -> Result<()> {
     let [arg] = &args[..] else { return Err("windows_matrix: one JSON input".into()) };
     let value = blaze_script::input::read(arg).map_err(|e| e.0)?;
     let m: Matrix = serde_json::from_value(value.clone())?;
+    if m.vendor_config.is_some() && m.vendor.is_none() {
+        return Err("vendor_config requires a vendor directory".into());
+    }
     if m.runs == 0
         || m.runs > 1000
         || m.volumes.is_empty()
@@ -444,6 +488,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vendoring_keeps_existing_target_flags_and_refuses_source_collisions() {
+        let base = "[target.x86_64-pc-windows-msvc]\nrustflags=['-Ctarget-feature=+crt-static']";
+        let added = "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='bench-vendor'";
+        let config = vendor_config(base, added).unwrap();
+        assert!(config.starts_with(base));
+        assert!(vendor_config(&config, added).is_err());
+        assert!(vendor_config(base, "[build]\njobs=1").is_err());
+    }
     #[test]
     fn percentiles_and_exact_edits() {
         assert_eq!(

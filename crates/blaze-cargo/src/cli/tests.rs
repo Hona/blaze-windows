@@ -602,6 +602,7 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
     let table: &[&[&str]] = &[
         &["build"],
         &["check", "-p", "opencode-desktop"],
+        &["check", "--locked", "-p", "opencode-desktop"],
         &["build", "--package", "rune", "-p", "rune-kit"],
         &["b"],
         &["build", "-q"],

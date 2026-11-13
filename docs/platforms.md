@@ -170,7 +170,8 @@ not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0
 - rustc's own link line for rune-desktop (258 objects, 387 rlibs, its C libraries, 13
   `/DELAYLOAD`s, its `.res`) links with blaze-link (`examples/pe_relink.rs`), and the program
   renders frames byte for byte the same as link.exe's image does.
-- The image's PDB is written beside it ([v2/plan/design/pdb.md](v2/plan/design/pdb.md)):
+- The image's PDB is written beside it (`app.pdb` for `app.exe`, `app.dll.pdb` for `app.dll`,
+  so the two can share a directory; [v2/plan/design/pdb.md](v2/plan/design/pdb.md)):
   dbghelp (std's backtrace) names Rust functions and their lines and C functions by name, cdb
   breaks on a Rust function by name. It has no types or locals, and is written whole by each
   link.
@@ -195,9 +196,10 @@ What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 wi
   pad that catches claims an exception in the search pass; cleanup pads run in the unwind pass.
 - Thread-local destructors, threads, `i128`, C varargs (`snprintf` from
   `legacy_stdio_definitions`, as under rustc), a 64 KiB frame (stack probes), SSE intrinsics.
-- Not done: a structured exception that is not a C++ one (an access violation) and a C++
-  `throw;` rethrow run no Rust cleanup pad; a Rust panic out of an `extern "C"` function with
-  no catcher above ends as an unhandled exception, not the "cannot unwind" abort.
+- A Rust panic escaping an `extern "C"` boundary terminates with `panic in a function that
+  cannot unwind`, including when no handler exists above the boundary. A non-C++ structured
+  exception caught above a Rust `extern "C-unwind"` frame runs no Rust drop, as on the pinned
+  MSVC Rust toolchain. Cleanup through a C++ `throw;` rethrow remains unverified.
 
 ### v2 output placement on Windows
 

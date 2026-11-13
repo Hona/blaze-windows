@@ -114,19 +114,19 @@ pub(crate) fn wasm_macro(job: &Job, unit: usize) -> bool {
 /// whose roots are its glue's exports, kept by name as a `cdylib`'s are; a proc macro built for
 /// the host is no build's (every build plans wasm macros, and [`super::compile`]'s `macros`
 /// refuses one), so asking for its roots is an error naming it.
-fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String> {
+fn root_kind(mode: Mode, name: &str, makes: &Makes, wasm: bool, harness: bool) -> Result<RootKind, String> {
     Ok(match makes {
         // A doctest's programs as tests: a `test_harness` example's crate has `cfg(test)` and
         // its harness, as rustdoc's `--test` builds it; any other program's roots are its
         // `main`, as a test crate's without `cfg(test)` are.
-        Makes::Executable if matches!(unit.mode, Mode::Test | Mode::Doctest) => RootKind::Test,
+        Makes::Executable if mode == Mode::Doctest || (mode == Mode::Test && harness) => RootKind::Test,
         Makes::Executable => RootKind::Executable,
         Makes::Shared { proc_macro: true } if wasm => RootKind::Shared,
         Makes::Shared { proc_macro: true } => {
             return Err(format!(
                 "proc macro `{}` is built for the host, not as a wasm module, yet its codegen was asked for: \
                  a build runs proc macros only as wasm32-wasip1 modules",
-                unit.target.name
+                name
             ));
         }
         Makes::Shared { proc_macro: false } => RootKind::Shared,
@@ -1107,6 +1107,12 @@ fn links_image(makes: &Makes, policy: &Policy) -> bool {
     policy.mode == BuildMode::Live && *makes == Makes::Executable
 }
 
+/// A published dependency's build script is an input at a fixed version, not a program
+/// edited in this workspace. Keep its requested debug info, but no space for future patches.
+fn keeps_patch_room(build_script: bool, member: bool, source: Option<&str>) -> bool {
+    !build_script || member || blaze_lower::local(source)
+}
+
 /// `krate`'s functions, built as `unit`, compiled from its roots (the unit's own crate, or one
 /// of the crates a `Doctest` unit expands into): `Err` with the code generator's errors, each
 /// naming the function it could not compile. `checks` is the unit's check running beside it:
@@ -1153,7 +1159,9 @@ pub(crate) fn generate<'db>(
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
     };
-    let roots = match frontend.roots(krate, root_kind(u, makes, wasm_macro(job, unit))?) {
+    let harness = job.plan(unit).map_err(|it| it.what)?.harness;
+    let kind = root_kind(u.mode, &u.target.name, makes, wasm_macro(job, unit), harness)?;
+    let roots = match frontend.roots(krate, kind) {
         Ok(it) => it,
         Err(error) => return Ok(Err(refused(reader, mounted.root(), vec![error]))),
     };
@@ -1565,7 +1573,7 @@ fn natives(
         if !libs.is_empty() {
             let mut search = search_dirs(&flags.search);
             search.extend(search_dirs(&compile.search));
-            crates.push(CrateNatives { libs, search });
+            crates.push(CrateNatives { unit: at, libs, search });
         }
     }
     let mut search = search_dirs(&own.search);
@@ -1685,6 +1693,7 @@ const FIRST_LIBRARY: u32 = 1 << 20;
 /// One crate's native libraries and the `-L`s its rustc is given ([`natives`]), owned for
 /// [`blaze_link::target::CrateLibs`].
 struct CrateNatives {
+    unit: u32,
     libs: Vec<NativeLib>,
     search: Vec<PathBuf>,
 }
@@ -2097,7 +2106,11 @@ fn link_at(
         // A wasm module is linked whole and never slid or patched in place, and its debug info
         // is its name section: each expansion instantiates the module afresh.
         true => blaze_link::target::reactor(blaze_link::Debug::None, false),
-        false => blaze_link::target::output(triple(job, u), shared, debug, true),
+        false => {
+            let package = job.package(u).map_err(|it| LinkCause::Given(it.what))?;
+            let incremental = keeps_patch_room(u.target.is_custom_build(), package.is_member, package.source.as_deref());
+            blaze_link::target::output(triple(job, u), shared, debug, incremental)
+        }
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
     // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
@@ -2138,9 +2151,11 @@ fn link_at(
             .map_err(linker(LinkStep::Output))?;
         search.extend(applied.search);
         // alloc: once per link, each crate's libraries as the linker takes them
-        let mut libs: Vec<CrateLibs<'_>> =
-            crates.iter().map(|it| CrateLibs { libs: &it.libs, search: &it.search }).collect();
-        libs.push(CrateLibs { libs: &applied.libs, search: &[] });
+        let name = |unit: usize| job.units().graph.units[unit].target.name.as_str();
+        let mut libs: Vec<CrateLibs<'_>> = crates.iter().map(|it| CrateLibs {
+            name: name(it.unit as usize), libs: &it.libs, search: &it.search,
+        }).collect();
+        libs.push(CrateLibs { name: name(unit), libs: &applied.libs, search: &[] });
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
         let located = {
             let _span = tracing::info_span!(target: "blaze", "link natives: locate").entered();
