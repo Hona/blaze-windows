@@ -112,6 +112,7 @@ pub fn words(words: &[OsString]) -> Route {
         program: Vec::new(), // alloc: once a command, the program's arguments
     };
     let mut rest = rest.iter();
+    let mut locked = false;
     while let Some(word) = rest.next() {
         let text = word.to_str();
         if matches!(text, Some("-p" | "--package")) {
@@ -157,6 +158,7 @@ pub fn words(words: &[OsString]) -> Route {
         let flag = match text {
             Some("-q" | "--quiet") => &mut asked.quiet,
             Some("-r" | "--release") => &mut asked.release,
+            Some("--locked") => &mut locked,
             _ => return Route::Engine(Why::Word(shown(word))),
         };
         if *flag {
@@ -202,7 +204,9 @@ pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
 
 /// Whether the variable `name` makes a command the engine's ([`env`]).
 pub fn refuses(name: &str) -> bool {
-    (name.starts_with("BLAZE_") && name != HOME)
+    // SCRIPT_READ is part of the invocation environment. Its checks and the sandbox
+    // grants stay in the daemon; the launcher neither parses it nor grants a path.
+    (name.starts_with("BLAZE_") && name != HOME && name != "BLAZE_SCRIPT_READ")
         || name == "IX_PROF"
         || name == "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"
 }
@@ -278,7 +282,7 @@ mod tests {
     #[test]
     fn blazes_own_variables_are_the_engines_to_read() {
         let names = |names: &[&str]| env(os(names).into_iter());
-        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "CARGO_TERM_COLOR", "BLAZEX"]), None);
+        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "BLAZE_SCRIPT_READ", "CARGO_TERM_COLOR", "BLAZEX"]), None);
         for name in ["BLAZE_CORES", "BLAZE_PINNED_BY", "BLAZE_IGNORE_PIN_FOR", "BLAZE_RUN_AS_DEFAULT", "BLAZE_PROFILE",
             "BLAZE_STATS", "BLAZE_UI", "BLAZE_LAUNCHED", "IX_PROF", "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"]
         {
