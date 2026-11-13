@@ -46,7 +46,10 @@ fn link_with(mut output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkErro
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
         .into_iter()
         .map(|it| {
-            let bytes: Arc<[u8]> = std::fs::read(&it.path).unwrap().into();
+            let bytes: Arc<[u8]> = match it.made {
+                Some((_, made)) => made,
+                None => std::fs::read(&it.path).unwrap().into(),
+            };
             (it.name, bytes, it.kind)
         })
         .collect();
@@ -186,6 +189,29 @@ fn a_gui_program_entered_at_main_crt_startup_runs_without_a_console() {
     let dir = scratch("gui");
     std::fs::write(dir.join("gui.exe"), &bytes).unwrap();
     assert_eq!(run(&dir.join("gui.exe"), &[]), (0, "gui without a console\n".into()));
+}
+
+/// Two `.res` files of a GUI program merged into its resources, which it reads back as the
+/// loader and the shell do (`pe_run/res.c`): the manifest's common controls 6 and per-monitor
+/// DPI, the icon, data by name and number, a string in the second file's language, the version.
+/// Without the resources it fails every check (`res.c` exits 127), as link.exe's does.
+#[test]
+fn resources_of_two_res_files_are_the_programs_and_its_manifest_is_applied() {
+    let (gui, libs) = with_args(
+        output(None, &["res.obj"]),
+        &[&fixture("app.res").to_string_lossy(), &fixture("more.res").to_string_lossy(), "/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"],
+    );
+    let bytes = link_with(gui, &libs).unwrap();
+    let dirs = directories(&bytes);
+    assert!(dirs[object::pe::IMAGE_DIRECTORY_ENTRY_RESOURCE].1 > 0, "{dirs:x?}");
+    let dir = scratch("res");
+    std::fs::write(dir.join("res.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("res.exe"), &[]), (0, "res 0\n".into()));
+
+    // The same program without them: the checks fail, so they read what the link put there.
+    let bytes = link(output(None, &["res.obj"])).unwrap();
+    std::fs::write(dir.join("bare.exe"), &bytes).unwrap();
+    assert_eq!(run(&dir.join("bare.exe"), &[]), (127, "res 127\n".into()));
 }
 
 /// The DLLs an image imports from, lowercased, in its import directory's order.

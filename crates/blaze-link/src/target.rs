@@ -106,6 +106,9 @@ const MACOS_MINIMUM: u32 = 0x000b_0000;
 /// The domain a linker script's bytes are named in for the engine's reader.
 const SCRIPT: &str = "blaze v2 link target script";
 
+/// The domain the object of a link's resources is named in ([`crate::pe::rsrc`]).
+const RESOURCES: &str = "blaze v2 link target resources";
+
 /// The domain a PE archive's bytes are named in for what its members ask for.
 const ASKED: &str = "blaze v2 link target default libraries";
 
@@ -435,6 +438,9 @@ fn locate_with<A: Ask>(
         found: &found,
         out: Vec::with_capacity(libs.iter().map(|it| it.libs.len()).sum::<usize>() + 8),
         listings: RefCell::default(),
+        // alloc: none until a `.res` is on the line
+        resources: Vec::new(),
+        resources_at: 0,
     };
     for name in target.start(&output.kind)? {
         line.object(name)?;
@@ -467,6 +473,7 @@ fn locate_with<A: Ask>(
     for input in &output.link.inputs {
         line.input(input)?;
     }
+    line.make_resources()?;
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
@@ -1592,6 +1599,10 @@ struct Line<'a> {
     out: Vec<Located>,
     /// Each search directory's entry names, read once per link ([`listing`]).
     listings: RefCell<HashMap<PathBuf, Option<Listing>, Global>>,
+    /// The `.res` files the link arguments name, each once, and where on the line the object
+    /// of their resources goes ([`Line::resource`]).
+    resources: Vec<PathBuf>,
+    resources_at: usize,
 }
 
 /// A directory's entry names, ASCII lowercased.
@@ -1662,7 +1673,10 @@ impl Line<'_> {
     fn input(&mut self, input: &Path) -> Result<(), LinkError> {
         let extension = input.extension().and_then(|it| it.to_str()).unwrap_or_default();
         let is = |it: &str| extension.eq_ignore_ascii_case(it);
-        let kind = if is("obj") || is("o") || is("res") {
+        if is("res") && self.output.format == Format::Pe {
+            return self.resource(input);
+        }
+        let kind = if is("obj") || is("o") {
             NativeKind::Object
         } else if is("lib") || is("a") {
             NativeKind::Archive { whole: false }
@@ -1687,6 +1701,61 @@ impl Line<'_> {
             ..it
         })?;
         self.push(path, kind)
+    }
+
+    /// A compiled resource file the link arguments name: its resources join the other `.res`
+    /// files', merged into one object the link makes ([`crate::pe::rsrc`], as link.exe runs
+    /// `cvtres` over them all), on the line where the first was.
+    fn resource(&mut self, input: &Path) -> Result<(), LinkError> {
+        let path = match input.to_str() {
+            Some(name) => self.default_library(name),
+            // alloc: error path
+            None => Err(fail(format!("the input file {} is not UTF-8", input.display()))),
+        }
+        .map_err(|it| LinkError {
+            // alloc: error path
+            what: format!("the link argument's resource file {}: {}", input.display(), it.what),
+            ..it
+        })?;
+        if self.resources.is_empty() {
+            self.out.push(Located {
+                // clone: once per link with resources, where the made object stands
+                path: path.clone(),
+                // alloc: once per link with resources, what errors call the made object
+                name: "the link's resources".to_owned(),
+                kind: NativeKind::Object,
+                made: None,
+            });
+            self.resources_at = self.out.len() - 1;
+        }
+        if !self.resources.contains(&path) {
+            self.resources.push(path);
+        }
+        Ok(())
+    }
+
+    /// The object of every `.res` file's resources ([`Line::resource`]), made in its place.
+    fn make_resources(&mut self) -> Result<(), LinkError> {
+        if self.resources.is_empty() {
+            return Ok(());
+        }
+        // alloc: once per link with resources, each file's resources
+        let mut files = Vec::with_capacity(self.resources.len());
+        for path in &self.resources {
+            let name = path.to_string_lossy().into_owned();
+            // alloc: error path
+            let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
+            let resources = crate::pe::rsrc::read(&name, &bytes).map_err(fail)?;
+            files.push((name, resources));
+        }
+        let names: Vec<String> = files.iter().map(|it| it.0.clone()).collect();
+        let merged = crate::pe::rsrc::merge(files).map_err(fail)?;
+        let bytes: Arc<[u8]> = crate::pe::rsrc::object(&merged).into();
+        let at = &mut self.out[self.resources_at];
+        // alloc: once per link with resources, what errors call the made object
+        at.name = format!("the resources of {}", names.join(", "));
+        at.made = Some((ContentId::of(RESOURCES, &bytes), bytes));
+        Ok(())
     }
 
     fn object(&mut self, name: &str) -> Result<(), LinkError> {
