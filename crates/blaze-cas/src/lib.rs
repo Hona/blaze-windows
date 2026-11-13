@@ -1494,6 +1494,7 @@ enum Op {
         asked: Tag,
         step: publish::Step,
     },
+    Lease { to: FileName, len: u64, wrote: u64, whole: Arc<Vec<(u64, Vec<u8>)>> },
     /// The name the derived whole file `id` is made under ([`Store::deriving_file`]) removed,
     /// so the whole file of its base, `base` (`from`), can be cloned there.
     DeriveClear {
@@ -2973,6 +2974,27 @@ impl Store {
         );
         self.place_spans.insert(tag, span);
         self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        tag
+    }
+
+    /// On a volume without block sharing, publish by exclusive custody when the bytes
+    /// prove the base; otherwise start a new generation. `whole` is the independent
+    /// witness from the linker, not bytes read from the destination.
+    pub fn place_edit(&mut self, to: FileName, patch: Sparse, whole: Sparse, effects: &mut Vec<Effect>) -> Tag {
+        assert!(!self.tiers.iter().any(|tier| to.is_under(&tier.dir)));
+        self.tidy();
+        let tag = self.tags.fresh();
+        let valid = patch.check().and_then(|()| whole.check());
+        if patch.len != whole.len || valid.is_err() {
+            self.answer(Placed { tag, to, result: Err(valid.err().unwrap_or_else(|| "patch length differs from whole output".into())), bytes: PlacedBytes::default() });
+            return tag;
+        }
+        let wrote = patch.bytes();
+        let whole = Arc::new(whole.runs); // alloc: shared witness until custody is decided
+        let span = tracing::info_span!(target: "blaze", parent: None, "place", %to, how = "exclusive edit", bytes = tracing::field::Empty);
+        self.place_spans.insert(tag, span);
+        self.tags.ops.insert(tag, Op::Lease { to: to.clone(), len: patch.len, wrote, whole: whole.clone() });
+        effects.push(Effect::TryPatch { file: to, len: patch.len, delta: patch.runs, whole, tag });
         tag
     }
 
@@ -4824,6 +4846,14 @@ impl Store {
                 self.patch_step(op, done, effects);
             }
             Op::Runs { asked, step } => self.runs_step(asked, step, &done, effects),
+            Op::Lease { to, len, wrote, whole } => match done {
+                Done::Patched(false) => {
+                    let runs = Arc::unwrap_or_clone(whole);
+                    self.publish(completion.tag, to, Content::Sparse(Sparse { len, runs }), Durable::No, 0, effects);
+                }
+                Done::Patched(true) => self.answer(Placed { tag: completion.tag, to, result: Ok(()), bytes: PlacedBytes { copied: wrote, ..PlacedBytes::default() } }),
+                other => self.answer(Placed { tag: completion.tag, to, result: Err(describe(&other)), bytes: PlacedBytes::default() }),
+            },
             // Nothing waits for it, and one that fails is of a path placed again or removed
             // since: the next clone of the path's file writes out what it left.
             Op::OutputBack => {}
