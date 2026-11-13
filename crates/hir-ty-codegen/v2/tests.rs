@@ -4142,14 +4142,14 @@ fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
     db.set_file_text(file,&source.replace("y * 3", "y * 4"));
     let since = {
         let f = front(&db,&policy,krate);
-        assert!(f.resume_world(&kept,view));
+        f.resume_world(&kept,view).unwrap();
         assert!(f.devirt.world().is_some());
         f.abandon_resumed_world();
         assert!(f.devirt.world().is_none());
         f.view().unwrap()
     };
     db.set_file_text(file, &source.replace("dep::resize::<K>(x, &|y| y * 3)", "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)"));
-    assert!(!front(&db,&policy,krate).resume_world(&kept,since));
+    assert!(front(&db,&policy,krate).resume_world(&kept,since).is_err());
 }
 
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at

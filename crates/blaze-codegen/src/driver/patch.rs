@@ -464,10 +464,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         // build is refused with the front end's reason (`refused`; rule no-fallback), and
         // the kept walk goes back as it was, so the refusal stands until its cause is gone.
         let seen = walked.seen;
-        if walked.keep.takes_world && !walked.world.as_ref().zip(seen).is_some_and(|(world, since)| {
-            self.frontend.resume_world(world, since)
-        }) {
-            return Err("the kept program's dyn facts were not validated");
+        if walked.keep.takes_world {
+            self.frontend.resume_world(
+                walked.world.as_ref().ok_or("the front end kept no world checkpoint")?,
+                seen.ok_or("the world checkpoint has no database view")?,
+            )?;
         }
         let describe_round = usize::from(walked.keep.takes_world);
         let named = match seen {

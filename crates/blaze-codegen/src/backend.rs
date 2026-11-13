@@ -356,8 +356,8 @@ pub trait Frontend: Sync {
     }
 
     /// Install the world only if both the plain walk and the closed walk still yield it.
-    fn resume_world(&self, _: &Self::World, _: u64) -> bool {
-        false
+    fn resume_world(&self, _: &Self::World, _: u64) -> Result<(), &'static str> {
+        Err("the front end does not resume a closed world")
     }
 
     /// A structural walk starts without a world, including after an attempted patch.

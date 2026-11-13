@@ -19,7 +19,7 @@
 
 use std::{
     alloc::Global,
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -240,8 +240,8 @@ pub struct Checkpoint {
 
 #[derive(PartialEq, Eq, Debug)]
 struct Members {
-    functions: HashSet<(HirInstance, Origin)>,
-    statics: HashSet<HirStatic>,
+    functions: HashMap<(HirInstance, Origin), Arc<Contribution>>,
+    statics: HashMap<HirStatic, Arc<StaticContribution>>,
 }
 
 impl State {
@@ -263,47 +263,73 @@ impl State {
         self.using_resumed.store(false, Ordering::Release);
     }
 
-    pub(super) fn resume(&self, front: &HirFrontend<'_>, kept: &Checkpoint, view: u64) -> bool {
+    pub(super) fn resume(
+        &self,
+        front: &HirFrontend<'_>,
+        kept: &Checkpoint,
+        view: u64,
+    ) -> Result<(), &'static str> {
         use blaze_query::db::{Changed, View};
-        let valid = front.with(|db| {
+        front.with(|db| {
             if self.makes.get() != Some(&kept.makes)
                 || program_name(db, kept.makes.0, kept.makes.1) != kept.program
             {
-                return false;
+                return Err("another program made the world checkpoint");
             }
             let since = View::from_u64(view);
             let Changed::Keys(changed) = contribution::changed_since(db, since) else {
-                return false;
+                return Err("the changed set of world contributions is unknown");
             };
             for id in changed {
-                let Some((i, o, facing)) = contribution::arguments(db, id) else { return false };
-                if facing == front.facing(None)
-                    && (kept.plain.functions.contains(&(i.clone(), o))
-                        || kept.closed.functions.contains(&(i, o)))
-                {
-                    return false;
+                let Some((i, o, facing)) = contribution::arguments(db, id) else {
+                    return Err("a changed world contribution has no arguments");
+                };
+                if facing == front.facing(None) {
+                    let asked = (i, o);
+                    if let Some(was) = kept
+                        .plain
+                        .functions
+                        .get(&asked)
+                        .or_else(|| kept.closed.functions.get(&asked))
+                    {
+                        let now = contribution(db, asked.0, o, facing)
+                            .as_ref()
+                            .map_err(|_| "a function's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            return Err(
+                                "a reached function changed its world contribution or plain edges",
+                            );
+                        }
+                    }
                 }
             }
             let Changed::Keys(changed) = static_contribution::changed_since(db, since) else {
-                return false;
+                return Err("the changed set of static world contributions is unknown");
             };
             for id in changed {
                 let Some((s, facing)) = static_contribution::arguments(db, id) else {
-                    return false;
+                    return Err("a changed static world contribution has no arguments");
                 };
-                if facing == front.facing(None)
-                    && (kept.plain.statics.contains(&s) || kept.closed.statics.contains(&s))
-                {
-                    return false;
+                if facing == front.facing(None) {
+                    if let Some(was) =
+                        kept.plain.statics.get(&s).or_else(|| kept.closed.statics.get(&s))
+                    {
+                        let now = static_contribution(db, s, facing)
+                            .as_ref()
+                            .map_err(|_| "a static's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            return Err(
+                                "a reached static changed its world contribution or plain edges",
+                            );
+                        }
+                    }
                 }
             }
-            true
-        });
-        if !valid || self.resumed.set(kept.clone()).is_err() {
-            return false;
-        }
+            Ok(())
+        })?;
+        self.resumed.set(kept.clone()).map_err(|_| "the front end already resumed a world")?;
         self.using_resumed.store(true, Ordering::Release);
-        true
+        Ok(())
     }
 }
 
@@ -367,10 +393,36 @@ impl State {
             let slot = if held.is_none() { &self.plain } else { &self.closed_members };
             if slot.get().is_none() {
                 // alloc: one membership index for this round; changes are probed by item.
-                let members = Arc::new(Members {
-                    functions: functions.iter().cloned().collect(),
-                    statics: statics.iter().copied().collect(),
-                });
+                let members = frontend.with(|db| {
+                    let facing = frontend.facing(None);
+                    let fail = |s: &String| refused_of(db, krate, kind, s);
+                    Ok::<_, CodegenError>(Arc::new(Members {
+                        functions: functions
+                            .iter()
+                            .map(|(i, o)| {
+                                Ok((
+                                    (i.clone(), *o),
+                                    contribution(db, i.clone(), *o, facing)
+                                        .as_ref()
+                                        .map_err(fail)?
+                                        .clone(),
+                                ))
+                            })
+                            .collect::<Result<_, CodegenError>>()?,
+                        statics: statics
+                            .iter()
+                            .map(|s| {
+                                Ok((
+                                    *s,
+                                    static_contribution(db, *s, facing)
+                                        .as_ref()
+                                        .map_err(fail)?
+                                        .clone(),
+                                ))
+                            })
+                            .collect::<Result<_, CodegenError>>()?,
+                    }))
+                })?;
                 if slot.put(members).is_err() {
                     return Err(frontend.with(|db| {
                         refused_of(
@@ -490,7 +542,7 @@ fn contribution(
     i: HirInstance,
     o: Origin,
     facing: super::frontend::Facing,
-) -> Result<Contribution, String> {
+) -> Result<Arc<Contribution>, String> {
     let front = facing.front(db)?;
     let origin = front.compiled_for(db, &i, &o);
     let inlined = front.inlines_for(db, &i, &o)?;
@@ -515,7 +567,7 @@ fn contribution(
     let foreign = (!facts.foreign.is_empty())
         .then(|| format!("{} carries it across the program's edge", super::Named(db, &i)));
     let objects = object_inputs(&front, db, &facts)?;
-    Ok(Contribution {
+    Ok(Arc::new(Contribution {
         origin,
         edges,
         count: super::frontend::counted_memo(db, i, ()),
@@ -524,7 +576,7 @@ fn contribution(
         foreign,
         loader,
         objects,
-    })
+    }))
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -540,7 +592,7 @@ fn static_contribution(
     db: &Db,
     value: HirStatic,
     facing: super::frontend::Facing,
-) -> Result<StaticContribution, String> {
+) -> Result<Arc<StaticContribution>, String> {
     let front = facing.front(db)?;
     let mut facts = Facts::default();
     let mut edges = super::places::Placer::open();
@@ -572,7 +624,7 @@ fn static_contribution(
     let origin = front.origin(db, value.0.krate(db));
     let mut edges = edges.into_refs();
     super::frontend::asked_by(front.static_owner(db, &value), &mut edges);
-    Ok(StaticContribution { facts, edges, origin, objects })
+    Ok(Arc::new(StaticContribution { facts, edges, origin, objects }))
 }
 
 /// The program's world from what its walk reached; `None` where no reached body calls through

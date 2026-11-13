@@ -1103,7 +1103,7 @@ impl Frontend for HirFrontend<'_> {
 
     fn kept_world(&self) -> Option<Self::World> { self.devirt.checkpoint() }
 
-    fn resume_world(&self, world: &Self::World, since: u64) -> bool {
+    fn resume_world(&self, world: &Self::World, since: u64) -> Result<(), &'static str> {
         self.devirt.resume(self, world, since)
     }
 
