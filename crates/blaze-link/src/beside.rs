@@ -133,6 +133,11 @@ pub(crate) struct Input<'a> {
     pub functions: &'a [Func<'a>],
     pub lines: &'a [Lined<'a>],
     pub given: Given<'a>,
+    /// PE: the native code's functions the image keeps, each `(name, address)`, which a PDB
+    /// names as publics (C has no records of Rust's), with the version of the resolution they
+    /// are of (`native::Resolved::natives_version`); `None` when they are the ones the last
+    /// update was given. `None` for the other formats.
+    pub publics: Option<(u64, &'a [(&'a str, u64)])>,
 }
 
 /// Which functions an [`Input`] holds.
@@ -269,7 +274,9 @@ pub(crate) fn file_name(format: Format, image: &str) -> Option<String> {
         Format::Elf => Some(format!("{image}.debug")),
         // alloc: as above
         Format::MachO => Some(format!("{image}.dSYM/Contents/Resources/DWARF/{image}")),
-        Format::Pe | Format::Wasm => None,
+        // alloc: as above; the name the image's CodeView record gives
+        Format::Pe => Some(format!("{}.pdb", crate::pe::pdb_stem(image))),
+        Format::Wasm => None,
     }
 }
 
@@ -330,7 +337,8 @@ fn id_at(format: Format) -> Option<usize> {
         Format::Elf => Some(NOTE_AT + 16),
         // The header, then `LC_UUID`'s command and size.
         Format::MachO => Some(32 + 8),
-        Format::Pe | Format::Wasm => None,
+        Format::Pe => Some(crate::pe::pdb::GUID_AT),
+        Format::Wasm => None,
     }
 }
 
@@ -501,6 +509,9 @@ pub(crate) struct Kept {
     sums: Option<crc::Sums>,
     /// The bytes the update in hand read to seal the file.
     summed: u64,
+    /// PE: the PDB as last given, to patch, and the version of the native functions it names.
+    pdb: Option<crate::pe::pdb::Model>,
+    pdb_natives: Option<u64>,
 }
 
 impl Kept {
@@ -529,6 +540,8 @@ impl Kept {
             encoded: 0,
             sums: None,
             summed: 0,
+            pdb: None,
+            pdb_natives: None,
         }
     }
 
@@ -544,6 +557,7 @@ impl Kept {
             + self.sums.as_ref().map_or(0, crc::Sums::held)
             + self.records.capacity() * size_of::<(InstanceKey, Record)>()
             + self.files.iter().map(|it| 2 * it.capacity()).sum::<usize>()) as u64
+            + self.pdb.as_ref().map_or(0, crate::pe::pdb::Model::held)
     }
 
     /// Forgets the file last given: the next update lays it out whole.
@@ -589,6 +603,9 @@ impl Kept {
                 input.name, input.format
             ));
         };
+        if input.format == Format::Pe {
+            return self.pdb(input, exe, name, all);
+        }
         let table = table_of(input.format, exe)?;
         // Why every function is encoded, when they are: the caller's reason, or the one the
         // update of a change stopped for.
@@ -654,6 +671,100 @@ impl Kept {
             whole: Some(why),
             plist: plist(input.format, input.name),
         }))
+    }
+
+    /// A PE image's PDB ([`crate::pe::pdb`]): a patch of the one last given for a link's
+    /// change where its model takes it ([`crate::pe::pdb::Model::patch`]), else laid out whole
+    /// from every function.
+    fn pdb(
+        &mut self,
+        input: &Input<'_>,
+        exe: &impl Fn(u64, &mut [u8]),
+        name: String,
+        all: Option<&'static str>,
+    ) -> Result<Option<DebugWrite>, String> {
+        let headers = crate::pe::pdb::Headers::read(exe)?;
+        let natives = input.publics.map(|it| it.1);
+        if let Given::Changed { gone, count } = input.given {
+            let same = self.format == input.format && self.name == input.name;
+            let why = match (self.pdb.as_mut(), self.id) {
+                (Some(model), Some(base)) if same => {
+                    let patched =
+                        model.patch(headers, input.id, input.functions, input.lines, gone, count, natives);
+                    match patched {
+                        Ok(Ok(writes)) => {
+                            let len = model.len();
+                            let file = &mut *self.file;
+                            file.resize(len as usize, 0);
+                            for (at, bytes) in &writes {
+                                file[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+                            }
+                            self.encoded = input.functions.len() as u64;
+                            self.id = Some(input.id);
+                            self.at = Some(input.generation);
+                            if let Some((version, _)) = input.publics {
+                                self.pdb_natives = Some(version);
+                            }
+                            return Ok(Some(DebugWrite {
+                                name,
+                                id: input.id,
+                                base: Some(base),
+                                len,
+                                writes,
+                                records: input.functions.len() as u64 + gone.len() as u64,
+                                encoded: self.encoded,
+                                summed: 0,
+                                all: None,
+                                whole: None,
+                                plist: None,
+                            }));
+                        }
+                        Ok(Err(why)) => why,
+                        Err(what) => {
+                            self.pdb = None;
+                            self.id = None;
+                            return Err(what);
+                        }
+                    }
+                }
+                _ => "no PDB was written yet",
+            };
+            // The model is not the file's after a patch stopped part way.
+            self.pdb = None;
+            self.id = None;
+            self.asked = Some(why);
+            return Ok(None);
+        }
+        let why = self.asked.take().unwrap_or("no link's change was at hand");
+        let model = crate::pe::pdb::Model::new(headers, input.id, input.functions, input.lines, natives.unwrap_or(&[]))?;
+        self.file = Bytes(std::sync::Arc::new(model.file()));
+        self.pdb = Some(model);
+        self.pdb_natives = input.publics.map(|it| it.0);
+        self.encoded = input.functions.len() as u64;
+        self.id = Some(input.id);
+        self.at = Some(input.generation);
+        self.format = input.format;
+        // alloc: once per PDB laid out whole, the image's name
+        self.name = input.name.to_owned();
+        Ok(Some(DebugWrite {
+            name,
+            id: input.id,
+            base: None,
+            len: self.file.len() as u64,
+            // clone: the whole file, once per whole layout; the model keeps its own
+            writes: vec![(0, self.file.to_vec())],
+            records: input.functions.len() as u64,
+            encoded: self.encoded,
+            summed: 0,
+            all: all.or(Some(why)),
+            whole: Some(why),
+            plist: None,
+        }))
+    }
+
+    /// The version of the native functions the PDB last given names (`Input::publics`).
+    pub(crate) fn pdb_natives(&self) -> Option<u64> {
+        self.pdb_natives.filter(|_| self.pdb.is_some())
     }
 
     /// `function`'s rows with their files by number, into `rows`: `None` for a file the line

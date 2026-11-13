@@ -253,6 +253,7 @@ pub(super) struct Accepting {
     accepted: Option<OwnedSocket>,
     addresses: UnsafeCell<[u8; 2 * ADDRESS]>,
     pub(super) stopping: bool,
+    said_refusal: bool,
 }
 
 impl Accepting {
@@ -262,6 +263,7 @@ impl Accepting {
             accepted: None,
             addresses: UnsafeCell::new([0; 2 * ADDRESS]),
             stopping: false,
+            said_refusal: false,
         }
     }
 
@@ -296,15 +298,25 @@ impl Accepting {
     }
 
     /// The connection the completed accept made.
-    pub(super) fn take(&mut self) -> io::Result<OwnedSocket> {
+    pub(super) fn take(&mut self) -> io::Result<Option<OwnedSocket>> {
         let accepted = self.accepted.take().expect("an accept completed");
         let listener = raw(&self.listener.socket);
         // So the socket is the listener's in every call that asks (shutdown, its names).
         set(&accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listener)?;
-        if self.listener.family != AF_UNIX {
+        if self.listener.family == AF_UNIX {
+            // Address::Unix promises a user-private endpoint. Do not hand the protocol
+            // even one byte from an unidentified peer, or let it shut down the listener.
+            if let Err(why) = crate::platform::identity::check_peer(&accepted) {
+                if !self.said_refusal {
+                    eprintln!("blaze: refusing an unidentified or foreign local socket peer: {why}");
+                    self.said_refusal = true;
+                }
+                return Ok(None);
+            }
+        } else {
             nodelay(&accepted)?;
         }
-        Ok(accepted)
+        Ok(Some(accepted))
     }
 }
 

@@ -74,22 +74,31 @@ pub(super) fn locate(
     let scratch = dir.join("fetched");
     fs::create_dir_all(&scratch).map_err(|e| failed(format!("{}: {e}", scratch.display())))?;
     let archive = fetch(pin, &scratch).map_err(&failed)?;
-    unpack(&archive, &to).map_err(|e| failed(format!("unpacking {}: {e}", archive.display())))?;
+    unpack(&archive, pin.asset.ends_with(".zip"), &to).map_err(|e| failed(format!("unpacking {}: {e}", archive.display())))?;
     // The archive is the store's now; the copy written out is not needed again.
     let _ = blaze_fetch::unpack::remove_all(&scratch);
     Ok(to)
 }
 
-/// The gzip `archive` (one member: the program) written to `to`, executable: to a file beside
-/// it first, renamed over, so `to` is whole or absent, and two commands at once each rename the
-/// same bytes.
-fn unpack(archive: &Path, to: &Path) -> io::Result<()> {
+/// The program in `archive` written to `to`, executable: a gzip of the one program, or (`is_zip`,
+/// Windows' asset) a zip whose member of `to`'s file name is it. To a file beside it first,
+/// renamed over, so `to` is whole or absent, and two commands at once each rename the same
+/// bytes.
+fn unpack(archive: &Path, is_zip: bool, to: &Path) -> io::Result<()> {
     // alloc: once per first use
     let part = to.with_extension(format!("part-{}", std::process::id()));
     let written = (|| {
-        let mut from = flate2::read::GzDecoder::new(fs::File::open(archive)?);
         let mut file = fs::File::create(&part)?;
-        io::copy(&mut from, &mut file)?;
+        if is_zip {
+            let mut zipped = zip::ZipArchive::new(fs::File::open(archive)?).map_err(io::Error::other)?;
+            let name = to.file_name().and_then(|it| it.to_str()).unwrap_or("duckdb");
+            let mut from = zipped.by_name(name).map_err(|error| {
+                io::Error::new(io::ErrorKind::NotFound, format!("its member {name}: {error}"))
+            })?;
+            io::copy(&mut from, &mut file)?;
+        } else {
+            io::copy(&mut flate2::read::GzDecoder::new(fs::File::open(archive)?), &mut file)?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -227,14 +236,45 @@ mod tests {
         assert!(none.contains("pins no DuckDB") && none.contains("BLAZE_DUCKDB"), "{none}");
     }
 
-    /// The pin of every host a release is built for is a SHA-256 and a `.gz` of DuckDB's CLI.
+    /// The pin of every host a release is built for is a SHA-256 and a `.gz` of DuckDB's CLI, or
+    /// on Windows, where DuckDB releases none, a `.zip`.
     #[test]
     fn every_pin_is_a_sha256_of_a_gz() {
         for (_, pin) in observe::DUCKDB_PINS {
             assert_eq!(pin.sha256.len(), 64, "{pin:?}");
             assert!(pin.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{pin:?}");
-            assert!(pin.asset.starts_with("duckdb_cli-") && pin.asset.ends_with(".gz"), "{pin:?}");
+            let windows = pin.asset.contains("-windows-");
+            let packed = if windows { ".zip" } else { ".gz" };
+            assert!(pin.asset.starts_with("duckdb_cli-") && pin.asset.ends_with(packed), "{pin:?}");
             assert!(pin.url().contains(observe::DUCKDB_VERSION), "{pin:?}");
         }
+    }
+    /// Windows' pin is a zip: its member of the program's name (`duckdb.exe` there) is laid
+    /// out; a zip without it is an error naming the member, with nothing left at the path.
+    #[test]
+    fn a_zipped_pin_lays_out_its_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let zipped = |members: &[(&str, &[u8])]| {
+            let path = dir.path().join(format!("archive-{}.zip", members.len()));
+            let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            for (name, bytes) in members {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+            path
+        };
+        let program = format!("duckdb{}", std::env::consts::EXE_SUFFIX);
+        let pin = Pin { asset: "duckdb_cli-windows-test.zip", sha256: "22dd" };
+        let good = zipped(&[(program.as_str(), b"the program")]);
+        let state = dir.path().join("state");
+        let fetched = locate(None, &state, Some(&pin), |_: &Pin, _: &Path| Ok(good.clone())).unwrap(); // clone: a test's path
+        assert_eq!(fs::read(&fetched).unwrap(), b"the program");
+        assert!(fetched.ends_with(&program));
+        let bad = zipped(&[("README", b"x"), ("other", b"y")]);
+        let empty = dir.path().join("empty");
+        let said = locate(None, &empty, Some(&pin), |_: &Pin, _: &Path| Ok(bad.clone())).unwrap_err(); // clone: a test's path
+        assert!(said.contains(&program), "{said}");
+        assert!(!pin.laid_out(&empty).exists());
     }
 }

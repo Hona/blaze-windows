@@ -33,7 +33,8 @@ fn a_volume_is_said_to_share_blocks_exactly_where_a_clone_there_works() {
         let scratch = dir.join(format!(".blaze-volume-test.{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let (from, to) = (scratch.join("from"), scratch.join("to"));
-        let bytes: Vec<u8> = (0..256u32 << 10).map(|it| (it * 31 % 251) as u8).collect();
+        // Past a whole cluster: the clone is in whole clusters, the file's length is not.
+        let bytes: Vec<u8> = (0..(256u32 << 10) + 123).map(|it| (it * 31 % 251) as u8).collect();
         std::fs::write(&from, &bytes).unwrap();
         let cloned = clone(&from, &to);
         let held = std::fs::read(&to).ok();

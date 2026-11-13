@@ -1000,6 +1000,11 @@ fn a_windows_path_is_the_walks_path_and_the_host_opens_it_at_its_name() {
     assert_eq!(guest(r"data\a.txt"), "data/a.txt", "relative, `\\` a separator");
     assert_eq!(guest("/C:/Users/a"), "/C:/Users/a");
     assert_eq!(guest("C:"), "C:", "a drive alone stays relative: from `/`, the walk's `/C:`");
+    assert_eq!(
+        guest(r"D:/ws/app/c:\Users\a\pkg/data\a.txt"),
+        "/C:/Users/a/pkg/data/a.txt",
+        "wasi-libc hands `C:\\a` over after its working directory, as a relative path"
+    );
 }
 /// On Windows a macro given its package as rustc's process is given it (`C:\...`) reads below it
 /// whichever way it spells the path, and the read is noted under the walk's one name; outside

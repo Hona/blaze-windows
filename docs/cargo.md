@@ -227,9 +227,14 @@ example, a test or a build script is an executable; a `cdylib` (a native Node ad
 extension, a plugin) or a proc macro is a shared library, at cargo's path
 (`target/debug/lib<name>.so`, `.dylib` on macOS), linked with the package's
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`; a library (`lib`, `rlib`) is written
-with no object code, its functions kept in the store for the programs that link it. A crate
-type of `staticlib` or `dylib` fails the build, naming the target: blaze's linker writes
-neither yet ([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
+with no object code, its functions kept in the store for the programs that link it. A library
+the build only depends on that also lists an rlib (`lib` or `rlib`) is built as that rlib
+alone, its `cdylib`, `staticlib` or `dylib` not made: what depends on it links the rlib, and
+no step of the build reads the other files, which cargo writes all the same into `deps/`
+(`blaze_units::schema::builds_only_its_rlib`; rav1d's `["staticlib", "rlib"]`, a plugin's
+`["cdylib", "rlib"]`). Asked for itself, or with no rlib, a crate type of `staticlib` or
+`dylib` fails the build, naming the target: blaze's linker writes neither yet
+([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
 blaze's load does not build, saying what: an artifact dependency (`-Z bindeps`), a
 `metabuild`, a target spec file, a target blaze has no data of, and a rustc `-Z` flag in
 `RUSTFLAGS` that `crates/blaze-cargo/src/unstable.rs` refuses.
@@ -751,7 +756,13 @@ system directories are those of the toolchain: each of the script's `LIB` and th
 `%ProgramFiles%` and `%ProgramFiles(x86)%` that Visual Studio and the Windows SDK install into.
 A library a script finds in a cache of the machine (rune-desktop's Ghostty, under
 `%LOCALAPPDATA%\seer\ghostty-vt`) goes in `build-script-link-dirs` under its variable:
-`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`.
+`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`; or, for every
+workspace of the machine, in blaze's settings (`config.toml` in blaze's home):
+
+```toml
+[sandbox]
+build-script-link-dirs = ["${LOCALAPPDATA}/seer/ghostty-vt"]   # read as each run is checked
+```
 
 and, for a package of the workspace, in its own manifest:
 
@@ -955,6 +966,24 @@ no system call blaze has no shim for. The glue's `getenv` replaces wasi-libc's, 
 whole environment on its first call, and asks the host one variable at a time (the bridge's
 `env_var`). So `env::var` keys an expansion by the variables it read, and a per-run variable it
 never reads (`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all.
+
+On Windows the daemon names a path `/C:/a` (`blaze_core::platform::path`), which is also how
+wasi-libc names it, and a macro walks and is keyed by that name. A path cargo gives a crate
+(`CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_TARGET_TMPDIR`,
+`CARGO_BIN_EXE_*`) reaches the program as Windows names it, `C:\a`, as cargo gives it to rustc:
+from `env!` and `option_env!`, and from a macro's `env::var` (`base_db::given_value`). A macro
+may name a file in either spelling (`C:\a\b`, `C:\a/b`, `/C:/a/b`, and `C:\a` after its working
+directory, as wasi-libc hands a path it takes for relative): each is the one walked name
+(`src/os/host.rs`). `include!`, `include_str!` and `include_bytes!` of such a path resolve at
+the daemon's name (`base_db::named_path`).
+
+A source file with CRLF line endings is read as rustc reads it: each `\r\n` is a `\n` in a
+string, byte string or C string literal (a `\` before the line's end continues it), in a doc
+comment's attribute, and in what a proc macro or `macro_rules!` is handed; `line!`, `column!` and
+a diagnostic's line and column count no `\r`. `include_str!` and `include_bytes!` read the file's
+bytes as they are. The text blaze keeps, hashes and gives spans into is the file's own bytes:
+the reading happens where text becomes a value (`parser::cook::as_read`,
+`syntax_bridge::doc_text_as_read`).
 
 Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and a
 memory budget. The instance runs on a kept expansion thread, never on a fiber, because a

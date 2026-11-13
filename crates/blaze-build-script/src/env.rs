@@ -492,8 +492,17 @@ const FIXED: usize = 40;
 pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error> {
     unit.check()?;
     let host = HostOs::of(&unit.host);
+    // Windows names a variable whatever its case (`Path` is `PATH`), as cargo's `env::var_os`
+    // and `Command::env` read and replace it there.
+    let same_name = |a: &OsStr, b: &OsStr| match host.windows {
+        true => a.eq_ignore_ascii_case(b),
+        false => a == b,
+    };
     let inherited_var = |name: &str| {
-        inherited.iter().find(|(it, _)| it == OsStr::new(name)).map(|(_, value)| value.as_os_str())
+        inherited
+            .iter()
+            .find(|(it, _)| same_name(it, OsStr::new(name)))
+            .map(|(_, value)| value.as_os_str())
     };
     let package = &unit.package;
     let metadata: usize = unit.dependencies.iter().map(|it| it.metadata.len()).sum();
@@ -636,6 +645,23 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
             "CARGO_MAKEFLAGS",
             ["-j --jobserver-fds=", auth.as_str(), " --jobserver-auth=", auth.as_str()].concat(),
         );
+    }
+    if host.windows {
+        // What cargo sets (or takes away) replaces an inherited variable of any case: one
+        // variable of each name reaches the script, spelt as cargo spells it.
+        // alloc: setup, once per unit on Windows: the inherited variables cargo leaves.
+        let kept: Vec<(OsString, OsString)> = inherited
+            .iter()
+            .filter(|(name, _)| {
+                !cmd.vars.iter().any(|(it, _)| {
+                    let it: &str = it;
+                    let it = OsStr::new(it);
+                    it != name.as_os_str() && same_name(it, name)
+                })
+            })
+            .cloned()
+            .collect();
+        return Ok(merged(&kept, cmd));
     }
     Ok(merged(inherited, cmd))
 }

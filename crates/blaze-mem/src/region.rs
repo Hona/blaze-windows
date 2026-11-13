@@ -138,6 +138,13 @@ impl Region {
         Region::sparse(bytes, tag, Sparse::Readable)
     }
 
+    /// Reserves a sparse column accessed only below `ensure`'s published prefix. On an
+    /// overcommitting kernel the sparse mapping needs no system call to grow. On Windows
+    /// only the prefix needs commit charge, not every possible slot of the column.
+    pub fn reserve_sparse_prefix(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        if cfg!(windows) { Region::reserve(bytes, tag) } else { Region::reserve_sparse(bytes, tag) }
+    }
+
     /// A sparse region its owner counts by ranges alone ([`Region::reuse`], [`Region::evict`]),
     /// touching no byte of one before reusing it: the store's buffer pool. On Linux and macOS it
     /// is [`Region::reserve_sparse`]; on Windows, which cannot commit terabytes, only reserved,

@@ -69,32 +69,33 @@ pub(crate) fn makes(unit: &Unit, asked: bool) -> Result<Makes, String> {
     if target.is_proc_macro() {
         return Ok(Makes::Shared { proc_macro: true });
     }
+    // cargo writes every crate type a library lists, a dependency's too, but a dependency's
+    // `cdylib`, `staticlib` or `dylib` is a file no step of the build reads: a library a build
+    // only depends on, which is also an `rlib` (`lib`), is built as that rlib and nothing else
+    // (`schema::builds_only_its_rlib`, which its planned files follow too); the programs that
+    // link it behave as under cargo (tree-sitter-highlight's `crate-type = ["lib",
+    // "staticlib"]`, betteroffice's `["cdylib", "rlib"]`).
+    let kinds = target.crate_types.iter().chain(&target.kind).map(String::as_str);
+    if schema::builds_only_its_rlib(kinds, asked) {
+        return Ok(Makes::Library);
+    }
     if has("cdylib") {
         return Ok(Makes::Shared { proc_macro: false });
     }
     if has("staticlib") || has("dylib") {
         let kind = if has("staticlib") { "staticlib" } else { "dylib" };
-        // cargo writes every crate type a library lists, a dependency's too, but a dependency's
-        // `staticlib` or `dylib` is a file no step of the build reads: what depends on the
-        // library links its `rlib`, and an archive or dylib in `deps/` is no output a program
-        // links (only an artifact dependency would name one). So a library a
-        // build only depends on, which is also an `rlib` (`lib`), is built as that rlib and
-        // nothing else; the programs that link it behave as under cargo (tree-sitter-highlight's
-        // `crate-type = ["lib", "staticlib"]`). Where the build is asked for the library itself,
-        // or it has no rlib to link, the file is what is asked for, and this linker does not
-        // write it: an error naming it, never a build that quietly leaves it out.
-        let rlib = has("lib") || has("rlib");
-        if asked || !rlib {
-            let why = match asked {
-                true => "the build is asked for this library",
-                false => "it has no `lib` or `rlib` its dependents could link instead",
-            };
-            return Err(format!(
-                "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
-                 types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
-                target.name
-            ));
-        }
+        // The build is asked for the library itself, or it has no rlib to link: the file is
+        // what is asked for, and this linker does not write it: an error naming it, never a
+        // build that quietly leaves it out.
+        let why = match asked {
+            true => "the build is asked for this library",
+            false => "it has no `lib` or `rlib` its dependents could link instead",
+        };
+        return Err(format!(
+            "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
+             types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
+            target.name
+        ));
     }
     Ok(Makes::Library)
 }
@@ -1556,9 +1557,10 @@ fn natives(
             true => Some(krate),
             false => job.crates.krate(at as usize),
         };
-        if let Some(krate) = crate_of {
-            libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
-            assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
+        // Each crate's `#[link(.., cfg(..))]`s as the linked program's crate decides them.
+        if let Some(of) = crate_of {
+            libs.extend(frontend.linked(of, krate).map_err(|it| it.what)?);
+            assembled.extend(frontend.global_asm(of, triple).map_err(|it| it.what)?);
         }
         if !libs.is_empty() {
             let mut search = search_dirs(&flags.search);
@@ -1723,7 +1725,8 @@ pub(crate) struct LinkMade {
 /// `split-debuginfo`: beside the image unless the profile says `off`, which puts it inside as
 /// before. `packed` and `unpacked` are both the one side file blaze writes (it has no
 /// per-crate objects to leave debug info in). An image with no debug info has none either
-/// way, and a format blaze writes no side file for (PE, wasm) keeps what it had.
+/// way. A PE image's is its PDB, beside it whatever the profile says; wasm, for which blaze
+/// writes no side file, keeps what it had.
 pub(crate) fn debug_place(
     debug: blaze_link::Debug,
     format: blaze_link::Format,
@@ -1732,6 +1735,9 @@ pub(crate) fn debug_place(
     use blaze_link::{Debug, Format};
     match (debug, split) {
         (Debug::None, _) => Ok(Debug::None),
+        // A PE image's debug info is its PDB, beside it, whatever the profile says: Windows'
+        // debuggers read none inside it.
+        (_, None | Some("off" | "packed" | "unpacked")) if format == Format::Pe => Ok(Debug::Beside),
         (_, Some("off")) => Ok(Debug::Lines),
         (_, None | Some("packed" | "unpacked")) => Ok(match format {
             Format::Elf | Format::MachO => Debug::Beside,
@@ -2027,6 +2033,8 @@ pub(crate) enum LinkStep {
     Bytes,
     /// Making the image's debug side file.
     Debug,
+    /// Making a DLL's import library.
+    Import,
 }
 
 impl LinkStep {
@@ -2038,6 +2046,7 @@ impl LinkStep {
             LinkStep::Stage => "staging the change",
             LinkStep::Bytes => "writing the image",
             LinkStep::Debug => "making the debug side file",
+            LinkStep::Import => "making the import library",
         }
     }
 }
@@ -2278,6 +2287,11 @@ fn link_at(
         Ok(_) => debug_side(job, unit, path, &mut linked),
         Err(_) => Ok(Vec::new()), // alloc: none, empty
     };
+    // A DLL's import library, beside it: written from its exports as committed.
+    let import = match &made {
+        Ok(_) => import_side(job, unit, path, &linked),
+        Err(_) => Ok(Vec::new()), // alloc: none, empty
+    };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
         Ok(_) => linked
@@ -2350,7 +2364,8 @@ fn link_at(
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let side = debug?;
+    let mut side = debug?;
+    side.extend(import?);
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -3301,3 +3316,38 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
     Ok(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 
+
+/// The import library planned beside the DLL `path` (`foo.dll.lib`, cargo's output of a
+/// `cdylib` on MSVC, [`super::artifact::import_library`]), written from the DLL's exports as
+/// this link committed them (`Image::import_library`, link.exe's `/IMPLIB`), at that path and
+/// at its uplifted copy: none for any other image. A DLL planned with one whose link makes
+/// none is an error naming both: nothing is placed in its stead.
+fn import_side(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    linked: &Linked,
+) -> Result<Vec<SideFile>, LinkCause> {
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    let Some(lib) = super::artifact::import_library(path, plan) else {
+        return Ok(Vec::new()); // alloc: none, empty
+    };
+    let _span = tracing::info_span!(target: "blaze", "link import library", unit = %path).entered();
+    let bytes = linked
+        .image
+        .import_library()
+        .map_err(|error| LinkCause::Linker { step: LinkStep::Import, error })?
+        .ok_or_else(|| {
+            LinkCause::Given(format!(
+                "{lib} is planned beside {path}, and its link makes no import library: it is no DLL"
+            ))
+        })?;
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve import library", &bytes));
+    let file = blaze_cas::Sparse { len: bytes.len() as u64, runs: vec![(0, bytes)] };
+    let file = Arc::new(Made::Whole(file)); // alloc: once per import library, shared by its paths
+    Ok(std::iter::once(lib)
+        .chain(super::artifact::uplifted(lib, plan))
+        // clone: a refcount; alloc: once per import library, a path or two
+        .map(|at| SideFile { path: at.to_owned(), key, file: Arc::clone(&file) })
+        .collect())
+}

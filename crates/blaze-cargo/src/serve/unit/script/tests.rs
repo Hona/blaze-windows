@@ -446,3 +446,17 @@ fn a_developer_prompt_is_set_over_the_jobs_environment_once_per_name() {
     folded.dedup();
     assert_eq!(folded.len(), names.len(), "{names:?}");
 }
+#[cfg(windows)]
+#[test]
+fn fetched_native_inputs_stop_at_the_archive_or_git_revision() {
+    let sources = std::path::Path::new(r"D:\sources");
+    for (package, payload) in [
+        (r"git\checkouts\font-packs\123abcd\crates\latin", r"git\checkouts\font-packs\123abcd"),
+        (r"registry\src\index\native-src-1.0", r"registry\src\index\native-src-1.0"),
+    ] {
+        assert_eq!(super::fetched_input(sources, &sources.join(package)), Some(sources.join(payload)));
+    }
+    for path in [r"D:\elsewhere", r"D:\sources\git\db\a", r"D:\sources\git\checkouts\x\..\elsewhere"] {
+        assert_eq!(super::fetched_input(sources, std::path::Path::new(path)), None);
+    }
+}

@@ -296,8 +296,13 @@ impl World {
     /// The store dropped, as its process ends, and opened again.
     fn open(&mut self) {
         self.store = None;
-        let mut store = open_with(&mut self.sim, sharing_config(self.sharing));
+        // The planted open must run with its bug enabled during the placement sweep,
+        // not after the sweep has already removed the derived file under test.
+        let mut effects = Vec::new();
+        let mut store = Store::open(sharing_config(self.sharing), &mut effects);
         store.plant = self.plant;
+        drive(&mut self.sim, &mut store, &mut effects);
+        assert!(store.ready(), "{:?}", store.broken());
         self.store = Some(store);
     }
 

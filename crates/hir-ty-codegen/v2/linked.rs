@@ -110,10 +110,12 @@ impl HirFrontend<'_> {
     /// The native libraries `krate`'s `#[link(..)]`s link it against, as rustc's
     /// `rustc_metadata::native_libs` collects them: each `extern` block's in the order
     /// written, the blocks in the order of their modules, without those whose `cfg(..)` the
-    /// crate leaves out. A form blaze can't link is an error naming it.
-    pub fn linked(&self, krate: Crate) -> Result<Vec<NativeLib>, CodegenError> {
+    /// crate `linking`, which links the program, leaves out (rustc's `relevant_lib`, in the
+    /// linking session: [`hir_def::attrs::NativeLib::linked_under`]). A form blaze can't link
+    /// is an error naming it.
+    pub fn linked(&self, krate: Crate, linking: Crate) -> Result<Vec<NativeLib>, CodegenError> {
         // clone: per crate linked, its few libraries, out of the database's memo
-        self.with(|db| linked(db, krate).clone()).map_err(error)
+        self.with(|db| linked(db, krate, linking).clone()).map_err(error)
     }
 
     /// Whether `krate` is a GUI program on Windows: `#![windows_subsystem = "windows"]`
@@ -204,7 +206,8 @@ fn error(what: String) -> CodegenError {
 /// function it walked them all again every link (2.8 ms of a one-function edit of hello
 /// world, `link natives`); as a memo, a crate nothing was written in is one check.
 #[blaze_query::tracked(returns(ref))]
-fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
+fn linked(db: &Db, krate: Crate, linking: Crate) -> Result<Vec<NativeLib>, String> {
+    let cfg = linking.cfg_options(db);
     // alloc: an error's name of the crate
     let named = || format!("crate `{}`", krate.named(db));
     // alloc: per crate linked, its libraries
@@ -216,7 +219,7 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
             // A block's `#[link(wasm_import_module = "..")]` names no library: on wasm its
             // functions are the module's imports from that module (`v2::wasm::imports`), and
             // elsewhere rustc ignores it.
-            for lib in AttrFlags::native_libs(db, block).iter() {
+            for lib in AttrFlags::native_libs(db, block).iter().filter(|it| it.linked_under(cfg)) {
                 let name = lib.name.as_str();
                 let kind = match lib.kind {
                     Written::Unspecified | Written::Dylib => NativeLibKind::Dylib,

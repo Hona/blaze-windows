@@ -705,6 +705,49 @@ pub fn refused_report(
     ))
 }
 
+/// The directories every workspace's scripts may name on this machine, beside a workspace's
+/// own: `build-script-link-dirs` under `[sandbox]` in blaze's settings (`config.toml` in its
+/// home, [`blaze_manifest::user_config`]), as [`link_dirs`] reads a workspace's. Where a
+/// library of the machine is (a cache a script fills, rune-desktop's Ghostty under
+/// `%LOCALAPPDATA%\seer\ghostty-vt`) is the machine's to say, not each checkout's: `${NAME}/rest`
+/// names one under a variable of the script's environment. Read as a run is checked, as the
+/// store of pinned native inputs is found ([`Ran::native`]). Empty with no home or no file.
+pub fn machine_link_dirs(
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<PathBuf>, String> {
+    let Some(home) = blaze_manifest::user_config::home() else { return Ok(Vec::new()) };
+    machine_link_dirs_in(&blaze_manifest::user_config::file(&home), env)
+}
+
+/// [`machine_link_dirs`] of the settings `file`.
+fn machine_link_dirs_in(
+    file: &Path,
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<PathBuf>, String> {
+    use blaze_manifest::user_config::{UserConfigError, read, section};
+    const KEY: &str = "sandbox.build-script-link-dirs";
+    let Some(table) = read(file).map_err(|it| it.to_string())? else { return Ok(Vec::new()) };
+    let Some(sandbox) = section(&table, file, "sandbox").map_err(|it| it.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = sandbox.get("build-script-link-dirs") else { return Ok(Vec::new()) };
+    let wrong = || UserConfigError::setting(file, KEY, "a list of directories", value).to_string();
+    let dirs = value.as_array().ok_or_else(wrong)?;
+    let dirs: Vec<String> = dirs
+        .iter()
+        .map(|it| it.as_str().map(str::to_owned).ok_or_else(wrong))
+        .collect::<Result<_, _>>()?;
+    for dir in &dirs {
+        if !dir.starts_with("${") && !Spelling::of(dir, cfg!(windows)).absolute {
+            return Err(format!(
+                "{} sets `{KEY}` to a list with `{dir}`, which is no absolute directory",
+                file.display()
+            ));
+        }
+    }
+    link_dirs(&dirs, env).map_err(|it| format!("{}: {it}", file.display()))
+}
+
 /// The workspace's `build-script-link-dirs` as a script started in `env` may name them: an
 /// entry `${NAME}/rest` is the variable `NAME`'s value then `/rest` (a machine's install of
 /// what the script links, which the manifest can't spell: `${LLVM_SYS_231_PREFIX}/lib`), any
@@ -1111,5 +1154,38 @@ mod tests {
         assert!(refused(ok.as_bytes(), &ran).is_empty());
         let beside = "cargo:rustc-link-search=native=C:\\Users\\u\\AppData\\Local\\other\n";
         assert_eq!(refused(beside.as_bytes(), &ran).len(), 1);
+    }
+
+    /// blaze's settings name the machine's own library directories for every workspace: a
+    /// search there passes with no workspace saying so, one beside it does not; a setting that
+    /// is no list of directories, or names a relative one, is an error naming the file and the
+    /// key; no file is no directory.
+    #[test]
+    fn the_machines_settings_name_its_library_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        assert_eq!(machine_link_dirs_in(&file, &[]).unwrap(), Vec::<PathBuf>::new());
+        let root = if cfg!(windows) { r"C:\cache" } else { "/cache" };
+        let env: Vec<(OsString, OsString)> = vec![("CACHE".into(), root.into())];
+        std::fs::write(
+            &file,
+            "[sandbox]\nbuild-script-link-dirs = [\"${CACHE}/seer/ghostty-vt\"]\n",
+        )
+        .unwrap();
+        let found = machine_link_dirs_in(&file, &env).unwrap();
+        let ran = Ran { link_dirs: &found, windows: cfg!(windows), ..ran() };
+        let search =
+            |dir: &str| refused(format!("cargo:rustc-link-search=native={dir}\n").as_bytes(), &ran);
+        let inside = format!("{root}/seer/ghostty-vt/0f3a");
+        assert!(search(&inside).is_empty(), "{inside}");
+        assert_eq!(search(&format!("{root}/other")).len(), 1);
+        std::fs::write(&file, "[sandbox]\nbuild-script-link-dirs = \"/x\"\n").unwrap();
+        let error = machine_link_dirs_in(&file, &env).unwrap_err();
+        assert!(
+            error.contains("sandbox.build-script-link-dirs") && error.contains("config.toml"),
+            "{error}"
+        );
+        std::fs::write(&file, "[sandbox]\nbuild-script-link-dirs = [\"lib\"]\n").unwrap();
+        assert!(machine_link_dirs_in(&file, &env).unwrap_err().contains("no absolute directory"));
     }
 }

@@ -170,7 +170,12 @@ impl Fixture {
     pub(crate) fn open(&self, ask: &Ask<'_>) -> ViewId {
         let files: Vec<(&str, &[u8])> =
             ask.files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
-        let mut env: Vec<(String, String)> = vec![("HOME".to_owned(), "/home/u".to_owned())];
+        // The home as each system names it: cargo's home is `.cargo` under `USERPROFILE` on
+        // Windows, under `HOME` elsewhere, so the fixture's is one on every host.
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".to_owned(), "/home/u".to_owned()),
+            ("USERPROFILE".to_owned(), "/home/u".to_owned()),
+        ];
         env.extend(ask.env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
         env.sort();
         let mut mounts = vec![mount(WS, "ws"), library_mount(self.library, COMMIT)];
@@ -753,6 +758,72 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     for (_, plan) in &first {
         assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
     }
+}
+
+/// The invariant: the build's rustflags for a platform reach every unit of its standard library
+/// built for it, as cargo's `-Zbuild-std` passes them, and none of std's build scripts, which
+/// are the host's: the front end compiles `core` with the cfg they give (`-C
+/// target-feature=+crt-static` picks its `/defaultlib:libcmt`), never the platform's bare one.
+#[test]
+fn the_rustflags_reach_the_standard_librarys_units_for_the_platform() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let flag = "--cfg=blaze_std_flag";
+    let planned =
+        ready(fixture.plan(fixture.open(&Ask { env: &[("RUSTFLAGS", flag)], ..ask(&files) })));
+    let has = |plan: &UnitPlan| {
+        plan.cfgs.iter().any(|it| it == "blaze_std_flag")
+            || plan.rustflags.iter().any(|it| it == flag)
+    };
+    let std = std_plans(&planned);
+    let (scripts, crates): (Vec<_>, Vec<_>) = std.iter().partition(|((_, target, mode), _)| {
+        *mode == Mode::RunCustomBuild || target.starts_with("build-script")
+    });
+    assert!(!crates.is_empty());
+    for ((package, target, mode), plan) in &crates {
+        assert!(has(plan), "{package} {target} {mode:?}: {plan:?}");
+    }
+    for ((package, target, mode), plan) in &scripts {
+        assert!(!has(plan), "{package} {target} {mode:?}: {plan:?}");
+    }
+}
+
+/// The invariant: with `--target` of the host's own triple the target's rustflags reach the
+/// target's standard library and never the host's, which its build scripts link: cargo gives a
+/// host unit none of them, so the host's std is told the platform's own cfg (no `crt-static`
+/// of the target's flags: a build script linked with the dynamic VC runtime and a `core`
+/// asking for the static one is LNK2038).
+#[test]
+fn with_a_target_of_the_hosts_own_triple_the_hosts_std_has_none_of_the_targets_rustflags() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let flag = "--cfg=blaze_std_flag";
+    let files = [files[0], files[1], ("ws/build.rs", "fn main() {}\n")];
+    let ask = Ask { args: &["--target", HOST], env: &[("RUSTFLAGS", flag)], ..ask(&files) };
+    let planned = ready(fixture.plan(fixture.open(&ask)));
+    let has = |plan: &UnitPlan| {
+        plan.cfgs.iter().any(|it| it == "blaze_std_flag")
+            || plan.rustflags.iter().any(|it| it == flag)
+    };
+    let mut seen = [0, 0];
+    for (unit, plan) in planned.graph.units.iter().zip(&planned.plans) {
+        let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
+        if !unit.is_std || script {
+            continue;
+        }
+        let what = format!("{} {} {:?}", unit.pkg_id, unit.target.name, unit.platform);
+        match unit.platform {
+            Some(_) => {
+                assert!(has(plan), "{what}: {plan:?}");
+                seen[1] += 1;
+            }
+            None => {
+                assert!(!has(plan), "{what}: {plan:?}");
+                seen[0] += 1;
+            }
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "a std unit of each platform: {seen:?}");
 }
 
 /// Each unit of the standard library that both `a` and `b` plan whose plan (its outputs, its

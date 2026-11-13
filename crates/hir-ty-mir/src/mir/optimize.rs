@@ -587,6 +587,47 @@ pub(super) fn live_on_entry<'f>(
     entry
 }
 
+/// Direct reads of a local before its next definition, by block. This describes
+/// reads of the local itself, not indirect reads through addresses of it.
+pub struct ReadOnEntry(blaze_ids::bits::BitMatrix);
+
+impl ReadOnEntry {
+    /// Which incoming local values any continuation of each block can read. Calls may
+    /// unwind before writing their destination; a partial assignment keeps the rest.
+    pub fn of(body: &MirBody<'_>) -> Self {
+        frame::task(Tag::Mir, |frame| {
+            let rpo = reverse_postorder(body, frame);
+            let reads = |live: &mut Bits<'_>, local, mention, _| {
+                if !matches!(mention, Mention::Storage | Mention::Assigned) {
+                    live.insert(local_index(local));
+                }
+            };
+            let rows = live_on_entry(
+                body, &rpo, frame,
+                |live, stmt, at| {
+                    if let StatementKind::Assign(to, _) = stmt && to.projection.is_empty() {
+                        live.remove(local_index(to.local));
+                    }
+                    visit_statement(stmt, at, &mut |l, m, at| reads(live, l, m, at));
+                },
+                |live, term, at| {
+                    if matches!(term, TerminatorKind::Return) {
+                        live.insert(local_index(super::return_slot()));
+                    }
+                    visit_terminator(term, at, &mut |l, m, at| reads(live, l, m, at));
+                },
+            );
+            // alloc: result survives the liveness walk's scratch
+            let words = rows.iter().flat_map(|row| row.words().iter().copied()).collect();
+            Self(blaze_ids::bits::BitMatrix::from_words(rows.len(), body.locals.len(), words))
+        })
+    }
+
+    pub fn contains(&self, block: usize, slot: usize) -> bool {
+        self.0.contains(block, slot)
+    }
+}
+
 /// Immediate dominators of the reachable blocks (Cooper, Harvey and Kennedy).
 pub(super) struct Dominators<'f> {
     /// By block index: the immediate dominator, `None` for a block that is not reachable.

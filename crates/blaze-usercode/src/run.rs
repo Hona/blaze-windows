@@ -177,6 +177,9 @@ impl Value {
 pub enum Mode {
     Normal,
     Verify,
+    /// The platform cannot account for its reads. Keep the sandbox, not the result. No
+    /// previous trace (including a record written by another launcher) authorizes reuse.
+    Unobserved,
 }
 
 /// What a run is.
@@ -382,10 +385,12 @@ impl Run {
         I::Error: From<NoRoot>,
     {
         let roots = spec.roots.view();
-        let found = index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs))
-            .map_err(RunError::Find)?;
+        let found = match spec.mode {
+            Mode::Unobserved => None,
+            Mode::Normal | Mode::Verify => Some(index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs)).map_err(RunError::Find)?),
+        };
         let (kept, verified) = match found {
-            Found::Hit { value, verified, .. } => {
+            Some(Found::Hit { value, verified, .. }) => {
                 let value = Value::decode(value).map_err(RunError::BadValue)?;
                 // What it printed, with this run's roots.
                 (
@@ -397,7 +402,7 @@ impl Run {
                     verified,
                 )
             }
-            Found::Miss { .. } => (None, None),
+            Some(Found::Miss { .. }) | None => (None, None),
         };
         let kept = match (kept, spec.mode) {
             (Some(value), Mode::Normal) => {
@@ -508,6 +513,9 @@ impl Run {
             .transpose()
             .map_err(|error| RunError::Output { key, error })?;
         let value = Value::of(exit, files);
+        if self.spec.mode == Mode::Unobserved {
+            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
+        }
         // One comparison for verify mode, stderr included: the one sharing makes
         // ([`ported_differs`]), so a rerun that differs only in stderr is a difference said
         // here, never a silent retraction in `verify::keep` or a mismatch of its own key.
@@ -1357,6 +1365,26 @@ mod tests {
         let completed =
             run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
         Ok((completed.value, true))
+    }
+
+    #[test]
+    fn an_unobserved_run_neither_uses_nor_publishes_a_cached_value() {
+        let mut sim = Sim::new(3, Faults::default());
+        let mut store = opened(&mut sim);
+        let data = Rc::new(RefCell::new([1; 32]));
+        let printed = Rc::new(RefCell::new(b"first".to_vec()));
+        script(&mut sim, data, printed.clone(), Rc::new(RefCell::new(0)));
+        let mut inputs = Fixed {
+            files: [("/ws/data".into(), [1; 32])].into(),
+            env: vec![("CC".into(), "cc".into())],
+        };
+        assert!(go(&mut sim, &mut store, &mut inputs, Mode::Unobserved).unwrap().1);
+        // No record was published. A traced run must execute too.
+        assert!(go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap().1);
+        // Same declared inputs, different result. Must neither reuse nor collide.
+        *printed.borrow_mut() = b"second".to_vec();
+        let (value, ran) = go(&mut sim, &mut store, &mut inputs, Mode::Unobserved).unwrap();
+        assert!(ran && value.stdout == b"second");
     }
 
     #[test]

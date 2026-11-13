@@ -1,0 +1,56 @@
+name: Windows host
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [windows/host, windows/int]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: '8'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '0'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      # The pinned /MT LLVM uses STL entry points absent from VS 2022's 14.44 libcpmt.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - name: Check the selected CRT
+        run: |
+          if ($env:VCToolsVersion -notmatch '^14\.5\d\.') {
+            throw "LLVM needs MSVC 14.5x; selected '$env:VCToolsVersion'"
+          }
+          cl 2>&1 | Select-Object -First 1
+      - name: Bootstrap the engine
+        run: cargo build --locked -p blaze-engine --bin blaze
+      - name: Check the bootstrap binary
+        run: |
+          ./target/debug/blaze.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $headers = dumpbin /nologo /headers target/debug/blaze.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not ($headers -match '^\s*800000 size of stack reserve\s*$')) {
+            throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
+          }
+      - name: Host, store and linker units
+        run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link

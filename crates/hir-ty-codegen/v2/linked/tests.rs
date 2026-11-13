@@ -64,7 +64,7 @@ extern "system" {
 }
 "#,
     );
-    let mut libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    let mut libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
     for lib in &mut libs {
         lib.imports.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     }
@@ -134,7 +134,7 @@ extern "C" {
 }
 "#,
     );
-    let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+    let error = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
     assert!(error.what.contains("`#[link_ordinal(65536)]` on `far`"), "{}", error.what);
 }
 
@@ -155,7 +155,7 @@ extern "C" {}
 extern "C" {}
 "#,
     );
-    let libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    let libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
     assert_eq!(
         libs,
         [
@@ -170,6 +170,29 @@ extern "C" {}
             },
         ]
     );
+}
+
+/// A `#[link(.., cfg(..))]` is decided by the cfg of the crate that links the program, not of
+/// the crate that names it, as rustc's `relevant_lib` decides it in the linking session: core,
+/// built without `+crt-static`, names `/defaultlib:libcmt` under `cfg(target_feature =
+/// "crt-static")` and `/defaultlib:msvcrt` under its negation, and a program built with
+/// `+crt-static` links the first (it linked the second, and the link refused it as LNK2038).
+#[test]
+fn a_links_cfg_is_the_linking_crates() {
+    let (db, frontend) = frontend(
+        r#"
+//- /dep.rs crate:dep
+#[link(name = "static_crt", cfg(target_feature = "crt-static"))]
+#[link(name = "dynamic_crt", cfg(not(target_feature = "crt-static")))]
+extern "C" {}
+//- /main.rs crate:main deps:dep cfg:target_feature=crt-static
+"#,
+    );
+    let main = fixture::test_crate(&db);
+    let dep = main.data(&*db).dependencies[0].crate_id;
+    assert_eq!(frontend.linked(dep, main).unwrap(), [lib("static_crt", NativeLibKind::Dylib)]);
+    // Control: linked by a crate without the feature, the block's other library.
+    assert_eq!(frontend.linked(dep, dep).unwrap(), [lib("dynamic_crt", NativeLibKind::Dylib)]);
 }
 
 #[test]
@@ -197,7 +220,7 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ),
     ] {
         let (db, frontend) = frontend(text);
-        let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+        let error = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
         assert!(error.what.contains(named), "{text}: {}", error.what);
     }
 }

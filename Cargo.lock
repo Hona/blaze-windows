@@ -1554,7 +1554,9 @@ dependencies = [
  "hegeltest",
  "hir-def",
  "hir-expand",
+ "hir-ty",
  "hir-ty-mir",
+ "hir-ty-pure",
  "intern",
  "proc-macro-api",
  "span",
@@ -2147,6 +2149,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",

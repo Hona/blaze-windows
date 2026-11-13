@@ -186,10 +186,10 @@ impl Query for WorkspaceQuery {
         let manifest_path = match (&key.manifest, &key.config) {
             (Some(path), _) => Some(path.clone()),
             (None, ConfigOf::View) => match cx.get::<Asking>(&())?.get() {
-                Ok(asked) => asked.manifest_path.map(|it| match it.starts_with('/') {
-                    true => it,
-                    false => format!("{}/{it}", asked.cwd),
-                }),
+                Ok(asked) => match asked.manifest_path.map(|it| typed_manifest(&asked.cwd, &it)).transpose() {
+                    Ok(path) => path,
+                    Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
+                },
                 Err(error) => return Ok(Cbor(Err(Unread::Failed(error)))),
             },
             (None, ConfigOf::Fixed { .. }) => None,
@@ -376,5 +376,43 @@ members = ["m/*"]
             panic!("not here")
         };
         assert_eq!(toml::to_string(&read).unwrap(), toml::to_string(&parsed).unwrap());
+    }
+}
+
+/// The daemon's name of the `--manifest-path` the command was given in `cwd` (a daemon
+/// name): an absolute path as the client's system writes it (`C:\w\Cargo.toml` on Windows,
+/// `/w/Cargo.toml` on Unix) is that path's daemon name ([`blaze_core::platform::path::daemon`]);
+/// another is below `cwd`, its parts apart by `/` (Windows writes `\` too).
+fn typed_manifest(cwd: &str, typed: &str) -> Result<String, LoadError> {
+    let path = Path::new(typed);
+    if path.is_absolute() {
+        return blaze_core::platform::path::daemon(path)
+            .map_err(|error| load_error(&anyhow::anyhow!("--manifest-path: {error}"), None));
+    }
+    let typed = if cfg!(windows) { typed.replace('\\', "/") } else { typed.to_owned() };
+    Ok(format!("{}/{typed}", cwd.trim_end_matches('/')))
+}
+#[cfg(test)]
+mod typed_manifest_tests {
+    use super::typed_manifest;
+
+    /// The invariant: a `--manifest-path` the system calls absolute is its own daemon name,
+    /// never joined to the directory the command ran in (I14: `C:\...` read as
+    /// `/C:/cwd/C:/...`); a relative one is below that directory.
+    #[test]
+    fn a_typed_manifest_path_is_named_as_the_daemon_names_it() {
+        #[cfg(windows)]
+        {
+            let cwd = "/C:/Users/me/elsewhere";
+            assert_eq!(typed_manifest(cwd, r"C:\w\hello\Cargo.toml").unwrap(), "/C:/w/hello/Cargo.toml");
+            assert_eq!(typed_manifest(cwd, r"d:/w/Cargo.toml").unwrap(), "/D:/w/Cargo.toml");
+            assert_eq!(typed_manifest(cwd, r"\\host\share\w\Cargo.toml").unwrap(), "/UNC/host/share/w/Cargo.toml");
+            assert_eq!(typed_manifest(cwd, r"sub\Cargo.toml").unwrap(), "/C:/Users/me/elsewhere/sub/Cargo.toml");
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(typed_manifest("/home/me", "/w/Cargo.toml").unwrap(), "/w/Cargo.toml");
+            assert_eq!(typed_manifest("/home/me", "sub/Cargo.toml").unwrap(), "/home/me/sub/Cargo.toml");
+        }
     }
 }

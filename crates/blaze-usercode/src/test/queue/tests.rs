@@ -1673,3 +1673,60 @@ fn drive(fork: u64) -> (Vec<Finished>, usize) {
     }
     (fake.results, used.len())
 }
+
+/// The invariant: a binary run whole is cut into runs whose command lines (the program, the
+/// flags, each name with its space and quotes) fit the longest line, in its jobs' order with
+/// none lost or repeated; one that fits, or one of a fork server, is itself; a name that fits
+/// in no line is an error naming it. The command line of each run is the one the queue starts
+/// it with, measured.
+#[test]
+fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
+    let threads = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(9) };
+    let jobs: Vec<Job> = (0..600).map(|n| job(&format!("module::t{n} \"x\""), 1)).collect();
+    let whole = || Binary { mode: threads.clone(), ..binary("lib", jobs.clone()) };
+    let longest = 4000;
+    let runs = whole().whole_runs(longest).unwrap();
+    assert!(runs.len() > 1, "{}", runs.len());
+    let names: Vec<&str> = runs.iter().flat_map(|it| it.jobs.iter().map(|it| it.name.as_str())).collect();
+    assert_eq!(names, jobs.iter().map(|it| it.name.as_str()).collect::<Vec<_>>());
+    for run in &runs {
+        assert!(!run.jobs.is_empty());
+        assert_eq!((run.id, &run.program, &run.mode), (whole().id, &whole().program, &threads));
+        let mut effects = Vec::new();
+        let _queue = Queue::new(config(64), vec![run_of(run)], Duration::ZERO, &mut effects);
+        let line = effects
+            .iter()
+            .find_map(|it| match it {
+                Effect::Spawn { command, .. } => Some(
+                    blaze_core::create_process::command_line(&command.program, &command.args).unwrap(),
+                ),
+                _ => None,
+            })
+            .expect("the run is spawned");
+        assert!(line.len() <= longest, "{} > {longest}", line.len());
+    }
+    assert_eq!(whole().whole_runs(1 << 20).unwrap().len(), 1);
+    assert_eq!(binary("lib", jobs.clone()).whole_runs(10).unwrap().len(), 1, "a fork server's");
+    let long = Binary { mode: threads.clone(), ..binary("lib", vec![job(&"x".repeat(5000), 1)]) };
+    let refused = long.whole_runs(longest).unwrap_err();
+    assert!(refused.contains("xxxx") && refused.contains("lib"), "{refused}");
+}
+
+/// A copy of `run`, as the queue is given its own.
+fn run_of(run: &Binary) -> Binary {
+    Binary {
+        id: run.id,
+        name: run.name.clone(),
+        program: run.program.clone(),
+        env: run.env.clone(),
+        dir: run.dir.clone(),
+        read: run.read.clone(),
+        write: run.write.clone(),
+        network: run.network,
+        memory: run.memory,
+        mode: run.mode.clone(),
+        jobs: run.jobs.clone(),
+        loaded: run.loaded.clone(),
+        sandboxed: run.sandboxed,
+    }
+}

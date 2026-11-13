@@ -39,8 +39,9 @@ use intern::Symbol;
 /// read from the disk.
 const DIR: &str = "/@blaze-probe";
 
-/// `HOME` of the load, in the package's directory: no `$CARGO_HOME/config.toml` is there.
-const HOME: &str = "/@blaze-probe/home";
+/// The probe's synthetic Cargo home. Give the loader the directory itself, not HOME:
+/// Windows otherwise discovers the real user's configuration through USERPROFILE.
+const CARGO_HOME: &str = "/@blaze-probe/home/.cargo";
 
 /// The probe's root file in the package.
 const ROOT_FILE: &str = "probe.rs";
@@ -130,7 +131,7 @@ pub(super) fn check(
             args: ["--release", "--target", asked.triple].map(str::to_owned).to_vec(),
             root: DIR.to_owned(),
             cwd: DIR.to_owned(),
-            env: vec![("HOME".to_owned(), HOME.to_owned())],
+            env: vec![("CARGO_HOME".to_owned(), CARGO_HOME.to_owned())],
             files: Vec::new(),
         },
         mounts,
@@ -227,10 +228,12 @@ fn std_script(
     units: &Units,
     library: &Library,
 ) -> anyhow::Result<()> {
-    let root = library.dir.join("std/build.rs");
-    let root = root.to_str().with_context(|| format!("{} is not UTF-8", root.display()))?;
-    let read = |path: &str| std::fs::read(path).map_err(|e| format!("reading {path}: {e}"));
-    let script = stdlib::scripts::identify("std", root, read).map_err(anyhow::Error::msg)?;
+    let root = blaze_core::platform::path::daemon(&library.dir.join("std/build.rs"))?;
+    let read = |name: &str| {
+        let path = blaze_core::platform::path::host(name);
+        std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))
+    };
+    let script = stdlib::scripts::identify("std", &root, read).map_err(anyhow::Error::msg)?;
     let index = units
         .graph
         .units

@@ -973,7 +973,7 @@ fn exports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
 
 /// The PDB a debugger looks for is the image's name with `.pdb` for its extension: this stem
 /// and [`PDB`].
-pub(super) fn pdb_stem(name: &str) -> &str {
+pub(crate) fn pdb_stem(name: &str) -> &str {
     match name.rsplit_once('.') {
         Some((stem, _)) if !stem.is_empty() => stem,
         _ => name,
@@ -982,8 +982,8 @@ pub(super) fn pdb_stem(name: &str) -> &str {
 
 const PDB: &str = ".pdb";
 
-/// The debug directory: one CodeView entry naming the PDB by the image's ID. No PDB is
-/// written.
+/// The debug directory: one CodeView entry naming the PDB by the image's ID, which the PDB
+/// carries (`crate::pe::pdb`).
 fn debug(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     let stem = pdb_stem(placed.name);
     let data = region.addr + DEBUG_DIRECTORY;

@@ -1941,6 +1941,9 @@ pub(crate) struct Resolved {
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
+    /// Moves when what native code the image keeps may have: a resolution rebuilt or grown.
+    /// What a PDB's publics are of (`Resolved::native_functions`).
+    pub(crate) natives_version: u64,
     /// Of each name resolved, by [`Symbols::dense`]: `O_*` bits.
     outcomes: CowVec<u8>,
     /// The names `outcomes` holds.
@@ -1956,6 +1959,35 @@ pub(crate) struct Resolved {
 impl Resolved {
     fn outcome(&self, sym: Sym) -> u8 {
         self.outcomes.get(Symbols::dense(sym)).copied().unwrap_or(0)
+    }
+
+    /// The functions of the native code `state` keeps, each `(name, address)`, globals and
+    /// statics, as their objects name them: what a PDB names native code by (its publics).
+    /// MSVC's own labels (`$LN12`, `$unwind$...`) are left out.
+    pub(crate) fn native_functions<'r>(&'r self, state: &crate::state::State) -> Vec<(&'r str, u64)> {
+        let Some(graph) = self.graph.as_deref() else { return Vec::new() };
+        // alloc: once per PDB written, a name per native function
+        let mut out = Vec::new();
+        for (load, it) in graph.loads.iter().enumerate() {
+            let parsed = &it.parsed;
+            let object = parsed.object();
+            for symbol in &object.symbols {
+                let SymbolDef::Section { section, value, .. } = symbol.def else { continue };
+                if symbol.kind != SymbolKind::Function
+                    || !self.marks.sections.get(graph.flat(load as u32, section))
+                {
+                    continue;
+                }
+                let name = object.name(symbol.name);
+                if name.is_empty() || name.starts_with('$') {
+                    continue;
+                }
+                let Some((piece, offset)) = state.home(parsed.section_sym(section)) else { continue };
+                let Some(piece) = state.piece(piece).filter(|it| it.placed()) else { continue };
+                out.push((name, piece.addr + offset + value));
+            }
+        }
+        out
     }
 
     /// The global names the natives define, each once, as resolution chose them: neither
@@ -3176,6 +3208,10 @@ impl<'a> Stage<'a> {
             Some(it) => it,
             None => self.rebuild(&old, &refs, outside)?,
         };
+        if rebuild || !gained.is_empty() {
+            static VERSIONS: AtomicU64 = AtomicU64::new(1);
+            next.natives_version = VERSIONS.fetch_add(1, Ordering::Relaxed);
+        }
         next.refs = refs;
         next.pieces = self.new.piece_count();
         next.removals = self.new.removals();
@@ -4206,6 +4242,8 @@ impl<'a> Stage<'a> {
             // alloc: once per graph built
             commons: Arc::new(commons),
             marks,
+            // Set by the stage that made it (`Stage::resolve`).
+            natives_version: 0,
             outcomes: table,
             named,
             defined: list,

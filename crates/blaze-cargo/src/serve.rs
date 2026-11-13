@@ -729,22 +729,19 @@ impl std::fmt::Display for Before {
 /// What a daemon adds to its pid in `serve.lock` once its stop wrote its image.
 const STOPPED: &str = "stopped";
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hold(
     state: &Path,
     ready: Option<&Ready>,
 ) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
-    use std::{
-        io::{Read as _, Seek as _, Write as _},
-        os::unix::fs::OpenOptionsExt as _,
-    };
+    use std::io::{Read as _, Seek as _, Write as _};
     let lock = state.join("serve.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    // The state's directory is the user's alone on Windows (`platform::home`'s ACL).
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
         .open(&lock)
         .with_context(|| format!("opening the daemon's lock {}", lock.display()))?;
     let tried = stdx::file_lock::Locked::try_lock(file)
@@ -815,7 +812,7 @@ pub(crate) struct Ready {
 
 impl Ready {
     /// The pipe, its reporter started: the calling thread is the start's, which it reports on.
-    #[cfg(all(unix, feature = "native"))]
+    #[cfg(all(any(unix, windows), feature = "native"))]
     fn new(pipe: std::fs::File) -> anyhow::Result<Ready> {
         let pipe = Arc::new(blaze_core::lock::Lock::new("serve.ready.pipe", Some(pipe)));
         let starting = blaze_profile::starting::Starting::here();
@@ -857,20 +854,20 @@ fn say(ready: Option<&Ready>, phase: Phase) {
 }
 
 /// How often [`Ready`]'s reporter says what the start's thread is inside.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 const REPORT_EVERY: Duration = Duration::from_millis(500);
 
 /// The most reports [`Ready`]'s reporter writes: a start's phases are bounded (the CLI waits
 /// [`BEFORE_ENDS`] and a minute a phase), so a start still going past ten minutes on top of
 /// that has long been given up on, and the reporter stops, saying so in the log.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 const REPORTS_MAX: u64 = (BEFORE_ENDS.as_secs() + 600) * 1000 / REPORT_EVERY.as_millis() as u64;
 
 /// [`Ready`]'s reporter: every [`REPORT_EVERY`], an [`INSIDE`] record of what `starting` is
 /// inside, until the pipe is gone (the daemon listens, or its start failed), a write fails (the
 /// CLI that waited is gone) or [`REPORTS_MAX`]. Each tick waits for an absolute deadline taken
 /// as the tick before ended, so nothing restarts a wait that is interrupted.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 fn report(
     pipe: &blaze_core::lock::Lock<Option<std::fs::File>>,
     starting: blaze_profile::starting::Starting,
@@ -925,6 +922,34 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
+/// The pipe of `blaze serve --ready-fd N` on Windows, `N` the number of the handle this process
+/// inherited ([`crate::cli::daemon`]'s start): checked to be a pipe, made this process's alone
+/// (no process it starts inherits it).
+#[cfg(all(windows, feature = "native"))]
+fn ready(handle: i32) -> anyhow::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation},
+        Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType},
+    };
+    let raw = usize::try_from(handle)
+        .ok()
+        .filter(|it| *it != 0)
+        .with_context(|| format!("blaze serve --ready-fd {handle}: no handle's number"))?
+        as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: asks of a number and reads no memory of this process; one that is no open
+    // handle is FILE_TYPE_UNKNOWN, refused below.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
+        bail!("blaze serve --ready-fd {handle}: not a pipe this process was started with");
+    }
+    // SAFETY: as above; clears a flag of an open handle.
+    if unsafe { SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        bail!("blaze serve --ready-fd {handle}: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: open (a pipe, found above), passed for this alone by the CLI that started the
+    // process, and owned by nothing else in it: `serve` takes it before it opens anything.
+    Ok(unsafe { std::fs::File::from_raw_handle(raw) })
+}
 /// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
 #[cfg(feature = "native")]
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
@@ -954,13 +979,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         );
     }
     // First too: nothing this process starts may inherit the pipe.
-    #[cfg(unix)]
     let ready = args.ready.map(ready).transpose()?.map(Ready::new).transpose()?;
-    #[cfg(not(unix))]
-    let ready = match args.ready {
-        Some(_) => bail!("blaze serve --ready-fd: the CLI starts the daemon so on Unix only"),
-        None => None,
-    };
     let socket = match args.socket {
         Some(socket) => std::path::absolute(&socket)
             .with_context(|| format!("the socket {}", socket.display()))?,
@@ -1027,7 +1046,7 @@ pub(crate) struct Engine {
 /// What the engine holds for its life: the state's lock, which the next engine on it waits on,
 /// and the lease of the shared standard library's store.
 struct Held {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     lock: stdx::file_lock::Locked,
     /// How the daemon before this one on the state ended, as its lock said.
     before: Before,
@@ -1044,9 +1063,9 @@ pub(crate) fn engine(
     std::fs::create_dir_all(&state)
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let (lock, before) = hold(&state, ready)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let (_, before) = (ready, Before::None);
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
     // directories.
@@ -1265,7 +1284,7 @@ pub(crate) fn engine(
             format!("making {}, where each sandboxed spawn gets its directory", scratch.display())
         })?;
     let held = Held {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         lock,
         before,
         _std_lease: std_lease,
@@ -1289,7 +1308,7 @@ pub(crate) struct Running {
 impl Running {
     /// Its stop wrote its image: its lock says so to the daemon after it ([`Before`]).
     pub(crate) fn stopped(&mut self) -> anyhow::Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use std::io::{Seek as _, Write as _};
             let file = &mut *self.held.lock;

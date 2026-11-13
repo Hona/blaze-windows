@@ -1214,7 +1214,7 @@ const EVICT_NEEDS: &str = "blaze needs Linux 6.13 for any advice to its own proc
 #[cfg(target_os = "macos")]
 const EVICT_CALL: &str = "madvise(MADV_FREE_REUSABLE)";
 #[cfg(windows)]
-const EVICT_CALL: &str = "VirtualFree(MEM_DECOMMIT)";
+const EVICT_CALL: &str = "DiscardVirtualMemory";
 #[cfg(all(
     any(unix, target_arch = "wasm64"),
     not(any(target_os = "linux", target_os = "macos"))

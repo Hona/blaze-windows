@@ -112,9 +112,22 @@ impl MapOptions {
     ///
     /// As [`Mapped::map`].
     pub unsafe fn open(self, path: &Path) -> io::Result<Mapped> {
-        let file = File::open(path)?;
+        let mut open = File::options();
+        open.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+            // Deny an in-place writer (including an already open writable section), not a
+            // reader or a publisher replacing this generation's name.
+            open.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        }
+        let file = open.open(path)?;
         // SAFETY: the caller's contract, which `map` states.
-        unsafe { self.map(&file) }
+        let mapped = unsafe { self.view(&file) }?;
+        #[cfg(windows)]
+        let mapped = mapped.hold(file);
+        Ok(mapped)
     }
 
     /// The whole of `file`, mapped read-only and shared with every other mapping of it; an
@@ -128,6 +141,17 @@ impl MapOptions {
     /// truncate would fault on the next read of the pages cut. (Windows refuses to cut a file
     /// a view of which is open, but not to write it.)
     pub unsafe fn map(self, file: &File) -> io::Result<Mapped> {
+        // SAFETY: the caller's map contract.
+        let mapped = unsafe { self.view(file) }?;
+        #[cfg(windows)]
+        let mapped = mapped.hold(file.try_clone()?);
+        Ok(mapped)
+    }
+
+    /// # Safety
+    /// As `map`. The caller still holds the file; on Windows it hands the view a handle
+    /// before publishing it to readers.
+    unsafe fn view(self, file: &File) -> io::Result<Mapped> {
         // `fstat` of the descriptor mapped: the one length every read is bounded by.
         let len = usize::try_from(file.metadata()?.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory")
@@ -137,7 +161,7 @@ impl MapOptions {
         }
         // SAFETY: the caller's contract above; `len` is not 0.
         let (at, len) = unsafe { sys::map(file, len, self) }?;
-        Ok(Mapped { at, len })
+        Ok(Mapped { at, len, #[cfg(windows)] backing: None })
     }
 }
 
@@ -146,6 +170,11 @@ impl MapOptions {
 pub struct Mapped {
     at: NonNull<u8>,
     len: usize,
+    // A section reference is not an open file handle. With only the section left, an
+    // ordinary Win32 replace can delete its backing data: cold faults then return zeroes.
+    // Keep an opener until Drop has unmapped the view. Blaze replaces by POSIX rename.
+    #[cfg(windows)]
+    backing: Option<File>,
 }
 
 // SAFETY: read-only pages that no one writes while they are mapped (`MapOptions::map`'s
@@ -156,7 +185,15 @@ unsafe impl Sync for Mapped {}
 
 impl Mapped {
     /// No bytes, and nothing to unmap: what an empty file maps.
-    pub const EMPTY: Mapped = Mapped { at: NonNull::dangling(), len: 0 };
+    pub const EMPTY: Mapped = Mapped { at: NonNull::dangling(), len: 0, #[cfg(windows)] backing: None };
+
+    #[cfg(windows)]
+    fn hold(mut self, file: File) -> Self {
+        if self.len != 0 {
+            self.backing = Some(file);
+        }
+        self
+    }
 
     /// The file at `path` mapped whole, with [`MapOptions::new`].
     ///

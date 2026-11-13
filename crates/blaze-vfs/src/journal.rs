@@ -52,7 +52,7 @@ use std::alloc::Global;
 use crate::{
     FILE_DOMAIN, Mode, Recovered, Ticket,
     image::Bytes,
-    tree::{DIR_MODE, NodeId, Tree, check},
+    tree::{DIR_MODE, NodeId, Tree, component},
 };
 
 const MAGIC: [u8; 4] = *b"BZJ4";
@@ -696,8 +696,7 @@ fn load(
             while !rest.is_done() {
                 let name = rest.str_u32().ok()?;
                 // As the tree writes them: one component each, sorted by bytes, so distinct.
-                let one = check(name).is_ok() && !name.contains('/');
-                if !one || last.is_some_and(|it| it >= name) {
+                if !component(name) || last.is_some_and(|it| it >= name) {
                     return None;
                 }
                 last = Some(name);

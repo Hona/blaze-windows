@@ -488,6 +488,89 @@ fn a_crate_asking_for_the_other_vc_runtime_is_refused() {
     assert!(error.what.contains("`msvcrt`") && error.what.contains("LNK2038"), "{error}");
 }
 
+/// A Rust function's name and line as dbghelp reads them from the image's PDB: the program
+/// (`pdb.c`) asks for `blaze_where`'s, as std's backtrace asks for each frame's, and the PDB
+/// written beside it (`Image::debug_file`) answers with the name and the row its span table
+/// gives the code at that offset; the program's C `main` is named by the PDB's publics.
+#[test]
+fn dbghelp_names_a_rust_function_and_its_line_from_the_pdb() {
+    use blaze_codegen::{Line, Target};
+    use blaze_format::SpanRef;
+    let mut output = output(None, &["pdb.obj"]);
+    output.debug = Debug::Beside;
+    // Room to grow, as a dev build's: an edit is a patch of the image, and of its PDB.
+    output.incremental = true;
+    let crates = [crate::target::CrateLibs { libs: &[], search: &[] }];
+    let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused")).unwrap();
+    let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
+        .into_iter()
+        .map(|it| (it.name, it.made.map_or_else(|| std::fs::read(&it.path).unwrap().into(), |it| it.1), it.kind))
+        .collect();
+    let natives = read
+        .iter()
+        .enumerate()
+        .map(|(at, (name, bytes, kind))| Native {
+            id: ContentId::of("blaze-link pe run", bytes),
+            name,
+            bytes,
+            kind: *kind,
+            order: at as u32,
+        })
+        .collect();
+    let spans = super::SpanTable {
+        files: vec!["src/answer.rs".into()],
+        spans: vec![
+            super::Position { file: 0, line: 7, column: 5 },
+            super::Position { file: 0, line: 8, column: 5 },
+        ],
+    }
+    .encode();
+    let anchor = super::id(91);
+    // `lea rax, [rip - 7]; ret`: where its own code starts.
+    let mut answer = super::function(1, &[0x48, 0x8d, 0x05, 0xf9, 0xff, 0xff, 0xff, 0xc3], Vec::new());
+    answer.lines = vec![
+        Line { at: 0, span: SpanRef { anchor, index: 0 } },
+        Line { at: 5, span: SpanRef { anchor, index: 1 } },
+    ];
+    let change = Change {
+        added: vec![&answer],
+        names: vec![("blaze_where".into(), Target::Function(answer.key))],
+        debug_names: vec![(answer.key, "blaze::answer".into())],
+        spans: vec![(anchor, &spans)],
+        natives,
+        ..Change::default()
+    };
+    let mut image = Image::new(name("out/app.exe"), output).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, change).unwrap();
+    let pdb = image.debug_file().unwrap().expect("a PE image's PDB");
+    assert_eq!(pdb.name, "app.pdb");
+    let dir = scratch("pdb");
+    std::fs::write(dir.join("app.exe"), contents(disk.file("out/app.exe"))).unwrap();
+    std::fs::write(dir.join("app.pdb"), pdb.apply(crate::Format::Pe, None).unwrap()).unwrap();
+    let out = Command::new(dir.join("app.exe")).current_dir(&dir).output().unwrap();
+    let printed = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    assert_eq!((out.status.code(), printed.as_str()), (Some(0), "blaze::answer+2\nsrc/answer.rs:8\nmain+1\n"));
+
+    // An edit: a `nop` first, and its row at 5 is line 7. The image places it anew; the PDB is
+    // a patch of the last one, and dbghelp reads the edit from it.
+    let mut edited = super::function(1, &[0x90, 0x48, 0x8d, 0x05, 0xf8, 0xff, 0xff, 0xff, 0xc3], Vec::new());
+    edited.lines = vec![
+        Line { at: 0, span: SpanRef { anchor, index: 1 } },
+        Line { at: 5, span: SpanRef { anchor, index: 0 } },
+    ];
+    let change = Change { added: vec![&edited], removed: vec![edited.key], ..Change::default() };
+    disk.link(&mut image, change).unwrap();
+    let patch = image.debug_file().unwrap().expect("a PE image's PDB");
+    assert!(patch.base.is_some() && patch.whole.is_none(), "a patch of the last PDB: {:?}", patch.whole);
+    let old = std::fs::read(dir.join("app.pdb")).unwrap();
+    std::fs::write(dir.join("app.pdb"), patch.apply(crate::Format::Pe, Some(&old)).unwrap()).unwrap();
+    std::fs::write(dir.join("app.exe"), contents(disk.file("out/app.exe"))).unwrap();
+    let out = Command::new(dir.join("app.exe")).current_dir(&dir).output().unwrap();
+    let printed = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    assert_eq!((out.status.code(), printed.as_str()), (Some(0), "blaze::answer+2\nsrc/answer.rs:7\nmain+1\n"));
+}
+
 /// A DLL's import library as blaze writes it (`Image::import_library`, what rustc writes as a
 /// `cdylib`'s `.dll.lib`) links the importer as `lib.exe`'s does: its function and its data.
 #[test]
