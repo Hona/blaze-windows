@@ -381,6 +381,8 @@ pub(crate) struct Model {
     slots: Vec<(InstanceKey, Slot)>,
     /// Every procedure's place, sorted: what DBI's section contributions are runs of.
     spans: Vec<(u16, u32, u32)>,
+    /// The functions of no code, sorted: they have no records.
+    empty: Vec<InstanceKey>,
     /// The native code's functions the publics name, as a hash: a change of them lays out
     /// whole.
     natives: u64,
@@ -532,6 +534,7 @@ impl Model {
             file_of: blaze_hash::HashMap::with_capacity_in(64, std::alloc::Global),
             slots: Vec::with_capacity(placed.len()),
             spans: placed.iter().map(|it| (it.section, it.offset, it.size)).collect(),
+            empty: functions.iter().filter(|it| it.size == 0).map(|it| it.key).collect(),
             natives: natives_hash(natives),
         };
         let row_files = model.files_of(lines);
@@ -614,6 +617,8 @@ impl Model {
         }
         model.slots.sort_unstable_by_key(|it| it.0);
         model.spans.sort_unstable();
+        model.empty.sort_unstable();
+        model.empty.dedup();
         if model.slots.windows(2).any(|it| it[0].0 == it[1].0) {
             return Err("two functions of one key: no PDB describes both".into()); // alloc: error path
         }
@@ -914,19 +919,31 @@ impl Model {
         let mut names_changed = false;
         let mut refs_changed = false;
         for key in gone {
+            if let Ok(at) = self.empty.binary_search(key) {
+                self.empty.remove(at);
+                continue;
+            }
             let Ok(at) = self.slots.binary_search_by_key(key, |it| it.0) else {
                 return Ok(Err("a function the link removed has no record"));
             };
-            let (_, slot) = self.slots.remove(at);
-            self.unspan(slot.place);
-            let module = &mut self.streams[usize::from(MODULE)];
-            skip(module, slot.sym_at as usize, slot.sym_len as usize);
-            dirty.push((usize::from(MODULE), slot.sym_at as usize..(slot.sym_at + slot.sym_len) as usize));
-            if slot.line_cap != 0 {
-                ignore(module, slot.line_at as usize, slot.line_cap as usize);
-                dirty.push((usize::from(MODULE), slot.line_at as usize..(slot.line_at + slot.line_cap) as usize));
-            }
+            self.drop_slot(at, &mut dirty);
             names_changed = true;
+        }
+        // A function of no code has no records: only its key is kept, so the records and those
+        // number the image's functions.
+        for function in functions.iter().filter(|it| it.size == 0) {
+            if let Ok(at) = self.slots.binary_search_by_key(&function.key, |it| it.0) {
+                self.drop_slot(at, &mut dirty);
+                names_changed = true;
+            }
+            if let Err(at) = self.empty.binary_search(&function.key) {
+                self.empty.insert(at, function.key);
+            }
+        }
+        for function in &placed {
+            if let Ok(at) = self.empty.binary_search(&function.key) {
+                self.empty.remove(at);
+            }
         }
         let mut rows = Vec::new();
         let mut out = Out::default();
@@ -1036,7 +1053,7 @@ impl Model {
                 }
             }
         }
-        if self.slots.len() != count {
+        if self.slots.len() + self.empty.len() != count {
             return Ok(Err("the records number other than the image's functions"));
         }
         if self.files.len() != files_before {
@@ -1072,6 +1089,20 @@ impl Model {
         }
         self.headers = headers;
         Ok(Ok(self.writes(dirty, whole_streams, resized, directory_before)))
+    }
+
+    /// Takes out the slots of `self.slots[at]`: its procedure stepped over, its line table
+    /// ignored, its place unspanned; its reference left unreferenced.
+    fn drop_slot(&mut self, at: usize, dirty: &mut Vec<(usize, std::ops::Range<usize>)>) {
+        let (_, slot) = self.slots.remove(at);
+        self.unspan(slot.place);
+        let module = &mut self.streams[usize::from(MODULE)];
+        skip(module, slot.sym_at as usize, slot.sym_len as usize);
+        dirty.push((usize::from(MODULE), slot.sym_at as usize..(slot.sym_at + slot.sym_len) as usize));
+        if slot.line_cap != 0 {
+            ignore(module, slot.line_at as usize, slot.line_cap as usize);
+            dirty.push((usize::from(MODULE), slot.line_at as usize..(slot.line_at + slot.line_cap) as usize));
+        }
     }
 
     fn span(&mut self, place: (u16, u32, u32)) {

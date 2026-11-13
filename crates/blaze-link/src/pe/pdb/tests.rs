@@ -394,6 +394,8 @@ enum Op {
     Add(u8, u8),
     Remove(u8),
     Rename(u8),
+    /// The function's code becomes none.
+    Empty(u8),
 }
 
 #[hegel::composite]
@@ -401,11 +403,12 @@ fn op(tc: &hegel::TestCase) -> Op {
     use hegel::generators as gs;
     let n = tc.draw(gs::integers::<u8>().max_value(11));
     let seed = tc.draw(gs::integers::<u8>());
-    match tc.draw(gs::integers::<u8>().max_value(5)) {
+    match tc.draw(gs::integers::<u8>().max_value(6)) {
         0..=2 => Op::Edit(n, seed),
         3 => Op::Add(n, seed),
         4 => Op::Remove(n),
-        _ => Op::Rename(n),
+        5 => Op::Rename(n),
+        _ => Op::Empty(n),
     }
 }
 
@@ -439,6 +442,11 @@ fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
                 (vec![u32::from(n)], vec![])
             }
             Op::Remove(n) if program.funcs.remove(&u32::from(n)).is_some() => (vec![], vec![u32::from(n)]),
+            Op::Empty(n) if program.funcs.contains_key(&u32::from(n)) => {
+                let it = program.funcs.get_mut(&u32::from(n)).unwrap();
+                (it.1, it.3) = (0, Vec::new());
+                (vec![u32::from(n)], vec![])
+            }
             Op::Rename(n) if program.funcs.contains_key(&u32::from(n)) => {
                 let name = format!("app::renamed{step}::f{n}");
                 program.make(u32::from(n), step as u8, Some(name));
@@ -479,7 +487,7 @@ fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
 }
 
 /// The refinement: after any sequence of edits (bodies, added, removed and renamed
-/// functions), the PDB patched by each link's change reads as the one laid out whole from the
+/// functions, a function's code made none), the PDB patched by each link's change reads as the one laid out whole from the
 /// same program: the same procedures, places, rows and references.
 #[hegel::test(test_cases = 200)]
 fn a_pdb_kept_by_patches_reads_as_one_laid_out_whole(tc: hegel::TestCase) {
