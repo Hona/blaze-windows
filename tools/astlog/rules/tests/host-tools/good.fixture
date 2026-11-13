@@ -1,0 +1,4 @@
+use blaze_core::platform::command::command;
+fn helper(dir: &std::path::Path) {
+    command("git", dir);
+}

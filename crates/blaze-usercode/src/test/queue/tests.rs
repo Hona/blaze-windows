@@ -33,6 +33,10 @@ fn config(jobs: usize) -> Config {
     }
 }
 
+fn handed_path(relative: &str) -> OsString {
+    config(1).root.join(relative).into_os_string()
+}
+
 fn job(name: &str, expected_ms: u64) -> Job {
     Job {
         name: name.into(),
@@ -124,7 +128,7 @@ struct Fake {
 impl Fake {
     fn new(config: Config, binaries: Vec<Binary>) -> Fake {
         let mut effects = Vec::new();
-        let queue = Queue::new(config, binaries, Duration::ZERO, &mut effects);
+        let queue = Queue::on_driver(config, binaries, Duration::ZERO, &mut effects, true);
         let mut fake = Fake {
             queue,
             now: Duration::ZERO,
@@ -358,8 +362,8 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
         Fake::new(config(2), vec![binary("lib", vec![job("a", 10), job("b", 50), job("c", 30)])]);
     assert_eq!(fake.records.get(&name("req/1/r0")), Some(&Vec::new()));
     let command = &fake.spawns[0].1;
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
-    assert!(command.env.contains(&(confine::LIVE.into(), "/root/req/1/r0".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t0"))));
+    assert!(command.env.contains(&(confine::LIVE.into(), handed_path("req/1/r0"))));
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     assert!(command.args.is_empty());
     let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else {
@@ -382,7 +386,7 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
         &[
             Line::new(Seen::Read, "", "/lib/libc.so"),
             Line::new(Seen::Env, "", SOCKET),
-            Line::new(Seen::Looked, "", "/root/req/1/t0"),
+            Line::new(Seen::Looked, "", handed_path("req/1/t0").to_str().unwrap()),
             Line::new(Seen::Read, "b", "/ws/b.txt"),
             Line::new(Seen::Read, "c", "/ws/c.txt"),
         ],
@@ -643,7 +647,7 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     assert!(fake.records.is_empty(), "no record is made: {:?}", fake.records);
     let command = &fake.spawns[0].1;
     assert_eq!(command.sandbox, Sandbox::Off);
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t0"))));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE), "{:?}", command.env);
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     let conn = fake.hello(0, &["a", "b", "c"]);
@@ -727,7 +731,7 @@ fn an_outside_and_a_sandboxed_run_of_one_program_each_run_their_own_tests() {
         (command.sandbox.clone(), command.program.clone()),
         (Sandbox::Off, PathBuf::from("/bin/lib"))
     );
-    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t1".into())));
+    assert!(command.env.contains(&(SOCKET.into(), handed_path("req/1/t1"))));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE));
     assert!(!fake.records.contains_key(&name("req/1/r1")));
     let out = fake.hello(1, &all);
@@ -1036,7 +1040,7 @@ fn simulated(two_outside: bool) {
         let two =
             Binary { sandboxed: !two_outside, ..binary("two", vec![job("d", 50), job("e", 5)]) };
         let mut effects = Vec::new();
-        let mut queue = Queue::new(config(2), vec![one, two], sim.now(), &mut effects);
+        let mut queue = Queue::on_driver(config(2), vec![one, two], sim.now(), &mut effects, true);
         let mut played: Vec<Played> = [vec!["a", "fails", "c"], vec!["d", "e"]]
             .into_iter()
             .map(|tests| Played {

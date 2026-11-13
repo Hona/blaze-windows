@@ -35,12 +35,12 @@ impl WarmKey {
     pub fn of(code: &ContentId, command: &Command, set: &[(OsString, OsString)]) -> WarmKey {
         let mut hasher = Hasher::new(crate::trace::os_domain!("blaze v2 warm key 1"));
         hasher.id(code);
-        hasher.part(&crate::trace::os_bytes(command.program.as_os_str()));
+        crate::trace::hash_os(&mut hasher, command.program.as_os_str());
         hasher.update(&(command.args.len() as u64).to_le_bytes());
         for arg in &command.args {
-            hasher.part(&crate::trace::os_bytes(arg));
+            crate::trace::hash_os(&mut hasher, arg);
         }
-        hasher.part(&crate::trace::os_bytes(command.dir.as_os_str()));
+        crate::trace::hash_os(&mut hasher, command.dir.as_os_str());
         blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
             let mut sorted: Vec<&(OsString, OsString), &blaze_mem::Frame> =
                 Vec::with_capacity_in(set.len(), frame);
@@ -48,7 +48,8 @@ impl WarmKey {
             sorted.sort_unstable();
             hasher.update(&(sorted.len() as u64).to_le_bytes());
             for (name, value) in sorted.iter() {
-                hasher.part(&crate::trace::os_bytes(name)).part(&crate::trace::os_bytes(value));
+                crate::trace::hash_os(&mut hasher, name);
+                crate::trace::hash_os(&mut hasher, value);
             }
         });
         match &command.sandbox {
@@ -58,7 +59,7 @@ impl WarmKey {
                 for list in [read, write] {
                     hasher.update(&(list.len() as u64).to_le_bytes());
                     for path in list {
-                        hasher.part(&crate::trace::os_bytes(path.as_os_str()));
+                        crate::trace::hash_os(&mut hasher, path.as_os_str());
                     }
                 }
                 hasher.update(&[u8::from(*network), u8::from(*trace)]);
@@ -432,8 +433,8 @@ mod tests {
         let server = pool.start(key, command("/a"), &mut effects);
         let (listen, spawn) = tags(&effects);
         let Effect::Spawn { command, .. } = &effects[1] else { panic!() };
-        assert!(command.env.iter().any(|it| it.0 == SOCKET && it.1 == "/root/pool/socket/0/s"));
-        assert!(command.env.iter().any(|it| it.0 == LIVE && it.1 == "/root/pool/live/0"));
+        assert!(command.env.contains(&(SOCKET.into(), config().root.join("pool/socket/0/s").into())));
+        assert!(command.env.contains(&(LIVE.into(), config().root.join("pool/live/0").into())));
         let Sandbox::On { write, .. } = &command.sandbox else { panic!() };
         assert_eq!(write, &[PathBuf::from("/root/pool/socket/0")]);
         assert!(pool.owns(listen) && pool.owns(spawn));
