@@ -1319,6 +1319,12 @@ mod tests {
         };
         spec.roots =
             crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
+        // Windows has no roots: `script::prepare` keys a run by its absolute directory and read
+        // roots there, so each checkout's run is its own.
+        #[cfg(windows)]
+        {
+            spec.key.given = ContentId::of("blaze v2 test checkout", dir.as_bytes());
+        }
         spec
     }
 
@@ -1482,6 +1488,22 @@ mod tests {
         // Two checkouts run it and agree: verified.
         assert!(go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap().1);
         assert!(go_in(&mut sim, &mut store, Mode::Normal, "/ckout/b").unwrap().1);
+        // On Windows a run has no roots and is keyed by its checkout: no checkout is given
+        // another's, so each runs and keeps its own, and a rerun that differs has nothing
+        // shared to retract.
+        if cfg!(windows) {
+            let (third, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/c").unwrap();
+            assert!(ran && third.stdout == b"cargo:rustc-cfg=one\n", "a third checkout runs its own");
+            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            match go_in(&mut sim, &mut store, Mode::Verify, "/ckout/c") {
+                Err(RunError::Differs { retracted: None, .. }) => {}
+                other => panic!("a checkout's own value that reruns otherwise is no shared one, not {other:?}"),
+            }
+            let (first, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap();
+            assert!(!ran && first.stdout == b"cargo:rustc-cfg=one\n", "another checkout keeps its own");
+            assert_eq!(*runs.borrow(), 4);
+            return;
+        }
         // A third is given it without a run.
         let (given, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/c").unwrap();
         assert!(!ran && given.stdout == b"cargo:rustc-cfg=one\n");
@@ -1561,6 +1583,29 @@ mod tests {
         }
         let hit = pure_hit(&store, &mut inputs, "/ckout/c")
             .expect("a third checkout is given the pure key's value");
+        // On Windows a run has no roots: what the pure key keeps names the files it read by
+        // their absolute paths, and a third checkout is given it because those files are as
+        // they were, not because two checkouts agreed. Nothing is verified across checkouts,
+        // so a check run that differs retracts nothing, and the sandboxed key is each
+        // checkout's own.
+        if cfg!(windows) {
+            assert!(hit.verified.is_none(), "nothing is verified across checkouts on Windows");
+            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            // The check run is of the third checkout's own key, which kept nothing: it runs
+            // and keeps what it ran.
+            let ran =
+                match go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Verify, "/ckout/c")) {
+                    Ok((ran, true)) => ran,
+                    other => panic!("a check run of a checkout's own key that kept nothing runs, not {other:?}"),
+                };
+            assert_eq!(ran.stdout, b"cargo:rustc-cfg=other\n");
+            let c = spec_in(Mode::Normal, "/ckout/c").roots;
+            assert!(crate::pure::retract(&mut store, &proof, c.view(), &hit, &ran).unwrap().is_none());
+            let (fourth, ran) =
+                go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, "/ckout/d")).unwrap();
+            assert!(ran && fourth.stdout == b"cargo:rustc-cfg=other\n", "a fourth checkout runs its own");
+            return;
+        }
         assert!(hit.verified.is_some(), "verified across the two checkouts");
 
         // The third reruns it on request and gets otherwise: the sandboxed key is retracted,
