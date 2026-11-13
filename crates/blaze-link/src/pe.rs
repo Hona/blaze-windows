@@ -24,7 +24,10 @@
 mod coff;
 pub(crate) mod delay;
 mod image;
+pub(crate) mod pdb;
 pub(crate) mod rsrc;
+
+pub(crate) use image::pdb_stem;
 pub(crate) mod raw_dylib;
 #[cfg(test)]
 pub(crate) mod tests;

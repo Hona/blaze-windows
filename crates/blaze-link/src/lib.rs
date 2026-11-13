@@ -439,7 +439,7 @@ impl Image {
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
         }
-        if output.debug == Debug::Beside && !matches!(output.format, Format::Elf | Format::MachO)
+        if output.debug == Debug::Beside && output.format == Format::Wasm
         {
             // alloc: error path
             return Err(fail(format!(
@@ -1161,7 +1161,9 @@ impl Image {
         // The link's change, when the side file last given is of the generation it was
         // staged from: its functions alone are encoded.
         let delta = &*state.debug_delta;
-        let all = if delta.full {
+        let all = if format == Format::Pe {
+            Some("a PDB is written whole by each link")
+        } else if delta.full {
             Some("the link laid the image out whole, or recorded no change")
         } else if self.beside.at() != Some(delta.base) {
             Some("the side file last given is not of the generation the link was staged from")
@@ -1213,6 +1215,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
+                publics: &[],
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1225,6 +1228,12 @@ impl Image {
             views.push(piece)?;
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        // A PDB names native code by its objects' names; DWARF's side file does not.
+        let publics = match format {
+            Format::Pe => state.resolved.native_functions(state),
+            // alloc: none, empty
+            _ => Vec::new(),
+        };
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1233,6 +1242,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
+            publics: &publics,
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);

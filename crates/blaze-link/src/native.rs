@@ -1958,6 +1958,35 @@ impl Resolved {
         self.outcomes.get(Symbols::dense(sym)).copied().unwrap_or(0)
     }
 
+    /// The functions of the native code `state` keeps, each `(name, address)`, globals and
+    /// statics, as their objects name them: what a PDB names native code by (its publics).
+    /// MSVC's own labels (`$LN12`, `$unwind$...`) are left out.
+    pub(crate) fn native_functions<'r>(&'r self, state: &crate::state::State) -> Vec<(&'r str, u64)> {
+        let Some(graph) = self.graph.as_deref() else { return Vec::new() };
+        // alloc: once per PDB written, a name per native function
+        let mut out = Vec::new();
+        for (load, it) in graph.loads.iter().enumerate() {
+            let parsed = &it.parsed;
+            let object = parsed.object();
+            for symbol in &object.symbols {
+                let SymbolDef::Section { section, value, .. } = symbol.def else { continue };
+                if symbol.kind != SymbolKind::Function
+                    || !self.marks.sections.get(graph.flat(load as u32, section))
+                {
+                    continue;
+                }
+                let name = object.name(symbol.name);
+                if name.is_empty() || name.starts_with('$') {
+                    continue;
+                }
+                let Some((piece, offset)) = state.home(parsed.section_sym(section)) else { continue };
+                let Some(piece) = state.piece(piece).filter(|it| it.placed()) else { continue };
+                out.push((name, piece.addr + offset + value));
+            }
+        }
+        out
+    }
+
     /// The global names the natives define, each once, as resolution chose them: neither
     /// Rust's nor the image beside's. One defined as an alias of its fallback is weak, at
     /// the fallback's place on the line. `inputs` are those it was resolved from.

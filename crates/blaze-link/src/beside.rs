@@ -133,6 +133,9 @@ pub(crate) struct Input<'a> {
     pub functions: &'a [Func<'a>],
     pub lines: &'a [Lined<'a>],
     pub given: Given<'a>,
+    /// PE: the native code's functions the image keeps, each `(name, address)`, which a PDB
+    /// names as publics (C has no records of Rust's). Empty for the other formats.
+    pub publics: &'a [(&'a str, u64)],
 }
 
 /// Which functions an [`Input`] holds.
@@ -269,7 +272,9 @@ pub(crate) fn file_name(format: Format, image: &str) -> Option<String> {
         Format::Elf => Some(format!("{image}.debug")),
         // alloc: as above
         Format::MachO => Some(format!("{image}.dSYM/Contents/Resources/DWARF/{image}")),
-        Format::Pe | Format::Wasm => None,
+        // alloc: as above; the name the image's CodeView record gives
+        Format::Pe => Some(format!("{}.pdb", crate::pe::pdb_stem(image))),
+        Format::Wasm => None,
     }
 }
 
@@ -330,7 +335,8 @@ fn id_at(format: Format) -> Option<usize> {
         Format::Elf => Some(NOTE_AT + 16),
         // The header, then `LC_UUID`'s command and size.
         Format::MachO => Some(32 + 8),
-        Format::Pe | Format::Wasm => None,
+        Format::Pe => Some(crate::pe::pdb::GUID_AT),
+        Format::Wasm => None,
     }
 }
 
@@ -589,6 +595,9 @@ impl Kept {
                 input.name, input.format
             ));
         };
+        if input.format == Format::Pe {
+            return self.pdb(input, exe, name, all);
+        }
         let table = table_of(input.format, exe)?;
         // Why every function is encoded, when they are: the caller's reason, or the one the
         // update of a change stopped for.
@@ -653,6 +662,45 @@ impl Kept {
             all,
             whole: Some(why),
             plist: plist(input.format, input.name),
+        }))
+    }
+
+    /// A PE image's PDB ([`crate::pe::pdb`]), written whole: a change's functions alone are not
+    /// enough, so an update of one asks for every function.
+    fn pdb(
+        &mut self,
+        input: &Input<'_>,
+        exe: &impl Fn(u64, &mut [u8]),
+        name: String,
+        all: Option<&'static str>,
+    ) -> Result<Option<DebugWrite>, String> {
+        const WHOLE: &str = "a PDB is written whole by each link";
+        if matches!(input.given, Given::Changed { .. }) {
+            self.asked = Some(WHOLE);
+            return Ok(None);
+        }
+        let headers = crate::pe::pdb::Headers::read(exe)?;
+        let bytes = crate::pe::pdb::write(&headers, &input.id, input.functions, input.lines, input.publics)?;
+        self.encoded = input.functions.len() as u64;
+        self.file = Bytes(std::sync::Arc::new(bytes));
+        self.id = Some(input.id);
+        self.at = Some(input.generation);
+        self.format = input.format;
+        // alloc: once per PDB, the image's name
+        self.name = input.name.to_owned();
+        Ok(Some(DebugWrite {
+            name,
+            id: input.id,
+            base: None,
+            len: self.file.len() as u64,
+            // clone: the whole file, once per PDB; the model keeps its own
+            writes: vec![(0, self.file.to_vec())],
+            records: input.functions.len() as u64,
+            encoded: self.encoded,
+            summed: 0,
+            all: all.or(self.asked.take()).or(Some(WHOLE)),
+            whole: Some(WHOLE),
+            plist: None,
         }))
     }
 

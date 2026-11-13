@@ -61,7 +61,8 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
 
 /// Debug info goes beside an ELF or Mach-O image by default and under either split setting;
 /// `off` puts it inside as before; no debug info is none wherever; a format with no side file
-/// keeps what it had; a setting rustc does not take is refused by name.
+/// keeps what it had; a PE image's is its PDB under every setting; a setting rustc does not
+/// take is refused by name.
 #[test]
 fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
     use blaze_link::{Debug, Format};
@@ -73,7 +74,12 @@ fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
         assert_eq!(super::debug_place(Debug::None, format, None), Ok(Debug::None));
         assert_eq!(super::debug_place(Debug::None, format, Some("off")), Ok(Debug::None));
     }
-    assert_eq!(super::debug_place(Debug::Lines, Format::Pe, None), Ok(Debug::Lines));
+    // A PE image's debug info is its PDB, beside it under every setting.
+    for split in [None, Some("off"), Some("packed"), Some("unpacked")] {
+        assert_eq!(super::debug_place(Debug::Lines, Format::Pe, split), Ok(Debug::Beside));
+        assert_eq!(super::debug_place(Debug::None, Format::Pe, split), Ok(Debug::None));
+    }
+    assert_eq!(super::debug_place(Debug::Lines, Format::Wasm, None), Ok(Debug::Lines));
     let refused = super::debug_place(Debug::Lines, Format::Elf, Some("split")).unwrap_err();
     assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
 }
