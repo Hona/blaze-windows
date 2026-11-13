@@ -345,6 +345,8 @@ struct Slot {
     line_cap: u32,
     ref_at: u32,
     name: String,
+    /// Its section, offset and size.
+    place: (u16, u32, u32),
 }
 
 /// Why a patch stopped: the file is laid out whole, for this reason.
@@ -377,6 +379,8 @@ pub(crate) struct Model {
     file_of: blaze_hash::HashMap<String, u32, std::alloc::Global>,
     /// By key.
     slots: Vec<(InstanceKey, Slot)>,
+    /// Every procedure's place, sorted: what DBI's section contributions are runs of.
+    spans: Vec<(u16, u32, u32)>,
     /// The native code's functions the publics name, as a hash: a change of them lays out
     /// whole.
     natives: u64,
@@ -527,6 +531,7 @@ impl Model {
             files: Vec::new(),
             file_of: blaze_hash::HashMap::with_capacity_in(64, std::alloc::Global),
             slots: Vec::with_capacity(placed.len()),
+            spans: placed.iter().map(|it| (it.section, it.offset, it.size)).collect(),
             natives: natives_hash(natives),
         };
         let row_files = model.files_of(lines);
@@ -603,10 +608,12 @@ impl Model {
         for ((function, (sym_at, sym_len)), (line_at, line_cap)) in placed.iter().zip(syms).zip(line_slots) {
             let ref_at = records.len() as u32;
             reference(&mut records, sym_at, &function.name);
-            let slot = Slot { sym_at, sym_len, line_at, line_cap, ref_at, name: function.name.clone().into_owned() };
+            let place = (function.section, function.offset, function.size);
+            let slot = Slot { sym_at, sym_len, line_at, line_cap, ref_at, name: function.name.clone().into_owned(), place };
             model.slots.push((function.key, slot));
         }
         model.slots.sort_unstable_by_key(|it| it.0);
+        model.spans.sort_unstable();
         if model.slots.windows(2).any(|it| it[0].0 == it[1].0) {
             return Err("two functions of one key: no PDB describes both".into()); // alloc: error path
         }
@@ -690,18 +697,8 @@ impl Model {
     /// DBI: the module, its section contributions (runs of its procedures that touch), the
     /// section map, its files, the EC names and the debug header naming the section headers.
     fn dbi(&self) -> Vec<u8> {
-        let module = &self.streams[usize::from(MODULE)];
-        let mut spans: Vec<(u16, u32, u32)> = self
-            .slots
-            .iter()
-            .map(|(_, it)| {
-                let body = &module[it.sym_at as usize + 4..];
-                (u16::from_le_bytes([body[32], body[33]]), u32_at(body, 28), u32_at(body, 12))
-            })
-            .collect();
-        spans.sort_unstable();
         let mut runs: Vec<(u16, u32, u32)> = Vec::new();
-        for (section, offset, size) in spans {
+        for &(section, offset, size) in &self.spans {
             match runs.last_mut() {
                 Some(last) if last.0 == section && last.1 + last.2 >= offset => {
                     last.2 = last.2.max(offset + size - last.1);
@@ -921,6 +918,7 @@ impl Model {
                 return Ok(Err("a function the link removed has no record"));
             };
             let (_, slot) = self.slots.remove(at);
+            self.unspan(slot.place);
             let module = &mut self.streams[usize::from(MODULE)];
             skip(module, slot.sym_at as usize, slot.sym_len as usize);
             dirty.push((usize::from(MODULE), slot.sym_at as usize..(slot.sym_at + slot.sym_len) as usize));
@@ -1018,15 +1016,23 @@ impl Model {
                     }
                     slot.sym_at = sym_at as u32;
                     slot.sym_len = sym_len;
+                    let (old, new) = (slot.place, (function.section, function.offset, function.size));
+                    slot.place = new;
                     slot.line_at = line_at;
                     slot.line_cap = line_cap;
+                    if old != new {
+                        self.unspan(old);
+                        self.span(new);
+                    }
                 }
                 Err(at) => {
                     names_changed = true;
                     refs_changed = true;
                     let name = function.name.clone().into_owned();
                     let ref_at = Model::push_reference(&mut self.streams[usize::from(RECORDS)], sym_at as u32, &name);
-                    self.slots.insert(at, (function.key, Slot { sym_at: sym_at as u32, sym_len, line_at, line_cap, ref_at, name }));
+                    let place = (function.section, function.offset, function.size);
+                    self.slots.insert(at, (function.key, Slot { sym_at: sym_at as u32, sym_len, line_at, line_cap, ref_at, name, place }));
+                    self.span(place);
                 }
             }
         }
@@ -1066,6 +1072,17 @@ impl Model {
         }
         self.headers = headers;
         Ok(Ok(self.writes(dirty, whole_streams, resized, directory_before)))
+    }
+
+    fn span(&mut self, place: (u16, u32, u32)) {
+        let at = self.spans.partition_point(|it| *it < place);
+        self.spans.insert(at, place);
+    }
+
+    fn unspan(&mut self, place: (u16, u32, u32)) {
+        let at = self.spans.partition_point(|it| *it < place);
+        debug_assert_eq!(self.spans.get(at), Some(&place), "a procedure's place is spanned");
+        self.spans.remove(at);
     }
 
     /// Appends a reference to the symbol record stream: its offset.

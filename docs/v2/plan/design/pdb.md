@@ -1,6 +1,6 @@
 ---
 status: current
-summary: A PE image's PDB is its side file - MSF 7.0 with the PDB info stream (the image's build id as GUID, age 1), empty TPI and IPI, DBI with one module of every Rust function, its section contributions, section map, files and the image's section headers, the module's `S_GPROC32` procedures and C13 line tables, globals for Rust functions and publics for native ones - giving std's backtrace (dbghelp) names and lines and cdb breakpoints by name. Built - laid out whole (400,000 functions in 0.30 s) and patched per function by each link's change (an edit of a desktop-sized PDB writes about 340 bytes in 20 ms), a Hegel refinement test and a run-tier test through dbghelp. Not built - types, locals, inline sites, the C objects' own `.debug$S`.
+summary: A PE image's PDB is its side file - MSF 7.0 with the PDB info stream (the image's build id as GUID, age 1), empty TPI and IPI, DBI with one module of every Rust function, its section contributions, section map, files and the image's section headers, the module's `S_GPROC32` procedures and C13 line tables, globals for Rust functions and publics for native ones - giving std's backtrace (dbghelp) names and lines and cdb breakpoints by name. Built - laid out whole (400,000 functions in 0.30 s) and patched per function by each link's change (an edit of a desktop-sized PDB writes about 340 bytes in about 1 ms), a Hegel refinement test and a run-tier test through dbghelp. Not built - types, locals, inline sites, the C objects' own `.debug$S`.
 date: 2026-11-13
 ---
 # PDB for blaze's PE images
@@ -83,9 +83,9 @@ update lays the file out whole with new room, and `DebugWrite::whole` says why.
 
 The function's procedure (in place), its line table (in place when its rows fit), DBI's
 contribution, the build id. Measured (`a_desktop_sized_patch`, 400,000 functions): about
-340 bytes in 3 or 4 writes, in 20 ms, against 142 MB whole. The bytes are at the floor; the
-20 ms are not: DBI's contributions are made again from every slot (O(functions)), the next
-thing to make incremental.
+340 bytes in 3 or 4 writes, in 0.7-1.4 ms, against 142 MB whole. DBI's contributions are runs
+of a sorted list of the procedures' places, kept by each patch; what is left of the time is
+DBI's runs made again (O(functions), a linear pass) and the directory compared.
 
 ### Tests
 
