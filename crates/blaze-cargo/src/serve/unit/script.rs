@@ -514,6 +514,11 @@ pub(crate) fn started_in(
     #[cfg(windows)]
     if sandboxed {
         developer_prompt(job, unit, &mut env)?;
+        // The stand-in is a link under the daemon's state directory, not beside its std
+        // sources; the AppContainer also has its own LOCALAPPDATA. Give it the daemon's std.
+        let std = crate::toolchain::library::found()?;
+        env.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::toolchain::library::VAR));
+        env.push((crate::toolchain::library::VAR.into(), std.dir.as_os_str().to_owned()));
     }
     #[cfg(not(windows))]
     let _ = unit;
@@ -880,7 +885,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
+        How::Sandboxed(prepared) if prepared.spec.mode != blaze_usercode::run::Mode::Normal => {
             false
         }
         How::Sandboxed(prepared) => {
@@ -1069,6 +1074,41 @@ pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
         .with(Role::OutDir, &unit.out_dir)
 }
 
+/// The source payload containing `package`, if Blaze fetched it. A Git dependency's
+/// payload is its checkout: a member may read assets beside it. A registry package is
+/// one archive. Never walk up looking for `.git` on disk or leave the verified payload.
+#[cfg(windows)]
+fn fetched_input(sources: &Path, package: &Path) -> Option<PathBuf> {
+    use std::path::Component::Normal;
+    let mut parts = package.strip_prefix(sources).ok()?.components();
+    let (Some(Normal(kind)), Some(Normal(sub)), Some(Normal(index)), Some(Normal(revision))) =
+        (parts.next(), parts.next(), parts.next(), parts.next()) else { return None };
+    if parts.any(|p| !matches!(p, Normal(_))) { return None; }
+    ((kind == "git" && sub == "checkouts") || (kind == "registry" && sub == "src"))
+        .then(|| sources.join(kind).join(sub).join(index).join(revision))
+}
+
+/// Bundled native sources may live in a build-dependency: its code, inside the script,
+/// opens files relative to its own compile-time CARGO_MANIFEST_DIR (e.g. luau0-src).
+#[cfg(windows)]
+fn script_inputs(job: &Job, compile: usize, read: &mut Vec<PathBuf>) -> Result<(), ApiError> {
+    let units = job.units();
+    let sources = blaze_core::platform::path::host(&job.input.config.sources);
+    let mut seen = vec![false; units.graph.units.len()]; // alloc: visit each compiled dependency once
+    let mut pending = vec![compile]; // alloc: the script's dependency walk
+    while let Some(index) = pending.pop() {
+        let unit = job.unit(index)?;
+        if std::mem::replace(&mut seen[index], true) { continue; }
+        let package = package_of(units, unit)?;
+        let dir = manifest_dir(&package.name, &package.manifest_path)?;
+        if let Some(input) = fetched_input(&sources, &dir) { read.push(input); }
+        pending.extend(unit.dependencies.iter().map(|dep| dep.index));
+    }
+    let std = crate::toolchain::library::found().map_err(|why| ApiError::new(why, None))?;
+    read.push(std.dir.clone()); // clone: the launch spec owns its roots
+    Ok(())
+}
+
 /// Run `run` ready to begin; none while its script is not built.
 fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let units = job.units();
@@ -1122,6 +1162,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         job.shared.tools.clone(),
     ];
     #[cfg(windows)]
+    if !outside(job, run) { script_inputs(job, compile, &mut read)?; }
+    #[cfg(windows)]
     if let Some((_, paths)) = job.input.config.invocation.env.iter().find(|(name, _)| name == "BLAZE_SCRIPT_READ") {
         // A checkout cannot choose these via a gitfile, PATH or Cargo's [env]. This is the
         // caller's environment, before any values from the project are applied.
@@ -1144,6 +1186,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
         })
         .collect();
+    read.sort_unstable();
     read.dedup();
     let place = Place {
         code,
@@ -1152,6 +1195,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         network: false,
         memory: None,
         mode: match rechecks(job)? {
+            _ if !crate::sandbox::v2::OBSERVES_READS => blaze_usercode::run::Mode::Unobserved,
             true => blaze_usercode::run::Mode::Verify,
             false => blaze_usercode::run::Mode::Normal,
         },
