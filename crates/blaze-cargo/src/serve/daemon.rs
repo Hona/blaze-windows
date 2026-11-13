@@ -1657,7 +1657,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
-            crate::serve::fetch::on_disk_mark(std::path::Path::new(at))
+            crate::serve::fetch::on_disk_mark(&blaze_core::platform::path::host(at))
         });
         if let Some((first, why)) = forgotten.first() {
             tracing::info!(target: "blaze", packages = forgotten.len(), first = %first, why = %why, "fetched packages whose copy on disk is not their mount's are fetched again");

@@ -35,7 +35,7 @@ fn code(marks: &[ContentId; 2]) -> [u8; 32] {
 /// Writes the code map of `image`, just linked at `path` from `built`, when the target
 /// directory has a `perf` directory.
 pub(crate) fn write_map(job: &Job, path: &str, image: &Image, built: &Built) -> Result<(), String> {
-    let perf = Path::new(&job.units().target_dir).join(DIR);
+    let perf = blaze_core::platform::path::host(&job.units().target_dir).join(DIR);
     if !perf.try_exists().map_err(|error| format!("{}: {error}", perf.display()))? {
         return Ok(());
     }
