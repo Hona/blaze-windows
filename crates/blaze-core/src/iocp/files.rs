@@ -700,7 +700,7 @@ fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
 }
 
 fn control<T, U>(
-    handle: &OwnedHandle,
+    handle: &impl std::os::windows::io::AsRawHandle,
     code: u32,
     input: Option<&T>,
     output: Option<&mut U>,
@@ -727,6 +727,18 @@ fn control<T, U>(
             std::ptr::null_mut(),
         )
     })
+}
+
+/// Mark before setting EOF: the unused patch room then allocates no NTFS clusters.
+pub(crate) fn sparse_output(file: &std::fs::File) -> io::Result<()> {
+    use windows_sys::Win32::System::SystemServices::FILE_SUPPORTS_SPARSE_FILES;
+    let mut flags = 0;
+    // SAFETY: a live handle; only the filesystem flags are requested.
+    sys::check(unsafe { GetVolumeInformationByHandleW(file.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut flags, std::ptr::null_mut(), 0) })?;
+    if flags & FILE_SUPPORTS_SPARSE_FILES != 0 {
+        control::<(), ()>(file, FSCTL_SET_SPARSE, None, None)?;
+    }
+    Ok(())
 }
 
 /// `to` made sharing `from`'s blocks (ReFS's block cloning), or an error naming the file

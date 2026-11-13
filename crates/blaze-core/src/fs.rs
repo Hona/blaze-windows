@@ -10,6 +10,13 @@ pub use mapped::{Advice, MapOptions, Mapped};
 
 mod patch;
 pub(crate) use patch::matches_patch;
+
+pub(crate) fn sparse_file(path: &Path, len: u64) -> io::Result<()> {
+    let file = making_parent(path, || OpenOptions::new().write(true).create_new(true).open(path))?;
+    #[cfg(windows)]
+    crate::iocp::files::sparse_output(&file)?;
+    file.set_len(len)
+}
 #[cfg(windows)]
 pub(crate) use crate::iocp::files::try_patch;
 
