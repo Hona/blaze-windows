@@ -2305,6 +2305,9 @@ mod eh_frame_reach;
 
 mod tls_desc;
 
+#[cfg(windows)]
+mod pe_run;
+
 /// The state's columns, read and written as a stage does.
 mod columns {
     use blaze_codegen::Line;

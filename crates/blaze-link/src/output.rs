@@ -90,6 +90,10 @@ pub struct LinkArgs {
     /// given: every name the image defines that one matches ([`crate::args::glob`]) is
     /// exported, and kept for it (`Stage::export_for_libraries`).
     pub export_dynamic: Vec<String>,
+    /// Input files given as link arguments (link.exe's bare `foo.obj`, `foo.lib`, `foo.res`),
+    /// in the order given: [`crate::target::locate`] puts them on the line after the crates'
+    /// libraries, each read by what it is.
+    pub inputs: Vec<std::path::PathBuf>,
 }
 
 /// What a symbol nothing on the link line defines becomes.

@@ -2545,6 +2545,9 @@ impl<'a> Stage<'a> {
                 .map_or(0, |it| object.sections[*it as usize].data.len())
         };
         for (index, group) in object.groups.iter().enumerate() {
+            if group.local {
+                continue;
+            }
             let index = index as u32;
             let name = object.name(group.name);
             let entry = b.group_list.len() as u32;
@@ -2668,13 +2671,13 @@ impl<'a> Stage<'a> {
                     }
                     continue;
                 }
-                SymbolDef::Fallback { search, .. } => {
+                SymbolDef::Fallback { symbol: default, search } => {
                     if search {
                         b.flag(slot, PULL);
                     }
                     let it = &mut b.graph.slots[slot as usize];
                     if it.fallback == NONE64 {
-                        it.fallback = pack(load, at as u32);
+                        it.fallback = pack(load, default);
                     }
                     continue;
                 }
@@ -4412,7 +4415,7 @@ mod tests {
         assert!(check_object(&bad, 16).unwrap_err().contains("past the object's 1"));
 
         let mut bad = good();
-        bad.groups = vec![Group { name: bad.symbols[0].name, sections: 0..1, largest: false }];
+        bad.groups = vec![Group { name: bad.symbols[0].name, sections: 0..1, largest: false, local: false }];
         bad.grouped = vec![4];
         assert!(check_object(&bad, 16).unwrap_err().contains("COMDAT"));
 

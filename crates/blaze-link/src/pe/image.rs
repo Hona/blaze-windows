@@ -748,6 +748,48 @@ fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
     Ok(cells)
 }
 
+/// Each import address table cell as the file holds it, `(cell, value)` in address order: the
+/// import lookup table entry of its import (a hint/name RVA, or an ordinal), read back from the
+/// import directory [`imports`] wrote. The regions keep the cells zero; the core lays these
+/// over them ([`crate::model::Writer::encode`]). Windows' loader binds a DLL's cells only where
+/// the file's IAT holds those entries, as link.exe and lld-link write it: with zero cells it
+/// binds none and loads none of the DLLs, and the program calls through a null pointer at its
+/// first import (seen on Windows 11 26100: `__security_init_cookie`'s
+/// `GetSystemTimeAsFileTime`).
+pub(super) fn iat_slots(placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+    let Some((_, region)) = placed.region(&Class::Synthetic(IDATA)) else {
+        // alloc: none, an empty `Vec`
+        return Ok(Vec::new());
+    };
+    if region.size == 0 {
+        // alloc: none, an empty `Vec`
+        return Ok(Vec::new());
+    }
+    let base = placed.plan.base;
+    let mut slots = Vec::with_capacity(placed.imports.len());
+    let mut at = region.addr;
+    loop {
+        let descriptor = bytes_at::<{ DESCRIPTOR as usize }>(placed, at, "an import descriptor")?;
+        let (lookup, cells) = (u32_of(&descriptor, 0), u32_of(&descriptor, 16));
+        if lookup == 0 && cells == 0 {
+            break;
+        }
+        let (mut entry, mut cell) = (base + u64::from(lookup), base + u64::from(cells));
+        loop {
+            let value = u64_of(&bytes_at::<8>(placed, entry, "an import lookup table entry")?, 0);
+            if value == 0 {
+                break;
+            }
+            slots.push((cell, value));
+            entry += 8;
+            cell += 8;
+        }
+        at += DESCRIPTOR;
+    }
+    radix::sort_copy_by_key(&mut slots, |it| it.0);
+    Ok(slots)
+}
+
 /// The import directory, the lookup tables, the hint/name table and the DLL names. Each DLL's
 /// IAT cells are the core's GOT cells of its imports, consecutive and followed by a zero cell.
 fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {

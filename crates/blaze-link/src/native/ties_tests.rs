@@ -194,7 +194,7 @@ fn a_tied_section_is_no_root_and_no_start_symbol_keeps_it() {
 fn a_dropped_section_drops_what_is_tied_to_it() {
     let mut it = object(&[TEXT, counters(), Class::Rodata, TEXT], &[]);
     let name = it.names.push("f").unwrap();
-    it.groups = vec![crate::model::Group { name, sections: 0..1, largest: false }];
+    it.groups = vec![crate::model::Group { name, sections: 0..1, largest: false, local: false }];
     it.grouped = vec![0];
     it.ties =
         vec![Tie { section: 1, to: 0, ordered: false }, Tie { section: 2, to: 1, ordered: false }];

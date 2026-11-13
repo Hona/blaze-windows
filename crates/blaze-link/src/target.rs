@@ -451,6 +451,9 @@ fn locate_with<A: Ask>(
             line.library(&lib.name, lib.kind, lib.verbatim, own)?;
         }
     }
+    for input in &output.link.inputs {
+        line.input(input)?;
+    }
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
@@ -1564,6 +1567,40 @@ impl Line<'_> {
         names.contains(&key[..])
     }
 
+    /// An input file the link arguments name ([`crate::LinkArgs::inputs`]), as link.exe finds
+    /// one: an absolute path as it is, a relative one in the line's directories (link.exe's
+    /// `LIB`), ASCII case ignored. Read by its extension: `.obj` and `.o` an object, `.lib` and
+    /// `.a` an archive, `.res` a compiled resource file (an object to the reader).
+    fn input(&mut self, input: &Path) -> Result<(), LinkError> {
+        let extension = input.extension().and_then(|it| it.to_str()).unwrap_or_default();
+        let is = |it: &str| extension.eq_ignore_ascii_case(it);
+        let kind = if is("obj") || is("o") || is("res") {
+            NativeKind::Object
+        } else if is("lib") || is("a") {
+            NativeKind::Archive { whole: false }
+        } else {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "the link argument's input file {}: blaze's linker takes .obj, .o, .lib, .a and \
+                     .res files",
+                    input.display()
+                ),
+            ));
+        };
+        let path = match input.to_str() {
+            Some(name) => self.default_library(name),
+            // alloc: error path
+            None => Err(fail(format!("the input file {} is not UTF-8", input.display()))),
+        }
+        .map_err(|it| LinkError {
+            // alloc: error path
+            what: format!("the link argument's input file {}: {}", input.display(), it.what),
+            ..it
+        })?;
+        self.push(path, kind)
+    }
+
     fn object(&mut self, name: &str) -> Result<(), LinkError> {
         let path = self.found.object(name)?.to_path_buf();
         self.push(path, NativeKind::Object)
@@ -1629,7 +1666,7 @@ impl Line<'_> {
         let script = self.output.format == Format::Elf
             && matches!(kind, NativeKind::Shared { .. })
             && sniff(&path)? == Sniffed::Text;
-        let archive = pe && matches!(kind, NativeKind::Archive { .. });
+        let archive = pe && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let autolinks = self.output.format == Format::MachO
             && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let reexports =
@@ -1744,7 +1781,8 @@ impl Line<'_> {
         Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by)), &[]))
     }
 
-    /// The libraries the members of the PE archive at `at` ask for, each after it on the line
+    /// The libraries the members of the PE archive at `at` ask for (or the COFF object at `at`
+    /// itself), each after it on the line
     /// and followed in turn, as link.exe follows `/DEFAULTLIB` from the members it takes. A
     /// member's own `/NODEFAULTLIB` takes its own out ([`crate::pe::asked_libraries`]); one in
     /// another member does not, since that member may not be taken. Every member's are
@@ -1760,10 +1798,16 @@ impl Line<'_> {
         for (member, library) in asked.iter() {
             let path = self.default_library(library).map_err(|it| LinkError {
                 // alloc: error path
-                what: format!(
-                    "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
-                    self.out[at].name, it.what
-                ),
+                what: match member.is_empty() {
+                    true => format!(
+                        "{} asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                    false => format!(
+                        "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                },
                 ..it
             })?;
             self.push(path, NativeKind::Archive { whole: false })?;

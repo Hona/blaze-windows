@@ -394,6 +394,10 @@ impl Writer for Pe {
         image::file(self, placed)
     }
 
+    fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        image::iat_slots(placed)
+    }
+
     fn shared_entry(&self) -> Option<&'static str> {
         self.dll().then_some("_DllMainCRTStartup")
     }

@@ -780,6 +780,11 @@ pub(crate) struct Group {
     /// Of this name the group whose first section is largest is kept, not the first one
     /// (`IMAGE_COMDAT_SELECT_LARGEST`: MSVC's vftables with or without their RTTI locator).
     pub largest: bool,
+    /// The object's own, never one of a name shared with another object's: a COFF COMDAT
+    /// whose leader symbol is static (MSVC's `static` functions and the templates only one
+    /// object instantiates, under `/Gy`), which link.exe keeps per object. Its name is for
+    /// errors only.
+    pub local: bool,
 }
 
 /// Section `section` tied to section `to` of the same object ([`Object::ties`]): ELF
