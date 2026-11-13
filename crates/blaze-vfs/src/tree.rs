@@ -107,6 +107,14 @@ pub(crate) type Entry = (NameId, NodeId, Mode);
 /// git's mode of a directory entry.
 pub(crate) const DIR_MODE: u32 = 0o040000;
 
+/// A directory's Merkle input, in byte order of the entry names. Restore and the writer
+/// use the same encoding; they do not trust a structurally valid directory under another ID.
+pub(crate) fn encode_entry(bytes: &mut Vec<u8>, name: &[u8], code: u32, child: &ContentId) {
+    bytes.put_u32(code);
+    bytes.put_bytes_u64(name);
+    bytes.put_bytes(&child.0);
+}
+
 /// How many symlinks one path may pass through, as Linux allows.
 const MAX_LINKS: usize = 40;
 
@@ -149,9 +157,15 @@ pub(crate) fn op_paths(op: &Op) -> impl Iterator<Item = &str> {
 
 /// Checks that `path` has one or more parts, none empty, `.` or `..`.
 pub(crate) fn check(path: &str) -> Result<(), OpError> {
-    let bad = path.is_empty() || path.split('/').any(|it| it.is_empty() || it == "." || it == "..");
+    let bad = !path.split('/').all(component);
     // alloc: the error's path
     if bad { Err(OpError::BadPath(path.to_owned())) } else { Ok(()) }
+}
+
+/// A single tree entry, not a host path. On Unix a backslash is a literal filename byte;
+/// on Windows it would split this entry into two names when projected to disk.
+pub(crate) fn component(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\0']) && !(cfg!(windows) && name.contains('\\'))
 }
 
 /// A directory's entries as the tree reads them.
@@ -306,6 +320,7 @@ impl Tree {
     }
 
     pub(crate) fn name(&mut self, name: &str) -> NameId {
+        assert!(component(name), "invalid VFS entry name {name:?}");
         if let Some(id) = self.store.names().find_base(name.as_bytes()) {
             return NameId(id);
         }
@@ -392,6 +407,7 @@ impl Tree {
     /// bytes are each entry's git mode code, length-prefixed name and child ID, as
     /// [`DIR_DOMAIN`] says, built in one buffer and hashed in one call.
     fn dir_sorted(&mut self, entries: &mut [Entry]) -> NodeId {
+        assert!(entries.windows(2).all(|pair| self.name_bytes(pair[0].0) < self.name_bytes(pair[1].0)), "VFS directory entries must be distinct and in byte order");
         let mut bytes = std::mem::take(&mut self.scratch);
         bytes.clear();
         for entry in entries.iter_mut() {
@@ -403,9 +419,7 @@ impl Tree {
                 mode.git()
             };
             let name = self.name_bytes(name);
-            bytes.put_u32(code);
-            bytes.put_bytes_u64(name);
-            bytes.put_bytes(&self.id(child).0);
+            encode_entry(&mut bytes, name, code, &self.id(child));
         }
         let id = ContentId::of(DIR_DOMAIN, &bytes);
         self.scratch = bytes;
