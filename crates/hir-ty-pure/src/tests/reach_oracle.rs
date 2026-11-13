@@ -301,10 +301,10 @@ fn a_wide_dispatch_proof_scales() {
             eprintln!("{arms} arms, {blocks} blocks: {visits} visits, {:?}", start.elapsed());
             assert_eq!(reach.refused, None);
             assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
-            // A wide dispatch can carry one exclusion per preceding arm. Inspecting these
-            // along the dispatch is quadratic; rejoining the shared exits for each partial
-            // set of predecessors instead took cubic or worse work. No clock threshold.
-            assert!(visits <= 2 * (blocks as u64).pow(2), "{blocks} blocks, {visits} visits");
+            // A path carries one exclusion per preceding arm. None is a transitive or
+            // linear premise; each question should inspect only a bounded number of facts.
+            // Counts fact inspections and endpoint lookups, not allocations or wall time.
+            assert!(visits <= 80 * blocks as u64, "{blocks} blocks, {visits} visits");
         });
     }
 }

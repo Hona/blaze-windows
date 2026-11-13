@@ -243,6 +243,12 @@ impl Slots {
 }
 
 impl State {
+    /// A disequality can exclude a range endpoint, but cannot give a linear inequality,
+    /// an equality rewrite, or a step through a middle term. Rel::Ne sorts last.
+    fn comparisons(&self) -> &[Atom] {
+        &self.facts[..self.facts.partition_point(|fact| fact.rel != Rel::Ne)]
+    }
+
     fn has(&self, atom: Atom) -> bool {
         self.facts.binary_search(&atom).is_ok()
     }
@@ -892,8 +898,9 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
     /// `form <= bound`, the form with no constant.
     fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
-        self.visit(state.facts.len());
-        let mut known = Vec::with_capacity(state.facts.len()); // alloc: one bound per fact, per proof
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        let mut known = Vec::with_capacity(comparisons.len()); // alloc: one bound per comparison
         let mut add = |left: &Form, right: &Form, slack: i128| {
             if let Some((parts, constant)) = form_add(left, right, -1)
                 && !parts.is_empty()
@@ -902,7 +909,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 known.push((parts, bound));
             }
         };
-        for fact in &state.facts {
+        for fact in comparisons {
             let (a, b) = (self.form(fact.a), self.form(fact.b));
             match fact.rel {
                 Rel::Lt => add(&a, &b, -1),
@@ -1051,8 +1058,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         if self.const_of(term).is_some() {
             return (low, high);
         }
-        self.visit(state.facts.len());
-        for fact in &state.facts {
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        for fact in comparisons {
             let (left, right) = (fact.a == term, fact.b == term);
             if left == right {
                 continue;
@@ -1098,8 +1106,9 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
-        self.visit(state.facts.len());
-        for fact in &state.facts {
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        for fact in comparisons {
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
                 continue;
@@ -1120,6 +1129,26 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
         }
         // A value ruled out at an end moves the end: at most as many turns as such facts.
+        let excluded = |value| {
+            self.visit(0);
+            self.ids.get(&Term::Const(value)).is_some_and(|&id| state.has(Atom::new(Rel::Ne, term, id)))
+        };
+        // No exclusion can move either end without one naming its current value. This
+        // is the usual case, even on a dispatch path carrying hundreds of exclusions.
+        match (excluded(low), excluded(high)) {
+            (false, false) => return (low, high),
+            (true, false) => {
+                while low < high && excluded(low) { low += 1; }
+                return (low, high);
+            }
+            (false, true) => {
+                while low < high && excluded(high) { high -= 1; }
+                return (low, high);
+            }
+            // If both ends are excluded their meeting point can depend on fact order.
+            // Preserve that order, including the empty-range and saturating cases.
+            (true, true) => {}
+        }
         let mut turns = state.facts.len();
         loop {
             self.visit(state.facts.len());
@@ -1230,9 +1259,10 @@ impl<'a, 'db> Solver<'a, 'db> {
             return false;
         }
         let concluding = state.concluding(atom);
-        self.visit(state.facts.len() + concluding.len());
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len() + concluding.len());
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
-        for fact in &state.facts {
+        for fact in comparisons {
             let mut through = |mid: TermId, strict: bool| -> bool {
                 match rel {
                     Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
