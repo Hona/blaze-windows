@@ -13,7 +13,8 @@ use super::{
 };
 
 const RUN: Tag = Tag(5 << 32);
-const BEGAN_NS: u64 = 1_761_782_400_123_456_789;
+/// A time every system's clock holds exactly: Windows' counts 100 ns.
+const BEGAN_NS: u64 = 1_761_782_400_123_456_700;
 
 fn unit() -> bs::Unit {
     let mut unit = bs::Unit::default();

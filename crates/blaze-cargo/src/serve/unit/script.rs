@@ -1711,9 +1711,13 @@ fn live_record(
 
 /// `path` as the driver names it, under its root `/`.
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
-        format!("{} is not a path blaze can write cargo's files of a run at", path.display())
-    })
+    let refused = || format!("{} is not a path blaze can write cargo's files of a run at", path.display());
+    let text = path.to_str().ok_or_else(refused)?;
+    // A name is `/`-separated on every system; a path joined on Windows has `\` between its
+    // parts, which no Windows file name holds.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/"); // alloc: a name, three a run written
+    FileName::new(text.trim_start_matches('/')).ok_or_else(refused)
 }
 
 pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {

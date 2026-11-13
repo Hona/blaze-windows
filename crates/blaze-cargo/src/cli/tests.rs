@@ -22,12 +22,19 @@ fn invocation(words: Vec<OsString>) -> Invocation {
     }
 }
 
+/// The workspace the commands here run in, as the host names it: absolute on its system.
+#[cfg(windows)]
+const W: &str = r"C:\w";
+#[cfg(not(windows))]
+const W: &str = "/w";
+/// [`W`] as the daemon names it (`blaze_core::platform::path::daemon`).
+#[cfg(windows)]
+const WN: &str = "/C:/w";
+#[cfg(not(windows))]
+const WN: &str = "/w";
+
 fn place() -> Place {
-    Place {
-        cwd: PathBuf::from("/w"),
-        manifest: PathBuf::from("/w/Cargo.toml"),
-        root: PathBuf::from("/w"),
-    }
+    Place { cwd: PathBuf::from(W), manifest: PathBuf::from(W).join("Cargo.toml"), root: PathBuf::from(W) }
 }
 
 fn request_of(asked: &Invocation) -> Request {
@@ -56,13 +63,13 @@ fn cargo_blaze_and_blaze_are_the_same_command() {
     let request = request_of(&invocation(direct));
     assert_eq!(request, request_of(&invocation(through_cargo)));
     let Request::Build { view, targets } = request else { panic!("not a build: {request:?}") };
-    assert_eq!(view, ViewRef::Head("/w".to_owned()));
+    assert_eq!(view, ViewRef::Head(WN.to_owned()));
     assert_eq!(targets.packages, ["foo"]);
     assert_eq!(targets.profile, "release");
     let cargo = targets.cargo.unwrap();
     assert_eq!(cargo.command, "build");
     assert_eq!(cargo.args, ["--release", "-p", "foo"]);
-    assert_eq!((cargo.root.as_str(), cargo.cwd.as_str()), ("/w", "/w"));
+    assert_eq!((cargo.root.as_str(), cargo.cwd.as_str()), (WN, WN));
 }
 
 #[test]
@@ -128,7 +135,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
 #[test]
 fn ub_results_print_as_libtest_prints_them() {
     let failed = TestResult {
-        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        binary: format!("{WN}/target/debug/deps/foo-1"),
         name: "tests::aliasing".to_owned(),
         outcome: TestOutcome::Failed,
         output:
@@ -161,7 +168,7 @@ fn ub_results_print_as_libtest_prints_them() {
 #[test]
 fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
-        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        binary: format!("{WN}/target/debug/deps/foo-1"),
         name: name.to_owned(),
         outcome: TestOutcome::Passed,
         output: Vec::new(),
@@ -245,7 +252,8 @@ fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
 #[test]
 fn every_command_suggested_is_one() {
     // `blaze daemon` alone is no command: it takes a verb.
-    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+    // `blaze serve` is taken before the command line is read (`cli::main`), as the daemon it is.
+    for name in COMMANDS.iter().filter(|it| !matches!(**it, "daemon" | "serve")) {
         assert_ne!(
             args::parse(vec![OsString::from(*name)]),
             Ok(Asked::Unknown((*name).to_owned())),
@@ -473,7 +481,7 @@ fn run_becomes_its_program() {
     let Then::Exec(exec) = then else { panic!("{then:?}: {err}") };
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
-    assert_eq!(exec.cwd, PathBuf::from("/w"));
+    assert_eq!(exec.cwd, PathBuf::from(W));
     assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
 
     let two = [
@@ -701,7 +709,7 @@ fn plain_answer() -> Vec<Response> {
         green: 4,
         links: vec![blaze_api::Linked {
             how: blaze_api::LinkHow::Unchanged,
-            path: "/w/target/debug/foo".to_owned(),
+            path: format!("{WN}/target/debug/foo"),
         }],
         reran: 0,
         misses: 0,
@@ -745,7 +753,7 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
                     program.executable.as_deref().unwrap(),
                     &program.env,
                     &thin.program,
-                    std::path::Path::new("/w"),
+                    std::path::Path::new(W),
                 );
                 if !thin.quiet {
                     said.push_str(&exec.running(false));

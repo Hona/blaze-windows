@@ -264,9 +264,11 @@ fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
     let verbose = Speaking { verbose: 1, ..speaking() };
     run(&asked(Command::Test, &[]), &[doc], &[], 1, verbose, &mut err, &mut Fake::default())
         .unwrap();
+    // The program as the system names it, as cargo says it.
+    let program = blaze_core::platform::path::host("/w/target/debug/deps/my_lib-doctests");
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "   Doc-tests my-lib\n     Running `/w/target/debug/deps/my_lib-doctests`\n"
+        format!("   Doc-tests my-lib\n     Running `{}`\n", program.display())
     );
 }
 

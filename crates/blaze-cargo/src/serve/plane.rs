@@ -1981,7 +1981,8 @@ mod tests {
         assert_eq!(panic.message.as_deref(), Some("plane-test: the task's panic"));
         let at = panic.at.as_deref().expect("the hook saw where it was raised");
         assert!(
-            at.contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"),
+            // The file as the compiler named it: `\`-separated on Windows.
+            at.replace('\\', "/").contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"),
             "{at}"
         );
         assert_eq!(panic.to_string(), format!("panicked at {at}: plane-test: the task's panic"));
