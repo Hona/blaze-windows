@@ -2709,6 +2709,17 @@ impl AttrFlags {
         )
     }
 
+    /// `#![windows_subsystem = ".."]` of `krate`'s root, its `cfg_attr`s expanded (the
+    /// common `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`): `true` for
+    /// `"windows"`, a GUI program the loader gives no console, as rustc links it with
+    /// `/SUBSYSTEM:WINDOWS`; `false` for `"console"` or none. Another value is the attribute
+    /// check's error (E0539), never reached by a build.
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    pub fn windows_subsystem(db: &Db, krate: Crate) -> bool {
+        let root = crate::nameres::crate_def_map(db, krate).root_module_id();
+        symbol_attr(db, root.into(), "windows_subsystem").is_some_and(|it| it.as_str() == "windows")
+    }
+
     #[inline]
     pub fn target_features(db: &Db, owner: FunctionId) -> &HashSet<Symbol, Global> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
