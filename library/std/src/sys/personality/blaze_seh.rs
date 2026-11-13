@@ -47,6 +47,9 @@ const CXX_MAGIC: usize = 0x1993_0520;
 const CXX_MAGICS: [usize; 3] = [0x1993_0520, 0x1993_0521, 0x1993_0522];
 const EXCEPTION_NONCONTINUABLE: u32 = 1;
 const EXCEPTION_UNWINDING: u32 = 0x2;
+/// `STATUS_UNWIND_CONSOLIDATE`, and the number of words of MSVC's record of it.
+const UNWIND_CONSOLIDATE: u32 = 0x8000_0029;
+const CONSOLIDATE_PARAMETERS: u32 = 15;
 /// `EXCEPTION_EXIT_UNWIND | EXCEPTION_TARGET_UNWIND | EXCEPTION_COLLIDED_UNWIND`: a frame
 /// left with no exception (`longjmp`), the frame unwound to, or an unwind that met another.
 const NOTHING_TO_RUN: u32 = 0x4 | 0x20 | 0x40;
@@ -237,10 +240,23 @@ unsafe extern "system" fn rust_eh_personality(
     // context, valid for the call; the function entry, its unwind info and its handler data
     // are in the image it names, as the linker wrote them.
     unsafe {
-        let record_ref = &*record;
-        if record_ref.flags & NOTHING_TO_RUN != 0 {
+        if (*record).flags & NOTHING_TO_RUN != 0 {
             return CONTINUE_SEARCH;
         }
+        let unwinding = (*record).flags & EXCEPTION_UNWINDING != 0;
+        // A C++ `catch` unwinds to its catch block with a record of its own, which the unwinder
+        // ends in a call of the C++ runtime's (`STATUS_UNWIND_CONSOLIDATE`); its seventh word
+        // is the C++ exception's record. That record is what a pad is entered with and what
+        // the unwind to it is of: unwound with the other, the pad would be the catch block.
+        let record = match (*record).code == UNWIND_CONSOLIDATE
+            && (*record).parameters == CONSOLIDATE_PARAMETERS
+            && unwinding
+            && (*record).information[6] != 0
+        {
+            true => (*record).information[6] as *mut ExceptionRecord,
+            false => record,
+        };
+        let record_ref = &*record;
         let Some(thrown) = Thrown::of(record_ref) else { return CONTINUE_SEARCH };
         let dispatch = &*dispatch;
         let entry = &*dispatch.function_entry;
@@ -261,7 +277,6 @@ unsafe extern "system" fn rust_eh_personality(
         // A search stops at a pad that catches; an unwind runs every pad that cleans up. A
         // frame that catches is unwound past only by an unwind that started below it, of
         // something it would not have claimed.
-        let unwinding = record_ref.flags & EXCEPTION_UNWINDING != 0;
         if unwinding == catches {
             return CONTINUE_SEARCH;
         }
