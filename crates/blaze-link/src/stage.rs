@@ -2132,6 +2132,12 @@ impl<'a> Stage<'a> {
     /// Rewrites every piece referring to a symbol whose definition changed, and every cell
     /// running a body that moved. Costs the changed symbols' referrers.
     pub fn referrers(&mut self) {
+        // On the first link every piece was made by this stage (`make` puts it in
+        // `write`) and full relocation writes every cell. No earlier reference exists
+        // to revisit, even if a later placement round just added a thunk.
+        if !self.old.laid_out {
+            return;
+        }
         for sym in self.changed.iter() {
             for id in self.new.refs(sym) {
                 self.write.insert(id);
