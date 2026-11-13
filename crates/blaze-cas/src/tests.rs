@@ -4473,3 +4473,34 @@ fn a_process_installs_one_handle() {
 fn any(_: Kind, _: &[u8]) -> Result<(), String> {
     Ok(())
 }
+
+/// The invariant: a made place on a volume that shares no blocks asks for no write-back of
+/// what it placed (no patch will clone it), and on one that shares blocks asks for one, so the
+/// next patch's clone finds it written back. The bytes placed are the image's either way.
+#[test]
+fn a_made_place_asks_a_write_back_only_where_a_patch_will_clone_it() {
+    for (sharing, backs) in [(Sharing::Unshared, 0), (Sharing::Blocks, 1)] {
+        let mut sim = Sim::new(17, Faults::default());
+        let mut store = open_with(&mut sim, sharing_config(sharing));
+        let file = Sparse { len: 3 * 4096 + 5, runs: vec![(0, noise(100, 1)), (8192, noise(7, 2))] };
+        let mut want = vec![0; file.len as usize];
+        for (at, bytes) in &file.runs {
+            want[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+        }
+        let mut effects = Vec::new();
+        let to = name("out/app");
+        // clone: the test keeps its name of the path.
+        store.place_made(to.clone(), file, &mut effects);
+        let mut written_back = 0;
+        run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            written_back += usize::from(matches!(completion.done, Done::WrittenBack));
+            if store.owns(completion.tag) {
+                store.complete(completion, effects);
+            }
+        })
+        .expect("the effects end");
+        assert_eq!(store.placed().iter().map(|it| it.result.clone()).collect::<Vec<_>>(), [Ok(())]);
+        assert_eq!(sim.contents(&to), want);
+        assert_eq!(written_back, backs, "{sharing:?}");
+    }
+}

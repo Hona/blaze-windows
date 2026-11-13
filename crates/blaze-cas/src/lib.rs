@@ -2999,12 +2999,16 @@ impl Store {
                 // What the path's file holds that is only in memory is begun on its way to
                 // the device, and nothing waits for it: the clone the path's next patch
                 // starts from ([`Store::place_patched`]) then finds the file written back,
-                // or waits for what is left of these bytes and no more. The planted bug of
-                // a control asks for none.
+                // or waits for what is left of these bytes and no more. On a volume that
+                // shares no blocks no patch clones it, so none is asked: on Windows a
+                // write-back is a flush of the file and the drive's cache, 4 to 20 ms a file
+                // (measured on NTFS, 16 KiB to 64 MiB), for nothing. The planted bug of a
+                // control asks for none.
+                let shares = self.config.sharing == Sharing::Blocks;
                 #[cfg(test)]
-                let back = self.plant != PlacePlant::MadeNoWriteBack;
+                let back = shares && self.plant != PlacePlant::MadeNoWriteBack;
                 #[cfg(not(test))]
-                let back = true;
+                let back = shares;
                 if back {
                     // clone: the effect owns the name; once per place
                     let file = to.clone();

@@ -144,6 +144,24 @@ impl Target {
     }
 }
 
+/// Whether `crate_type` is one a dependent links as a Rust library: `lib` or `rlib`.
+pub fn is_rlib(crate_type: &str) -> bool {
+    matches!(crate_type, "lib" | "rlib")
+}
+
+/// Whether a library of `crate_types` is built as its rlib alone, its other crate types left
+/// unmade: where the build only depends on it (`asked` false: it is no root of the unit graph)
+/// and it has an rlib. What depends on a library links its rlib; a dependency's `cdylib`,
+/// `staticlib` or `dylib` is a file no step of the build reads (only an artifact dependency
+/// would name one, and blaze refuses those). cargo writes them all; blaze makes what the build
+/// reads, so rune-desktop's dependencies' six `cdylib`s and two `staticlib`s, each a whole
+/// link under cargo, cost nothing. The one rule: the unit's planned files
+/// (`load::plan::outputs`) and what its codegen makes (`blaze-cargo`'s `codegen::makes`) both
+/// read it. A library asked for, or with no rlib, keeps every crate type it lists.
+pub fn builds_only_its_rlib<'a>(crate_types: impl IntoIterator<Item = &'a str>, asked: bool) -> bool {
+    !asked && crate_types.into_iter().any(is_rlib)
+}
+
 /// A unit's profile as cargo prints it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Profile {

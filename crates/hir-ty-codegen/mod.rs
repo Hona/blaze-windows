@@ -2528,6 +2528,20 @@ fn static_link_name(db: &Db, id: StaticId) -> Result<Option<String>> {
     Ok(static_link_name_for(db, target_of_crate(db, id.krate(db))?, id))
 }
 
+/// Whether a static of an `extern` block is a DLL's, which a PE image reaches only through its
+/// import address table cell (`__imp_X`): one of a block whose first `#[link]` is a `dylib`
+/// (or of no kind) or a `raw-dylib`, on a COFF target, as rustc's `is_dllimport` has it. A
+/// static of a `static` library, or of a block that names none, is the image's own.
+pub(crate) fn dll_imported(db: &Db, id: StaticId) -> bool {
+    let ItemContainerId::ExternBlockId(block) = id.lookup(db).container else { return false };
+    let coff = target_of_crate(db, id.krate(db))
+        .is_ok_and(|target| target.object_format == ObjectFormat::Coff);
+    coff && AttrFlags::native_libs(db, block).first().is_some_and(|lib| {
+        use hir_def::attrs::NativeLibKind as Kind;
+        matches!(lib.kind, Kind::Unspecified | Kind::Dylib | Kind::RawDylib)
+    })
+}
+
 /// [`static_link_name`] on `target`, the target of the code that names the static.
 fn static_link_name_for(db: &Db, target: &Target, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -9179,12 +9193,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = self.cg.make_signature();
-        sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
-        sig.returns.push(AbiParam::new(ty));
-        let callee = self.cg.import(name, &sig)?;
-        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-        Ok(self.invoke(callee, args)[0])
+        let params: smallvec::SmallVec<[Type; 3]> = args.iter().map(|_| ty).collect();
+        self.builtin(name, &params, ty, args)
     }
 
     /// `as` between a float and an integer or another float.
@@ -13565,7 +13575,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         ));
                     self.builder.ins().try_call_indirect(try_fn, &[data], table);
                 } else {
-                    self.guarded_call(caught, |builder| {
+                    self.guarded_call(caught, true, |builder| {
                         builder.ins().call_indirect(try_sig, try_fn, &[data])
                     });
                     self.builder.ins().jump(returned, &[]);
@@ -15135,10 +15145,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a function of compiler-builtins, which are C's by convention.
     fn builtin(&mut self, name: &str, params: &[Type], ret: Type, args: &[Value]) -> Result<Value> {
-        // 64-bit Windows takes an integer of 128 bits by reference and returns it as a
-        // vector.
+        // 64-bit Windows takes an integer or a float of 128 bits by reference and returns it
+        // as a vector (`win64_pass_mode`, as LLVM's Win64 convention has `i128` and `fp128`).
         let windows = self.cg.target.call_conv == isa::CallConv::WindowsFastcall;
-        let wide = |ty: Type| windows && ty == types::I128;
+        let wide = |ty: Type| windows && (ty == types::I128 || ty == types::F128);
         let mut sig = self.cg.make_signature();
         sig.params.extend(
             params
@@ -15164,7 +15174,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let slot = self.scratch_wide();
         self.builder.ins().store(MEM, value, slot, 0);
-        Ok(self.builder.ins().load(types::I128, MEM, slot, 0))
+        Ok(self.builder.ins().load(ret, MEM, slot, 0))
     }
 
     /// Whether an atomic access of `ty` is made of compare-and-swaps of compiler_builtins:
@@ -15364,7 +15374,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self.guarded_call(pad, |builder| builder.ins().call(callee, args));
+            return self.guarded_call(pad, false, |builder| builder.ins().call(callee, args));
         }
         let sig = self.builder.func.dfg.ext_funcs[callee].signature;
         let (table, after) = self.exception_table(sig, pad);
@@ -15380,8 +15390,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self
-                .guarded_call(pad, |builder| builder.ins().call_indirect(sig, pointer, args));
+            return self.guarded_call(pad, false, |builder| {
+                builder.ins().call_indirect(sig, pointer, args)
+            });
         }
         let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call_indirect(pointer, args, table);
@@ -15456,15 +15467,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Makes a call that goes to `pad` when it unwinds, where a call cannot name its pad:
     /// the unwinder has the call return with the exception in a slot of the frame that is
-    /// empty otherwise, and the call is followed by a look at it.
+    /// empty otherwise, and the call is followed by a look at it. `catches`: the pad stops
+    /// the unwind (`catch_unwind`'s), so the personality claims the exception there while it
+    /// looks for a handler; any other pad cleans up, and runs while frames are unwound.
     fn guarded_call(
         &mut self,
         pad: ir::Block,
+        catches: bool,
         call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
     ) -> Vec<Value> {
         self.guarded = true;
         let loc = self.cg.source_loc(self.span);
-        self.builder.set_srcloc(unwind::seh::guarded(loc));
+        let marked = if catches { unwind::seh::catching(loc) } else { unwind::seh::guarded(loc) };
+        self.builder.set_srcloc(marked);
         let call = call(&mut self.builder);
         self.at(self.span);
         let results = self.builder.inst_results(call).to_vec(); // alloc: returned as a `Vec`

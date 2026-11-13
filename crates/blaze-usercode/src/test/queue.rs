@@ -132,6 +132,70 @@ pub struct Binary {
     pub sandboxed: bool,
 }
 
+impl Binary {
+    /// The binary, run whole ([`Mode::Threads`]), as runs whose command lines are each at most
+    /// `longest` UTF-16 units (Windows' 32767, [`blaze_core::platform::command::LONGEST_LINE`]):
+    /// its jobs in their order, cut where the next name would pass it, each run a `Binary` of
+    /// the same program, as the split of one executable inside and outside the sandbox is
+    /// (libtest's `--exact` of the names each is given). One whose names all fit is itself; one
+    /// name that fits in no line is an error naming it, never a run that leaves it out. The
+    /// line is what the queue starts it with ([`Queue`]'s `start_whole`): the program, each
+    /// name, and room for the flags it adds and the user's own.
+    pub fn whole_runs(self, longest: usize) -> Result<Vec<Binary>, String> {
+        let Mode::Threads { args, .. } = &self.mode else { return Ok(vec![self]) };
+        // `"program" --exact --test-threads=N --include-ignored`, the user's flags, a space each.
+        let units = |it: &std::ffi::OsStr| it.to_string_lossy().encode_utf16().count();
+        let fixed = units(self.program.as_os_str())
+            + 64
+            + args.iter().map(|it| units(it) + 3).sum::<usize>();
+        // A name is quoted when it has a space or a tab, and each `"` in it escaped.
+        let name = |it: &str| {
+            let quotes = it.contains([' ', '\t']).then_some(2).unwrap_or(0);
+            it.encode_utf16().count() + it.matches('"').count() + quotes + 1
+        };
+        let room = longest.saturating_sub(fixed);
+        if self.jobs.iter().map(|it| name(&it.name)).sum::<usize>() <= room {
+            return Ok(vec![self]);
+        }
+        let mut runs: Vec<Vec<Job>> = vec![Vec::new()];
+        let mut used = 0;
+        for job in self.jobs.iter() {
+            let len = name(&job.name);
+            if len > room {
+                return Err(format!(
+                    "test `{}` of {}: its name is longer than a command line of {} has room for",
+                    job.name, self.name, self.program.display()
+                ));
+            }
+            if used + len > room {
+                runs.push(Vec::new());
+                used = 0;
+            }
+            used += len;
+            // clone: once per test of a binary split, the run's own job.
+            runs.last_mut().expect("one run at least").push(job.clone());
+        }
+        Ok(runs
+            .into_iter()
+            .map(|jobs| Binary {
+                id: self.id,
+                // clone: once per run of a split binary, each owns its parts.
+                name: self.name.clone(),
+                program: self.program.clone(),
+                env: self.env.clone(),
+                dir: self.dir.clone(),
+                read: self.read.clone(),
+                write: self.write.clone(),
+                network: self.network,
+                memory: self.memory,
+                mode: self.mode.clone(),
+                jobs,
+                loaded: self.loaded.clone(),
+                sandboxed: self.sandboxed,
+            })
+            .collect())
+    }
+}
 /// A binary blaze holds in memory. Two are the same when they are one program.
 #[derive(Clone)]
 pub struct Loaded(pub Arc<Program>);

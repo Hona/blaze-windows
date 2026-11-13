@@ -99,8 +99,29 @@ pub(super) fn read<S: Borrow<Signature>>(
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
     let read = read_all(object, functions, recorder, Instrumented::default())?;
+    if read.iter().any(Result::is_err) {
+        keep_refused(object, functions.first().map_or("", |it| it.0));
+    }
     // alloc: the result, one per function
     Ok(read.into_iter().map(|it| it.map(|(code, ..)| code)).collect())
+}
+
+/// `BLAZE_KEEP_REFUSED_OBJECTS=<dir>` keeps each object LLVM made whose code is refused, as
+/// `<dir>/<its first function>.o`, for `llvm-objdump`/`dumpbin` to say what it holds; unset
+/// (as always but while one is looked into), nothing is written. What the build does is the
+/// same either way.
+fn keep_refused(object: &[u8], first: &str) {
+    let Some(dir) = std::env::var_os("BLAZE_KEEP_REFUSED_OBJECTS") else { return };
+    // alloc: once per refused object kept, its file's name
+    let name: String = first
+        .chars()
+        .map(|it| if it.is_ascii_alphanumeric() || it == '.' { it } else { '_' })
+        .collect();
+    let path = std::path::Path::new(&dir).join(format!("{name}.o"));
+    // A copy kept for a person: what fails to be written is said, and the build goes on.
+    if let Err(error) = std::fs::write(path, object) {
+        tracing::warn!(target: "blaze", %error, "keeping a refused object");
+    }
 }
 
 /// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
@@ -773,7 +794,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
             ..ConstBlob::default()
         };
         for (offset, relocation) in section.relocations() {
-            let target = match Self::destination(self.file, &relocation)? {
+            let destination = Self::destination(self.file, &relocation)?;
+            let target = match destination {
                 Destination::Named(name) => Symbol::parse(name),
                 Destination::Section(_) => None,
             };
@@ -793,7 +815,25 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 (Some(Symbol::Func(index)), 0) if absolute => {
                     blob.fn_relocs.push((offset as u32, FuncId::from_u32(index)));
                 }
-                _ => return Err(Unhandled::Shape("constants that hold an address of the code")),
+                (_, addend) => {
+                    let to = match destination {
+                        // alloc: error path
+                        Destination::Named(name) => format!("`{name}`"),
+                        Destination::Section(index) => match self.file.section_by_index(index) {
+                            // alloc: error path
+                            Ok(it) => format!("section `{}`", it.name().unwrap_or("?")),
+                            // alloc: error path
+                            Err(_) => format!("section {}", index.0),
+                        },
+                    };
+                    let section = section.name().unwrap_or("?");
+                    // alloc: error path
+                    return Err(Unhandled::Held(format!(
+                        "an address the code generator makes no constant of: at {offset} of \
+                         `{section}`, {:?} of {to} + {addend}",
+                        relocation.flags()
+                    )));
+                }
             }
         }
         Ok(blob)
@@ -1379,20 +1419,29 @@ impl<'data, 'file> Emitted<'data, 'file> {
             let value = table.read_uleb128().map_err(|_| MALFORMED)?;
             u32::try_from(value).map_err(|_| MALFORMED)
         };
-        // Where the pads are counted from, how the types are written and how the calls
-        // are: from the start of the function, not at all, and as numbers of any length.
-        let header = table.read_u8_array::<[u8; 3]>().map_err(|_| MALFORMED)?;
-        if header != [DW_EH_PE_omit.0, DW_EH_PE_omit.0, DW_EH_PE_uleb128.0] {
-            return Err(Unhandled::Shape("landing pads that name a type"));
+        // Where the pads are counted from: the start of the function.
+        if table.read_u8().map_err(|_| MALFORMED)? != DW_EH_PE_omit.0 {
+            return Err(Unhandled::Shape("landing pads counted from elsewhere"));
+        }
+        // The types, written only where a pad catches: `finish_guarded`'s `catch ptr null`,
+        // whose one type is none (anything). Where they are does not matter here.
+        if table.read_u8().map_err(|_| MALFORMED)? != DW_EH_PE_omit.0 {
+            uleb(&mut table)?;
+        }
+        // How the calls are written: as numbers of any length.
+        if table.read_u8().map_err(|_| MALFORMED)? != DW_EH_PE_uleb128.0 {
+            return Err(Unhandled::Shape("landing pads whose calls are not written as ULEB128"));
         }
         let len = uleb(&mut table)?;
         let mut calls = table.split(len as usize).map_err(|_| MALFORMED)?;
         let mut pads = seh::Pads::default();
         while !calls.is_empty() {
-            let (start, len, pad, _action) =
+            let (start, len, pad, action) =
                 (uleb(&mut calls)?, uleb(&mut calls)?, uleb(&mut calls)?, uleb(&mut calls)?);
             if pad != 0 {
-                pads.entered(start..start.checked_add(len).ok_or(MALFORMED)?, pad);
+                // An action is a clause of the pad's: only one that catches has one.
+                let calls = start..start.checked_add(len).ok_or(MALFORMED)?;
+                pads.entered(calls, pad, action != 0);
             }
         }
         Ok(pads)

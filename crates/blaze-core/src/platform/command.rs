@@ -14,6 +14,12 @@ use std::{ffi::OsStr, path::Path, process::Command};
 #[cfg(windows)]
 pub const NO_WINDOW: u32 = 0x0800_0000;
 
+/// The longest command line a process can be started with, in UTF-16 units, where the system
+/// has one: Windows' `CreateProcessW` takes 32767 with its NUL and refuses a longer one
+/// (os error 206). Unix's limit is on the arguments and environment together (`ARG_MAX`),
+/// which no command blaze makes comes near.
+pub const LONGEST_LINE: Option<usize> = if cfg!(windows) { Some(32_766) } else { None };
+
 /// A command of `program`, run in `dir`, made to run with no window of its own. The directory
 /// is asked for, never the daemon's own, as `std::process::Command::new` is banned for.
 pub fn command(program: impl AsRef<OsStr>, dir: &Path) -> Command {

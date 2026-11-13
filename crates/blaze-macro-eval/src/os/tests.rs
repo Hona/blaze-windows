@@ -978,18 +978,18 @@ fn assert_errnos(t: Target) {
     }
 }
 
-/// The walk names a Windows path as the daemon does, `/C:/a`; the host opens it verbatim. Each
-/// spelling Windows gives a variable (`C:\a`, `C:/a`, `\\?\C:\a`) is that same path, and a
-/// first part that is no drive names nothing there.
+/// The walk names a Windows path as the daemon does, `/C:/a`; the host opens it at the system's
+/// name. Each spelling Windows gives a variable (`C:\a`, `C:/a`, `\\?\C:\a`) is that same path,
+/// and a first part that is no drive names nothing there.
+#[cfg(windows)]
 #[test]
-fn a_windows_path_is_the_walks_path_and_the_host_opens_it_verbatim() {
-    use super::host::{windows_guest_path as guest, windows_host as host};
-    assert_eq!(host("/C:/Users/a/pkg").as_deref(), Some(r"\\?\C:\Users\a\pkg"));
-    assert_eq!(host("/c:/x/").as_deref(), Some(r"\\?\C:\x"));
-    assert_eq!(host("/C:").as_deref(), Some(r"\\?\C:\"));
-    assert_eq!(host("/UNC/srv/share/a/b").as_deref(), Some(r"\\?\UNC\srv\share\a\b"));
-    assert_eq!(host("/UNC/srv").as_deref(), None, "a share needs a name");
-    assert_eq!(host("/etc/hosts"), None);
+fn a_windows_path_is_the_walks_path_and_the_host_opens_it_at_its_name() {
+    use super::host::{guest_path as guest, on_host};
+    let host = |path: &str| on_host(path).map(|it| it.to_str().unwrap().to_owned());
+    assert_eq!(host("/C:/Users/a/pkg").as_deref(), Some(r"C:\Users\a\pkg"));
+    assert_eq!(host("/C:").as_deref(), Some(r"C:\"));
+    assert_eq!(host("/UNC/srv/share/a/b").as_deref(), Some(r"\\srv\share\a\b"));
+    assert_eq!(host("/etc/hosts"), None, "no path from the current drive's root");
     assert_eq!(host("/"), None);
     for spelt in [r"C:\Users\a\pkg", "C:/Users/a/pkg", r"\\?\C:\Users\a\pkg", r"c:\Users\a\pkg"] {
         assert_eq!(guest(spelt), "/C:/Users/a/pkg", "{spelt}");
@@ -999,9 +999,8 @@ fn a_windows_path_is_the_walks_path_and_the_host_opens_it_verbatim() {
     assert_eq!(guest(r"\\?\UNC\srv\share\a"), "/UNC/srv/share/a");
     assert_eq!(guest(r"data\a.txt"), "data/a.txt", "relative, `\\` a separator");
     assert_eq!(guest("/C:/Users/a"), "/C:/Users/a");
-    assert_eq!(guest("C:"), "/C:", "a drive alone, as wasi-libc hands `/C:` over");
+    assert_eq!(guest("C:"), "C:", "a drive alone stays relative: from `/`, the walk's `/C:`");
 }
-
 /// On Windows a macro given its package as rustc's process is given it (`C:\...`) reads below it
 /// whichever way it spells the path, and the read is noted under the walk's one name; outside
 /// it is still refused, by that name.

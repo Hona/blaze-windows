@@ -165,38 +165,14 @@ impl Spelling {
     }
 }
 
-/// `path` as the daemon spells it on Windows: `\` as `/`, `C:\a` and `\\?\C:\a` as `/C:/a`,
-/// `\\server\share` as `/UNC/server/share`.
-///
-/// windows: `blaze_core::platform::path` (lane host) is the daemon's one conversion; this is the
-/// same rule, kept here until it lands.
+/// `path` as the daemon names it on Windows ([`blaze_core::platform::path::daemon`]: `C:\a`
+/// and `\\?\C:\a` are `/C:/a`, `\\server\share` is `/UNC/server/share`), and a relative one
+/// with `/` between its parts, as Windows reads `\` in any path.
 fn windows_spelling(path: &str) -> std::borrow::Cow<'_, str> {
-    let unprefixed = path.strip_prefix(r"\\?\").or_else(|| path.strip_prefix(r"\??\"));
-    if let Some(share) = unprefixed.and_then(|it| it.strip_prefix(r"UNC\")) {
-        return format!("/UNC/{}", share.replace('\\', "/")).into();
-    }
-    let rest = unprefixed.unwrap_or(path);
-    let bytes = rest.as_bytes();
-    if bytes.len() >= 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes.get(2).is_none_or(|it| matches!(it, b'/' | b'\\'))
-    {
-        return format!(
-            "/{}:{}",
-            bytes[0].to_ascii_uppercase() as char,
-            rest[2..].replace('\\', "/")
-        )
-        .into();
-    }
-    if unprefixed.is_none()
-        && let Some(share) = path.strip_prefix(r"\\").or_else(|| path.strip_prefix("//"))
-    {
-        return format!("/UNC/{}", share.replace('\\', "/")).into();
-    }
-    match rest.contains('\\') {
-        true => rest.replace('\\', "/").into(),
-        false => rest.into(),
+    match blaze_core::platform::path::daemon(Path::new(path)) {
+        Ok(name) => name.into(),
+        Err(_) if path.contains('\\') => path.replace('\\', "/").into(),
+        Err(_) => path.into(),
     }
 }
 
@@ -1026,6 +1002,7 @@ mod tests {
     /// A Windows path is compared as Windows compares it: any separator, any spelling of the
     /// drive, any case. The package, `OUT_DIR`, the build directory, `LIB` and the Visual Studio
     /// and SDK trees may be searched; the home, another drive and a `..` out may not.
+    #[cfg(windows)]
     #[test]
     fn a_windows_link_search_is_compared_as_windows_compares_it() {
         let ran = windows_ran(windows_system());
@@ -1062,6 +1039,7 @@ mod tests {
     /// rune-desktop's `apps/desktop` and tauri's link options, winresource's `.res` and a
     /// library by name pass; a file the linker would write, a program it would load, a file
     /// outside the places a search may go and an option no rule names are refused.
+    #[cfg(windows)]
     #[test]
     fn msvc_link_args_are_the_options_and_files_the_rules_name() {
         let ran = windows_ran(windows_system());

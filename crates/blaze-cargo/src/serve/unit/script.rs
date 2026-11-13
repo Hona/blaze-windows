@@ -213,11 +213,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
-    let env = inherited(
-        &job.input.config.invocation.env,
-        job.plan(run).map_err(|it| it.what)?,
-        !outside(job, run),
-    );
+    let env = started_in(job, run, &unit)?;
     let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
     Ok((unit, vars))
 }
@@ -496,6 +492,94 @@ pub(crate) fn inherited(
     env.sort_by(|a, b| a.0.cmp(b.0));
     env.dedup_by(|later, first| later.0 == first.0);
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
+}
+
+/// The environment run `run`, of script `unit`, is started in: [`inherited`], and on Windows,
+/// for a sandboxed script built for an MSVC target when the job's environment is not a
+/// developer prompt's (it has no `VCINSTALLDIR`), that prompt's variables over it, its `PATH`
+/// in front of the job's ([`blaze_core::platform::msvc`]): in the AppContainer a C compiler can
+/// find Visual Studio by them alone. An unsandboxed run finds it as it would outside blaze.
+pub(crate) fn started_in(
+    job: &Job,
+    run: usize,
+    unit: &bs::Unit,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let sandboxed = !outside(job, run);
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "only Windows adds to it"))]
+    let mut env = inherited(
+        &job.input.config.invocation.env,
+        job.plan(run).map_err(|it| it.what)?,
+        sandboxed,
+    );
+    #[cfg(windows)]
+    if sandboxed {
+        developer_prompt(job, unit, &mut env)?;
+    }
+    #[cfg(not(windows))]
+    let _ = unit;
+    Ok(env)
+}
+
+/// [`started_in`]'s developer prompt, set over `env`.
+#[cfg(windows)]
+fn developer_prompt(
+    job: &Job,
+    unit: &bs::Unit,
+    env: &mut Vec<(OsString, OsString)>,
+) -> Result<(), String> {
+    use blaze_core::platform::msvc;
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let Some(target) = msvc::targets(&unit.target).then(|| msvc::arch(&unit.target)).flatten()
+    else {
+        return Ok(());
+    };
+    if named(env, "VCINSTALLDIR").is_some() {
+        return Ok(());
+    }
+    let host = msvc::arch(std::env::consts::ARCH)
+        .ok_or_else(|| format!("blaze runs on {}, which has no MSVC tools", std::env::consts::ARCH))?;
+    let developer = job.msvc.get_or_init(msvc::find).as_ref().map_err(|why| {
+        format!(
+            "the build script of `{}` for {} is started with a Visual Studio developer prompt's \
+             variables, as the sandbox can't find Visual Studio on its own, and {why}",
+            unit.package.name, unit.target
+        )
+    })?;
+    prompted(env, developer, host, target)
+}
+
+/// `env` with `developer`'s prompt for `host` and `target` over it. The job's `PATH`, under
+/// whatever case of its name the job gave it (`Path`, as Windows keeps it), is the prompt's tail
+/// and keeps that name, as every name the prompt sets replaces the job's of any case: Windows
+/// reads a name in any case, and of two that differ only so a program sees one.
+#[cfg(windows)]
+fn prompted(
+    env: &mut Vec<(OsString, OsString)>,
+    developer: &blaze_core::platform::msvc::Developer,
+    host: &str,
+    target: &str,
+) -> Result<(), String> {
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let (path_name, path) = match named(env, "PATH") {
+        Some(at) => {
+            let (name, value) = env.swap_remove(at);
+            (name, Some(value))
+        }
+        None => ("PATH".into(), None),
+    };
+    for (name, value) in developer.variables(host, target, path.as_ref())? {
+        let name = if name == "PATH" { path_name.clone() } else { name };
+        if let Some(at) = named(env, &name.to_string_lossy()) {
+            env.swap_remove(at);
+        }
+        env.push((name, value));
+    }
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
 }
 
 /// How a run ended, judged as cargo judges it.
@@ -1024,7 +1108,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let unit = script_unit(&of, run)
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
+    let env = started_in(job, run, &unit)
+        .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new());
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));

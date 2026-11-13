@@ -223,6 +223,77 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     }
 }
 
+/// `command` run to its end as `blaze run` runs a program on Windows, where no process can
+/// become another (cargo's `exec_replace`): started suspended, put in a job object of its own
+/// that ends every process still in it when this one ends (`KILL_ON_JOB_CLOSE`, so a program
+/// and what it started never outlive a `blaze run` that was killed; one that asks to leave the
+/// job may, `BREAKAWAY_OK`), then resumed and waited for. Started suspended, nothing it starts
+/// runs before it is in the job. Meanwhile this process ignores the console's Ctrl-C and
+/// Ctrl-Break: the program, on the same console, gets them and answers them itself, and the
+/// command ends with the code it ends with.
+#[cfg(windows)]
+pub fn run_held(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::{
+        io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+        process::{ChildExt as _, CommandExt as _},
+    };
+    use windows_sys::{
+        Win32::System::{
+            Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
+            },
+            Threading::{CREATE_SUSPENDED, ResumeThread},
+        },
+        core::BOOL,
+    };
+    unsafe extern "system" fn interrupted(event: u32) -> BOOL {
+        BOOL::from(event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+    }
+    // SAFETY: no attributes and no name: the call reads no memory of this process. The handle
+    // it makes is owned below, so it is closed once, as this process ends at the latest.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above: `CreateJobObjectW` just made it, and nothing else owns it.
+    let job = unsafe { OwnedHandle::from_raw_handle(job) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    // SAFETY: `limits` is a live local of the size the call is told, read and not kept.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `interrupted` is a function for the life of the process, as the handler must be.
+    if unsafe { SetConsoleCtrlHandler(Some(interrupted), 1) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
+    // SAFETY: both handles are open while `job` and `child` live, across the call.
+    let held = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+    // SAFETY: as above, the child's main thread, suspended once by its creation.
+    if held == 0 || unsafe { ResumeThread(child.main_thread_handle().as_raw_handle()) } == u32::MAX {
+        let error = std::io::Error::last_os_error();
+        // It never ran: ended where it stands, and its exit waited for so nothing outlives it.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait()
+}
 /// Waits for the child `pid` to exit without reaping it (`waitid` with `WNOWAIT`), so its
 /// `std::process::Child` still waits for it and its pid is no other process's until then: a
 /// test executable's exit, waited for apart from its output (`cli::live`). A `pid` that is no
@@ -500,56 +571,231 @@ pub fn clock_ticks() -> Option<u64> {
     u64::try_from(ticks).ok().filter(|it| *it > 0)
 }
 
-/// The handles of this process that a child would inherit, made not inheritable until this
-/// is dropped: [`withhold_inheritance`].
+/// A process started detached ([`spawn_detached`]): its handle, owned, and its process ID.
 #[cfg(windows)]
-pub struct Withheld(Vec<windows_sys::Win32::Foundation::HANDLE>);
+pub struct Detached {
+    process: std::os::windows::io::OwnedHandle,
+    pub pid: u32,
+}
 
-/// Has a process started until the result is dropped inherit no handle of this one but those
-/// it is given. A process is started with every handle of its parent that can be inherited,
-/// and those of a pipe this command writes to are among them, under their own numbers and
-/// under those the commands above this one had: whoever reads the pipe would wait for the
-/// child to end.
 #[cfg(windows)]
-pub fn withhold_inheritance() -> Withheld {
-    use windows_sys::Win32::Foundation::{
-        GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+impl Detached {
+    /// How it ended, `None` while it runs.
+    pub fn ended(&self) -> std::io::Result<Option<u32>> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        };
+        // SAFETY: the handle is open while `self` lives; a wait of 0 asks and does not wait.
+        #[expect(clippy::disallowed_methods, reason = "a wait of no time: whether it ended")]
+        match unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => return Ok(None),
+            WAIT_OBJECT_0 => {}
+            _ => return Err(std::io::Error::last_os_error()),
+        }
+        let mut code = 0;
+        // SAFETY: as above; `code` is a live local the call writes.
+        if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(code))
+    }
+}
+
+/// Whether a process this one starts may leave the job this one is in, and must say so: a
+/// process in a job is started in it, and ends with it where it kills on close (a terminal's,
+/// an IDE's, a CI runner's, `blaze run`'s), unless it is started with
+/// `CREATE_BREAKAWAY_FROM_JOB`, which the job allows or refuses (`BREAKAWAY_OK`); one that
+/// allows `SILENT_BREAKAWAY_OK` starts every child outside it. `Ok(false)` where it is in no
+/// job, or one whose children leave it unasked; an error naming the job's refusal where it is
+/// in one that lets none leave: a daemon started there would end with the command that
+/// started it.
+#[cfg(windows)]
+fn breakaway() -> std::io::Result<bool> {
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject,
+        },
+        Threading::GetCurrentProcess,
     };
-
-    /// Handles are multiples of four, and a command as short as this one has few.
-    const HANDLES: std::ops::RangeInclusive<usize> = 4..=0x1_0000;
-
-    let mut withheld = Vec::new();
-    for handle in HANDLES.step_by(4).map(|it| it as HANDLE) {
-        let mut flags = 0;
-        // SAFETY: `GetHandleInformation` checks `handle` and fails on a number that is no open
-        // handle, and `flags` is a `u32` it only writes; no Rust memory rests on the handle.
-        let held = unsafe { GetHandleInformation(handle, &mut flags) } != 0
-            && flags & HANDLE_FLAG_INHERIT != 0
-            // SAFETY: `handle` was just found open and inheritable; clearing the flag touches no
-            // memory, and `Withheld`'s drop sets it again. A number closed and reused meanwhile
-            // only has that handle's inheritance changed.
-            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0;
-        if held {
-            withheld.push(handle);
-        }
+    let mut in_job = 0;
+    // SAFETY: the current process's pseudo-handle, no job named (any job), and a live local
+    // the call writes.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    Withheld(withheld)
+    if in_job == 0 {
+        return Ok(false);
+    }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: no handle asks of the job this process is in; `limits` is a live local of the
+    // size the call is told, which it writes.
+    if unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = limits.BasicLimitInformation.LimitFlags;
+    if flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK != 0 {
+        return Ok(false);
+    }
+    if flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK != 0 {
+        return Ok(true);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "this command runs in a Windows job object that lets no process it starts leave it \
+         (no JOB_OBJECT_LIMIT_BREAKAWAY_OK), so a daemon it started would end with it: start \
+         the daemon (`blaze serve`) outside that job, or allow breakaway in it",
+    ))
 }
 
+/// Starts `program` with the arguments `args` makes of the number the child has `keep` under,
+/// in `dir`, detached from this console (`DETACHED_PROCESS`, a
+/// process group of its own, no window), out of this process's job where that must be asked
+/// ([`breakaway`]), with no standard input, `log` its standard output and error, and `keep`
+/// the one other handle it inherits. Every handle it inherits is named
+/// (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so none of this command's (a pipe whoever started
+/// it reads, which would then wait for the daemon to end) is, and nothing of this process is
+/// changed meanwhile. The environment is this process's.
 #[cfg(windows)]
-impl Drop for Withheld {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-        for &handle in &self.0 {
-            // SAFETY: the handle was open and inheritable when it was withheld; one closed
-            // since is refused, and one whose number another took has its inheritance set,
-            // which is no memory of this process's.
-            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+pub fn spawn_detached(
+    program: &std::path::Path,
+    args: impl FnOnce(usize) -> Vec<std::ffi::OsString>,
+    dir: &std::path::Path,
+    log: &std::fs::File,
+    keep: std::os::windows::io::BorrowedHandle<'_>,
+) -> std::io::Result<Detached> {
+    use std::os::windows::{
+        ffi::OsStrExt as _,
+        io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    };
+    let away = breakaway()?;
+    // Inheritable copies of what it is given, closed here once it started: the originals stay
+    // this process's alone.
+    let inheritable = |handle: std::os::windows::io::BorrowedHandle<'_>| -> std::io::Result<OwnedHandle> {
+        use windows_sys::Win32::{
+            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+            System::Threading::GetCurrentProcess,
+        };
+        let mut copy = std::ptr::null_mut();
+        // SAFETY: `handle` is open while borrowed; the copy is this process's, written to a
+        // live local and owned below, so closed once.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut copy,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: as above, the copy just made.
+        Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
+    };
+    let nul = std::fs::File::open("NUL")?;
+    let (input, output, kept) =
+        (inheritable(nul.as_handle())?, inheritable(log.as_handle())?, inheritable(keep)?);
+    let mut handles = [input.as_raw_handle(), output.as_raw_handle(), kept.as_raw_handle()];
+    let mut size = 0;
+    // SAFETY: a size query: no list is given, and `size` is a live local it writes.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    // alloc: once per daemon started, the attribute list's room (`u64`s, for its alignment).
+    let mut list = vec![0u64; size.div_ceil(8)];
+    let attributes = list.as_mut_ptr().cast();
+    // SAFETY: `list` is `size` bytes, live and exclusive, for one attribute.
+    if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: the list was just initialized for one attribute; `handles` outlives the call that
+    // starts the process, which reads it, and the list is deleted after that.
+    let listed = unsafe {
+        UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_mut_ptr().cast(),
+            size_of_val(&handles),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    let started = (|| {
+        if listed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // An inherited handle has its number in the child: the copy's.
+        let args = args(handles[2] as usize);
+        let mut line = blaze_core::create_process::command_line(program, &args)?;
+        let program: Vec<u16> = program.as_os_str().encode_wide().chain([0]).collect();
+        let dir: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = handles[0];
+        startup.StartupInfo.hStdOutput = handles[1];
+        startup.StartupInfo.hStdError = handles[1];
+        startup.lpAttributeList = attributes;
+        let flags = DETACHED_PROCESS
+            | CREATE_NEW_PROCESS_GROUP
+            | CREATE_NO_WINDOW
+            | CREATE_UNICODE_ENVIRONMENT
+            | EXTENDED_STARTUPINFO_PRESENT
+            | if away { CREATE_BREAKAWAY_FROM_JOB } else { 0 };
+        let mut info = PROCESS_INFORMATION::default();
+        // SAFETY: every pointer is to a live, NUL-ended buffer of this frame or the startup
+        // information above, whose list names open inheritable handles; `line` is writable,
+        // as the call needs; no environment is given (this process's is), and `info` is a
+        // live local it writes.
+        if unsafe {
+            CreateProcessW(
+                program.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                std::ptr::null(),
+                dir.as_ptr(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: both handles were just made by the call, and nothing else owns them.
+        let (process, _thread) = unsafe {
+            (OwnedHandle::from_raw_handle(info.hProcess), OwnedHandle::from_raw_handle(info.hThread))
+        };
+        Ok(Detached { process, pid: info.dwProcessId })
+    })();
+    // SAFETY: the list was initialized above, and the call that read it has returned.
+    unsafe { DeleteProcThreadAttributeList(attributes) };
+    started
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +879,54 @@ mod tests {
     #[test]
     fn the_clock_ticks() {
         assert!(clock_ticks().is_some());
+    }
+    /// The invariant: a process started detached writes its output to the log it is given, runs
+    /// in the directory it is given, and has the one other handle it is given under the number
+    /// it is told: what it writes there is read here, and the pipe ends as it does (no other
+    /// copy of its writer is left open, here or there). The process is this test binary, run
+    /// as [`detached_child`] (PowerShell, detached, ends at once with 0 and runs nothing).
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_process_has_its_log_its_directory_and_the_handle_it_is_told() {
+        use std::{io::Read as _, os::windows::io::AsHandle as _};
+        let dir = std::env::temp_dir().join(format!("blaze-detached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = std::fs::File::create(dir.join("log.txt")).unwrap();
+        let (mut ready, said) = std::io::pipe().unwrap();
+        let args = |handle: usize| {
+            std::fs::write(dir.join("handle.txt"), handle.to_string()).unwrap();
+            ["--exact", "raw::process::tests::detached_child", "--ignored", "--nocapture"]
+                .map(Into::into)
+                .to_vec()
+        };
+        let child =
+            spawn_detached(&std::env::current_exe().unwrap(), args, &dir, &log, said.as_handle())
+                .unwrap();
+        drop(said);
+        let mut heard = Vec::new();
+        ready.read_to_end(&mut heard).unwrap();
+        assert_eq!(heard, b"\n");
+        assert!(ended_within(child.pid, Duration::from_secs(30)).unwrap());
+        assert_eq!(child.ended().unwrap(), Some(0));
+        drop(log);
+        let logged = std::fs::read_to_string(dir.join("log.txt")).unwrap();
+        assert!(logged.contains(&format!("in {}", dir.display())), "{logged}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`a_detached_process_has_its_log_its_directory_and_the_handle_it_is_told`]'s child: says
+    /// its directory, and writes a line on the handle whose number is in `handle.txt` there.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run by a_detached_process_has_its_log_its_directory_and_the_handle_it_is_told"]
+    fn detached_child() {
+        use std::{io::Write as _, os::windows::io::FromRawHandle as _};
+        let Ok(number) = std::fs::read_to_string("handle.txt") else { return };
+        println!("in {}", std::env::current_dir().unwrap().display());
+        let handle = number.trim().parse::<usize>().unwrap() as windows_sys::Win32::Foundation::HANDLE;
+        // SAFETY: the handle the parent made this process inherit under this number, for this.
+        let mut pipe = unsafe { std::fs::File::from_raw_handle(handle) };
+        pipe.write_all(b"\n").unwrap();
     }
 }

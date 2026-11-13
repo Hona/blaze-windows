@@ -227,9 +227,14 @@ example, a test or a build script is an executable; a `cdylib` (a native Node ad
 extension, a plugin) or a proc macro is a shared library, at cargo's path
 (`target/debug/lib<name>.so`, `.dylib` on macOS), linked with the package's
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`; a library (`lib`, `rlib`) is written
-with no object code, its functions kept in the store for the programs that link it. A crate
-type of `staticlib` or `dylib` fails the build, naming the target: blaze's linker writes
-neither yet ([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
+with no object code, its functions kept in the store for the programs that link it. A library
+the build only depends on that also lists an rlib (`lib` or `rlib`) is built as that rlib
+alone, its `cdylib`, `staticlib` or `dylib` not made: what depends on it links the rlib, and
+no step of the build reads the other files, which cargo writes all the same into `deps/`
+(`blaze_units::schema::builds_only_its_rlib`; rav1d's `["staticlib", "rlib"]`, a plugin's
+`["cdylib", "rlib"]`). Asked for itself, or with no rlib, a crate type of `staticlib` or
+`dylib` fails the build, naming the target: blaze's linker writes neither yet
+([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
 blaze's load does not build, saying what: an artifact dependency (`-Z bindeps`), a
 `metabuild`, a target spec file, a target blaze has no data of, and a rustc `-Z` flag in
 `RUSTFLAGS` that `crates/blaze-cargo/src/unstable.rs` refuses.

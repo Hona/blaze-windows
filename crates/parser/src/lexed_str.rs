@@ -600,7 +600,8 @@ impl<'a> Converter<'a> {
                 } else {
                     let text = &source[self.offset + 1..][..len - 1];
                     let text = &text[..text.rfind('"').unwrap()];
-                    unescape_str(text, |_, res| {
+                    // As rustc reads the file: a CRLF within the literal is an LF.
+                    unescape_str(&crate::cook::as_read(text), |_, res| {
                         if let Err(e) = res {
                             self.error(err_to_msg(&e, Mode::Str));
                         }
@@ -614,7 +615,8 @@ impl<'a> Converter<'a> {
                 } else {
                     let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('"').unwrap()];
-                    unescape_byte_str(text, |_, res| {
+                    // As rustc reads the file: a CRLF within the literal is an LF.
+                    unescape_byte_str(&crate::cook::as_read(text), |_, res| {
                         if let Err(e) = res {
                             self.error(err_to_msg(&e, Mode::ByteStr));
                         }
@@ -628,7 +630,8 @@ impl<'a> Converter<'a> {
                 } else {
                     let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('"').unwrap()];
-                    unescape_c_str(text, |_, res| {
+                    // As rustc reads the file: a CRLF within the literal is an LF.
+                    unescape_c_str(&crate::cook::as_read(text), |_, res| {
                         if let Err(e) = res {
                             self.error(err_to_msg(&e, Mode::CStr));
                         }
@@ -718,6 +721,16 @@ fn err_to_msg(error: &EscapeError, mode: Mode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A string, byte string or C string across a CRLF line end, or continued by a `\` before
+    /// one, lexes with no error, as rustc reads the file with LF; a bare CR is still one.
+    #[test]
+    fn a_literal_across_a_crlf_line_end_is_no_error() {
+        let text = "const A: &str = \"a\r\nb\";\r\nconst B: &str = \"e\\\r\n    f\";\r\n\
+                    const C: &[u8] = b\"g\r\nh\";\r\nconst D: &CStr = c\"i\r\nj\";\r\n";
+        let lexed = LexedStr::new(Edition::CURRENT, text);
+        assert_eq!(lexed.errors().count(), 0, "{:?}", lexed.errors().collect::<Vec<_>>());
+    }
 
     /// Every start, range and text found by arithmetic is the one found by walking the tokens,
     /// across checkpoints and for tokens longer than a packed length holds.

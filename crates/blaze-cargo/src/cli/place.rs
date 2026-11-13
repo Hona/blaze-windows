@@ -183,26 +183,11 @@ pub fn utf8(path: &Path) -> Result<String, String> {
     blaze_core::platform::path::daemon(path).map_err(|why| why.to_string())
 }
 
-/// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its
-/// name alone: its value is never shown.
+/// The command's environment as a request carries it ([`blaze_core::platform::env::captured`]).
 pub fn env(
     vars: impl Iterator<Item = (OsString, OsString)>,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut env = Vec::with_capacity(vars.size_hint().0);
-    let refused = |named: &str| {
-        format!(
-            "the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry"
-        )
-    };
-    for (name, value) in vars {
-        match (name.into_string(), value.into_string()) {
-            (Ok(name), Ok(value)) => env.push((name, value)),
-            (Ok(name), Err(_)) => return Err(refused(&name)),
-            (Err(name), _) => return Err(refused(&name.to_string_lossy())),
-        }
-    }
-    env.sort_unstable();
-    Ok(env)
+    blaze_core::platform::env::captured(vars)
 }
 
 // Whether what cargo writes to stderr is colored (`--color`, `CARGO_TERM_COLOR`, anstream's
