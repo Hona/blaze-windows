@@ -209,6 +209,13 @@ fn member<'a>(
     name: Input<'_>,
     bytes: &'a [u8],
 ) -> Result<Parsed<'a>, String> {
+    if super::rsrc::is_res(bytes) {
+        return Err(fail(
+            name,
+            "a compiled resource file (.res) read as an object: the link merges the .res files on \
+             its line into one object of their resources (`target::locate`)",
+        ));
+    }
     if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0)
         && u16_at(bytes, 2) == Some(0xffff)
     {
@@ -400,7 +407,20 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
             index.push((names.push(&symbol_name).map_err(|e| fail(name, e))?, member));
         }
     }
-    if index.is_empty() && !members.is_empty() && !whole {
+    // No index: fine when no member defines a symbol one would name (rustc's rlib of a crate
+    // with no code of its own holds `lib.rmeta` and objects with no external definition).
+    let defines = |member: &Member| -> bool {
+        use object::{Object as _, ObjectSymbol as _};
+        let data = &bytes[member.bytes.clone()];
+        if u16_at(data, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0) && u16_at(data, 2) == Some(0xffff) {
+            return true;
+        }
+        match object::read::coff::CoffFile::<&[u8]>::parse(data) {
+            Ok(file) => file.symbols().any(|it| it.is_global() && it.is_definition()),
+            Err(_) => false,
+        }
+    };
+    if index.is_empty() && !whole && members.iter().any(defines) {
         return Err(fail(
             name,
             "an archive with no symbol index, so no member of it can be taken for a symbol (index it \
@@ -734,8 +754,6 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             SectionKind::Dropped
         } else if base == OBJ_PDATA {
             SectionKind::Unwind(super::named(OBJ_PDATA.into(), false, false))
-        } else if base == ".xdata" {
-            SectionKind::Unwind(Class::Rodata)
         } else {
             let write = flags & pe::IMAGE_SCN_MEM_WRITE.0 != 0;
             let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0;

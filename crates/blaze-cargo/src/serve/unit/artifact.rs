@@ -78,11 +78,11 @@ pub(crate) fn run_env(
 ) -> Vec<(String, String)> {
     let mut env = vec![("CARGO".to_owned(), cargo.to_owned())];
     for (name, value) in &plan.env {
-        let kept = name == "CARGO_MANIFEST_DIR"
-            || name == "CARGO_MANIFEST_PATH"
-            || name == "OUT_DIR"
-            || name.starts_with("CARGO_PKG_");
-        if kept {
+        let path = name == "CARGO_MANIFEST_DIR" || name == "CARGO_MANIFEST_PATH" || name == "OUT_DIR";
+        if path {
+            // The program opens them: the system's paths of the daemon's names.
+            env.push((name.clone(), system(value)));
+        } else if name.starts_with("CARGO_PKG_") {
             env.push((name.clone(), value.clone()));
         }
     }
@@ -104,10 +104,17 @@ pub(crate) fn run_env(
             "windows" => ";",
             _ => ":",
         };
+        let search: Vec<String> = search.into_iter().map(system).collect();
         env.push((dylib_var(os).to_owned(), search.join(separator)));
     }
     env.sort();
     env
+}
+
+/// The system's path of `name`, a path the daemon named, as a variable's text.
+fn system(name: &str) -> String {
+    // alloc: a variable's value, once per variable
+    blaze_core::platform::path::host(name).to_string_lossy().into_owned()
 }
 
 /// What the artifact is, as the agent API names it; a target kind blaze doesn't know is an

@@ -101,7 +101,9 @@ another blaze ([toolchain.md](toolchain.md)).
    project and on ripgrep 15.1.0.
 9. `blaze` links ELF, Mach-O and COFF executables (`unsupported_target` in
    `cargo/cli.rs`). On Windows x86-64 MSVC it links with `rust-lld` and was run by hand on a
-   toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)). On macOS
+   toy crate and `demo/life` ([platforms.md](platforms.md#windows-x86-64-msvc)); v2 links PE
+   with its own linker, whose state on Windows is in
+   [platforms.md](platforms.md#v2s-linker-on-windows-2026-11-13-branch-windowslink). On macOS
    arm64 it was run by hand on bun 1.4.3's dev loop (research/bun.md).
    Nobody recorded running it on Linux AArch64.
 10. CI: `storekills.py`, `storecorrupts.py` and `storeshared.py` on all four platforms.

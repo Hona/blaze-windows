@@ -158,60 +158,26 @@ pub fn root() -> anyhow::Result<PathBuf> {
 /// there is cloned from the daemon's store, and a clone does not cross file systems (blaze
 /// never copies instead), so daemons share it only within one file system.
 pub fn machine() -> anyhow::Result<PathBuf> {
-    let dir = user_shared()?;
     let root = root()?;
-    if same_file_system(&dir, &root)? { Ok(dir) } else { Ok(root.join("shared")) }
+    match user_shared()? {
+        Some(dir) if same_file_system(&dir, &root)? => Ok(dir),
+        _ => Ok(root.join("shared")),
+    }
 }
 
-/// Whether `a` and `b` are on one file system, each judged by the nearest of it and its
-/// ancestors that exists (a directory not made yet is made on its parent's).
-#[cfg(unix)]
+/// Whether `a` and `b` are on one volume (`blaze_core::platform::volume::same_volume`).
 fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-    let device = |path: &Path| -> anyhow::Result<u64> {
-        let mut at = path;
-        loop {
-            match std::fs::metadata(at) {
-                Ok(it) => return Ok(it.dev()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    at = at.parent().with_context(|| {
-                        format!("no ancestor of {} exists to say its file system", path.display())
-                    })?;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("the file system of {}", at.display()));
-                }
-            }
-        }
-    };
-    Ok(device(a)? == device(b)?)
+    Ok(blaze_core::platform::volume::same_volume(a, b)?)
 }
 
-/// Whether `a` and `b`, both absolute, are on one volume: the same drive or share prefix
-/// (ReFS clones within a volume alone).
-#[cfg(not(unix))]
-fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
-    let prefix = |path: &Path| match path.components().next() {
-        Some(std::path::Component::Prefix(it)) => Ok(it.as_os_str().to_ascii_uppercase()),
-        _ => Err(anyhow::anyhow!("{} names no volume to say its file system", path.display())),
-    };
-    Ok(prefix(a)? == prefix(b)?)
-}
-
-/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`), absolute.
-fn user_shared() -> anyhow::Result<PathBuf> {
-    let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
-        Some(caches) => PathBuf::from(caches).join("blaze"),
-        None => {
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-            PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
-                .join(".cache/blaze")
-        }
-    };
+/// The directory every daemon of the user shares (`blaze_core::platform::home`'s `machine`:
+/// `blaze` in the user's cache directory, `%LOCALAPPDATA%\blaze` on Windows), absolute.
+fn user_shared() -> anyhow::Result<Option<PathBuf>> {
+    let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
+    let Some(dir) = found.machine else { return Ok(None) };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
-    std::path::absolute(&dir).with_context(|| {
+    std::path::absolute(&dir).map(Some).with_context(|| {
         format!("the machine's shared directory {} against the current directory", dir.display())
     })
 }
@@ -1200,8 +1166,20 @@ pub(crate) fn engine(
         blaze_graph::arena::machine_budget(1 << 30, told)
             .context("the memory the daemon's tasks may hold")?,
     );
+    // How outputs get to their paths is the volume's to say, once: a clone where its files
+    // share blocks (ReFS, APFS, Btrfs, XFS with reflinks), their bytes written where they
+    // share none (NTFS, ext4).
+    let sharing_of = |dir: &Path| -> anyhow::Result<blaze_core::Sharing> {
+        let volume = blaze_core::platform::volume(dir)?;
+        tracing::info!(target: "blaze", dir = %dir.display(), system = %volume.system, sharing = volume.sharing.name(), "a store's volume");
+        Ok(volume.sharing)
+    };
+    let store_sharing = sharing_of(&paths.state)?;
+    let std_sharing = sharing_of(&std)?;
     let options = Options {
         state: file_name(&paths.state)?,
+        store_sharing,
+        std_sharing,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,
         sources: file_name(&sources)?,

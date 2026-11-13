@@ -118,6 +118,11 @@ fn tarball(entries: &[Entry<'_>]) -> Vec<u8> {
 
 const SERDE: &str = "serde v1.0.219";
 
+/// The daemon's name of a path of the system's.
+fn named(path: &Path) -> String {
+    blaze_core::platform::path::daemon(path).unwrap()
+}
+
 fn crate_fetch(sha256: &str) -> Fetch {
     Fetch {
         what: SERDE.to_owned(),
@@ -158,7 +163,7 @@ fn a_fetched_package_is_on_disk_where_it_is_mounted() {
     ])
     .unwrap();
     let at = sources.join("registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.219");
-    let fetch = Fetch { at: at.to_str().unwrap().to_owned(), ..crate_fetch(&"0".repeat(64)) };
+    let fetch = Fetch { at: named(&at), ..crate_fetch(&"0".repeat(64)) };
     super::keep_on_disk(&fetch, &source, &sources).unwrap();
     assert_eq!(std::fs::read(at.join("src/lib.c")).unwrap(), b"int f(void) { return 0; }\n");
     assert_eq!(std::fs::read(at.join(".cargo-ok")).unwrap(), br#"{"v":1}"#);
@@ -180,7 +185,7 @@ fn a_fetched_package_is_on_disk_where_it_is_mounted() {
     super::keep_on_disk(&fetch, &source, &sources).unwrap();
     let index_at = sources.join("registry/index/x/.cache/se/rd/serde");
     let index =
-        Fetch { at: index_at.to_str().unwrap().to_owned(), kind: FetchKind::IndexFile, ..fetch };
+        Fetch { at: named(&index_at), kind: FetchKind::IndexFile, ..fetch };
     super::keep_on_disk(
         &index,
         &Source { files: vec![file("serde", b"{}", Mode::Regular)], under: "serde".into() },
@@ -201,13 +206,13 @@ fn a_lock_files_traversal_name_is_refused_before_anything_is_written() {
         files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)],
         under: String::new(),
     };
-    let root = sources.to_str().unwrap();
+    let root = named(&sources);
     for at in [
         format!("{root}/registry/src/index.crates.io-1949cf8c6b5b557f/../../../../escaped/x-1.0.0"),
         format!("{root}/registry/src/index.crates.io-1949cf8c6b5b557f/./x-1.0.0"),
         format!("{root}/registry/src//x-1.0.0"),
         format!("{root}/registry/index/x-1.0.0"),
-        format!("{}/escaped/x-1.0.0", dir.path().to_str().unwrap()),
+        format!("{}/escaped/x-1.0.0", named(dir.path())),
         "relative/registry/src/d/x-1.0.0".to_owned(),
     ] {
         let fetch = Fetch { at: at.clone(), ..crate_fetch(&"0".repeat(64)) };
@@ -229,7 +234,7 @@ fn a_copy_on_disk_that_is_not_the_fetched_package_is_refused_by_name() {
     let sources = dir.path().join("sources");
     let at = sources
         .join("git/checkouts/repo-0123456789abcdef/0123456789abcdef0123456789abcdef01234567");
-    let fetch = Fetch { at: at.to_str().unwrap().to_owned(), ..crate_fetch(&"0".repeat(64)) };
+    let fetch = Fetch { at: named(&at), ..crate_fetch(&"0".repeat(64)) };
     let one = Source {
         files: vec![file("Cargo.toml", b"[package]\n", Mode::Regular)],
         under: String::new(),
@@ -477,20 +482,22 @@ fn no_userinfo_is_said() {
 #[test]
 fn a_checkout_is_where_cargo_keeps_it() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
-    let home = super::git::cargo_home(
-        "/home/u/.cargo/git/checkouts/serde-1234567890abcdef/0123456",
+    // The daemon's names: from the root on Unix, from the drive on Windows.
+    let home = if cfg!(windows) { "/C:/Users/u/.cargo" } else { "/home/u/.cargo" };
+    let found = super::git::cargo_home(
+        &format!("{home}/git/checkouts/serde-1234567890abcdef/0123456"),
         "serde-1234567890abcdef",
         commit,
     )
     .unwrap();
-    assert_eq!(home, Path::new("/home/u/.cargo"));
+    assert_eq!(found, blaze_core::platform::path::host(home));
     for at in [
-        "/home/u/.cargo/git/checkouts/other-1234567890abcdef/0123456",
-        "/home/u/.cargo/git/db/serde-1234567890abcdef/0123456",
-        "/home/u/.cargo/git/checkouts/serde-1234567890abcdef/7654321",
-        "/home/u/.cargo/git/checkouts/serde-1234567890abcdef/012",
+        format!("{home}/git/checkouts/other-1234567890abcdef/0123456"),
+        format!("{home}/git/db/serde-1234567890abcdef/0123456"),
+        format!("{home}/git/checkouts/serde-1234567890abcdef/7654321"),
+        format!("{home}/git/checkouts/serde-1234567890abcdef/012"),
     ] {
-        assert!(super::git::cargo_home(at, "serde-1234567890abcdef", commit).is_err(), "{at}");
+        assert!(super::git::cargo_home(&at, "serde-1234567890abcdef", commit).is_err(), "{at}");
     }
 }
 
@@ -539,7 +546,7 @@ fn a_git_tree_is_its_commit_with_modes() {
         what: "g v0.0.0".to_owned(),
         url: url.to_string(),
         kind: FetchKind::Git { commit: commit.clone() },
-        at: at.to_str().unwrap().to_owned(),
+        at: named(&at),
     };
     let fake = Fake::new(Vec::new());
     let source = fetcher(&fake).fetch(&fetch).unwrap();

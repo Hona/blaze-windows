@@ -160,39 +160,63 @@ impl Real {
     }
 }
 
-/// blaze's executable linked as `rustc` and `rustdoc` in `dir`: what a build script is given as
+/// blaze's executable as `rustc` and `rustdoc` in `dir`: what a build script is given as
 /// `RUSTC` and `RUSTDOC`, so a probe of them (`autocfg`, `version_check`) is answered by blaze
 /// and no rustc runs (docs/no-rustc.md).
+///
+/// On Unix each is a symbolic link to `launcher`. Windows makes one of those without elevation
+/// only in Developer Mode, so there each is a hard link to `launcher` where `dir` is on its
+/// volume, and a copy of it where it is not (a `BLAZE_HOME` on another drive): which is the
+/// volumes' to say, once, never a link tried and a copy made when it fails. A stand-in that is
+/// `launcher` already (the same file, or a copy of its length and time) is kept; any other is
+/// replaced.
 fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     for name in ["rustc", "rustdoc"] {
         let at = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        match std::fs::read_link(&at) {
-            Ok(to) if to == launcher => continue,
-            Ok(_) => {
-                std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", at.display())),
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(launcher, &at)
-            .map_err(|error| format!("{}: {error}", at.display()))?;
-        // A symbolic link as on unix, so `read_link` above finds it again: a hard link is no link
-        // `read_link` reads (every start then failed on the one made before), and none can cross
-        // volumes (a BLAZE_HOME on another drive than the launcher). windows: unprivileged
-        // symbolic links need Developer Mode; without it this fails naming the link.
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(launcher, &at).map_err(|error| {
-            format!(
-                "{}: {error} (a symbolic link to blaze; Windows makes one without elevation only in Developer Mode)",
-                at.display()
-            )
-        })?;
+        stand_in(&at, launcher).map_err(|error| format!("{}: {error}", at.display()))?;
     }
     Ok(())
 }
 
+#[cfg(unix)]
+fn stand_in(at: &std::path::Path, launcher: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::read_link(at) {
+        Ok(to) if to == launcher => return Ok(()),
+        Ok(_) => std::fs::remove_file(at)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::os::unix::fs::symlink(launcher, at)
+}
+
+#[cfg(not(unix))]
+fn stand_in(at: &std::path::Path, launcher: &std::path::Path) -> std::io::Result<()> {
+    use blaze_core::platform::volume::file_id;
+    let theirs = file_id(launcher)?;
+    let parent = at.parent().unwrap_or(at);
+    let linked = file_id(parent)?.volume == theirs.volume;
+    match file_id(at) {
+        Ok(ours) if ours == theirs => return Ok(()),
+        Ok(_) if !linked && same_copy(at, launcher)? => return Ok(()),
+        Ok(_) => std::fs::remove_file(at)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match linked {
+        true => std::fs::hard_link(launcher, at),
+        // A copy keeps its source's time of last write (CopyFileExW), what says it is current.
+        false => std::fs::copy(launcher, at).map(drop),
+    }
+}
+
+/// Whether `at` is a copy of `launcher` as [`stand_in`] makes one: of its length and its time
+/// of last write.
+#[cfg(not(unix))]
+fn same_copy(at: &std::path::Path, launcher: &std::path::Path) -> std::io::Result<bool> {
+    let (ours, theirs) = (std::fs::metadata(at)?, std::fs::metadata(launcher)?);
+    Ok(ours.len() == theirs.len() && ours.modified()? == theirs.modified()?)
+}
 impl Steps for Real {
     type Front = JobFront;
     type Writer = UnitWriter;
@@ -1497,6 +1521,10 @@ pub(crate) struct Job {
     pub(crate) layout: OnceLock<Result<Option<layout::Profiles>, String>>,
     /// `blaze test --ub`'s tests, selected once on a worker, read by every evaluation.
     pub(crate) ub: OnceLock<test::UbTests>,
+    /// The Visual Studio tools and Windows SDK its sandboxed build scripts are started with a
+    /// developer prompt's variables for ([`script::started_in`]), found the first time one runs.
+    #[cfg(windows)]
+    pub(crate) msvc: OnceLock<Result<blaze_core::platform::msvc::Developer, String>>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
     /// The dependency crates checked this build, kept with the front end until the head's next
@@ -1564,6 +1592,8 @@ impl Job {
             lint_profiles: Default::default(),
             layout: Default::default(),
             ub: Default::default(),
+            #[cfg(windows)]
+            msvc: Default::default(),
             began: Instant::now(),
             later: Lock::new("serve.unit.later", Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Lock::new("serve.unit.seeds", Vec::new()),

@@ -23,6 +23,8 @@ test = false
 [dependencies]
 # The one schema and its frames: the requests this sends are the CLI's, byte for byte.
 blaze-api.workspace = true
+# Where blaze's home is (`platform::home`), and on Unix the one deadline wait.
+blaze-core.workspace = true
 # The name of the file a pin's lookup is kept in (`pin.rs`).
 blaze-format.workspace = true
 blaze-ids.workspace = true
@@ -34,8 +36,6 @@ blaze-report.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Where the daemon listens, the checkout, the config files outside it, the environment.
 blaze-client.workspace = true
-# The one deadline wait.
-blaze-core.workspace = true
 libc.workspace = true
 tracing.workspace = true
 

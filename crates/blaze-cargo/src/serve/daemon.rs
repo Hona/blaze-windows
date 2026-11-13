@@ -463,6 +463,12 @@ pub struct Options {
     /// daemon's driver is the simulation and its files are in no file system, as effects of
     /// the store's that the daemon's driver completes.
     pub store_loader: blaze_cas::Loader,
+    /// Whether the volumes of its store and of the shared store of the standard library share
+    /// blocks ([`blaze_cas::Config::sharing`]), each asked once as the daemon starts
+    /// ([`blaze_core::platform::volume`]): where they do not (NTFS), every output is written
+    /// where it goes and none is cloned.
+    pub store_sharing: blaze_core::Sharing,
+    pub std_sharing: blaze_core::Sharing,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -1381,6 +1387,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 load_tags: LOADS,
                 // clone: once per daemon started, a path
                 loader: options.store_loader.clone(),
+                sharing: options.store_sharing,
             };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
@@ -1392,6 +1399,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             load_tags: STD_LOADS,
             // clone: once per daemon started, a path
             loader: options.store_loader.clone(),
+            sharing: options.std_sharing,
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1649,7 +1657,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
-            crate::serve::fetch::on_disk_mark(std::path::Path::new(at))
+            crate::serve::fetch::on_disk_mark(&blaze_core::platform::path::host(at))
         });
         if let Some((first, why)) = forgotten.first() {
             tracing::info!(target: "blaze", packages = forgotten.len(), first = %first, why = %why, "fetched packages whose copy on disk is not their mount's are fetched again");

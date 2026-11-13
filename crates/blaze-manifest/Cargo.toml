@@ -17,6 +17,7 @@ doctest = false
 anyhow.workspace = true
 # The version cargo 1.99 renders its manifest diagnostics with, so that they read the same.
 annotate-snippets.workspace = true
+blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-resolve.workspace = true

@@ -13,7 +13,10 @@ use crate::guest::{Guest, Stop, tests::Buffer};
 /// A package and an output directory beside a file neither holds, in a fresh directory of
 /// its own under the system's temporary one, each path real.
 struct Scratch {
+    /// The host's name of it, which the test makes files under.
     top: PathBuf,
+    /// The walk's name of it (`/C:/Users/...` on Windows), as the daemon names paths.
+    top_name: String,
     pkg: String,
     out: String,
     secret: String,
@@ -37,8 +40,9 @@ impl Scratch {
         #[cfg(unix)]
         std::os::unix::fs::symlink("data/a.txt", top.join("pkg/inner")).unwrap();
         let top = fs::canonicalize(&top).unwrap();
-        let real = |rel: &str| top.join(rel).to_str().unwrap().to_owned();
-        Scratch { pkg: real("pkg"), out: real("out"), secret: real("secret.txt"), top }
+        let top_name = walk_name(&top);
+        let real = |rel: &str| format!("{top_name}/{rel}");
+        Scratch { pkg: real("pkg"), out: real("out"), secret: real("secret.txt"), top, top_name }
     }
 
     fn env(&self) -> Env {
@@ -54,6 +58,11 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.top);
     }
+}
+
+/// The walk's name of the host's absolute `path`: on Windows `\\?\C:\a` is `/C:/a`.
+fn walk_name(path: &std::path::Path) -> String {
+    super::host::guest_path(path.to_str().unwrap()).into_owned()
 }
 
 fn shim(t: Target, call: Call) -> Shim {
@@ -170,7 +179,7 @@ fn a_file_in_the_package_is_read_whole_and_noted() {
 fn a_relative_path_starts_at_the_calls_directory_and_only_the_roots_are_read() {
     let scratch = Scratch::new("cwd");
     let env = scratch.env();
-    let top = scratch.top.to_str().unwrap().to_owned();
+    let top = scratch.top_name.clone();
     let Some(mut run) = Run::in_dir(&env, &top) else { return };
     let fd = run.open("pkg/data/a.txt", 0).unwrap();
     assert_eq!(fd, 3, "a path relative to the workspace's root, into the package, is read");
@@ -279,7 +288,7 @@ fn canonicalize_walks_the_ancestors_of_the_package_and_reads_none_of_them() {
 fn an_ancestor_is_not_opened_and_a_sibling_of_the_package_is_refused_by_name() {
     let scratch = Scratch::new("sibling");
     let env = scratch.env();
-    let top = scratch.top.to_str().unwrap().to_owned();
+    let top = scratch.top_name.clone();
     let refused = |stop: Stop, path: &str| {
         assert!(
             stop.0.starts_with(&format!("reads `{path}`"))
@@ -313,7 +322,7 @@ fn an_ancestor_is_not_opened_and_a_sibling_of_the_package_is_refused_by_name() {
 fn a_link_the_packages_path_goes_through_is_read_as_that_link() {
     let scratch = Scratch::new("through");
     std::os::unix::fs::symlink("pkg", scratch.top.join("alias")).unwrap();
-    let top = scratch.top.to_str().unwrap().to_owned();
+    let top = scratch.top_name.clone();
     let mut env = Env::default();
     env.set(MANIFEST_DIR, format!("{top}/alias"));
     let mut os = Os::wasm_in(&env, manifest_dir(&env));
@@ -967,4 +976,64 @@ fn assert_errnos(t: Target) {
     for (errno, code) in pairs {
         assert_eq!(t.errno(errno), code, "{errno:?}");
     }
+}
+
+/// The walk names a Windows path as the daemon does, `/C:/a`; the host opens it at the system's
+/// name. Each spelling Windows gives a variable (`C:\a`, `C:/a`, `\\?\C:\a`) is that same path,
+/// and a first part that is no drive names nothing there.
+#[cfg(windows)]
+#[test]
+fn a_windows_path_is_the_walks_path_and_the_host_opens_it_at_its_name() {
+    use super::host::{guest_path as guest, on_host};
+    let host = |path: &str| on_host(path).map(|it| it.to_str().unwrap().to_owned());
+    assert_eq!(host("/C:/Users/a/pkg").as_deref(), Some(r"C:\Users\a\pkg"));
+    assert_eq!(host("/C:").as_deref(), Some(r"C:\"));
+    assert_eq!(host("/UNC/srv/share/a/b").as_deref(), Some(r"\\srv\share\a\b"));
+    assert_eq!(host("/etc/hosts"), None, "no path from the current drive's root");
+    assert_eq!(host("/"), None);
+    for spelt in [r"C:\Users\a\pkg", "C:/Users/a/pkg", r"\\?\C:\Users\a\pkg", r"c:\Users\a\pkg"] {
+        assert_eq!(guest(spelt), "/C:/Users/a/pkg", "{spelt}");
+    }
+    assert_eq!(guest(r"C:\Users\a\pkg/data\a.txt"), "/C:/Users/a/pkg/data/a.txt");
+    assert_eq!(guest(r"\\srv\share\a"), "/UNC/srv/share/a");
+    assert_eq!(guest(r"\\?\UNC\srv\share\a"), "/UNC/srv/share/a");
+    assert_eq!(guest(r"data\a.txt"), "data/a.txt", "relative, `\\` a separator");
+    assert_eq!(guest("/C:/Users/a"), "/C:/Users/a");
+    assert_eq!(guest("C:"), "C:", "a drive alone stays relative: from `/`, the walk's `/C:`");
+}
+/// On Windows a macro given its package as rustc's process is given it (`C:\...`) reads below it
+/// whichever way it spells the path, and the read is noted under the walk's one name; outside
+/// it is still refused, by that name.
+#[cfg(windows)]
+#[test]
+fn a_package_spelt_as_windows_spells_it_is_read_by_the_walks_name() {
+    let scratch = Scratch::new("windows");
+    let host_dir =
+        |rel: &str| scratch.top.join(rel).to_str().unwrap().trim_start_matches(r"\\?\").to_owned();
+    let mut env = Env::default();
+    env.set(MANIFEST_DIR, host_dir("pkg"));
+    env.set(OUT_DIR, host_dir("out"));
+    let cwd = host_dir("pkg");
+    let mut os = Os::wasm_in(&env, &cwd);
+    let a = format!("{}/data/a.txt", scratch.pkg);
+    for spelt in
+        [host_dir(r"pkg\data\a.txt"), format!(r"{}/data/a.txt", host_dir("pkg")), a.clone()]
+    {
+        let fd = os.open_path((At::Root, &spelt), true, false).unwrap().unwrap();
+        assert_eq!(os.read_fd(fd, 64, None).unwrap(), b"hello, macro", "{spelt}");
+        os.close_fd(fd).unwrap();
+    }
+    let relative = os.open_path((At::Cwd, r"data\b.txt"), true, false).unwrap().unwrap();
+    assert_eq!(os.read_fd(relative, 64, None).unwrap(), b"b");
+    let seen: Vec<_> = os.seen().filter(|it| it.0 != Seen::Env).map(|it| it.1.to_owned()).collect();
+    assert!(seen.iter().all(|it| it.starts_with(&scratch.pkg)), "{seen:?}");
+    assert!(seen.contains(&a), "{seen:?}");
+    let stop = os.open_path((At::Root, &host_dir("secret.txt")), true, false).unwrap_err();
+    assert!(stop.0.contains(&scratch.secret), "{stop}");
+    let listed = os.open_path((At::Root, &host_dir("pkg")), true, true).unwrap().unwrap();
+    let mut names = Vec::new();
+    while let Some(entry) = os.dir_entry(listed, names.len() as u64).unwrap() {
+        names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+    }
+    assert_eq!(names, [".", "..", "data", "src"]);
 }

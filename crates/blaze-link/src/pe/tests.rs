@@ -904,7 +904,7 @@ fn encoders() {
 #[test]
 fn synthetic_sizes() {
     let classes = |counts: &Counts| -> Vec<Class> {
-        image::synthetic(counts, false).into_iter().map(|it| it.0).collect()
+        image::synthetic(counts, false, false).into_iter().map(|it| it.0).collect()
     };
     assert_eq!(
         classes(&Counts::default()),
@@ -922,7 +922,7 @@ fn synthetic_sizes() {
         library_names: 12,
         ..Counts::default()
     };
-    let sizes = image::synthetic(&counts, false);
+    let sizes = image::synthetic(&counts, false, false);
     let idata = sizes.iter().find(|it| it.0 == Class::Synthetic(IDATA)).unwrap().1;
     // Two descriptors, a lookup table of 2, a hint/name entry, the DLL name.
     assert_eq!(idata, 40 + 16 + 14 + 13);
@@ -1429,7 +1429,7 @@ fn coff_object_sections_and_groups() {
             (".drectve", &SectionKind::Dropped, false),
             (".text$mn", &SectionKind::Alloc(Class::Text, rank(Some("mn"))), false),
             (".pdata", &SectionKind::Unwind(pdata), false),
-            (".xdata", &SectionKind::Unwind(Class::Rodata), false),
+            (".xdata", &SectionKind::Alloc(Class::Rodata, 0), false),
             (".tls$", &SectionKind::Alloc(Class::Tdata, 1), true),
             (".bss", &SectionKind::Alloc(Class::Bss, 0), true),
         ]
@@ -2434,7 +2434,7 @@ fn without_a_dev_run_the_image_is_unchanged() {
     let plan = writer.plan();
     assert_eq!((plan.page, plan.headers), (0x1000, 0x1000));
     let tls = |dev_run| {
-        image::synthetic(&Counts::default(), dev_run)
+        image::synthetic(&Counts::default(), dev_run, false)
             .into_iter()
             .find(|it| it.0 == Class::Synthetic(TLS_DIR))
     };

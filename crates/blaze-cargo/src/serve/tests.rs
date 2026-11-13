@@ -1402,6 +1402,8 @@ fn options() -> Options {
         // The simulation's files are in no file system a loader's thread could read: the
         // stores load their packs through the daemon's driver.
         store_loader: blaze_cas::Loader::Pumped,
+        store_sharing: blaze_core::Sharing::Blocks,
+        std_sharing: blaze_core::Sharing::Blocks,
         socket: Some(name(SOCKET)),
         http: None,
         budget: None,

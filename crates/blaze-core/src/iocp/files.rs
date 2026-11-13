@@ -16,7 +16,8 @@ use windows_sys::Win32::{
         FILE_BASIC_INFO, FILE_END_OF_FILE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAG_SEQUENTIAL_SCAN,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo,
+        FILE_ID_INFO, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileEndOfFileInfo,
+        FileIdInfo,
         GetFileAttributesW, GetFileInformationByHandleEx, GetFileSizeEx,
         GetVolumeInformationByHandleW, INVALID_FILE_ATTRIBUTES, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, ReadFile,
@@ -473,6 +474,58 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
         )
     })
     .map_err(named)
+}
+
+/// The volume's serial number and the file's 128-bit id of the file at `path`
+/// ([`crate::platform::volume::file_id`]), opened for its attributes alone, links followed.
+pub(crate) fn file_id(path: &Path) -> io::Result<(u64, u128)> {
+    let wide = sys::path(path)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = sys::owned(handle)?;
+    // SAFETY: all zeros is a valid buffer of plain integers.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle and a buffer of the class's type and size.
+    sys::check(unsafe {
+        GetFileInformationByHandleEx(
+            handle.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    })?;
+    Ok((info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
+}
+
+/// The file system `dir` is on and whether its files can share blocks
+/// ([`crate::platform::volume`]): `dir`, a directory or file that exists, opened for its
+/// attributes alone (a directory needs `FILE_FLAG_BACKUP_SEMANTICS` to be opened at all) and
+/// its volume asked. One open and one call: no file is made.
+pub(crate) fn volume(dir: &Path) -> io::Result<(String, bool)> {
+    let wide = sys::path(dir)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    file_system(&sys::owned(handle)?)
 }
 
 /// The name of the file system `handle` is on, and whether it shares blocks between files.

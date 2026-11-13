@@ -14,6 +14,7 @@ pub(crate) fn opened(sim: &mut Sim) -> blaze_cas::Store {
         tags: 1 << 40,
         load_tags: (1 << 40) + (1 << 32),
         loader: blaze_cas::Loader::Pumped,
+        sharing: blaze_core::Sharing::Blocks,
     };
     let mut effects = Vec::new();
     let mut store = blaze_cas::Store::open(config, &mut effects);

@@ -321,6 +321,7 @@ fn daemon(
         tags: 1 << 48,
         load_tags: (1 << 48) + (1 << 32),
         loader: blaze_cas::Loader::Pumped,
+        sharing: blaze_core::Sharing::Blocks,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {

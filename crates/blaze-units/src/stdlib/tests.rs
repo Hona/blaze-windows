@@ -314,6 +314,23 @@ fn a_proc_macro_of_a_static_target_has_no_crt_static() {
     assert!(cfgs.iter().any(|it| it == "proc_macro"));
 }
 
+/// The invariant: `-C target-feature=+crt-static` on MSVC (which respects it and links the C
+/// runtime dynamically by default) reaches a build script as `crt-static` in
+/// `CARGO_CFG_TARGET_FEATURE`, which `cc` reads to compile C with `/MT` and not `/MD`; without
+/// it the script has none.
+#[test]
+fn crt_static_on_msvc_reaches_a_build_scripts_target_features() {
+    let triple = "x86_64-pc-windows-msvc";
+    let features = |args: &CfgArgs| {
+        let env = cargo_cfg_env(&target_cfg(triple, args).unwrap());
+        let var = env.iter().find(|(it, _)| it == "CARGO_CFG_TARGET_FEATURE").unwrap();
+        var.1.split(',').map(str::to_owned).collect::<Vec<_>>()
+    };
+    let flags = ["-C".to_owned(), "target-feature=+crt-static".to_owned()];
+    assert!(features(&CfgArgs::from_flags(&flags).unwrap()).contains(&"crt-static".to_owned()));
+    assert!(!features(&CfgArgs::default()).contains(&"crt-static".to_owned()));
+}
+
 #[test]
 fn an_unknown_target_is_refused_naming_it() {
     let error = target_cfg("riscv64gc-unknown-plan9", &CfgArgs::default()).unwrap_err();
