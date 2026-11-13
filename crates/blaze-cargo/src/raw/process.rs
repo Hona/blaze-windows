@@ -223,6 +223,77 @@ pub fn ended_within(pid: u32, long: Duration) -> std::io::Result<bool> {
     }
 }
 
+/// `command` run to its end as `blaze run` runs a program on Windows, where no process can
+/// become another (cargo's `exec_replace`): started suspended, put in a job object of its own
+/// that ends every process still in it when this one ends (`KILL_ON_JOB_CLOSE`, so a program
+/// and what it started never outlive a `blaze run` that was killed; one that asks to leave the
+/// job may, `BREAKAWAY_OK`), then resumed and waited for. Started suspended, nothing it starts
+/// runs before it is in the job. Meanwhile this process ignores the console's Ctrl-C and
+/// Ctrl-Break: the program, on the same console, gets them and answers them itself, and the
+/// command ends with the code it ends with.
+#[cfg(windows)]
+pub fn run_held(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::windows::{
+        io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+        process::{ChildExt as _, CommandExt as _},
+    };
+    use windows_sys::{
+        Win32::System::{
+            Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
+            },
+            Threading::{CREATE_SUSPENDED, ResumeThread},
+        },
+        core::BOOL,
+    };
+    unsafe extern "system" fn interrupted(event: u32) -> BOOL {
+        BOOL::from(event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+    }
+    // SAFETY: no attributes and no name: the call reads no memory of this process. The handle
+    // it makes is owned below, so it is closed once, as this process ends at the latest.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above: `CreateJobObjectW` just made it, and nothing else owns it.
+    let job = unsafe { OwnedHandle::from_raw_handle(job) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    // SAFETY: `limits` is a live local of the size the call is told, read and not kept.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `interrupted` is a function for the life of the process, as the handler must be.
+    if unsafe { SetConsoleCtrlHandler(Some(interrupted), 1) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut child = command.creation_flags(CREATE_SUSPENDED).spawn()?;
+    // SAFETY: both handles are open while `job` and `child` live, across the call.
+    let held = unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) };
+    // SAFETY: as above, the child's main thread, suspended once by its creation.
+    if held == 0 || unsafe { ResumeThread(child.main_thread_handle().as_raw_handle()) } == u32::MAX {
+        let error = std::io::Error::last_os_error();
+        // It never ran: ended where it stands, and its exit waited for so nothing outlives it.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait()
+}
 /// Waits for the child `pid` to exit without reaping it (`waitid` with `WNOWAIT`), so its
 /// `std::process::Child` still waits for it and its pid is no other process's until then: a
 /// test executable's exit, waited for apart from its output (`cli::live`). A `pid` that is no
