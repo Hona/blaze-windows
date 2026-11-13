@@ -1199,7 +1199,9 @@ fn relative_file(
 ) -> Result<EditionedFileId, ExpandError> {
     let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
-    let path = AnchoredPath { anchor: call_site, path: path_str };
+    // A path the program spelt as the system does (`env!("OUT_DIR")` on Windows) is the daemon's.
+    let named = base_db::named_path(path_str);
+    let path = AnchoredPath { anchor: call_site, path: &named };
     let res: FileId = match db.resolve_path(path) {
         Some(file) => file,
         None => included_source(db, call_id, tt, path, err_span)?,
@@ -1374,7 +1376,9 @@ fn included_bytes<'db>(
     path_span: Span,
 ) -> Result<&'db [u8], ExpandError> {
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
-    let path = AnchoredPath { anchor, path };
+    // A path the program spelt as the system does (`env!("OUT_DIR")` on Windows) is the daemon's.
+    let named = base_db::named_path(path);
+    let path = AnchoredPath { anchor, path: &named };
     let unloaded = || {
         // alloc: an error's message, on the error path
         ExpandError::other(path_span, format!("failed to load file `{}`", path.path))
@@ -1438,7 +1442,12 @@ fn include_str_expand<'f>(
 fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
     db.env_is_read(krate, key.as_str());
-    base_db::env_var(db, krate, key.as_str())
+    let value = base_db::env_var(db, krate, key.as_str())?;
+    // A path cargo gives is the system's, as rustc reads it ([`base_db::given_value`]).
+    Some(match base_db::given_value(key.as_str(), &value) {
+        std::borrow::Cow::Borrowed(_) => value,
+        std::borrow::Cow::Owned(it) => it,
+    })
 }
 
 fn env_expand<'f>(

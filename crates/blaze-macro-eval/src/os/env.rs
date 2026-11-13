@@ -2,6 +2,8 @@
 //! `environ` gives whole, each read noted. Setting a variable would set it for the whole
 //! compiler, so it stops the expansion.
 
+use std::borrow::Cow;
+
 use blaze_usercode::trace::{ALL_ENV, Seen};
 
 use super::{Done, Noted, Os, ok};
@@ -30,7 +32,7 @@ impl<'a> Os<'a> {
             return ok(ret, 0);
         };
         self.bytes.clear();
-        self.bytes.extend_from_slice(value.as_bytes());
+        self.bytes.extend_from_slice(base_db::given_value(name, value).as_bytes());
         self.bytes.push(0);
         let value = g.alloc(&self.bytes, 1)?;
         self.answers.push((name, value));
@@ -38,22 +40,30 @@ impl<'a> Os<'a> {
     }
 
     /// The calling crate's variable `name`, noted read by name: what a wasm macro's `getenv`
-    /// asks the host, one variable at a time (`blaze_proc_macro::env_var`).
-    pub(crate) fn var(&mut self, name: &str) -> Option<&'a str> {
+    /// asks the host, one variable at a time (`blaze_proc_macro::env_var`). A path cargo gives
+    /// is the system's, as rustc's process has it (`base_db::given_value`).
+    pub(crate) fn var(&mut self, name: &str) -> Option<Cow<'a, str>> {
         self.trace.note(Noted::Seen(Seen::Env), name);
-        self.env.iter().find(|(it, _)| *it == name).map(|(_, value)| value)
+        self.env
+            .iter()
+            .find(|(it, _)| *it == name)
+            .map(|(name, value)| base_db::given_value(name, value))
     }
 
     /// The calling crate's variables sorted by name, the whole environment noted read: what
     /// `environ` gives, and WASI's `environ_get` to a wasm macro, which std's `env::vars`
     /// reaches (its `getenv` asks by name, [`Os::var`]).
-    pub(crate) fn walk_environ(&mut self) -> Vec<(&'a str, &'a str)> {
+    pub(crate) fn walk_environ(&mut self) -> Vec<(&'a str, Cow<'a, str>)> {
         if !self.trace.all_env {
             self.trace.all_env = true;
             self.trace.note(Noted::Seen(Seen::Env), ALL_ENV);
         }
         // alloc: once per expansion that walks the whole environment
-        let mut vars: Vec<(&str, &str)> = self.env.iter().collect();
+        let mut vars: Vec<(&str, Cow<'a, str>)> = self
+            .env
+            .iter()
+            .map(|(name, value)| (name, base_db::given_value(name, value)))
+            .collect();
         vars.sort_unstable();
         vars
     }
