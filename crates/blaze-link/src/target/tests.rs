@@ -237,7 +237,7 @@ fn shared(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, Link
 /// `libs` as one crate's whose compile searches no directory of its own: each searched in the
 /// link's directories alone.
 fn program(libs: &[NativeLib]) -> [CrateLibs<'_>; 1] {
-    [CrateLibs { libs, search: &[] }]
+    [CrateLibs { name: "ffi", libs, search: &[] }]
 }
 
 /// [`locate_with`] for a target that links nothing from blaze's toolchain.
@@ -557,8 +557,8 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
     let first = [static_lib("asm", false)];
     let second = [static_lib("asm", false), static_lib("shared", false), dylib("dyn")];
     let libs = [
-        CrateLibs { libs: &first, search: &one_dirs },
-        CrateLibs { libs: &second, search: &two_dirs },
+        CrateLibs { name: "first", libs: &first, search: &one_dirs },
+        CrateLibs { name: "second", libs: &second, search: &two_dirs },
     ];
     // The link's directories have `one`'s first, which a name resolved once for the whole
     // program would take for both.
@@ -1014,6 +1014,7 @@ fn a_verbatim_defaultlib_is_a_default_library() {
     output.link.pe.crt_static = true;
     let error = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap_err();
     assert!(error.what.contains("LNK2038"), "{}", error.what);
+    assert!(error.what.contains("crate `ffi` links the VC runtime library `/defaultlib:msvcrt`"), "{error}");
     output.link.pe.crt_static = false;
 
     let error =

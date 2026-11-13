@@ -46,7 +46,7 @@ fn link_with(output: Output, libs: &[NativeLib]) -> Result<Vec<u8>, LinkError> {
 
 /// [`link_with`]'s file, and the image it is of.
 fn link_image(mut output: Output, libs: &[NativeLib]) -> Result<(Vec<u8>, Image), LinkError> {
-    let crates = [crate::target::CrateLibs { libs, search: &[] }];
+    let crates = [crate::target::CrateLibs { name: "program", libs, search: &[] }];
     let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused"))?;
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
         .into_iter()
@@ -432,7 +432,7 @@ fn default_libraries_are_searched_after_the_named_ones() {
     let mut output = output(None, &[]);
     let libs = [lib(&first), lib(&second)];
     let search = [dir.clone()];
-    let crates = [crate::target::CrateLibs { libs: &libs, search: &[] }];
+    let crates = [crate::target::CrateLibs { name: "program", libs: &libs, search: &[] }];
     let located = crate::target::locate(&mut output, &crates, &search, Path::new("unused")).unwrap();
     let files: Vec<String> = located
         .iter()
@@ -500,7 +500,7 @@ fn dbghelp_names_a_rust_function_and_its_line_from_the_pdb() {
     output.debug = Debug::Beside;
     // Room to grow, as a dev build's: an edit is a patch of the image, and of its PDB.
     output.incremental = true;
-    let crates = [crate::target::CrateLibs { libs: &[], search: &[] }];
+    let crates = [crate::target::CrateLibs { name: "program", libs: &[], search: &[] }];
     let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused")).unwrap();
     let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
         .into_iter()

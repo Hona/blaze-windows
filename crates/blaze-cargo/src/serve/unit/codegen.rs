@@ -1565,7 +1565,7 @@ fn natives(
         if !libs.is_empty() {
             let mut search = search_dirs(&flags.search);
             search.extend(search_dirs(&compile.search));
-            crates.push(CrateNatives { libs, search });
+            crates.push(CrateNatives { unit: at, libs, search });
         }
     }
     let mut search = search_dirs(&own.search);
@@ -1685,6 +1685,7 @@ const FIRST_LIBRARY: u32 = 1 << 20;
 /// One crate's native libraries and the `-L`s its rustc is given ([`natives`]), owned for
 /// [`blaze_link::target::CrateLibs`].
 struct CrateNatives {
+    unit: u32,
     libs: Vec<NativeLib>,
     search: Vec<PathBuf>,
 }
@@ -2138,9 +2139,11 @@ fn link_at(
             .map_err(linker(LinkStep::Output))?;
         search.extend(applied.search);
         // alloc: once per link, each crate's libraries as the linker takes them
-        let mut libs: Vec<CrateLibs<'_>> =
-            crates.iter().map(|it| CrateLibs { libs: &it.libs, search: &it.search }).collect();
-        libs.push(CrateLibs { libs: &applied.libs, search: &[] });
+        let name = |unit: usize| job.units().graph.units[unit].target.name.as_str();
+        let mut libs: Vec<CrateLibs<'_>> = crates.iter().map(|it| CrateLibs {
+            name: name(it.unit as usize), libs: &it.libs, search: &it.search,
+        }).collect();
+        libs.push(CrateLibs { name: name(unit), libs: &applied.libs, search: &[] });
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
         let located = {
             let _span = tracing::info_span!(target: "blaze", "link natives: locate").entered();
