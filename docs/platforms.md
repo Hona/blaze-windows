@@ -170,10 +170,12 @@ not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0
 - rustc's own link line for rune-desktop (258 objects, 387 rlibs, its C libraries, 13
   `/DELAYLOAD`s, its `.res`) links with blaze-link (`examples/pe_relink.rs`), and the program
   renders frames byte for byte the same as link.exe's image does.
-- Not done: a PDB (the image names one in its debug directory and none is written, so
-  backtraces have no names; design in [v2/plan/design/pdb.md](v2/plan/design/pdb.md)), CFG
-  tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a `.res` manifest
-  works).
+- The image's PDB is written beside it ([v2/plan/design/pdb.md](v2/plan/design/pdb.md)):
+  dbghelp (std's backtrace) names Rust functions and their lines and C functions by name, cdb
+  breaks on a Rust function by name. It has no types or locals, and is written whole by each
+  link.
+- Not done: CFG tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a
+  `.res` manifest works).
 
 ## macOS arm64
 
