@@ -1067,9 +1067,9 @@ impl fmt::Display for MemoryLine<'_> {
 /// [`MEMORY_LOG_EVERY`], at a stop, and first in the postmortem of a daemon past its memory
 /// ceiling (`serve::stop`).
 pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     let resident = crate::raw::memory::footprint(std::process::id());
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let resident = None;
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
@@ -2619,7 +2619,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if let Some(bytes) = crate::raw::memory::own_footprint() {
             blaze_profile::plot(Plot::Footprint, bytes);
             let kept = blaze_graph::arena::kept_of(&memory, bytes);
