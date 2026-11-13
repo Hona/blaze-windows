@@ -617,8 +617,10 @@ struct Solver<'a, 'db> {
     addressed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
-    /// Forward priority in an acyclic body; otherwise the original FIFO, as loop bounds
-    /// widen against the previous visit and their precision depends on visit order.
+    /// Each block's place in reverse postorder: the worklist's priority, so every path into a
+    /// block is walked before it, but along a back edge. Breadth-first in a body with a loop,
+    /// rune's `runtime::build::<impl#0>::build` took minutes an instance and the real hello's
+    /// codegen 33+ minutes; reverse postorder for every body, 9 (INTEGRATION I49).
     rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
@@ -677,9 +679,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         let mut rank = vec![0; count]; // alloc: the worklist rank of each block, once per proof
         let read = hir_ty_mir::mir::ReadOnEntry::in_order(body, |order| {
-            if !cyclic.contains(&true) {
-                for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
-            }
+            for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
         });
         let mut solver = Solver {
             db,
