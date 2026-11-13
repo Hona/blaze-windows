@@ -1161,9 +1161,7 @@ impl Image {
         // The link's change, when the side file last given is of the generation it was
         // staged from: its functions alone are encoded.
         let delta = &*state.debug_delta;
-        let all = if format == Format::Pe {
-            Some("a PDB is written whole by each link")
-        } else if delta.full {
+        let all = if delta.full {
             Some("the link laid the image out whole, or recorded no change")
         } else if self.beside.at() != Some(delta.base) {
             Some("the side file last given is not of the generation the link was staged from")
@@ -1207,6 +1205,10 @@ impl Image {
                 }
             }
             views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+            // A PDB's publics: given again only when the native code may have changed.
+            let version = state.resolved.natives_version;
+            let publics = (format == Format::Pe && self.beside.pdb_natives() != Some(version))
+                .then(|| (version, state.resolved.native_functions(state)));
             let input = beside::Input {
                 format,
                 name: &self.name,
@@ -1215,7 +1217,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
-                publics: &[],
+                publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1229,11 +1231,8 @@ impl Image {
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
         // A PDB names native code by its objects' names; DWARF's side file does not.
-        let publics = match format {
-            Format::Pe => state.resolved.native_functions(state),
-            // alloc: none, empty
-            _ => Vec::new(),
-        };
+        let version = state.resolved.natives_version;
+        let publics = (format == Format::Pe).then(|| (version, state.resolved.native_functions(state)));
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1242,7 +1241,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
-            publics: &publics,
+            publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);

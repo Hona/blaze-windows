@@ -401,7 +401,7 @@ fn input_of<'a>(
         functions,
         lines,
         given,
-        publics: &[],
+        publics: None,
     }
 }
 
@@ -794,7 +794,7 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
-        publics: &[],
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
@@ -831,7 +831,7 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
-        publics: &[],
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
@@ -861,7 +861,7 @@ fn an_executable_with_no_build_id_is_refused_by_name() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
-        publics: &[],
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());

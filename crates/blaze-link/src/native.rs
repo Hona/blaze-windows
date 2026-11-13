@@ -1941,6 +1941,9 @@ pub(crate) struct Resolved {
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
+    /// Moves when what native code the image keeps may have: a resolution rebuilt or grown.
+    /// What a PDB's publics are of (`Resolved::native_functions`).
+    pub(crate) natives_version: u64,
     /// Of each name resolved, by [`Symbols::dense`]: `O_*` bits.
     outcomes: CowVec<u8>,
     /// The names `outcomes` holds.
@@ -3205,6 +3208,10 @@ impl<'a> Stage<'a> {
             Some(it) => it,
             None => self.rebuild(&old, &refs, outside)?,
         };
+        if rebuild || !gained.is_empty() {
+            static VERSIONS: AtomicU64 = AtomicU64::new(1);
+            next.natives_version = VERSIONS.fetch_add(1, Ordering::Relaxed);
+        }
         next.refs = refs;
         next.pieces = self.new.piece_count();
         next.removals = self.new.removals();
@@ -4235,6 +4242,8 @@ impl<'a> Stage<'a> {
             // alloc: once per graph built
             commons: Arc::new(commons),
             marks,
+            // Set by the stage that made it (`Stage::resolve`).
+            natives_version: 0,
             outcomes: table,
             named,
             defined: list,
