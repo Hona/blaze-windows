@@ -732,7 +732,6 @@ mod user {
     )
 }
 
-
 #[test]
 fn macro2_body_macro_path_is_private_to_the_def_site() {
     // A path a `macro` writes reaches what is private to where the macro is defined, wherever

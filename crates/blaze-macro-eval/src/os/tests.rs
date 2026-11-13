@@ -1009,14 +1009,17 @@ fn a_windows_path_is_the_walks_path_and_the_host_opens_it_verbatim() {
 #[test]
 fn a_package_spelt_as_windows_spells_it_is_read_by_the_walks_name() {
     let scratch = Scratch::new("windows");
-    let host_dir = |rel: &str| scratch.top.join(rel).to_str().unwrap().trim_start_matches(r"\\?\").to_owned();
+    let host_dir =
+        |rel: &str| scratch.top.join(rel).to_str().unwrap().trim_start_matches(r"\\?\").to_owned();
     let mut env = Env::default();
     env.set(MANIFEST_DIR, host_dir("pkg"));
     env.set(OUT_DIR, host_dir("out"));
     let cwd = host_dir("pkg");
     let mut os = Os::wasm_in(&env, &cwd);
     let a = format!("{}/data/a.txt", scratch.pkg);
-    for spelt in [host_dir(r"pkg\data\a.txt"), format!(r"{}/data/a.txt", host_dir("pkg")), a.clone()] {
+    for spelt in
+        [host_dir(r"pkg\data\a.txt"), format!(r"{}/data/a.txt", host_dir("pkg")), a.clone()]
+    {
         let fd = os.open_path((At::Root, &spelt), true, false).unwrap().unwrap();
         assert_eq!(os.read_fd(fd, 64, None).unwrap(), b"hello, macro", "{spelt}");
         os.close_fd(fd).unwrap();

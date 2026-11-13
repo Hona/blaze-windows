@@ -27,7 +27,11 @@ pub(super) const WINDOWS: bool = cfg!(windows);
 /// The host's name of the walk's absolute `path`, or `None` when it names nothing on this
 /// host (on Windows, `/` itself or a first part that is no drive and no `UNC`).
 pub(super) fn on_host(path: &str) -> Option<Cow<'_, Path>> {
-    if WINDOWS { windows_host(path).map(|it| Cow::Owned(PathBuf::from(it))) } else { Some(Cow::Borrowed(Path::new(path))) }
+    if WINDOWS {
+        windows_host(path).map(|it| Cow::Owned(PathBuf::from(it)))
+    } else {
+        Some(Cow::Borrowed(Path::new(path)))
+    }
 }
 
 /// [`on_host`] on Windows, as text: `/C:/a/b` is `\\?\C:\a\b`, `/C:` is `\\?\C:\`, and
@@ -102,7 +106,11 @@ pub(super) fn windows_guest_path(path: &str) -> Cow<'_, str> {
         None => (false, path),
     };
     let bytes = rest.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\')) {
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
+    {
         let letter = (bytes[0].to_ascii_uppercase()) as char;
         return Cow::Owned(format!("/{letter}:{}", rest[2..].replace('\\', "/")));
     }

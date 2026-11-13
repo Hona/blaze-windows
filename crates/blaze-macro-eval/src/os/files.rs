@@ -269,7 +269,8 @@ pub(super) fn walk(
             if links > MAX_LINKS {
                 return Err(Fail::Errno(Errno::Loop));
             }
-            let host = host::on_host(out).ok_or_else(|| Fail::Io(io::ErrorKind::NotFound.into()))?;
+            let host =
+                host::on_host(out).ok_or_else(|| Fail::Io(io::ErrorKind::NotFound.into()))?;
             let target = fs::read_link(&host).map_err(Fail::Io)?;
             let Some(target) = host::link_target(&target) else { return Err(Fail::NotUtf8) };
             out.truncate(parent);
@@ -1099,7 +1100,8 @@ impl<'a> Os<'a> {
             path.push(b'/');
         }
         let dir = path.len();
-        let host = host::on_host(&slot.path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let host =
+            host::on_host(&slot.path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         for entry in fs::read_dir(host)? {
             let entry = entry?;
             let kind = entry.file_type()?;
