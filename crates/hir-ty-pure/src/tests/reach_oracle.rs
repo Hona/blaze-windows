@@ -256,3 +256,41 @@ fn the_oracle_catches_a_model_that_says_first_is_always_some() {
     let Err(what) = caught else { panic!("the planted model was not caught: {caught:?}") };
     assert!(what.contains("is discharged, and the run panics"), "{what}");
 }
+
+/// The most implications any joined state of `probe` holds, where `probe` joins a `bool` of
+/// two comparisons `joins` times, each read once and then gone (a drop flag's shape).
+fn most_implications(joins: u32) -> usize {
+    let mut body = String::new();
+    for n in 0..joins {
+        body += &format!(
+            "{{ let b{n} = x < {} && y < {} && x != {}; if b{n} {{ r += 1; }} }}\n",
+            n + 10,
+            n + 5,
+            n + 20
+        );
+    }
+    // alloc: a test's fixture
+    let source = format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub fn probe(x: u32, y: u32) -> u32 {{\n    let mut r = 0u32;\n{body}    r\n}}\n"
+    );
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        reach::MOST_IMPLICATIONS.set(0);
+        let reach = reach::of_body(&db, def);
+        assert_eq!(reach.refused, None);
+        reach::MOST_IMPLICATIONS.get()
+    })
+}
+
+/// The invariant: what a join implies of a joined `bool` is forgotten once no later read can
+/// reach that value, so the implications a state holds do not grow with the joins before
+/// it. rune's `dispatch_action` carried 18,570 to its end and took hours (INTEGRATION I49).
+#[test]
+fn a_join_forgets_the_implications_of_values_gone() {
+    let (few, many) = (most_implications(2), most_implications(24));
+    assert!(few > 0, "the shape makes no implications to forget");
+    assert_eq!(few, many, "the implications grew with the joins: {few} for 2, {many} for 24");
+}
