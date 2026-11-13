@@ -1613,6 +1613,7 @@ version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-resolve",
