@@ -516,3 +516,27 @@ fn a_body_edit_writes_blocks_not_the_file() {
     let written: usize = writes.iter().map(|it| it.1.len()).sum();
     assert!(written <= 6 * BLOCK, "{written} bytes written of a {whole}-byte PDB: {:?}", writes.iter().map(|it| (it.0, it.1.len())).collect::<Vec<_>>());
 }
+/// How long an edit's patch of a desktop-sized PDB takes and what it writes. Not a check:
+/// `cargo test --release -p blaze-link --lib a_desktop_sized_patch -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn a_desktop_sized_patch() {
+    let image = exe();
+    let mut program = Program::default();
+    for n in 0..400_000 {
+        program.make(n, (n % 251) as u8, Some(format!("_RNvMs{n}_NtCsajBxKdOt8Cw_16opencode_desktop4viewNtB5_4View6render{n}")));
+    }
+    let (functions, lines) = program.input(None);
+    let started = std::time::Instant::now();
+    let mut model = Model::new(headers(&image), [1; 16], &functions, &lines, &[]).unwrap();
+    let whole = model.file();
+    eprintln!("whole: {:.3} s, {:.1} MB", started.elapsed().as_secs_f64(), whole.len() as f64 / 1e6);
+    for (step, n) in [123_456u32, 7, 399_999].into_iter().enumerate() {
+        program.make(n, 200 + step as u8, None);
+        let (functions, lines) = program.input(Some(&[n]));
+        let started = std::time::Instant::now();
+        let writes = model.patch(headers(&image), [2 + step as u8; 16], &functions, &lines, &[], 400_000, None).unwrap().unwrap();
+        let written: usize = writes.iter().map(|it| it.1.len()).sum();
+        eprintln!("edit {n}: {:.6} s, {written} bytes in {} writes", started.elapsed().as_secs_f64(), writes.len());
+    }
+}
