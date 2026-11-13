@@ -55,8 +55,8 @@ use super::{
     places::{self, Ref},
 };
 use crate::{
-    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm, fn_trait_methods,
-    fncache,
+    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, ObjectFormat, asm,
+    fn_trait_methods, fncache,
     fragment::{Asked, DataRequest, FuncTarget, Recorder},
     is_integer, is_thread_local,
 };
@@ -599,6 +599,19 @@ impl Listed {
             }
         }
     }
+
+    /// Lists what the code of `format` names to reach a thread-local: ELF's `__tls_get_addr`,
+    /// COFF's `_tls_index`; Mach-O's descriptor is the static's own.
+    fn thread_local(&mut self, format: ObjectFormat) {
+        match format {
+            ObjectFormat::Coff => {
+                self.symbol(Cow::Borrowed(places::COFF_TLS_INDEX));
+            }
+            ObjectFormat::Elf | ObjectFormat::MachO | ObjectFormat::Wasm => {
+                self.libcall(ir::LibCall::ElfTlsGetAddr);
+            }
+        }
+    }
 }
 
 /// A set of the blocks of a body, a bit a block, by the block's index in the body's arena.
@@ -699,7 +712,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                                         );
                                     }
                                     if is_thread_local(db, *id) {
-                                        listed.libcall(ir::LibCall::ElfTlsGetAddr);
+                                        listed.thread_local(fx.cg.target.object_format);
                                     }
                                     Some(place)
                                 }

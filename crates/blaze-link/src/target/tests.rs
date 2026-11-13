@@ -193,7 +193,12 @@ fn glibc(target: Target) -> Glibc {
 }
 
 fn dylib(name: &str) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind: NativeLibKind::Dylib, verbatim: false }
+    NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::Dylib,
+        verbatim: false,
+        imports: Vec::new(),
+    }
 }
 
 fn static_lib(name: &str, whole: bool) -> NativeLib {
@@ -201,11 +206,17 @@ fn static_lib(name: &str, whole: bool) -> NativeLib {
         name: name.to_owned(),
         kind: NativeLibKind::Static { whole, bundle: true },
         verbatim: false,
+        imports: Vec::new(),
     }
 }
 
 fn verbatim(name: &str) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind: NativeLibKind::Dylib, verbatim: true }
+    NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::Dylib,
+        verbatim: true,
+        imports: Vec::new(),
+    }
 }
 
 fn executable(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, LinkError> {
@@ -626,8 +637,12 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     for dir in [&a, &b, &glibc.gcc, &glibc.libc] {
         assert!(error.what.contains(dir.to_str().unwrap()), "{}", error.what);
     }
-    let framework =
-        NativeLib { name: "Cocoa".to_owned(), kind: NativeLibKind::Framework, verbatim: false };
+    let framework = NativeLib {
+        name: "Cocoa".to_owned(),
+        kind: NativeLibKind::Framework,
+        verbatim: false,
+        imports: Vec::new(),
+    };
     let error = locate_plain(&cache, &glibc.answers, &output, &[framework], &search).unwrap_err();
     assert!(error.what.contains("Cocoa") && error.what.contains("Apple"), "{}", error.what);
 }
@@ -711,6 +726,7 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
         name: "CoreFoundation".to_owned(),
         kind: NativeLibKind::Framework,
         verbatim: false,
+        imports: Vec::new(),
     };
     let located =
         locate_plain(&cache, &answers, &output, &[dylib("iconv"), framework], &[]).unwrap();
@@ -925,6 +941,52 @@ fn a_windows_line_is_searched_in_lib_and_its_libraries_are_read_as_archives() {
             (b.join("foo.lib"), NativeKind::Archive { whole: true })
         ]
     );
+}
+
+fn raw_dylib(name: &str, verbatim: bool, symbols: &[&str]) -> NativeLib {
+    let imports = symbols
+        .iter()
+        .map(|it| blaze_codegen::RawImport { symbol: (*it).to_owned(), ordinal: None, data: false })
+        .collect();
+    NativeLib { name: name.to_owned(), kind: NativeLibKind::RawDylib, verbatim, imports }
+}
+
+/// A `raw-dylib` is searched for nowhere: the link makes its DLL's import library, one for
+/// every `raw-dylib` of the DLL (its file name matched as the loader matches it), at the place
+/// of the first, and only on Windows.
+#[test]
+fn a_raw_dylib_is_an_import_library_the_link_makes() {
+    let a = temp("raw-dylib-lib");
+    touch(&a.join("user32.lib"), ARCHIVE);
+    let answers = Answers::new().var("LIB", format!("{};", a.display()));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "x86_64-pc-windows-msvc").unwrap();
+    let libs = [
+        raw_dylib("kernel32.dll", true, &["Sleep"]),
+        dylib("user32"),
+        raw_dylib("bcryptprimitives", false, &["ProcessPrng"]),
+        raw_dylib("KERNEL32", false, &["ExitProcess", "Sleep"]),
+    ];
+    let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
+    let names: Vec<&str> = located.iter().map(|it| it.name.as_str()).collect();
+    let user32 = a.join("user32.lib").to_string_lossy().into_owned();
+    assert_eq!(names, ["raw-dylib kernel32.dll", &user32, "raw-dylib bcryptprimitives.dll"]);
+    assert!(located.iter().all(|it| it.kind == ARCHIVED));
+    let made: Vec<bool> = located.iter().map(|it| it.made.is_some()).collect();
+    assert_eq!(made, [true, false, true]);
+    let kernel32 = &located[0].made.as_ref().unwrap().1;
+    let wanted = crate::pe::raw_dylib::import_library(
+        "kernel32.dll",
+        &raw_dylib("", false, &["Sleep", "ExitProcess"]).imports,
+    )
+    .unwrap();
+    assert_eq!(&kernel32[..], &wanted[..], "both libraries' imports, each once");
+
+    let glibc = glibc(Target::LinuxX86_64);
+    let linux = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
+    let error = locate_plain(&cache, &glibc.answers, &linux, &[raw_dylib("k", false, &[])], &[])
+        .unwrap_err();
+    assert!(error.what.contains("a `raw-dylib` is a Windows DLL"), "{}", error.what);
 }
 
 /// A COFF object whose `.drectve` is `directives`.

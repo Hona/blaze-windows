@@ -8,9 +8,9 @@ use blaze_codegen::{
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_mem::Frame;
-use cranelift_codegen::{binemit, isa::TargetIsa};
+use cranelift_codegen::{binemit, ir, isa::TargetIsa};
 
-use super::places::{PERSONALITY, libcall_name};
+use super::places::{self, PERSONALITY, libcall_name};
 use crate::{
     ConstBlob, DataIdentity,
     fragment::{self, DataRequest, FuncRequest, RelocName, Requests},
@@ -534,9 +534,15 @@ fn reloc_target(
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
         RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)),
-        RelocName::Known(symbol) => {
+        // COFF's thread-local sequence reads the image's TLS slot from `_tls_index`, which the
+        // linker's TLS directory points the loader at; the walk lists it with every thread-local.
+        RelocName::Known(ir::KnownSymbol::CoffTlsIndex) => resolve.symbol(places::COFF_TLS_INDEX),
+        RelocName::Known(symbol @ ir::KnownSymbol::ElfGlobalOffsetTable) => {
             // alloc: an error
-            Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
+            Err(format!(
+                "a relocation at the linker's {symbol:?}: v2 reaches the GOT through its cells, \
+                 never through `_GLOBAL_OFFSET_TABLE_`"
+            ))
         }
         // The function's own code, at its start: `function` moved the offset into the addend.
         RelocName::Own(0) => Ok(Target::Direct(key)),

@@ -46,6 +46,10 @@ pub(crate) type Ref = FrontRef<HirInstance, HirStatic>;
 /// The symbol of the routine the unwinder asks about a frame with landing pads.
 pub(crate) const PERSONALITY: &str = crate::unwind::PERSONALITY;
 
+/// The symbol COFF's thread-local sequence reads the image's TLS slot from: the linker's (or
+/// the CRT's `tlssup`) cell that the TLS directory names, which the loader fills.
+pub(crate) const COFF_TLS_INDEX: &str = "_tls_index";
+
 /// The reference a function request of the IR builder is.
 pub(crate) fn func_ref(db: &Db, target: &FuncTarget) -> Result<Ref, String> {
     match target {

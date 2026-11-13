@@ -181,6 +181,9 @@ pub struct FixtureWithProjectMeta {
     pub target_data_layout: String,
     /// Specifies the target architecture.
     pub target_arch: String,
+    /// `//- target: <tuple>`: the crates' target tuple, when not the one `target_arch` implies
+    /// (`x86_64-pc-windows-msvc` for a fixture of what only Windows links).
+    pub target: Option<String>,
 }
 
 impl FixtureWithProjectMeta {
@@ -237,6 +240,14 @@ impl FixtureWithProjectMeta {
             fixture = remain;
         }
 
+        let mut target = None;
+        if let Some(meta) = fixture.strip_prefix("//- target:") {
+            first_row += 1;
+            let (meta, remain) = meta.split_once('\n').unwrap();
+            target = Some(meta.trim().to_owned());
+            fixture = remain;
+        }
+
         if let Some(meta) = fixture.strip_prefix("//- proc_macros:") {
             first_row += 1;
             let (meta, remain) = meta.split_once('\n').unwrap();
@@ -287,6 +298,7 @@ impl FixtureWithProjectMeta {
             toolchain,
             target_data_layout,
             target_arch,
+            target,
         }
     }
 
@@ -608,6 +620,7 @@ fn parse_fixture_gets_full_meta() {
         toolchain,
         target_data_layout: _,
         target_arch: _,
+        target: _,
     } = FixtureWithProjectMeta::parse(
         r#"
 //- toolchain: nightly
