@@ -38,12 +38,11 @@ use windows_sys::Win32::{
         ERROR_PATH_NOT_FOUND, HANDLE,
     },
     Storage::FileSystem::{
-        CreateFileW, ExtendedFileIdType, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_ID_128, FILE_ID_DESCRIPTOR,
-        FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+        CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileIdInfo,
         GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        OPEN_EXISTING, OpenFileById, VOLUME_NAME_DOS, VOLUME_NAME_GUID, VOLUME_NAME_NT,
+        OPEN_EXISTING, VOLUME_NAME_DOS, VOLUME_NAME_GUID, VOLUME_NAME_NT,
     },
     System::{
         IO::{DeviceIoControl, OVERLAPPED},
@@ -62,7 +61,10 @@ use windows_sys::Win32::{
     },
 };
 
-use super::sys;
+use super::{
+    observe::{self, Open},
+    sys,
+};
 use crate::{Cursor, FileName, Journaled, Lost, journal::barrier::At};
 
 /// What one read of the journal fills at most.
@@ -595,25 +597,11 @@ impl Volume {
 
 impl System for Volume {
     fn find(&mut self, id: u128) -> Found {
-        let descriptor = FILE_ID_DESCRIPTOR {
-            dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
-            Type: ExtendedFileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 {
-                ExtendedFileId: FILE_ID_128 { Identifier: id.to_le_bytes() },
-            },
-        };
-        // SAFETY: an open handle on the volume, a descriptor of the size it says, and no
-        // security attributes. No access is asked: a name needs none.
-        let opened = sys::owned(unsafe {
-            OpenFileById(
-                self.hint.as_raw_handle(),
-                &descriptor,
-                0,
-                SHARE_ALL,
-                std::ptr::null(),
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        });
+        // An observer's handle (`super::observe`): a name asked of a file just made is never in
+        // the way of its maker's rename of the directory it is in. Its attributes alone are
+        // asked, as an oplock needs.
+        let at = observe::At::Id { root: self.hint.as_raw_handle(), id };
+        let opened = observe::open(at, Open { access: FILE_READ_ATTRIBUTES, link_itself: true });
         let handle = match opened {
             Ok(handle) => handle,
             Err(error) => {
@@ -629,7 +617,7 @@ impl System for Volume {
                 };
             }
         };
-        match final_path(&handle, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
+        match final_path_of(handle.raw(), FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
             Ok(()) => self.relative(),
             Err(_) => Found::Unknown,
         }
@@ -645,12 +633,17 @@ impl System for Volume {
 
 /// The path of what `handle` is open on, as `flags` asks, into `into` (no NUL).
 fn final_path(handle: &OwnedHandle, flags: u32, into: &mut Vec<u16>) -> io::Result<()> {
+    final_path_of(handle.as_raw_handle(), flags, into)
+}
+
+/// [`final_path`] of a raw handle of the caller's.
+fn final_path_of(handle: HANDLE, flags: u32, into: &mut Vec<u16>) -> io::Result<()> {
     loop {
         let room = into.capacity().max(260);
         into.resize(room, 0);
         // SAFETY: an open handle and a buffer of the length given.
         let len = unsafe {
-            GetFinalPathNameByHandleW(handle.as_raw_handle(), into.as_mut_ptr(), room as u32, flags)
+            GetFinalPathNameByHandleW(handle, into.as_mut_ptr(), room as u32, flags)
         };
         let len = len as usize;
         if len == 0 {

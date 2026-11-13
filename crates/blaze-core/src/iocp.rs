@@ -47,6 +47,7 @@
 
 pub(crate) mod files;
 mod net;
+mod observe;
 mod process;
 mod rundirs;
 mod stamp;
@@ -1081,7 +1082,7 @@ impl Iocp {
     }
 
     /// `len` bytes at `at` of `file`, through its kept handle. A whole file is read on the
-    /// threads instead ([`files::read_whole`]): its open is most of its cost and has no
+    /// threads instead ([`observe::read_whole`]): its open is most of its cost and has no
     /// overlapped form, and a handle kept by its name would read a file replaced by another
     /// process's rename as it was.
     fn read(&mut self, file: &FileName, at: u64, len: usize, tag: Tag) -> io::Result<()> {
@@ -2586,7 +2587,7 @@ fn joined<'a>(into: &'a mut PathBuf, root: &Path, file: &FileName) -> &'a Path {
 fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
     let Kept { at, to, paths } = kept;
     match effect {
-        Effect::ReadAll { file, .. } => match paths.of(&file).and_then(files::read_whole) {
+        Effect::ReadAll { file, .. } => match paths.of(&file).and_then(observe::read_whole) {
             Ok(bytes) => Ok(Done::Read(bytes)),
             // A file that is not there reads as empty.
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Done::Read(Vec::new())), // alloc: none, an empty `Vec`.
