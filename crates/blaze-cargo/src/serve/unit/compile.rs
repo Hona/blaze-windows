@@ -1013,7 +1013,7 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
         .map_err(|error| error.what)?;
         // In place of its crate's identity as one part: what that identity is made of, so the
         // file, setting or dependency that changed is the one named.
-        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit, identity)?)?);
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
