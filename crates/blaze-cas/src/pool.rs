@@ -420,7 +420,8 @@ impl<G: Give> Pool<G> {
             // alloc: an error path
             why: err.to_string(),
         };
-        let pages = Region::reserve_sparse((total * PAGE) as usize, blaze_mem::Tag::Pool)
+        // Every page is reused before a load or an append writes it, and read only once loaded.
+        let pages = Region::reserve_sparse_ranges((total * PAGE) as usize, blaze_mem::Tag::Pool)
             .map_err(|err| reserving("its pages", err))?;
         let words = Region::reserve_sparse(total as usize * size_of::<u64>(), blaze_mem::Tag::Store)
             .map_err(|err| reserving("its pages' state words", err))?;
