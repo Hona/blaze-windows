@@ -1753,7 +1753,12 @@ impl ScriptRun {
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
-            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
+            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env).and_then(
+                |mut it| {
+                    it.extend(crate::directives::machine_link_dirs(&start.env)?);
+                    Ok(it)
+                },
+            ) {
                 // The layouts of the pinned native inputs it was given may be searched and
                 // be an rpath: each is the verified unpacking of its pinned archive.
                 Ok(mut it) => {

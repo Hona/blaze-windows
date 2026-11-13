@@ -756,7 +756,13 @@ system directories are those of the toolchain: each of the script's `LIB` and th
 `%ProgramFiles%` and `%ProgramFiles(x86)%` that Visual Studio and the Windows SDK install into.
 A library a script finds in a cache of the machine (rune-desktop's Ghostty, under
 `%LOCALAPPDATA%\seer\ghostty-vt`) goes in `build-script-link-dirs` under its variable:
-`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`.
+`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`; or, for every
+workspace of the machine, in blaze's settings (`config.toml` in blaze's home):
+
+```toml
+[sandbox]
+build-script-link-dirs = ["${LOCALAPPDATA}/seer/ghostty-vt"]   # read as each run is checked
+```
 
 and, for a package of the workspace, in its own manifest:
 
