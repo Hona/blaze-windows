@@ -456,6 +456,7 @@ fn another_triple_is_an_error_naming_it() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_linux_line_is_the_c_runtime_around_the_libraries_with_libcs_script_followed() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -498,6 +499,7 @@ const DEBIAN_GCC_S: &[u8] =
     b"/* GNU ld script\n   Use the shared library, but some functions are only in\n   the static library.  */\nGROUP ( libgcc_s.so.1 -lgcc )\n";
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn debians_libgcc_s_script_is_followed_by_libgcc_s_so_1_and_libgcc() {
     let glibc = glibc(Target::LinuxX86_64);
     let (gcc, libc) = (&glibc.gcc, &glibc.libc);
@@ -586,6 +588,7 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
 
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_one() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -747,6 +750,7 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
 /// nix's dev shell on macOS: libiconv is not in the SDK, and cc-wrapper passes its directory
 /// to the linker from `NIX_LDFLAGS`, as rustc's link through `cc` gets it.
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
     let sdk = temp("sdk-driver");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
@@ -847,6 +851,7 @@ fn a_library_only_on_a_nix_ldflags_path_the_c_driver_left_out_is_not_found_and_s
 /// nix's libiconv re-exports libcharset by its absolute install name, which no `-L` names:
 /// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
     let sdk = temp("sdk-reexport");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
@@ -1043,8 +1048,8 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let libs = [dylib("msvcrt"), dylib("kernel32")];
     let expected = [
         (vc.join("msvcrt.lib"), ARCHIVED),
-        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("kernel32.lib"), ARCHIVED),
+        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("ucrt.lib"), ARCHIVED),
         (vc.join("oldnames.lib"), ARCHIVED),
     ];
@@ -1052,7 +1057,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     assert_eq!(
         line(&located),
         expected,
-        "each after the library that asked, each once, libcmt taken out by its asker"
+        "after every library the link names, in the order asked, each once, libcmt taken out by its asker"
     );
     let read = cache.asked.lock().len();
     assert_eq!(read, 3, "msvcrt.lib, vcruntime.lib and the empty archives' one content");
@@ -1068,7 +1073,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let located =
         locate_plain(&cache, &answers, &output, &libs, std::slice::from_ref(&mine)).unwrap();
     assert_eq!(
-        line(&located)[1],
+        line(&located)[2],
         (mine.join("vcruntime.lib"), ARCHIVED),
         "the link's directories before LIB's"
     );
@@ -1353,6 +1358,7 @@ const SANITIZERS: [(Sanitizers, &str, &str); 3] = [
 ];
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -1408,6 +1414,7 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
     let sdk = temp("sanitize-sdk");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);

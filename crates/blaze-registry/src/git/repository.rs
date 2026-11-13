@@ -196,11 +196,11 @@ fn git(root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
 
 /// `git` on the fetch's clone at `root`, with none of the user's or the system's
 /// configuration, as the clone was made.
-#[expect(clippy::disallowed_methods, reason = "every `git` is run in the repository it is about")]
 fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = blaze_core::platform::command::command("git", root);
     command
-        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
         .env("GIT_NO_LAZY_FETCH", "1")

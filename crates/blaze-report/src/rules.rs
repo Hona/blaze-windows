@@ -57,7 +57,9 @@ pub const RULES: &[Rule] = &[
                `rustc-link-arg` lines (and their -bins, -bin=, -tests, -benches, -examples and -cdylib forms) \
                may give only arguments that change how the output is linked, never which program links it or \
                what it loads: the list in crates/blaze-cargo/src/directives.rs (LINK_ARGS), `-lNAME`, and an \
-               rpath to $ORIGIN or to a directory `rustc-link-search` may name.\n\n\
+               rpath to $ORIGIN or to a directory `rustc-link-search` may name; for an MSVC target also the \
+               link.exe options of MSVC_OPTIONS with the value each takes, and a library, object, .res or \
+               .exp in a directory `rustc-link-search` may name.\n\n\
                Way out: a script that needs more runs outside the sandbox, by name in \
                `unsandboxed-build-scripts` under [workspace.metadata.blaze.sandbox] in the workspace's root \
                manifest.",
@@ -68,7 +70,8 @@ pub const RULES: &[Rule] = &[
         text: "A build script runs in the sandbox, and a `rustc-link-search` (or a `-L` in `rustc-flags`) it \
                prints reaches every link of its package and of what links it. So the directory must be inside \
                its OUT_DIR, its package, the build directory (its dependencies' OUT_DIRs), a system directory \
-               the linker searches anyway (/usr/lib, /nix/store, Homebrew's and Apple's SDKs; the list is \
+               the linker searches anyway (/usr/lib, /nix/store, Homebrew's and Apple's SDKs, on Windows the script's LIB and the \
+               Visual Studio and Windows SDK trees; the list is \
                SYSTEM in crates/blaze-cargo/src/directives.rs), or a layout of blaze's own pinned native \
                inputs (a `sha256-<digest>` directory under `<BLAZE_HOME>/native`).\n\n\
                Ways out: a directory of the system it links from goes in `build-script-link-dirs = [...]` under \

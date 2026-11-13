@@ -24,3 +24,4 @@ foreach ($def in 'runlib', 'nosuch') {
     if ($LASTEXITCODE -ne 0) { throw "lib $def" }
     Remove-Item "$def.exp"
 }
+cl_ @common /MT /Fonatives.obj natives.c

@@ -444,6 +444,8 @@ fn locate_with<A: Ask>(
         // alloc: none until a `.res` is on the line
         resources: Vec::new(),
         resources_at: 0,
+        // alloc: none until an archive asks for a default library
+        defaulted: Vec::new(),
     };
     for name in target.start(&output.kind)? {
         line.object(name)?;
@@ -493,6 +495,7 @@ fn locate_with<A: Ask>(
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
+    line.flush_defaults()?;
     for name in target.end() {
         line.object(name)?;
     }
@@ -1619,6 +1622,9 @@ struct Line<'a> {
     /// of their resources goes ([`Line::resource`]).
     resources: Vec<PathBuf>,
     resources_at: usize,
+    /// The PE default libraries found so far, each once, in the order asked: on the line last
+    /// ([`Line::flush_defaults`]).
+    defaulted: Vec<PathBuf>,
 }
 
 /// A directory's entry names, ASCII lowercased.
@@ -1986,6 +1992,24 @@ impl Line<'_> {
                 },
                 ..it
             })?;
+            let pe = self.output.format == Format::Pe;
+            if !self.defaulted.iter().any(|it| *it == path || (pe && it.as_os_str().eq_ignore_ascii_case(path.as_os_str()))) {
+                self.defaulted.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// The default libraries [`Line::defaults`] found, on the line after every other library,
+    /// as link.exe searches them after those of its command line: a library asked for by a member
+    /// is searched after one the link names (Ghostty's Zig-built `_fltused` before LIBCMT's).
+    /// Each one's own are followed in turn.
+    fn flush_defaults(&mut self) -> Result<(), LinkError> {
+        let mut next = 0;
+        while let Some(path) = self.defaulted.get(next) {
+            // clone: once per default library, its path for the line
+            let path = path.clone();
+            next += 1;
             self.push(path, NativeKind::Archive { whole: false })?;
         }
         Ok(())

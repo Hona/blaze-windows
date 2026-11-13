@@ -503,6 +503,40 @@ impl Image {
         })
     }
 
+    /// The import library of a Windows DLL as its last commit left it: what rustc writes beside a
+    /// `cdylib` as `<name>.dll.lib` (link.exe's `/IMPLIB`), for programs that link against the
+    /// DLL. One short import member per export, by name, a data export (`DATA`) reached only
+    /// through `__imp_`. `None` for any other image; an error before the first commit.
+    pub fn import_library(&self) -> Result<Option<Vec<u8>>, LinkError> {
+        let OutputKind::Shared { name, .. } = &self.output.kind else { return Ok(None) };
+        if self.output.format != Format::Pe {
+            return Ok(None);
+        }
+        if !self.state.laid_out {
+            return Err(LinkError {
+                function: None,
+                // alloc: error path
+                what: format!("{}: an import library before the DLL's first commit", self.to),
+                refusal: None,
+            });
+        }
+        let mut exports: Vec<&model::Export> = self.state.exports.iter().collect();
+        exports.sort_by(|a, b| a.name.cmp(&b.name));
+        // alloc: once per import library, an import per export
+        let imports: Vec<blaze_codegen::RawImport> = exports
+            .iter()
+            .map(|it| blaze_codegen::RawImport {
+                // clone: the import library's own names
+                symbol: it.name.clone(),
+                ordinal: None,
+                data: !matches!(it.kind, model::SymbolKind::Function),
+            })
+            .collect();
+        pe::raw_dylib::import_library(name, &imports)
+            .map(Some)
+            .map_err(|what| LinkError { function: None, what, refusal: None })
+    }
+
     /// Whether the volume the image is written on can clone it ([`blaze_core::platform::volume`]
     /// of its directory): with [`blaze_core::Sharing::Blocks`] (the default) a commit of a stage
     /// that placed into the room the image kept clones the image and writes what changed; with

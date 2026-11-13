@@ -284,7 +284,31 @@ fn nice_at_least(nice: i32) -> Result<(), PriorityError> {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: the process's class lowered to below normal, nice 10's place among its classes
+/// (normal is nice 0, idle is nice 19). Never `PROCESS_MODE_BACKGROUND_BEGIN`, which lowers
+/// the process's disk and memory priority too and would make a build wait on every read.
+#[cfg(windows)]
+fn nice_at_least(_nice: i32) -> Result<(), PriorityError> {
+    use windows_sys::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS,
+        SetPriorityClass,
+    };
+    // SAFETY: the process's pseudo-handle, which needs no closing; one call each.
+    let now = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    if now == BELOW_NORMAL_PRIORITY_CLASS || now == IDLE_PRIORITY_CLASS {
+        return Ok(());
+    }
+    // SAFETY: as above.
+    match unsafe { SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS) } {
+        0 => Err(PriorityError {
+            call: "SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)",
+            why: std::io::Error::last_os_error(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn nice_at_least(_nice: i32) -> Result<(), PriorityError> {
     Err(PriorityError {
         call: "lowering the process's priority",
@@ -361,5 +385,24 @@ mod tests {
         // `all` on a machine the default would also give every core still differs: priority.
         let all = Cores::resolve(Setting::All, n(18));
         assert!(!all.agrees(&of(Some("18".as_ref()), n(18)).unwrap()));
+    }
+
+    /// Windows: lowered once to below normal and left there when asked again; the test gives
+    /// the process its class back after (which Windows lets a process do, unlike nice).
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_class_is_lowered_to_below_normal_once() {
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, SetPriorityClass,
+        };
+        // SAFETY: the process's pseudo-handle; one call each.
+        let before = unsafe { GetPriorityClass(GetCurrentProcess()) };
+        nice_at_least(NICE).unwrap();
+        nice_at_least(NICE).unwrap();
+        // SAFETY: as above.
+        let now = unsafe { GetPriorityClass(GetCurrentProcess()) };
+        // SAFETY: as above.
+        unsafe { SetPriorityClass(GetCurrentProcess(), before) };
+        assert_eq!(now, BELOW_NORMAL_PRIORITY_CLASS);
     }
 }
