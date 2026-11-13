@@ -384,6 +384,24 @@ pub fn prove<'db>(
         return Reach::refused("it is a coroutine");
     }
     let count = body.basic_blocks.len();
+    // One span a proof, named for its body: a proof is a fixpoint whose cost the budget bounds
+    // only in rounds, and it ran for minutes under a span that said only `mir SpendFacts`.
+    let span = tracing::info_span!(
+        target: "blaze",
+        "reach prove",
+        function = tracing::field::Empty,
+        blocks = count,
+        visits = tracing::field::Empty,
+    );
+    if !span.is_disabled()
+        && let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner
+    {
+        // alloc: a span's name of the body, once a proof
+        let mut path = String::new();
+        hir_def::span_names::write_body_path(db, def, &mut path);
+        span.record("function", path.as_str());
+    }
+    let _entered = span.enter();
     // alloc: the body's blocks by index, once per proof
     let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
     for block in &blocks {
@@ -410,7 +428,11 @@ pub fn prove<'db>(
     let word = layout.pointer_size().bits() as u32;
     let mut solver = Solver::new(db, infcx, env, body, &blocks, word);
     let Some(entries) = solver.solve() else {
-        return Reach::refused("its proof did not settle within the budget");
+        span.record("visits", proof_fuel() - solver.fuel.get());
+        return Reach::refused(match solver.spent() {
+            true => "its proof visited more facts than its budget",
+            false => "its proof did not settle within the budget",
+        });
     };
     // The verdicts, from the settled entry states.
     let mut dead = vec![false; count]; // alloc: one flag per block, the proof's result
@@ -439,6 +461,10 @@ pub fn prove<'db>(
         if explain.contains(&(at as u32)) && !out.safe {
             explained.push((at as u32, solver.why_reached(at as u32, &entries)));
         }
+    }
+    span.record("visits", proof_fuel() - solver.fuel.get());
+    if solver.spent() {
+        return Reach::refused("its proof visited more facts than its budget");
     }
     sites.sort();
     Reach {
@@ -491,6 +517,30 @@ struct Solver<'a, 'db> {
     /// The statement being walked, and how many unknowns it has made.
     at: (u32, u32),
     made: u32,
+    /// The facts and implications the proof may still visit ([`Self::spend`]).
+    fuel: std::cell::Cell<u64>,
+}
+
+/// The facts and implications one proof may visit, over all its entailment questions. The
+/// rounds of [`Solver::solve`] are bounded by the body's size, but what one round costs grows
+/// with the facts its states hold (`holds` at depth 2 walks them twice over, each step's
+/// `bounds` again): `compiler_builtins`' `fma_round` on `u128` took 791 s. Past it the proof
+/// is refused, as one that does not settle is. 2^26 visits is about a second.
+const PROOF_FUEL: u64 = 1 << 26;
+
+#[cfg(test)]
+thread_local! {
+    /// The fuel of the proofs this thread makes in place of [`PROOF_FUEL`], for the test that
+    /// a proof past its fuel is refused (`tests/reach_oracle.rs`).
+    pub(crate) static TEST_FUEL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn proof_fuel() -> u64 {
+    #[cfg(test)]
+    if let Some(fuel) = TEST_FUEL.get() {
+        return fuel;
+    }
+    PROOF_FUEL
 }
 
 /// The widest range a term's value is kept in.
@@ -547,6 +597,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             word,
             at: (0, 0),
             made: 0,
+            fuel: std::cell::Cell::new(proof_fuel()),
         };
         solver.exposed = solver.exposed_locals();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
@@ -555,6 +606,21 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         solver.named = named;
         solver
+    }
+
+    /// Takes `visits` from the proof's fuel: false once it is spent, and from then on. A
+    /// question asked without fuel is answered "not shown", which proves less, and the proof
+    /// that ran out is refused ([`Self::spent`]).
+    fn spend(&self, visits: usize) -> bool {
+        let left = self.fuel.get();
+        let visits = visits as u64 + 1;
+        self.fuel.set(left.saturating_sub(visits));
+        left >= visits
+    }
+
+    /// Whether the proof ran out of fuel.
+    fn spent(&self) -> bool {
+        self.fuel.get() == 0
     }
 
     // Terms.
@@ -714,6 +780,9 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
     /// `form <= bound`, the form with no constant.
     fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
+        if !self.spend(state.facts.len()) {
+            return Vec::new(); // alloc: none, empty
+        }
         let mut known = Vec::with_capacity(state.facts.len()); // alloc: one bound per fact, per proof
         let mut add = |left: &Form, right: &Form, slack: i128| {
             if let Some((parts, constant)) = form_add(left, right, -1)
@@ -760,7 +829,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if self.form_high(state, &bare).is_some_and(|high| high <= limit) {
             return true;
         }
-        if depth == 0 {
+        if depth == 0 || !self.spend(known.len()) {
             return false;
         }
         for (parts, bound) in known {
@@ -872,6 +941,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         if self.const_of(term).is_some() {
             return (low, high);
         }
+        if !self.spend(state.facts.len()) {
+            return ANY;
+        }
         for fact in &state.facts {
             let (left, right) = (fact.a == term, fact.b == term);
             if left == right {
@@ -918,6 +990,9 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
+        if !self.spend(state.facts.len()) {
+            return (low, high);
+        }
         for fact in &state.facts {
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
@@ -941,6 +1016,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A value ruled out at an end moves the end: at most as many turns as such facts.
         let mut turns = state.facts.len();
         loop {
+            if !self.spend(state.facts.len()) {
+                return self.ranges[term as usize];
+            }
             let mut moved = false;
             for fact in &state.facts {
                 if fact.rel != Rel::Ne || (fact.a != term && fact.b != term) {
@@ -1026,7 +1104,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if depth >= 2 && self.linear(state, atom) {
             return true;
         }
-        if depth == 0 {
+        if depth == 0 || !self.spend(state.facts.len() + state.imps.len()) {
             return false;
         }
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
@@ -1116,6 +1194,8 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// Writes down what the state's implications give: the conclusion of each whose premise
     /// holds. False when one contradicts the state. Each implication fires at most once.
     fn saturate(&self, state: &mut State) -> bool {
+        // Bounded by the proof's fuel too: a question asked without it is "not shown", so
+        // once it is spent no premise holds and nothing is added.
         saturate(state, |state, atom| self.entails(state, atom))
     }
 
@@ -2041,7 +2121,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 Some(mut state) => self.transfer(block as u32, &mut state).edges,
                 None => Vec::new(),
             };
-            if self.terms.len() > 1 << 16 {
+            if self.terms.len() > 1 << 16 || self.spent() {
                 return None;
             }
             let changed = out != edges[block];
