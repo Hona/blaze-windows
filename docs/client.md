@@ -146,7 +146,7 @@ Everything else is the engine's, never done a second way:
 | When | What the thin `blaze` does |
 |---|---|
 | A word it does not read exactly as the CLI's parser does | runs the engine with the command line as typed. It reads `build`/`b`, `check`/`c`, `run`/`r`, quiet and release flags, simple `-p NAME` or `--package NAME` selectors, and `run`'s program arguments. |
-| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME`, or `IX_PROF` | the same |
+| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME` or the request's `BLAZE_SCRIPT_READ`, or `IX_PROF` | the same |
 | No current pin lookup is kept for the directory, the workspace pins another blaze, or `default` in blaze's home names another release | the same: the engine's launcher decides and keeps the lookup |
 | No daemon listens, or the daemon is not the engine beside it | the same: the engine starts or replaces the daemon, saying so |
 | The request is sent and the daemon reports progress, compilation, diagnostics or anything else the thin client does not print, or the answer has not ended within 60 seconds | hands the connection and the bytes already read to the engine (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks the request byte for byte and prints the answer without repeating the build. On Windows the parent waits for the engine; only the socket, answer file and standard streams are inherited. |
