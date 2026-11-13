@@ -1721,6 +1721,8 @@ impl<'db> Cx<'db> {
                     f.bool(lib.bundle);
                     f.debug(&lib.as_needed);
                     f.symbol(lib.import_name_type);
+                    // The `cfg(..)` the linking crate decides it by: part of what it is.
+                    f.debug(&lib.cfg);
                 }
                 f.symbol(AttrFlags::wasm_import_module(db, it));
             }
