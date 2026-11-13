@@ -773,6 +773,29 @@ fn a_chunk_record_drained_after_its_chunks_home_is_never_written() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// The invariant: a chunk whose copy became its indexed home is not written twice when
+/// the original drains after the index migration. The old delta no longer holds its key.
+#[test]
+fn an_original_chunk_can_drain_after_its_copy_is_only_in_the_index() {
+    let (mut sim, mut store, out, gate, put) =
+        a_chunk_claim_race(47, INDEX_AFTER as u64, output_with_a_short_last_chunk());
+    let last = *chunk_keys(&out).last().unwrap();
+    let home = store.loc_of(&last);
+    gate.wait();
+    let ticket = put.join().unwrap();
+    end_the_migration(&mut store);
+    assert!(store.tiers[0].delta.get(Held::writer(&*store.shared), &last).is_none());
+    flush(&mut sim, &mut store);
+    assert!(store.broken().is_none(), "{:?}", store.broken());
+    assert!(store.durable(ticket));
+    assert_eq!(store.loc_of(&last), home);
+    assert_dead_is_exact(&store);
+    drop(store);
+    sim.crash();
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(2)).as_ref(), Some(&out));
+}
+
 /// Dead bytes are exact: in every pack not removed, they are the spans of the records no key
 /// finds (`Pack::dead`). Run once every batch's moves are made, or a record drained and not
 /// yet moved to counts as one no key finds.
