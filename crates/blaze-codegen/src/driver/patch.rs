@@ -96,6 +96,8 @@ enum Item<I, S> {
 /// What a kept walk holds beside its nodes: what finds the changed set and what a change
 /// touches.
 pub(super) struct Keep<I, S> {
+    /// A whole walk with a consumer cannot be patched from its closed describes.
+    takes_world: bool,
     /// Every item the walk described, by its place in `graph`; `None` for a place given up.
     items: Vec<Option<Item<I, S>>>,
     /// Each function, by who asks for it, and each static, by its handle: what finds the
@@ -162,6 +164,7 @@ pub(super) struct Walked<I, S> {
 /// What a whole walk hands the build beside its result, for the walk to be kept
 /// ([`Build::keep_of`]): made only by a walk with no error.
 pub(super) struct Side<I, S> {
+    pub(super) closed: bool,
     pub(super) asked: HashMap<(I, Origin), InstanceKey>,
     pub(super) counted: Vec<((I, Origin), Counted)>,
     /// Every describe the walk's last round was given, by who asked.
@@ -431,6 +434,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let Some(walked) = kept.take_walk(program) else {
             return Err("no walk of this program is kept");
         };
+        if walked.keep.takes_world {
+            return Err("a kept function takes the program's dyn facts");
+        }
         if walked.roots_in != roots
             || walked.static_roots_in != static_roots
             || walked.check_in != check
@@ -625,6 +631,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             work.described += 1;
             redescribed += 1;
+            if now.takes_world {
+                return Err("a changed function takes the program's dyn facts");
+            }
             if !same_frame(&was, &now) {
                 return Err("a changed function is another's or is defined another way");
             }
@@ -721,6 +730,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return Err("the front end gave no count of a new function");
                 };
                 let key = node.unit.instance.key();
+                if node.described.takes_world {
+                    return Err("a new function takes the program's dyn facts");
+                }
                 if keep.askers.contains_key(&key) {
                     return Err("a new function has a key the walk holds");
                 }
@@ -1202,6 +1214,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
     ) -> Option<Keep<FrontInstance<B>, FrontStatic<B>>> {
         let mut keep = Keep {
+            takes_world: side.closed || side.described.iter().any(|(_, it)| it.takes_world),
             // alloc: per whole walk, one per item it described
             items: Vec::with_capacity(side.described.len() + side.statics.len()),
             functions: HashMap::with_capacity(side.described.len()),

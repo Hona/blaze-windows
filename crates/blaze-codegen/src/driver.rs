@@ -2831,6 +2831,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per build, sized by its roots
         let roots = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
         let side = (keeps && errors.is_empty()).then(|| patch::Side {
+            closed: round > 1,
             asked,
             counted,
             described: described_functions,

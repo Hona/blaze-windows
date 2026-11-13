@@ -111,7 +111,9 @@ fn remove_ref(program: &mut Program, caller: u32, at: usize, plant: Option<Plant
 
 /// Makes the call through a `dyn` of `site` direct to `target`.
 fn set_fact(program: &mut Program, site: u32, target: u32) {
-    program.dyn_sites.insert(site, target);
+    if program.dyn_sites.insert(site, target).is_none() {
+        program.touch(site); // The body now contains a dyn call, even before closing.
+    }
     program.touch_fact(site);
 }
 
@@ -730,6 +732,22 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     assert_eq!(grown.whole, None);
     assert_eq!((grown.described, grown.verified, grown.reached), (2, 0, COUNT + 1));
     assert_eq!(asked, (2, 0));
+}
+
+/// The first reachable consumer cannot reuse a walk made without closing dyn facts.
+#[test]
+fn introducing_the_first_dyn_consumer_closes_the_patched_program() {
+    let mut program = program();
+    let kept = Kept::new();
+    let walk = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap().walk
+    };
+    walk(&program);
+    assert_eq!(walk(&program).whole, None);
+    set_fact(&mut program, 2, 5);
+    assert_eq!(walk(&program).whole, Some("a changed function takes the program's dyn facts"));
+    assert!(program.engine.against.load(Ordering::Relaxed));
 }
 
 /// A build given nothing to keep describes in describes everything and says so.

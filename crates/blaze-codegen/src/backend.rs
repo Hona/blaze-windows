@@ -45,6 +45,10 @@ pub enum FrontRef<I, S> {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per function described
 pub struct Described<I, S> {
     pub item: ItemKey,
+    /// This body may consume a fact closed over the whole program. Even when its
+    /// current describe reads no such fact, introducing the first consumer requires
+    /// closing the world before the build can use the patched walk.
+    pub takes_world: bool,
     /// Its code, with the key of the store its body is written in: what its instance key
     /// ([`crate::Instance::key`]) and so the link name it by, so two bodies written alike in
     /// two places are two functions, each reporting its own positions.
@@ -335,7 +339,8 @@ pub trait Frontend: Sync {
         true
     }
 
-    /// Whether a walk of this front end may close facts of the whole program
+    /// Whether a walk of this front end may close facts of the whole program even
+    /// when no described function sets `takes_world`
     /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached,
     /// so a walk patched from a kept one, which holds only what changed, is for a front end
     /// that says `false`. The default is `true`.

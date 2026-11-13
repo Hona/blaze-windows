@@ -797,8 +797,8 @@ impl<'db> HirFrontend<'db> {
         let origin = self.compiled_for(db, instance, requester);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let owner = self.owner(db, &instance.0);
-        let walking =
-            super::devirt::walking(db, world, instance, inlined, || owner).map_err(fail)?;
+        let takes_world = super::devirt::takes_world(db, instance, inlined, || owner).map_err(fail)?;
+        let walking = refs::Walking { inlined, world: world.filter(|_| takes_world) };
         let built_in_code = built_in_code(db, hashes, &instance.0).map_err(fail)?;
         // A body built against the program's dyn facts is keyed by those it read (rule 21). A
         // copy of it built into a caller is built against none: `built_in_code`.
@@ -871,6 +871,7 @@ impl<'db> HirFrontend<'db> {
         span.record("function", name.as_str());
         Ok(Described {
             item,
+            takes_world,
             code,
             template_code,
             anchors,
@@ -1267,14 +1268,10 @@ impl Frontend for HirFrontend<'_> {
         Some(storage.durable_view().as_u64())
     }
 
-    /// A walk closes dyn facts only where some body takes the program's world
-    /// ([`super::devirt::takes_world`]), which needs a unit that MIR-inlines: with none of
-    /// any origin (a dev build), or an origin whose plan fails, it closes none.
+    /// `world_of` makes no world without a reached consumer. Each describe records
+    /// `takes_world` in its tracked result, including describes made before closing.
     fn closes(&self) -> bool {
-        match &self.units {
-            Some(units) => units.inlines.values().any(|it| *it != Ok(false)),
-            None => true,
-        }
+        false
     }
 
     fn spell(&self, instance: &HirInstance) -> String {
