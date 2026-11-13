@@ -9,8 +9,8 @@ mod tests;
 use super::{HashSource, Hashes, Kind, frontend::HirFrontend};
 use base_db::{Crate, Db};
 use blaze_codegen::{
-    BuiltId, CodegenError, CompiledFunction, Init, InstanceKey, NativeLib, NativeLibKind, Static,
-    Target, driver::Built,
+    BuiltId, CodegenError, CompiledFunction, Init, InstanceKey, NativeLib, NativeLibKind,
+    RawImport, Static, Target, driver::Built,
 };
 use blaze_core::lock::Lock;
 use blaze_format::cursor::Put;
@@ -18,8 +18,8 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::{
-    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule as _, ItemContainerId,
-    Lookup, ModuleDefId,
+    AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, ExternBlockId, FunctionId, HasModule as _,
+    ItemContainerId, Lookup, ModuleDefId,
     attrs::{AttrFlags, NativeLibKind as Written},
     expr_store::Body as BodyStore,
     nameres::crate_def_map,
@@ -27,6 +27,7 @@ use hir_def::{
 };
 use hir_ty_mir::mir::MirSpan;
 use hir_ty_share::code::{self, TABLES};
+use smallvec::SmallVec;
 use std::{
     alloc::Global,
     sync::atomic::{AtomicU64, Ordering},
@@ -203,6 +204,8 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
     // alloc: per crate linked, its libraries
     let mut libs = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
+        // The module's `raw-dylib` libraries, by their block: what its foreign items import.
+        let mut raw: SmallVec<[(ExternBlockId, usize); 2]> = SmallVec::new();
         for block in module.scope(db).extern_blocks() {
             // A block's `#[link(wasm_import_module = "..")]` names no library: on wasm its
             // functions are the module's imports from that module (`v2::wasm::imports`), and
@@ -216,12 +219,9 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                     }
                     Written::Framework => NativeLibKind::Framework,
                     Written::RawDylib => {
-                        // alloc: an error
-                        return Err(format!(
-                            "`#[link(name = \"{name}\", kind = \"raw-dylib\")]` in {}: blaze \
-                             links no `raw-dylib` (nor its `link_ordinal` and `import_name_type`)",
-                            named()
-                        ));
+                        raw_dylib_target(db, krate, name, named)?;
+                        raw.push((block, libs.len()));
+                        NativeLibKind::RawDylib
                     }
                     Written::Other(kind) => {
                         // alloc: an error
@@ -242,10 +242,13 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                     ));
                 }
                 if let Some(imported) = &lib.import_name_type {
+                    // rustc refuses it but on a `raw-dylib` for 32-bit x86, whose names are
+                    // decorated; blaze emits no code for 32-bit x86.
                     // alloc: an error
                     return Err(format!(
                         "`#[link(name = \"{name}\", import_name_type = \"{imported}\")]` in {}: \
-                         blaze links no `raw-dylib`, which `import_name_type` is for",
+                         an import name type is only for a `raw-dylib` on 32-bit x86, as rustc \
+                         says, and x86-64 decorates no names",
                         named()
                     ));
                 }
@@ -265,7 +268,8 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                     ));
                 }
                 // alloc: per library, its name for the link
-                libs.push(NativeLib { name: name.to_owned(), kind, verbatim: lib.verbatim });
+                let name = name.to_owned();
+                libs.push(NativeLib { name, kind, verbatim: lib.verbatim, imports: Vec::new() });
             }
         }
         for def in module.scope(db).declarations() {
@@ -282,19 +286,68 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
                 ),
                 _ => continue,
             };
-            if matches!(container, ItemContainerId::ExternBlockId(_))
-                && AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_ORDINAL)
-            {
-                // alloc: an error
-                return Err(format!(
-                    "`#[link_ordinal(..)]` on `{item}` in {}: blaze links no `raw-dylib`, \
-                     which imports by ordinal",
-                    named()
-                ));
+            let ItemContainerId::ExternBlockId(block) = container else { continue };
+            let ordinal = AttrFlags::link_ordinal(db, owner);
+            let mut of_block = raw.iter().filter(|it| it.0 == block).map(|it| it.1).peekable();
+            if of_block.peek().is_none() {
+                if ordinal.is_some() {
+                    // alloc: an error
+                    return Err(format!(
+                        "`#[link_ordinal(..)]` on `{item}` in {}: an ordinal imports from a \
+                         `raw-dylib`, and no `#[link(.., kind = \"raw-dylib\")]` is on its block",
+                        named()
+                    ));
+                }
+                continue;
+            }
+            let ordinal = match ordinal {
+                None => None,
+                Some(Ok(ordinal)) => Some(ordinal),
+                Some(Err(written)) => {
+                    // alloc: an error
+                    return Err(format!(
+                        "`#[link_ordinal({written})]` on `{item}` in {}: an ordinal is an integer \
+                         of 0 to 65535",
+                        named()
+                    ));
+                }
+            };
+            let target = crate::target_of_crate(db, krate).map_err(|e| e.to_string())?;
+            let (symbol, data) = match def {
+                ModuleDefId::FunctionId(it) => (crate::link_name_for(db, target, it), false),
+                ModuleDefId::StaticId(it) => (crate::static_link_name_for(db, target, it), true),
+                _ => continue,
+            };
+            // alloc: an error
+            let symbol = symbol.ok_or_else(|| format!("`{item}` in {} has no symbol", named()))?;
+            for at in of_block {
+                // clone: once per `raw-dylib` library of the item's block, nearly always one
+                libs[at].imports.push(RawImport { symbol: symbol.clone(), ordinal, data });
             }
         }
     }
     Ok(libs)
+}
+
+/// That `krate`'s target links a `raw-dylib`: one of Windows, whose loader binds imports by
+/// DLL. rustc refuses it elsewhere too (`raw-dylib` on ELF is an unstable feature of its own).
+fn raw_dylib_target(
+    db: &Db,
+    krate: Crate,
+    name: &str,
+    named: impl Fn() -> String,
+) -> Result<(), String> {
+    let target = crate::target_of_crate(db, krate).map_err(|e| e.to_string())?;
+    if target.object_format == crate::ObjectFormat::Coff {
+        return Ok(());
+    }
+    // alloc: an error
+    Err(format!(
+        "`#[link(name = \"{name}\", kind = \"raw-dylib\")]` in {}: `raw-dylib` links only on \
+         Windows, and the crate is for {}",
+        named(),
+        target.triple()
+    ))
 }
 
 /// The domain of a [`Table::id`].

@@ -23,6 +23,7 @@
 
 mod coff;
 mod image;
+pub(crate) mod raw_dylib;
 #[cfg(test)]
 pub(crate) mod tests;
 
