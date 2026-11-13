@@ -286,6 +286,7 @@ fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
 /// in the same order, and so adds the same facts and finds the same contradictions, as the
 /// table kept by premise it replaced (here, the reference), for an entailment that reads
 /// through `<` to `<=` and a contradiction that is a negated fact.
+#[cfg(test)]
 #[hegel::test(test_cases = 300)]
 fn saturating_by_conclusion_is_saturating_by_premise(tc: hegel::TestCase) {
     use hegel::generators as gs;
