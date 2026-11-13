@@ -136,23 +136,27 @@ engine links the compiler, so it takes milliseconds to start; the thin `blaze` l
 it and answers what would otherwise cost only that start:
 
 - `blaze --version`, from what it was built with and the launcher's kept pin lookup;
-- a `build` or a `run` with nothing to do: one request on the daemon's socket, the CLI's own
+- a `build`, `check` or `run` with nothing to do: after checking the daemon's identity and settings, it sends the CLI's own request
   (the same bytes; `the_thin_blaze_sends_this_clis_request_byte_for_byte` in blaze-cargo holds
   a table of command lines to it), its answer printed as the CLI prints it, and for `run` the
-  program, which it becomes.
+  program, which it becomes on Unix or waits for on Windows.
 
 Everything else is the engine's, never done a second way:
 
 | When | What the thin `blaze` does |
 |---|---|
-| A word it does not read exactly as the CLI's parser does (anything but `build`/`b`/`run`/`r` with `-q`, `--quiet`, `-r`, `--release`, and `run`'s program arguments), or `--version` with more words | runs the engine with the command line as typed |
-| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME`, or `IX_PROF` | the same |
+| A word it does not read exactly as the CLI's parser does | runs the engine with the command line as typed. It reads `build`/`b`, `check`/`c`, `run`/`r`, quiet and release flags, simple `-p NAME` or `--package NAME` selectors, and `run`'s program arguments. |
+| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME` or the request's `BLAZE_SCRIPT_READ`, or `IX_PROF` | the same |
 | No current pin lookup is kept for the directory, the workspace pins another blaze, or `default` in blaze's home names another release | the same: the engine's launcher decides and keeps the lookup |
 | No daemon listens, or the daemon is not the engine beside it | the same: the engine starts or replaces the daemon, saying so |
-| The request is sent and the answer is more than a build with nothing to do (a unit compiled, a diagnostic, a report, an error, anything recomputed), or has not ended 25 ms after it was sent | becomes the engine, handing it the connection and the answer read so far (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks its own request against the one sent, byte for byte, and prints the whole answer; the daemon is asked once |
+| The request is sent and the daemon reports progress, compilation, diagnostics or anything else the thin client does not print, or the answer has not ended within 60 seconds | hands the connection and the bytes already read to the engine (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks the request byte for byte and prints the answer without repeating the build. On Windows the parent waits for the engine; only the socket, answer file and standard streams are inherited. |
 
 `blaze-thin --thin-route WORDS...` says which of the first three rows a command line falls
 under (`thin`, or `engine:` and why) and runs nothing.
+
+`blaze-thin --thin-timing WORDS...` runs the command and writes elapsed microseconds at connect,
+status, send and reply (or handover). On Windows the main-entry and exit QPC ticks can be compared
+with a parent process's QPC samples to separate launch and teardown from daemon latency.
 
 The thin `blaze` says none of the lines about blaze's updates: the engine says them, before
 every command that reaches it. It sends no client rows to the profile history (it records

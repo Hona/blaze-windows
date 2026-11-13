@@ -252,19 +252,21 @@ impl Steps for Real {
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
         let at = || Some("the standard library's sources".to_owned());
-        let library =
-            crate::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
+        let library = tracing::info_span!(target: "blaze", "locate or install library sources")
+            .in_scope(crate::toolchain::library::fetch).map_err(|what| ApiError::new(what, at()))?;
         let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
         let named = blaze_units::stdlib::library_at(&library.commit);
         let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint");
         hasher.part(library.digest.as_bytes());
-        library_fingerprint(&library.dir, "", &mut hasher).map_err(in_dir)?;
+        tracing::info_span!(target: "blaze", "fingerprint library sources")
+            .in_scope(||library_fingerprint(&library.dir, "", &mut hasher)).map_err(in_dir)?;
         let fingerprint = format!("{:x}", hasher.finish());
         if kept.iter().any(|(it, mounted)| *it == fingerprint && *mounted == named) {
             return Ok(Library { at: named, fingerprint, source: None });
         }
         let mut files = Vec::new();
-        library_files(&library.dir, "", &mut files).map_err(in_dir)?;
+        tracing::info_span!(target: "blaze", "read library sources")
+            .in_scope(||library_files(&library.dir, "", &mut files)).map_err(in_dir)?;
         blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }

@@ -2,7 +2,8 @@
 # (MSVC 14.44, Windows SDK 10.0.26100) from this directory. `/Brepro` makes them the same bytes
 # each time; `/Gy` puts each function in its own COMDAT, as `cc` builds objects for Rust crates.
 $ErrorActionPreference = 'Stop'
-$common = @('/nologo', '/c', '/O1', '/Gy', '/GS', '/Brepro')
+# The CodeView object-name record otherwise contains the builder's absolute checkout path.
+$common = @('/nologo', '/c', '/O1', '/Gy', '/GS', '/Brepro', '/experimental:deterministic', "/pathmap:${PSScriptRoot}=X:\tests\pe_run")
 function cl_ { & cl.exe @args; if ($LASTEXITCODE -ne 0) { throw "cl $args" } }
 cl_ @common /MD /Fohello_md.obj hello.c
 cl_ @common /MT /Fohello_mt.obj hello.c

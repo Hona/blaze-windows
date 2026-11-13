@@ -127,7 +127,9 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
                 String::from_utf16_lossy(&name)
             )));
         }
-        by_name.push((upper(&name), given, name, value));
+        // alloc: once per variable, its comparison key for sorting the environment block
+        let key: Vec<_> = name.iter().copied().map(crate::platform::env::upper_unit).collect();
+        by_name.push((key, given, name, value));
     }
     by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     by_name.dedup_by(|later, kept| later.0 == kept.0);
@@ -144,22 +146,6 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
     }
     block.push(0);
     Ok(block)
-}
-
-/// Each code unit in upper case where that is one code unit, as Windows compares names.
-fn upper(units: &[u16]) -> Vec<u16> {
-    units
-        .iter()
-        .map(|&unit| {
-            let Some(c) = char::from_u32(u32::from(unit)) else { return unit };
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(one), None) => u16::try_from(u32::from(one)).unwrap_or(unit),
-                _ => unit,
-            }
-        })
-        // alloc: once per variable of a process spawned, its name's sort key
-        .collect()
 }
 
 fn invalid(message: String) -> io::Error {

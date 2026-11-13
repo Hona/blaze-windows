@@ -601,6 +601,9 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
     let files = vec![("/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())];
     let table: &[&[&str]] = &[
         &["build"],
+        &["check", "-p", "opencode-desktop"],
+        &["check", "--locked", "-p", "opencode-desktop"],
+        &["build", "--package", "rune", "-p", "rune-kit"],
         &["b"],
         &["build", "-q"],
         &["build", "--quiet", "-r"],
@@ -616,12 +619,15 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
         let thin = thin_asked(typed);
         let asked = invocation(typed.iter().map(OsString::from).collect());
         for (color, width) in [(false, None), (true, Some(100))] {
+            let root=std::env::current_dir().unwrap();
+            let host=Place {cwd:root.clone(), root:root.clone(),manifest:root.join("Cargo.toml")};
+            let wire=place::utf8(&root).unwrap();
             let cargo =
-                place::cargo(&asked, &place(), env.clone(), files.clone(), color, width).unwrap();
+                place::cargo(&asked, &host, env.clone(), files.clone(), color, width).unwrap();
             let cli = request(&asked, cargo).unwrap();
             let sent = blaze_thin::request::Sent {
-                cwd: "/w".to_owned(),
-                root: "/w".to_owned(),
+                cwd: wire.clone(),
+                root: wire,
                 env: env.clone(),
                 files: files.clone(),
                 color,
@@ -732,7 +738,7 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
         let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
         assert_eq!(out, "", "{typed:?}");
         match thin.command {
-            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Build | blaze_thin::route::Command::Check => assert_eq!(then, Then::Exit(0), "{typed:?}"),
             blaze_thin::route::Command::Run => {
                 let program = plain.program().expect("the one bin runs");
                 let exec = Exec::of(

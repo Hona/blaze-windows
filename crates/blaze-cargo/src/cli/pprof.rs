@@ -526,6 +526,7 @@ fn open_page(link: &str) -> Result<(&'static str, PathBuf), String> {
     // Not recursive: a directory someone else made there first is refused, not used.
     #[cfg(unix)]
     let made = {
+        // astlog-ignore: direct-host-import -- create-new only; a pre-existing token-page directory is refused.
         use std::os::unix::fs::DirBuilderExt as _;
         std::fs::DirBuilder::new().mode(0o700).create(&dir)
     };
@@ -630,6 +631,7 @@ mod tests {
         let dir = page.parent().unwrap().to_owned();
         #[cfg(unix)]
         let private = {
+            // astlog-ignore: direct-host-import -- test the actual kernel mode independently of the writer.
             use std::os::unix::fs::PermissionsExt as _;
             let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             ((mode(&page), mode(&dir)) == (0o600, 0o700)).then_some(()).ok_or_else(|| "not 0600 in 0700".to_owned())
