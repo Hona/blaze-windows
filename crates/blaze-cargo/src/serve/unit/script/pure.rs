@@ -109,12 +109,23 @@ pub(crate) fn of(job: &Job, compile: usize) -> Option<&Pure> {
 /// found its value under its pure key. Works the proof and the lookups out the first time it is
 /// asked, reading the front end through `reader`.
 pub(crate) fn unbuilt(job: &Job, reader: &UnitReader, unit: usize) -> Result<bool, ApiError> {
+    // No observation isn't evidence against the proof, nor authority to publish a verified
+    // result. Do not consult or populate the pure-run cache on a host with no read tracer.
     let u = job.unit(unit)?;
     if !u.target.is_custom_build() || matches!(u.mode, Mode::RunCustomBuild) || job.sandbox_off() {
         return Ok(false);
     }
     // `BLAZE_SCRIPT_CACHE=check` reruns what the store kept, a pure key's hit among it.
     let verify = verifies(job)? || super::rechecks(job)?;
+    if !crate::sandbox::v2::OBSERVES_READS {
+        if verify {
+            return Err(ApiError::new(
+                format!("cannot verify a cached script run: {}", crate::sandbox::v2::NOT_TRACED_ON_WINDOWS),
+                Some(u.pkg_id.clone()),
+            ));
+        }
+        return Ok(false);
+    }
     let Some(slot) = job.pure.get(unit) else { return Ok(false) };
     if slot.get().is_none() {
         // Named for the script it proves (`serde v1.0.219 (build script)`): every build
