@@ -8,7 +8,7 @@ use super::*;
 use crate::cli::{
     args::{Asked, Invocation},
     say::Ended,
-    test::tests::{Fake, built},
+    test::tests::{Fake, built_in},
 };
 
 fn os(words: &[&str]) -> impl Iterator<Item = OsString> {
@@ -318,7 +318,7 @@ fn tests_built() -> Vec<Response> {
         foo_compiling(),
         Response::Built {
             members: 1,
-            artifacts: built(),
+            artifacts: built_in(WN),
             profile: "`test` profile [unoptimized + debuginfo]".to_owned(),
         },
         Response::Done { ok: true },
@@ -469,7 +469,7 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
 
 #[test]
 fn run_becomes_its_program() {
-    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let foo = crate::cli::run::tests::artifact_in(WN, "foo", "bin", "foo", false, Some("foo"));
     let built = Response::Built {
         members: 1,
         artifacts: vec![foo],
@@ -485,8 +485,8 @@ fn run_becomes_its_program() {
     assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
 
     let two = [
-        crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
-        crate::cli::run::tests::artifact("foo", "bin", "bar", false, Some("bar")),
+        crate::cli::run::tests::artifact_in(WN, "foo", "bin", "foo", false, Some("foo")),
+        crate::cli::run::tests::artifact_in(WN, "foo", "bin", "bar", false, Some("bar")),
     ];
     let built = Response::Built {
         members: 1,
@@ -555,7 +555,11 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         lines[2].starts_with("    Finished `dev` profile [unoptimized + debuginfo] target(s) in "),
         "{err}"
     );
-    assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
+    assert_eq!(
+        lines[3],
+        format!("   Generated {}", dir.join("foo").join("index.html").display()),
+        "{err}"
+    );
     assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
     assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
     let listed = std::fs::read_to_string(dir.join("crates.js")).unwrap();
