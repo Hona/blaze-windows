@@ -43,6 +43,8 @@ pub struct Asked {
     pub args: Vec<String>,
     pub quiet: bool,
     pub release: bool,
+    /// Package selectors as cargo's target selection receives them, in argument order.
+    pub packages: Vec<String>,
     /// `run`'s arguments of the program.
     pub program: Vec<OsString>,
 }
@@ -106,11 +108,25 @@ pub fn words(words: &[OsString]) -> Route {
         args: Vec::new(), // alloc: once a command, its words
         quiet: false,
         release: false,
+        packages: Vec::new(),
         program: Vec::new(), // alloc: once a command, the program's arguments
     };
     let mut rest = rest.iter();
     while let Some(word) = rest.next() {
         let text = word.to_str();
+        if matches!(text, Some("-p" | "--package")) {
+            let Some(package) = rest.next().and_then(|it| it.to_str()) else {
+                return Route::Engine(Why::Word(shown(word)));
+            };
+            // More complex package specs and patterns remain the full parser's.
+            if package.is_empty() || !package.starts_with(|c: char| c.is_ascii_alphanumeric())
+                || !package.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+                return Route::Engine(Why::Word(shown(word)));
+            }
+            asked.packages.push(package.to_owned());
+            asked.args.extend([shown(word), package.to_owned()]);
+            continue;
+        }
         // `run`'s program has the rest once its first argument comes (clap's
         // `trailing_var_arg`), the first `--` among them dropped; after a `--` it has all.
         let (program, drops) = match text {
@@ -235,7 +251,9 @@ mod tests {
         }
         // `--version` with anything after it is blaze's cargo's own, which says the binary.
         assert_eq!(engine(&["--version", "-v"]), Why::Command("--version".to_owned()));
-        for word in ["-v", "--verbose", "-p", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
+        assert_eq!(engine(&["build", "-p"]), Why::Word("-p".into()));
+        assert_eq!(asked(&["check", "-p", "opencode-desktop"]).packages, ["opencode-desktop"]);
+        for word in ["-v", "--verbose", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
             "--manifest-path", "-Zscript", "--features", "--target", "--profile", "-j8", "--goal", "--refused", "--help", "-h"]
         {
             assert_eq!(engine(&["build", word]), Why::Word(word.to_owned()), "{word}");

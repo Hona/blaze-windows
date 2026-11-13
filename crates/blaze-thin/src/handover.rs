@@ -22,11 +22,9 @@ use std::{ffi::OsString, time::Duration};
 /// cargo's is named so.
 pub const WORD: &str = "__answered";
 
-/// How long after it sent a build's request the thin `blaze` waits for the answer to end
-/// before the engine takes it over: an answer with nothing to do comes in well under this,
-/// and a build that takes longer has work to show, which the engine's printer (its live view,
-/// on a terminal) shows as it comes. The engine starts while the daemon builds.
-pub const AFTER: Duration = Duration::from_millis(25);
+/// Bound on waiting for a plain answer. A progress or diagnostic message hands over at once;
+/// a slow plain reply does not pay a second process start just for missing a 25 ms deadline.
+pub const AFTER: Duration = Duration::from_secs(60);
 
 /// The first bytes of the file: its format's name and version.
 const MAGIC: &[u8; 16] = b"blaze answered 1";

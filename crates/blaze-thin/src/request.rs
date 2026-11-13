@@ -108,7 +108,7 @@ pub fn request(asked: &Asked, sent: Sent) -> Request {
     };
     let profile = if asked.release { "release" } else { "dev" };
     let targets = Targets {
-        packages: Vec::new(), // alloc: none
+        packages: asked.packages.clone(), // clone: the request owns the selectors
         profile: profile.to_owned(), // alloc: the request's, once a command
         goal: None,
         target: None,
