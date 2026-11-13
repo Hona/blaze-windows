@@ -179,6 +179,11 @@ fn catch_dump() {
 #[cfg(not(unix))]
 pub fn catch() {}
 
+/// windows: nothing blocks on a stop pipe (no `serve::stop` guard is armed off unix), so there
+/// is nothing to wake.
+#[cfg(not(unix))]
+pub fn stop_begun() {}
+
 /// The signals that end a process by default and that a handler sees: SIGKILL and SIGSTOP
 /// can't be caught, std ignores SIGPIPE, [`catch`] has SIGTERM, SIGINT and SIGUSR1, and SIGSEGV
 /// and SIGBUS have std's handlers, which [`record_faults`] says each in front of.

@@ -711,7 +711,9 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
             return Err(DaemonError::Exited { socket, log, pid, phase: Phase::Launched, ended }.into());
         }
         if std::time::Instant::now() >= until {
-            return Err(DaemonError::NotListening { socket, log, pid, phase: Phase::Launched }.into());
+            // No ready pipe says what the start is inside on Windows: its log does.
+            let inside = None;
+            return Err(DaemonError::NotListening { socket, log, pid, phase: Phase::Launched, inside }.into());
         }
     }
 }
