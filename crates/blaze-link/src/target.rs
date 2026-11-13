@@ -2213,7 +2213,9 @@ fn by_extension(format: Format, name: &str, kind: NativeLibKind) -> NativeKind {
     let is = |it: &str| extension.eq_ignore_ascii_case(it);
     if is("o") || is("obj") {
         NativeKind::Object
-    } else if is("a") || is("lib") {
+    } else if is("a") || is("lib") || is("rlib") {
+        // An `.rlib` is rustc's archive of a crate's objects: a link line of rustc's (a
+        // benchmark against link.exe on its inputs) names them.
         NativeKind::Archive { whole }
     } else {
         NativeKind::Shared { as_needed: format == Format::Elf }

@@ -146,6 +146,30 @@ fn a_c_console_program_with_the_static_crt_runs() {
     assert_eq!((code, printed.as_str()), (42, "hello from nobody, 1 args\npid set\nrelocated yes\n"));
 }
 
+/// An `.xdata` section is kept by the `.pdata` that names it, not by its handler: when the
+/// handler (`__GSHandlerCheck`) is kept, every function of the static CRT whose unwind info
+/// names it is not. The static CRT's `printf` engine (`output.obj`, 1063 COMDATs) keeps 8.6 KB
+/// of code; with each `.xdata` kept by its handler it kept 120 KB, and the image 3.5 times
+/// link.exe's code.
+#[test]
+fn unwind_info_keeps_no_function_through_its_handler() {
+    let (_, image) = link_image(output(None, &["hello_mt.obj"]), &[]).unwrap();
+    let mut code = 0;
+    for piece in image.state.live_pieces() {
+        let crate::state::What::Native { obj, section, .. } = piece.what() else { continue };
+        if *piece.class() != crate::model::Class::Text {
+            continue;
+        }
+        let key = crate::symbols::SymKey::Section(obj, section);
+        let Some(sym) = image.symbols.find(key) else { continue };
+        let name = crate::native::describe(&image.symbols, &[&image.state], &image.writer, sym);
+        if name.ends_with("\\output.obj)") {
+            code += piece.size;
+        }
+    }
+    assert!(code < 16 << 10, "the static CRT's output.obj keeps {code} bytes of code");
+}
+
 #[test]
 fn cpp_exceptions_and_static_initialisers_run_with_the_dynamic_crt() {
     assert_eq!(linked_run("cpp_md", &["cpp_md.obj"], &[]), (0, "cpp ok 42 10\n".into()));

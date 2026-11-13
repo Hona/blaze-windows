@@ -88,6 +88,9 @@ fn main() {
         let started = Instant::now();
         let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, Debug::None, false)
             .expect("the output");
+        // rustc names the static VC runtime (`/defaultlib:libcmt`) on a `+crt-static` line.
+        output.link.pe.crt_static =
+            given.iter().any(|it| it.arg.eq_ignore_ascii_case("/defaultlib:libcmt"));
         let applied = blaze_link::args::apply(&mut output, &[], &given).unwrap_or_else(|e| panic!("{e}"));
         let mut all = libs.clone();
         all.extend(applied.libs);
