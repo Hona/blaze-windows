@@ -2093,6 +2093,12 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         lock(slot).misses.push(miss);
     }
     if let Some(Kept { record, mut puts, profiles }) = kept {
+        // The compile record carries the program; the run's cache is independently keyed.
+        // A hit for the compiler must still set up this job's proof and look up its runs,
+        // otherwise a script proved pure only finds its result after a *compile miss*.
+        if job.unit(unit)?.target.is_custom_build() && !elided_unbuilt(job, unit)? {
+            script::pure::unbuilt(job, reader, unit)?;
+        }
         puts.extend(library_puts(job));
         // What it said, drawn for this job's client from the files as they are: the record
         // holds no text drawn for the client of the build that made it.
