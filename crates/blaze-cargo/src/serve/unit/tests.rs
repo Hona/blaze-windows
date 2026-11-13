@@ -321,9 +321,11 @@ fn a_failed_script_says_what_cargo_says() {
     let report = judged.failure.expect("the run failed");
     assert_eq!(report.rule.as_deref(), Some("build-script:failed"));
     assert_eq!(report.subject(), Some("z-sys"));
+    // As cargo says it on each system (std's `ExitStatus` display).
+    let ended = if cfg!(windows) { "exit code: 101" } else { "exit status: 101" };
     assert_eq!(
         report.flat(),
-        "the build script failed\n  it ended with exit status: 101\n  thread 'main' panicked"
+        format!("the build script failed\n  it ended with {ended}\n  thread 'main' panicked")
     );
 
     // An error it logged fails it too, said as the headline.
@@ -568,16 +570,17 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
     let env = artifact::run_env(&plan, "/opt/blaze/bin/blaze", &script, &native, "linux");
     let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str());
     assert_eq!(get("CARGO"), Some("/opt/blaze/bin/blaze"));
-    assert_eq!(get("CARGO_MANIFEST_DIR"), Some("/w/p"));
-    assert_eq!(get("OUT_DIR"), Some("/w/target/debug/build/p-0002/out"));
+    // The program opens them: the system's paths of the daemon's names.
+    let host = |name: &str| blaze_core::platform::path::host(name).to_string_lossy().into_owned();
+    assert_eq!(get("CARGO_MANIFEST_DIR"), Some(host("/w/p").as_str()));
+    assert_eq!(get("OUT_DIR"), Some(host("/w/target/debug/build/p-0002/out").as_str()));
     assert_eq!(get("GIT_HASH"), Some("abc"));
     // What cargo sets for rustc only is not set for the program.
     assert_eq!(get("CARGO_PRIMARY_PACKAGE"), None);
     assert_eq!(get("CARGO_CRATE_NAME"), None);
-    assert_eq!(
-        get("LD_LIBRARY_PATH"),
-        Some("/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug")
-    );
+    let dirs = ["/w/target/debug/build/z-sys-0001/out/lib", "/w/target/debug/deps", "/w/target/debug"];
+    let joined = dirs.map(host).join(":");
+    assert_eq!(get("LD_LIBRARY_PATH"), Some(joined.as_str()));
     assert_eq!(artifact::dylib_var("macos"), "DYLD_FALLBACK_LIBRARY_PATH");
 
     let package = package(P, "p", "/w/p");
@@ -605,12 +608,7 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
         |name: &str| process.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("p")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
-    assert_eq!(
-        get("LD_LIBRARY_PATH"),
-        Some(OsString::from(
-            "/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug:/opt/lib"
-        ))
-    );
+    assert_eq!(get("LD_LIBRARY_PATH"), Some(OsString::from(format!("{joined}:/opt/lib"))));
     // A library's artifact runs nothing, and says no environment.
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
     let lib_plan = self::plan("-0123", &["/w/target/debug/deps/libp-0123.rlib"]);
