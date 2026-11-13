@@ -18,7 +18,6 @@ use blaze_items::ItemKey;
 use hir_def::{
     expr_store::lower::{GlobalAsm, global_asm},
     hir::{AsmOptions, AsmPiece},
-    nameres::crate_def_map,
 };
 use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use hir_ty_mir::mir::location::line_and_column;
@@ -130,8 +129,8 @@ fn object(db: &Db, krate: Crate, triple: &str) -> Result<Option<GlobalAsmObject>
 fn blocks(db: &Db, krate: Crate, crate_name: &str, arch: Arch) -> Result<Vec<Block>, String> {
     // alloc: per crate linked, its `global_asm!`s, none in most
     let mut blocks = Vec::new();
-    let def_map = crate_def_map(db, krate);
-    for (module, data) in def_map.modules(db) {
+    for &module in super::modules::declaring_modules(db, krate) {
+        let data = module.def_map(db).module(db, module);
         for (_, &call) in data.scope(db).iter_macro_invoc() {
             let loc = call.loc(db);
             if !matches!(loc.def.kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::GlobalAsm)) {
