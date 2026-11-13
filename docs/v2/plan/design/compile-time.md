@@ -65,6 +65,31 @@ hooks.
 
 ## Let the users help
 
+### Starting a Windows dev run (design, not yet enabled)
+
+Windows copies the environment at process creation. The CLI cannot pass its own PID as
+Unix does before `exec`, or add the launch reply to an already-created child's environment.
+Use the executable's **cooperative start hook**, with a bounded bootstrap record instead:
+
+1. `PrepareLaunch(program, generation)` pins the build and returns either `File` or a
+   single-use lease for this client connection and this image. A runner uses the file.
+2. For a lease, the CLI makes a private pipe and starts the leased executable suspended
+   in its kill-on-close job, inheriting only its standard handles and the pipe's read end.
+   The initial environment names that read handle; strip any caller-supplied value first.
+3. `BindLaunch(lease, child_pid, creation_time)` binds the lease once. Verify the client,
+   child identity, parent and image generation before returning a bounded bootstrap record.
+   Hold the child's process handle through completion; never identify it by PID alone.
+4. Resume the child and write the record to the pipe with a deadline. The hook reads and
+   validates the schema, generation and length before entering user code. It closes its
+   bootstrap handle and acknowledges readiness. The CLI never edits another process's
+   memory or environment. Ordinary run semantics (stdio, Ctrl-C, full exit code) stay the same.
+
+Any timeout, cancellation, disconnect, stale lease, or failed start releases the generation
+and ends the job. Do not retry as a file run. Test the lease state machine with disconnects
+at every transition, PID reuse, and two concurrent launches of different generations;
+the Windows check is a child reporting its own PID and generation, then a stale bind
+refused without any user code running. No handle or lease secret belongs in logs or cache keys.
+
 9. **Semantic edits.** The agent API takes edits by meaning: replace the body of `f`, add a
    field to `S`, rename `x`. Each edit is applied to the flat syntax directly and names exactly
    what changed. There is no diff and no reparse, and invalidation starts from the named item.
