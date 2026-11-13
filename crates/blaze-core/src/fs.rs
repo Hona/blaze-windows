@@ -314,25 +314,56 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.sync_data()
 }
 
-/// On Windows the store seals a file read-only before it asks for its write-back, and the
-/// read-only attribute refuses the handle to write that `FlushFileBuffers` needs (os error 5):
-/// the attribute is lifted for the flush and put back. windows: the real fix is to flush through
-/// the handle that wrote the file before the seal (or to not need the flush before a ReFS block
-/// clone), so the sealed file is never writable again.
+/// [`crate::Effect::WriteBack`] on Windows: the file's dirty pages written out through a view
+/// of it mapped to read, which needs no handle to write (a file the store sealed read-only
+/// refuses one, os error 5) and flushes no drive cache: as Linux's `sync_file_range`, nothing
+/// is made durable. `FlushFileBuffers` (a handle to write, and the drive's cache flushed) cost
+/// 3 to 7 times as much and left a ReFS clone of the file no faster (measured on ReFS, 16 KiB
+/// to 64 MiB: a flush of a 16 KiB file 3.3 to 3.9 ms, through a view 0.3 ms; a clone of a
+/// file just written 0.6 ms, after either 0.44 to 0.59 ms). A file of no bytes has nothing to
+/// write and can't be mapped.
 #[cfg(windows)]
+#[expect(unsafe_code, reason = "a read-only view of a file mapped, flushed and unmapped")]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
-    let sealed = std::fs::metadata(path)?.permissions();
-    if !sealed.readonly() {
-        return OpenOptions::new().write(true).open(path)?.sync_data();
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FlushViewOfFile, MapViewOfFile, PAGE_READONLY,
+            UnmapViewOfFile,
+        },
+    };
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(());
     }
-    let mut open = sealed.clone();
-    open.set_readonly(false);
-    std::fs::set_permissions(path, open)?;
-    let flushed = OpenOptions::new().write(true).open(path).and_then(|file| file.sync_data());
-    std::fs::set_permissions(path, sealed)?;
+    // SAFETY: `file` is an open handle, borrowed for the call; the rest are no attributes, the
+    // whole file and no name.
+    let mapping = unsafe {
+        CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+    };
+    if mapping.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `mapping` is the mapping just made, of the whole file, to read.
+    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) };
+    let flushed = if view.Value.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `view` is the whole file's view, mapped above and not yet unmapped; a length
+        // of 0 flushes all of it. It is unmapped once, here, and read by nothing.
+        let flushed = match unsafe { FlushViewOfFile(view.Value, 0) } {
+            0 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        };
+        // SAFETY: as above.
+        unsafe { UnmapViewOfFile(view) };
+        flushed
+    };
+    // SAFETY: `mapping` is open and owned here, closed once.
+    unsafe { CloseHandle(mapping) };
     flushed
 }
-
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
 #[cfg(target_os = "linux")]
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
@@ -1224,6 +1255,45 @@ mod tests {
                 0 => assert_eq!(stamp.size, (at % 7) as u64, "name {at}"),
                 _ => assert_eq!(*stamp, Stamp::GONE, "name {at}"),
             }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The invariant: a write-back of a file the store sealed read-only, its bytes still in
+    /// the cache, succeeds and leaves it sealed and as it was; of a file of no bytes too; of
+    /// none, the typed error. The control, the cause put back: a handle to write, which
+    /// `FlushFileBuffers` needs, is refused on the sealed file.
+    #[test]
+    fn a_sealed_file_is_written_back_and_stays_sealed() {
+        let root = std::env::temp_dir().join(format!("blaze-fs-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (path, empty) = (root.join("sealed"), root.join("empty"));
+        let bytes: Vec<u8> = (0..300_000u32).map(|it| it as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        for it in [&path, &empty] {
+            let mut sealed = std::fs::metadata(it).unwrap().permissions();
+            sealed.set_readonly(true);
+            std::fs::set_permissions(it, sealed).unwrap();
+        }
+        write_back(&path).unwrap();
+        write_back(&empty).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(write_back(&root.join("none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let refused = OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(5), "{refused}");
+        for it in [&path, &empty] {
+            let mut open = std::fs::metadata(it).unwrap().permissions();
+            #[expect(clippy::permissions_set_readonly_false, reason = "the test's own files, removed")]
+            open.set_readonly(false);
+            std::fs::set_permissions(it, open).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
     }
