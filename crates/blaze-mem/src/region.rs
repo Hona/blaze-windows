@@ -24,6 +24,15 @@ use std::{
 
 use crate::{MemError, Tag, huge::Pages, os, tag};
 
+/// What a sparse region promises before any range of it is reused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sparse {
+    /// Every byte readable from the start ([`Region::reserve_sparse`]).
+    Readable,
+    /// No byte touched before its range is reused ([`Region::reserve_sparse_ranges`]).
+    RangesOnly,
+}
+
 /// The largest single commit: past it a region grows 64 MB per system call.
 const MAX_STEP: usize = 64 << 20;
 
@@ -119,10 +128,26 @@ impl Region {
     /// windows are slots of 1 GiB in a reservation of terabytes). Mixing them panics, naming the
     /// region.
     pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        Region::sparse(bytes, tag, Sparse::Readable)
+    }
+
+    /// A sparse region its owner counts by ranges alone ([`Region::reuse`], [`Region::evict`]),
+    /// touching no byte of one before reusing it: the store's buffer pool. On Linux and macOS it
+    /// is [`Region::reserve_sparse`]; on Windows, which cannot commit terabytes, only reserved,
+    /// and each range committed by its [`Region::reuse`].
+    pub fn reserve_sparse_ranges(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        Region::sparse(bytes, tag, Sparse::RangesOnly)
+    }
+
+    fn sparse(bytes: usize, tag: Tag, kind: Sparse) -> Result<Region, MemError> {
         let granule = os::page_size().max(64 << 10);
         let reserved = crate::align::checked_align_up(bytes.max(1), granule)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
-        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve {
+        let made = match kind {
+            Sparse::Readable => os::reserve_sparse(reserved),
+            Sparse::RangesOnly => os::reserve_sparse_ranges(reserved),
+        };
+        let base = made.map_err(|os| MemError::Reserve {
             tag,
             bytes: reserved,
             os,
@@ -140,7 +165,8 @@ impl Region {
             held: AtomicUsize::new(0),
             tag,
         };
-        if cfg!(windows) {
+        // Windows committed a readable sparse region whole, and counts it so.
+        if cfg!(windows) && kind == Sparse::Readable {
             region.publish(reserved);
         }
         Ok(region)

@@ -121,6 +121,20 @@ pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
     reserve(bytes, false)
 }
 
+/// [`reserve_sparse`] for a region whose owner makes each range its own with [`reuse`] before it
+/// touches it ([`crate::Region::reserve_sparse_ranges`]). Windows has no overcommit, so committing
+/// a store pool's terabytes up front fails (`ERROR_COMMITMENT_LIMIT`): there the range is only
+/// reserved and [`reuse`] commits it. Elsewhere it is [`reserve_sparse`].
+#[cfg(windows)]
+pub(crate) fn reserve_sparse_ranges(bytes: usize) -> io::Result<NonNull<u8>> {
+    reserve(bytes, false)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reserve_sparse_ranges(bytes: usize) -> io::Result<NonNull<u8>> {
+    reserve_sparse(bytes)
+}
+
 /// [`reserve`] with the pages' protection `prot`.
 #[cfg(unix)]
 fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNull<u8>> {
