@@ -56,16 +56,10 @@ pub fn stamp(path: &Path) -> Result<Option<Stamp>, ()> {
 /// The first line of a kept lookup: its format's name and version.
 pub const KEPT: &str = "blaze pin lookup 1";
 
-/// blaze's home, where what it installs and what its user says live: `$BLAZE_HOME`, else
-/// `.blaze` in the user's home. The rule of `blaze_manifest::user_config::home`, which this
-/// crate does not link (it brings cargo's manifest schema); blaze-engine's tests hold the two
-/// to one answer.
+/// blaze's home, where what it installs and what its user says live
+/// (`blaze_core::platform::home`, as `blaze_manifest::user_config::home` finds it).
 pub fn home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
-    if let Some(home) = var("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    let user = var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(user).join(".blaze"))
+    blaze_core::platform::home::homes(var).ok().map(|it| it.home)
 }
 
 /// Where the lookup from `start` is kept under blaze's `home`: `pins/<hash of start>`. None

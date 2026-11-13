@@ -373,8 +373,8 @@ pub enum Effect {
     /// that completed before this was asked for survives a crash once it completes. What a
     /// `_synced` remove, create or `sync_names` of bstd waits for; a file's bytes are
     /// [`Effect::Sync`]'s. Unix: `fsync` of the directory (Apple's: `F_FULLFSYNC`, through
-    /// `sync_all`). Windows has no such call yet and fails, naming that. A `dir` that is not
-    /// there fails. Completes with [`Done::Synced`].
+    /// `sync_all`); Windows: `FlushFileBuffers` of the directory opened with backup semantics.
+    /// A `dir` that is not there fails. Completes with [`Done::Synced`].
     SyncDir {
         dir: FileName,
         tag: Tag,

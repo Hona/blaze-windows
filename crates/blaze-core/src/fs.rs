@@ -347,20 +347,17 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// [`crate::Effect::SyncDir`] on Windows: not built. A directory's names are flushed there
-/// through a handle opened with backup semantics, which this driver does not open yet, and
-/// nothing stands in for it (rule no-fallback).
+/// [`crate::Effect::SyncDir`] on Windows: `FlushFileBuffers` of the directory, opened for
+/// writing with backup semantics (a directory opens with no other flag), which commits its
+/// entries' changes (NTFS and ReFS journal them) and flushes the device's cache.
 #[cfg(windows)]
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        // alloc: an error path.
-        format!(
-            "Effect::SyncDir of {}: this driver has no directory sync on Windows yet \
-             (FlushFileBuffers of a directory handle), and nothing stands in for it",
-            path.display()
-        ),
-    ))
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, as `windows_sys` names it.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let dir = OpenOptions::new().write(true).custom_flags(BACKUP_SEMANTICS).open(path)?;
+    // durable: the effect is the sync its caller asked for.
+    dir.sync_all()
 }
 
 /// `bytes` written at `at` of the file at `path`, which exists.

@@ -51,22 +51,7 @@ pub struct Volume {
 /// The volume `path` is on, judged by the nearest of it and its ancestors that exists (a
 /// directory not made yet is made on its parent's volume). An error names the path.
 pub fn volume(path: &Path) -> io::Result<Volume> {
-    let mut at = path;
-    loop {
-        match std::fs::symlink_metadata(at) {
-            Ok(_) => break,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                at = at.parent().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        // alloc: an error path.
-                        format!("no ancestor of {} exists to say its volume", path.display()),
-                    )
-                })?;
-            }
-            Err(error) => return Err(named(at, error)),
-        }
-    }
+    let at = existing(path)?;
     let (system, shares) = ask(at).map_err(|error| named(at, error))?;
     let sharing = if shares { Sharing::Blocks } else { Sharing::Unshared };
     Ok(Volume { system, sharing })
@@ -112,6 +97,32 @@ fn ask(_: &Path) -> io::Result<(String, bool)> {
     Ok(("WASI".into(), false))
 }
 
+/// Whether `a` and `b` are on one volume, each judged by the nearest of it and its ancestors
+/// that exists (a directory not made yet is made on its parent's): their volumes' ids, never
+/// their drive letters, which a mounted folder shares with another volume.
+pub fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    Ok(file_id(existing(a)?)?.volume == file_id(existing(b)?)?.volume)
+}
+
+/// The nearest of `path` and its ancestors that exists.
+fn existing(path: &Path) -> io::Result<&Path> {
+    let mut at = path;
+    loop {
+        match std::fs::symlink_metadata(at) {
+            Ok(_) => return Ok(at),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                at = at.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        // alloc: an error path.
+                        format!("no ancestor of {} exists to say its volume", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(named(at, error)),
+        }
+    }
+}
 /// Which file a path names, as its volume knows it: two paths name one file (one is a hard
 /// link of the other) exactly when their ids are equal. Windows: the volume's serial number
 /// and the file's 128-bit id (`FileIdInfo`, which ReFS needs); Unix: the device and inode.
