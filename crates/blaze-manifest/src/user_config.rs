@@ -5,6 +5,8 @@
 //!
 //! - `[update]`: blaze's own updates (crates/blaze-engine/src/update.rs).
 //! - `[terminal]`: what stderr's terminal does (crates/blaze-cargo/src/cli/terminal.rs).
+//! - `[sandbox]`: the machine's library directories every build script may name
+//!   (`build-script-link-dirs`, crates/blaze-cargo/src/directives.rs).
 //!
 //! Not `home::root`: that is where the daemon keeps its state and the build directories
 //! (`$BLAZE_HOME`, else a cache directory), which a user may delete; this is where what blaze
