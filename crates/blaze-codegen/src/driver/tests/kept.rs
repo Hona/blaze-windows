@@ -750,6 +750,30 @@ fn introducing_the_first_dyn_consumer_closes_the_patched_program() {
     assert!(program.engine.against.load(Ordering::Relaxed));
 }
 
+/// Std's LLVM summaries do not see a stencil-only literal. They do see the
+/// references that mark an LLVM function callable from outside those summaries.
+#[test]
+fn a_stencil_edit_reuses_release_rows_only_with_the_same_import_boundary() {
+    let mut p = tree(3);
+    p.functions.get_mut(&3).unwrap().origin = Origin::Std;
+    let kept = Kept::new();
+    let run = |p: &Program| {
+        p.begin_build();
+        let result = built(p, WHOLE, Some(&kept), None);
+        assert_eq!(difference(&result, &built(&p.copy(), WHOLE, None, None)), None);
+        result.unwrap()
+    };
+    kept.give_back(run(&p));
+    p.functions.get_mut(&2).unwrap().body += 1;
+    p.touch(2);
+    let edit = run(&p);
+    assert!(edit.work.patched);
+    kept.give_back(edit);
+    p.functions.get_mut(&2).unwrap().calls.push(3);
+    p.touch(2);
+    assert!(!run(&p).work.patched);
+}
+
 /// A build given nothing to keep describes in describes everything and says so.
 #[test]
 fn a_build_that_keeps_no_walk_says_so() {

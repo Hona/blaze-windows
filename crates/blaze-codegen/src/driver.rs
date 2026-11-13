@@ -3583,7 +3583,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     Err(now) => {
                         lists_unkept = Some(
-                            "a function is folded or built by a release backend, or the \
+                            "a function is folded or profiled, or the \
                              build's lists are not a row a function",
                         );
                         Some(now)
