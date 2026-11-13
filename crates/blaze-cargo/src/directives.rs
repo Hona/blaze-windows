@@ -13,7 +13,10 @@
 //!   ([`Ran::native`]).
 //! - `rustc-link-arg` (and its `-bins`, `-bin=`, `-tests`, `-benches`, `-examples` and
 //!   `-cdylib` forms): one of [`LINK_ARGS`], one of [`LINK_ARG_PREFIXES`] with one value that
-//!   is no further linker word, or an rpath to a directory `rustc-link-search` may name.
+//!   is no further linker word, or an rpath to a directory `rustc-link-search` may name. For an
+//!   MSVC target, also an option of [`MSVC_OPTIONS`] (`/NAME` or `-NAME`, of any case) with
+//!   the value its rule takes, and a library or an object, a `.res` or a `.def` named by
+//!   itself: a library's bare name, or a file in a directory `rustc-link-search` may name.
 //! - `rustc-env`: not a variable cargo gives a crate itself, nor one rustc, rustdoc or cargo
 //!   reads when building it ([`given_by_cargo`]).
 //!
@@ -25,8 +28,17 @@
 //!
 //! A run outside the sandbox, which its workspace took out by name, is not checked: it can do
 //! anything anyway.
+//!
+//! On a Windows host the system's directories are those of the toolchain the linker searches
+//! anyway: each directory of the script's `LIB` (what a developer prompt sets, and what
+//! `link.exe` and blaze's linker search), and the trees Visual Studio and the Windows SDK
+//! install into ([`windows_system_dirs`]). A directory is compared as Windows compares it:
+//! `C:\a`, `c:/a`, `\\?\C:\a` and the daemon's `/C:/a` are one, whatever the case of a letter.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// The system's directories of libraries, which the linker searches anyway: naming one adds
 /// nothing a script could not link already. The Nix store is the closure a script's tools
@@ -101,55 +113,163 @@ pub struct Ran<'a> {
     /// whichever workspace pinned it: a machine whose only LLVM is the one blaze fetched
     /// points `LLVM_SYS_231_PREFIX` at it.
     pub native: Option<&'a Path>,
+    /// The host's own directories of libraries beside [`SYSTEM`]: on Windows the toolchain's
+    /// ([`windows_system_dirs`]).
+    pub system: &'a [PathBuf],
+    /// Whether the script's package is built for an MSVC target, whose linker takes
+    /// [`MSVC_OPTIONS`] and files named on its line.
+    pub msvc: bool,
+    /// Whether the host spells paths as Windows does: `\` a separator, a drive first, and a
+    /// letter's case no difference ([`Spelling`]).
+    pub windows: bool,
+}
+
+/// A path as one spelling a directive's path is compared in: `/` between its parts, each `.`
+/// and `..` resolved; on a Windows host an absolute path as the daemon names it (`/C:/a`,
+/// `/UNC/server/share/a`) and ASCII letters lowered, as Windows compares names. Only
+/// compared, never opened.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Spelling {
+    parts: Vec<String>,
+    absolute: bool,
+}
+
+impl Spelling {
+    fn of(path: &str, windows: bool) -> Spelling {
+        let path = match windows {
+            true => windows_spelling(path),
+            false => std::borrow::Cow::Borrowed(path),
+        };
+        let absolute = path.starts_with('/');
+        let mut parts: Vec<String> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." if absolute || parts.last().is_some_and(|it| it != "..") => {
+                    parts.pop();
+                }
+                part if windows => parts.push(part.to_ascii_lowercase()),
+                part => parts.push(part.to_owned()),
+            }
+        }
+        Spelling { parts, absolute }
+    }
+
+    fn starts_with(&self, root: &Spelling) -> bool {
+        self.absolute == root.absolute && self.parts.starts_with(&root.parts)
+    }
+
+    /// Whether a relative path climbs out of where it starts.
+    fn climbs(&self) -> bool {
+        !self.absolute && self.parts.first().is_some_and(|it| it == "..")
+    }
+}
+
+/// `path` as the daemon spells it on Windows: `\` as `/`, `C:\a` and `\\?\C:\a` as `/C:/a`,
+/// `\\server\share` as `/UNC/server/share`.
+///
+/// windows: `blaze_core::platform::path` (lane host) is the daemon's one conversion; this is the
+/// same rule, kept here until it lands.
+fn windows_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+    let unprefixed = path.strip_prefix(r"\\?\").or_else(|| path.strip_prefix(r"\??\"));
+    if let Some(share) = unprefixed.and_then(|it| it.strip_prefix(r"UNC\")) {
+        return format!("/UNC/{}", share.replace('\\', "/")).into();
+    }
+    let rest = unprefixed.unwrap_or(path);
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|it| matches!(it, b'/' | b'\\'))
+    {
+        return format!(
+            "/{}:{}",
+            bytes[0].to_ascii_uppercase() as char,
+            rest[2..].replace('\\', "/")
+        )
+        .into();
+    }
+    if unprefixed.is_none()
+        && let Some(share) = path.strip_prefix(r"\\").or_else(|| path.strip_prefix("//"))
+    {
+        return format!("/UNC/{}", share.replace('\\', "/")).into();
+    }
+    match rest.contains('\\') {
+        true => rest.replace('\\', "/").into(),
+        false => rest.into(),
+    }
 }
 
 impl Ran<'_> {
+    fn spelling(&self, path: &Path) -> Spelling {
+        Spelling::of(&path.to_string_lossy(), self.windows)
+    }
+
     /// The target directory's build directory, whose subdirectories are every package's
     /// `OUT_DIR`: `<build>/<package>-<hash>/out` or `<build>/<package>/<hash>/out`.
-    fn build_dir(&self) -> Option<&Path> {
-        let run_dir = self.out_dir.parent()?;
-        let above = run_dir.parent()?;
-        match above.file_name().is_some_and(|it| it == "build") {
-            true => Some(above),
-            false => above.parent().filter(|it| it.file_name().is_some_and(|it| it == "build")),
+    fn build_dir(&self) -> Option<Spelling> {
+        let mut out = self.spelling(self.out_dir);
+        let is_build = |it: &Spelling| it.parts.last().is_some_and(|it| it == "build");
+        for _ in 0..2 {
+            out.parts.pop()?;
         }
+        if is_build(&out) {
+            return Some(out);
+        }
+        out.parts.pop()?;
+        is_build(&out).then_some(out)
     }
 
     /// Whether `rustc-link-search` may name `dir`.
     fn may_search(&self, dir: &str) -> bool {
-        let dir = Path::new(dir);
-        if !dir.is_absolute() {
+        self.may_search_spelt(&Spelling::of(dir, self.windows))
+    }
+
+    /// Whether the linker may read the file `file` (a library, an object, a resource, a
+    /// manifest or a module definition named on its line): one in a directory
+    /// `rustc-link-search` may name.
+    fn may_read(&self, file: &str) -> bool {
+        let mut file = Spelling::of(file, self.windows);
+        file.parts.pop().is_some() && self.may_search_spelt(&file)
+    }
+
+    fn may_search_spelt(&self, dir: &Spelling) -> bool {
+        if !dir.absolute {
             // A relative one is relative to where rustc runs, the package's directory.
-            return !dir.components().any(|it| it == std::path::Component::ParentDir);
+            return !dir.climbs();
         }
-        let dir = blaze_manifest::paths::normalize_path(dir);
-        if self.in_native_layout(&dir) {
+        if self.in_native_layout(dir) {
             return true;
         }
-        [self.out_dir, self.package_dir]
+        let paths = [self.out_dir, self.package_dir]
             .into_iter()
-            .chain(self.build_dir())
-            .chain(SYSTEM.iter().map(Path::new))
+            .chain(self.system.iter().map(PathBuf::as_path))
             .chain(self.link_dirs.iter().map(PathBuf::as_path))
-            .any(|it| dir.starts_with(it))
+            .map(|it| self.spelling(it));
+        let system = SYSTEM.iter().map(|it| Spelling::of(it, self.windows));
+        paths.chain(self.build_dir()).chain(system).any(|it| dir.starts_with(&it))
     }
 
     /// Whether `dir`, normalized, is a layout of [`Self::native`] or inside one: under a
     /// `sha256-` and 64 lowercase hex digits directly below the store, never the store itself
     /// or what a layout under way leaves beside the layouts.
-    fn in_native_layout(&self, dir: &Path) -> bool {
-        let Some(below) = self.native.and_then(|it| dir.strip_prefix(it).ok()) else {
+    fn in_native_layout(&self, dir: &Spelling) -> bool {
+        let Some(store) = self.native.map(|it| self.spelling(it)) else { return false };
+        if !dir.starts_with(&store) {
             return false;
-        };
-        below.components().next().is_some_and(|it| {
-            it.as_os_str().to_str().and_then(|it| it.strip_prefix("sha256-")).is_some_and(|hex| {
-                hex.len() == 64 && hex.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'))
-            })
-        })
+        }
+        dir.parts.get(store.parts.len()).and_then(|it| it.strip_prefix("sha256-")).is_some_and(
+            |hex| hex.len() == 64 && hex.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f')),
+        )
     }
 
     /// Why the link argument `arg` is refused, `None` when it is not.
     fn link_arg_refused(&self, arg: &str) -> Option<String> {
+        if self.msvc
+            && let Some(verdict) = self.msvc_arg(arg)
+        {
+            return verdict.err();
+        }
         let rpath =
             ["-Wl,-rpath,", "-Wl,-rpath=", "-Wl,-R"].iter().find_map(|it| arg.strip_prefix(it));
         if let Some(dir) = rpath {
@@ -175,6 +295,213 @@ impl Ran<'_> {
          of blaze's pinned native inputs or one `build-script-link-dirs` names"
             .to_owned()
     }
+
+    /// The verdict on `arg` for an MSVC linker: `None` when it is no MSVC form (a `-` word no
+    /// option of [`MSVC_OPTIONS`] names, which the other rules judge), else whether it may be
+    /// given and why not.
+    fn msvc_arg(&self, arg: &str) -> Option<Result<(), String>> {
+        let Some(option) = arg.strip_prefix('/').or_else(|| arg.strip_prefix('-')) else {
+            return Some(self.msvc_file(arg));
+        };
+        let (name, value) = match option.split_once(':') {
+            Some((name, value)) => (name, Some(value)),
+            None => (option, None),
+        };
+        let upper = name.to_ascii_uppercase();
+        let Some((_, takes)) = MSVC_OPTIONS.iter().find(|(it, _)| *it == upper) else {
+            // `-pthread` and the like are the other rules'; a `/` word is an MSVC option
+            // whatever it is.
+            return arg.starts_with('/').then(|| {
+                Err(format!(
+                    "`/{name}`, an MSVC link option that is not one a build script may give ({})",
+                    allowed_msvc_options()
+                ))
+            });
+        };
+        let wrong = |what: &str| Err(format!("`/{upper}` {what}"));
+        Some(match (takes, value) {
+            (Takes::Nothing, None) => Ok(()),
+            (Takes::Nothing, Some(_)) => wrong("takes no value"),
+            (Takes::OptionalWord | Takes::OptionalLibrary, None) => Ok(()),
+            (Takes::Word | Takes::Text | Takes::File | Takes::Library | Takes::Dir, None) => {
+                wrong("takes a value after `:`")
+            }
+            (Takes::Word | Takes::OptionalWord, Some(value)) => match word(value) {
+                true => Ok(()),
+                false => wrong(&format!(
+                    "takes a name, a number or a list of them, not `{value}`: no path, space or \
+                     quote"
+                )),
+            },
+            (Takes::Text, Some(value)) => match value.contains(['/', '\\']) {
+                false => Ok(()),
+                true => wrong(&format!("takes text that names no path, not `{value}`")),
+            },
+            (Takes::File, Some(value)) => match self.may_read(value) {
+                true => Ok(()),
+                false => wrong(&format!("names `{value}`, a file in none of {}", self.places())),
+            },
+            (Takes::Library | Takes::OptionalLibrary, Some(value)) => self.msvc_library(value),
+            (Takes::Dir, Some(value)) => match self.may_search(value) {
+                true => Ok(()),
+                false => wrong(&format!("names `{value}`, which is none of {}", self.places())),
+            },
+        })
+    }
+
+    /// A file named on an MSVC linker's line by itself: a library (`delayimp.lib`, a name the
+    /// linker looks for on its search path, or a path), or an object, a compiled resource or a
+    /// module definition in a directory `rustc-link-search` may name.
+    fn msvc_file(&self, arg: &str) -> Result<(), String> {
+        let lower = arg.to_ascii_lowercase();
+        if lower.ends_with(".lib") || lower.ends_with(".a") {
+            return self.msvc_library(arg);
+        }
+        if !MSVC_FILES.iter().any(|it| lower.ends_with(it)) {
+            return Err(format!(
+                "`{arg}`, which is neither an MSVC link option nor a library, object, resource or \
+                 module definition ({})",
+                allowed_msvc_options()
+            ));
+        }
+        match self.may_read(arg) {
+            true => Ok(()),
+            false => Err(format!("`{arg}`, a file in none of {}", self.places())),
+        }
+    }
+
+    /// A library on an MSVC linker's line: its bare name, which the linker finds on the search
+    /// path the rules hold, or a path to one where `rustc-link-search` may go.
+    fn msvc_library(&self, library: &str) -> Result<(), String> {
+        let path = library.contains(['/', '\\', ':']);
+        match (path, path && self.may_read(library) || !path && word(library)) {
+            (_, true) => Ok(()),
+            (true, false) => {
+                Err(format!("the library `{library}`, a file in none of {}", self.places()))
+            }
+            (false, false) => Err(format!("the library `{library}`, which is no library's name")),
+        }
+    }
+}
+
+/// What an MSVC link option takes after its `:`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Takes {
+    /// No value: `/NOLOGO`.
+    Nothing,
+    /// One [`word`] or a `,` list of them: a name, a symbol, a number, a section's attributes.
+    Word,
+    /// A [`Takes::Word`], or no value: `/DEBUG`, `/DEBUG:FULL`.
+    OptionalWord,
+    /// Text that names no path: `/MANIFESTUAC:"level='asInvoker' uiAccess='false'"`.
+    Text,
+    /// A file the linker reads, in a directory `rustc-link-search` may name.
+    File,
+    /// A library: its name, or a path to one as [`Takes::File`].
+    Library,
+    /// A [`Takes::Library`], or no value: `/NODEFAULTLIB` alone takes every default away.
+    OptionalLibrary,
+    /// A directory the linker searches, one `rustc-link-search` may name.
+    Dir,
+}
+
+/// The MSVC link options a build script may give (rune-desktop's `/SUBSYSTEM`, `/ENTRY` and
+/// `/DELAYLOAD`, tauri's `/MANIFEST:EMBED`, `/MANIFESTINPUT` and `/WX`, the hybrid CRT's
+/// `/NODEFAULTLIB` and `/DEFAULTLIB`), by name, with what each takes: what changes how the
+/// image is linked, never which program links it, nor a file it writes (`/OUT`, `/PDB`,
+/// `/IMPLIB`, `/MAP:`, `/MANIFESTFILE` are none of these) or reads outside the places a search
+/// may go. `windows/link` reads each of them (`blaze-link`'s `Spelling::Msvc`). Sorted.
+pub const MSVC_OPTIONS: [(&str, Takes); 43] = [
+    ("ALTERNATENAME", Takes::Word),
+    ("BASE", Takes::Word),
+    ("CETCOMPAT", Takes::OptionalWord),
+    ("DEBUG", Takes::OptionalWord),
+    ("DEBUGTYPE", Takes::Word),
+    ("DEF", Takes::File),
+    ("DEFAULTLIB", Takes::Library),
+    ("DELAY", Takes::Word),
+    ("DELAYLOAD", Takes::Word),
+    ("DYNAMICBASE", Takes::OptionalWord),
+    ("ENTRY", Takes::Word),
+    ("EXPORT", Takes::Word),
+    ("FIXED", Takes::OptionalWord),
+    ("FORCE", Takes::OptionalWord),
+    ("GUARD", Takes::Word),
+    ("HEAP", Takes::Word),
+    ("HIGHENTROPYVA", Takes::OptionalWord),
+    ("IGNORE", Takes::Word),
+    ("INCLUDE", Takes::Word),
+    ("INCREMENTAL", Takes::OptionalWord),
+    ("LARGEADDRESSAWARE", Takes::OptionalWord),
+    ("LIBPATH", Takes::Dir),
+    ("MANIFEST", Takes::OptionalWord),
+    ("MANIFESTDEPENDENCY", Takes::Text),
+    ("MANIFESTINPUT", Takes::File),
+    ("MANIFESTUAC", Takes::Text),
+    ("MERGE", Takes::Word),
+    ("NATVIS", Takes::File),
+    ("NODEFAULTLIB", Takes::OptionalLibrary),
+    ("NOLOGO", Takes::Nothing),
+    ("NXCOMPAT", Takes::OptionalWord),
+    ("OPT", Takes::Word),
+    ("OSVERSION", Takes::Word),
+    ("RELEASE", Takes::Nothing),
+    ("SAFESEH", Takes::OptionalWord),
+    ("SECTION", Takes::Word),
+    ("STACK", Takes::Word),
+    ("STUB", Takes::File),
+    ("SUBSYSTEM", Takes::Word),
+    ("TSAWARE", Takes::OptionalWord),
+    ("VERSION", Takes::Word),
+    ("WHOLEARCHIVE", Takes::OptionalLibrary),
+    ("WX", Takes::OptionalWord),
+];
+
+/// What an MSVC linker reads when it is named by itself on its line, besides a library
+/// (`.lib`, `.a`): an object, a compiled resource (winresource's `resource.res`), and an
+/// export file.
+const MSVC_FILES: [&str; 4] = [".obj", ".o", ".res", ".exp"];
+
+/// Whether `value` is one word or a `,` list of words an MSVC option takes: a name, a symbol
+/// (C++'s `?f@@YAXXZ`), a number, `.rdata=.text`. No path: no `/`, `\` or `:`; no space or
+/// quote, which would make it more words of the line.
+fn word(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['/', '\\', ':', '"', '\''])
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn allowed_msvc_options() -> String {
+    let names: Vec<String> = MSVC_OPTIONS.iter().map(|(name, _)| format!("`/{name}`")).collect();
+    format!(
+        "{}, and a library, object, resource or export file in a directory the search may name",
+        names.join(", ")
+    )
+}
+
+/// The directories a Windows host's linker searches anyway, from a script's environment `env`:
+/// each of `LIB`'s, which a developer prompt sets for the toolchain it chose, and the trees
+/// Visual Studio and the Windows SDK install into (`ProgramFiles`, `ProgramFiles(x86)`), where
+/// `cc` finds the toolchain by itself (vswhere, the registry) and names, for one, ATL's `lib`.
+/// Names compare as Windows compares them ([`Spelling`]).
+pub fn windows_system_dirs(env: &[(OsString, OsString)]) -> Vec<PathBuf> {
+    let var = |name: &str| {
+        env.iter().rev().find(|(it, _)| it.eq_ignore_ascii_case(name)).map(|(_, value)| value)
+    };
+    // alloc: once per run checked, a few directories
+    let mut dirs = Vec::new();
+    if let Some(lib) = var("LIB") {
+        dirs.extend(
+            lib.to_string_lossy().split(';').filter(|it| !it.is_empty()).map(PathBuf::from),
+        );
+    }
+    for root in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(root) = var(root) else { continue };
+        for tree in ["Microsoft Visual Studio", "Windows Kits"] {
+            dirs.push(Path::new(root).join(tree));
+        }
+    }
+    dirs
 }
 
 /// Whether a value after a prefix is one word of the linker's that names no path above where
@@ -422,7 +749,7 @@ pub fn link_dirs(
                 ));
             };
             let value = Path::new(value);
-            if !value.is_absolute() {
+            if !Spelling::of(&value.to_string_lossy(), cfg!(windows)).absolute {
                 return Err(format!(
                     "`{dir}` of `build-script-link-dirs`: `{name}` is `{}`, which is no absolute path",
                     value.display()
@@ -433,16 +760,21 @@ pub fn link_dirs(
         .collect()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A run on a Unix host for a Unix target, whatever the host the test runs on: the rules
+    /// are text, compared as the run's host would.
     fn ran() -> Ran<'static> {
         Ran {
             package_dir: Path::new("/src/pkg"),
             out_dir: Path::new("/t/debug/build/pkg/0123/out"),
             link_dirs: Vec::<PathBuf>::leak(vec!["/opt/vendor/lib".into()]), // alloc: a test's, leaked
             native: Some(Path::new("/home/u/.blaze/native")),
+            system: &[],
+            msvc: false,
+            windows: false,
         }
     }
 
@@ -540,9 +872,15 @@ mod tests {
             refused_lines(&stdout),
             [
                 "cargo:rustc-link-search=native=/home/u/.blaze/native".to_owned(),
-                format!("cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}.new/lib"),
-                format!("cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}/../../../.ssh"),
-                format!("cargo:rustc-link-search=native=/home/other/.blaze/native/sha256-{digest}/lib"),
+                format!(
+                    "cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}.new/lib"
+                ),
+                format!(
+                    "cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}/../../../.ssh"
+                ),
+                format!(
+                    "cargo:rustc-link-search=native=/home/other/.blaze/native/sha256-{digest}/lib"
+                ),
             ]
         );
         let none = Ran { native: None, ..ran() };
@@ -635,7 +973,8 @@ mod tests {
 
     /// A link dir under a variable is where the script's environment puts it, and the search it
     /// prints there is allowed; an unset or relative variable is an error naming it, never a
-    /// dir left out.
+    /// dir left out. (Unix paths, joined as the host joins them: on Unix.)
+    #[cfg(unix)]
     #[test]
     fn a_link_dir_under_a_variable_is_where_the_scripts_environment_puts_it() {
         use std::ffi::OsString;
@@ -656,5 +995,143 @@ mod tests {
         );
         let relative = link_dirs(&dirs, &env("llvm")).unwrap_err();
         assert!(relative.contains("no absolute path"), "{relative}");
+    }
+
+    /// A run on a Windows host for `x86_64-pc-windows-msvc`, its package and `OUT_DIR` named as
+    /// the daemon names them, with the toolchain of a developer prompt in its `LIB`.
+    fn windows_ran(system: &'static [PathBuf]) -> Ran<'static> {
+        Ran {
+            package_dir: Path::new("/C:/src/app"),
+            out_dir: Path::new("/C:/src/target/debug/build/app-0123/out"),
+            link_dirs: &[],
+            native: Some(Path::new("/C:/Users/u/.blaze/native")),
+            system,
+            msvc: true,
+            windows: true,
+        }
+    }
+
+    fn windows_system() -> &'static [PathBuf] {
+        let env: Vec<(OsString, OsString)> = vec![
+            (
+                "Lib".into(),
+                r"C:\msvc\VC\Tools\MSVC\14.52\lib\x64;C:\Kits\10\Lib\10.0.26100.0\um\x64;".into(),
+            ),
+            ("ProgramFiles".into(), r"C:\Program Files".into()),
+            ("ProgramFiles(x86)".into(), r"C:\Program Files (x86)".into()),
+        ];
+        Vec::leak(windows_system_dirs(&env)) // alloc: a test's, leaked
+    }
+
+    /// A Windows path is compared as Windows compares it: any separator, any spelling of the
+    /// drive, any case. The package, `OUT_DIR`, the build directory, `LIB` and the Visual Studio
+    /// and SDK trees may be searched; the home, another drive and a `..` out may not.
+    #[test]
+    fn a_windows_link_search_is_compared_as_windows_compares_it() {
+        let ran = windows_ran(windows_system());
+        let stdout = "cargo:rustc-link-search=native=C:\\src\\target\\debug\\build\\app-0123\\out\n\
+                      cargo:rustc-link-search=native=c:/SRC/target/debug/build/zlib-4567/out/lib\n\
+                      cargo:rustc-link-search=native=\\\\?\\C:\\src\\app\\vendor\\lib\n\
+                      cargo:rustc-link-search=native=/C:/src/app/lib\n\
+                      cargo:rustc-link-search=native=C:\\msvc\\VC\\Tools\\MSVC\\14.52\\lib\\x64\n\
+                      cargo:rustc-link-search=native=C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\atlmfc\\lib\\x64\n\
+                      cargo:rustc-link-search=native=C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\n\
+                      cargo:rustc-link-search=native=vendor\\lib\n\
+                      cargo:rustc-link-search=native=C:\\Users\\u\\AppData\\Local\\seer\\ghostty-vt\\abc\n\
+                      cargo:rustc-link-search=native=D:\\src\\app\n\
+                      cargo:rustc-link-search=native=C:\\src\\app\\..\\..\\Users\\u\n\
+                      cargo:rustc-link-search=native=..\\outside\n";
+        let lines: Vec<String> =
+            refused(stdout.as_bytes(), &ran).into_iter().map(|it| it.line).collect();
+        assert_eq!(
+            lines,
+            [
+                "cargo:rustc-link-search=native=C:\\Users\\u\\AppData\\Local\\seer\\ghostty-vt\\abc",
+                "cargo:rustc-link-search=native=D:\\src\\app",
+                "cargo:rustc-link-search=native=C:\\src\\app\\..\\..\\Users\\u",
+                "cargo:rustc-link-search=native=..\\outside",
+            ]
+        );
+        // Without the toolchain's directories (no developer prompt, a host other than Windows),
+        // a search into them is refused like any other.
+        let bare = windows_ran(&[]);
+        let msvc = "cargo:rustc-link-search=native=C:\\msvc\\VC\\Tools\\MSVC\\14.52\\lib\\x64\n";
+        assert_eq!(refused(msvc.as_bytes(), &bare).len(), 1);
+    }
+
+    /// rune-desktop's `apps/desktop` and tauri's link options, winresource's `.res` and a
+    /// library by name pass; a file the linker would write, a program it would load, a file
+    /// outside the places a search may go and an option no rule names are refused.
+    #[test]
+    fn msvc_link_args_are_the_options_and_files_the_rules_name() {
+        let ran = windows_ran(windows_system());
+        let given = "cargo:rustc-link-arg-bin=opencode-desktop=/SUBSYSTEM:WINDOWS\n\
+                     cargo:rustc-link-arg-bin=opencode-desktop=/ENTRY:mainCRTStartup\n\
+                     cargo:rustc-link-arg-bin=opencode-desktop=/DELAYLOAD:comctl32.dll\n\
+                     cargo:rustc-link-arg-bin=opencode-desktop=delayimp.lib\n\
+                     cargo:rustc-link-arg-bins=/MANIFEST:EMBED\n\
+                     cargo:rustc-link-arg-bins=/MANIFESTINPUT:C:\\src\\app\\assets\\app.manifest\n\
+                     cargo:rustc-link-arg=/WX\n\
+                     cargo:rustc-link-arg=/subsystem:console,6.0\n\
+                     cargo:rustc-link-arg=-STACK:8388608\n\
+                     cargo:rustc-link-arg=/NODEFAULTLIB:libucrt.lib\n\
+                     cargo:rustc-link-arg=/NODEFAULTLIB\n\
+                     cargo:rustc-link-arg=/DEFAULTLIB:ucrt.lib\n\
+                     cargo:rustc-link-arg=/WHOLEARCHIVE:C:\\src\\target\\debug\\build\\app-0123\\out\\glue.lib\n\
+                     cargo:rustc-link-arg=/DEBUG:FULL\n\
+                     cargo:rustc-link-arg=/OPT:REF,ICF\n\
+                     cargo:rustc-link-arg=/NOLOGO\n\
+                     cargo:rustc-link-arg=/INCREMENTAL:NO\n\
+                     cargo:rustc-link-arg=/MANIFESTUAC:level='asInvoker' uiAccess='false'\n\
+                     cargo:rustc-link-arg=C:\\src\\target\\debug\\build\\app-0123\\out\\resource.res\n\
+                     cargo:rustc-link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\n\
+                     cargo:rustc-link-arg=-lstdc++\n";
+        let refused_lines = |stdout: &str| -> Vec<String> {
+            refused(stdout.as_bytes(), &ran).into_iter().map(|it| it.line).collect()
+        };
+        assert_eq!(refused_lines(given), Vec::<String>::new());
+        let bad = "cargo:rustc-link-arg=/OUT:C:\\Windows\\evil.exe\n\
+                   cargo:rustc-link-arg=/PDB:C:\\Users\\u\\x.pdb\n\
+                   cargo:rustc-link-arg=/MANIFESTFILE:C:\\Users\\u\\m\n\
+                   cargo:rustc-link-arg=/DELAYLOAD:..\\evil.dll\n\
+                   cargo:rustc-link-arg=/ENTRY\n\
+                   cargo:rustc-link-arg=/NOLOGO:YES\n\
+                   cargo:rustc-link-arg=/DEFAULTLIB:C:\\Users\\u\\evil.lib\n\
+                   cargo:rustc-link-arg=C:\\Users\\u\\evil.res\n\
+                   cargo:rustc-link-arg=/MANIFESTINPUT:D:\\m.manifest\n\
+                   cargo:rustc-link-arg=/LIBPATH:C:\\Users\\u\n\
+                   cargo:rustc-link-arg=C:\\tools\\plugin.dll\n\
+                   cargo:rustc-link-arg=/MANIFESTDEPENDENCY:C:\\x\n";
+        assert_eq!(refused_lines(bad), bad.lines().collect::<Vec<_>>());
+        // The same options on a target whose linker is not MSVC's are no option of its.
+        let unix = "cargo:rustc-link-arg=/SUBSYSTEM:WINDOWS\n";
+        assert_eq!(refused(unix.as_bytes(), &ran_unix_target()).len(), 1);
+    }
+
+    fn ran_unix_target() -> Ran<'static> {
+        Ran { msvc: false, ..windows_ran(&[]) }
+    }
+
+    #[test]
+    fn the_msvc_options_are_sorted_and_upper_case() {
+        assert!(MSVC_OPTIONS.windows(2).all(|it| it[0].0 < it[1].0), "{MSVC_OPTIONS:?}");
+        assert!(MSVC_OPTIONS.iter().all(|(it, _)| it.bytes().all(|b| b.is_ascii_uppercase())));
+    }
+
+    /// rune-desktop's terminal links Ghostty's library from the machine's cache under
+    /// `%LOCALAPPDATA%`: a workspace that names it under a variable (`${LOCALAPPDATA}/seer`)
+    /// lets the search there and nowhere beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_link_dir_under_a_variable_is_where_the_scripts_environment_puts_it() {
+        let env: Vec<(OsString, OsString)> =
+            vec![("LOCALAPPDATA".into(), r"C:\Users\u\AppData\Local".into())];
+        let found = link_dirs(&["${LOCALAPPDATA}/seer/ghostty-vt".to_owned()], &env).unwrap();
+        let ran = Ran { link_dirs: &found, ..windows_ran(&[]) };
+        let ok =
+            "cargo:rustc-link-search=native=C:\\Users\\u\\AppData\\Local\\seer\\ghostty-vt\\0f3a\n";
+        assert!(refused(ok.as_bytes(), &ran).is_empty());
+        let beside = "cargo:rustc-link-search=native=C:\\Users\\u\\AppData\\Local\\other\n";
+        assert_eq!(refused(beside.as_bytes(), &ran).len(), 1);
     }
 }
