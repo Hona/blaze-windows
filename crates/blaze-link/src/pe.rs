@@ -22,7 +22,10 @@
 //! always there, no base relocation lands in code and there is no CFG.
 
 mod coff;
+pub(crate) mod delay;
 mod image;
+pub(crate) mod rsrc;
+pub(crate) mod raw_dylib;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -143,7 +146,11 @@ impl Pe {
     }
 
     pub(crate) fn base(&self) -> u64 {
-        if self.dll() { DLL_BASE } else { EXE_BASE }
+        match self.output.link.pe.base {
+            Some(base) => base,
+            None if self.dll() => DLL_BASE,
+            None => EXE_BASE,
+        }
     }
 
     pub(crate) fn dev_run(&self) -> bool {
@@ -204,22 +211,28 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Patch => (Segment::Text, 1, ""),
         Class::Stubs => (Segment::Text, 2, ""),
         Class::Plt => (Segment::Text, 3, ""),
+        Class::Synthetic(delay::DELAY_CODE) => (Segment::Text, 4, ""),
         Class::Named { name, exec: true, .. } => (Segment::Text, 5, name),
-        Class::Rodata => (Segment::Rdata, 0, ""),
+        // The import address table, first in `.rdata` as link.exe lays it: once it has bound
+        // the cells, the loader makes the pages the IAT directory spans read-only, whatever
+        // section they are in, so nothing written may share them (seen on Windows 11 26100:
+        // the static CRT's first write to `.data` after an IAT there faulted).
+        Class::Got => (Segment::Rdata, 0, ""),
+        Class::Rodata => (Segment::Rdata, 1, ""),
         // The loader applies base relocations to read-only pages too: link.exe's `.rdata`
         // holds vtables.
-        Class::RelRo => (Segment::Rdata, 1, ""),
-        Class::EhFrame => (Segment::Rdata, 2, ""),
-        Class::Synthetic(IDATA) => (Segment::Rdata, 3, ""),
-        Class::Synthetic(EDATA) => (Segment::Rdata, 4, ""),
-        Class::Synthetic(DEBUG) => (Segment::Rdata, 5, ""),
-        Class::Synthetic(TLS_DIR) => (Segment::Rdata, 6, ""),
+        Class::RelRo => (Segment::Rdata, 2, ""),
+        Class::EhFrame => (Segment::Rdata, 3, ""),
+        Class::Synthetic(IDATA) => (Segment::Rdata, 4, ""),
+        Class::Synthetic(EDATA) => (Segment::Rdata, 5, ""),
+        Class::Synthetic(DEBUG) => (Segment::Rdata, 6, ""),
+        Class::Synthetic(TLS_DIR) => (Segment::Rdata, 7, ""),
         Class::Named { name, .. } if name == OBJ_PDATA => (Segment::Pdata, 0, name),
         Class::Named { name, .. } if name == RSRC => (Segment::Rsrc, 0, name),
-        Class::Named { name, write: false, .. } => (Segment::Rdata, 7, name),
+        Class::Named { name, write: false, .. } => (Segment::Rdata, 8, name),
         Class::Data => (Segment::Data, 0, ""),
         Class::Table => (Segment::Data, 1, ""),
-        Class::Got => (Segment::Data, 2, ""),
+        Class::Synthetic(delay::DELAY_DATA) => (Segment::Data, 2, ""),
         Class::PatchData => (Segment::Data, 3, ""),
         Class::InitArray => (Segment::Data, 4, ""),
         // ELF's alone: `image::sections` refuses one.
@@ -234,8 +247,27 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Tdata => (Segment::Tls, 0, ""),
         Class::Tbss => (Segment::Tls, 1, ""),
         Class::Synthetic(RELOC) => (Segment::Reloc, 0, ""),
-        Class::Synthetic(name) => (Segment::Rdata, 8, name),
+        Class::Synthetic(name) => (Segment::Rdata, 9, name),
         Class::Reserve(reserve) => (Segment::Reserve(*reserve), 0, ""),
+    }
+}
+
+/// The named sections link.exe lays into `.rdata` with the rest of the read-only data: the
+/// CRT's initializer tables and `/RTC` tables (its objects' `/MERGE:.CRT=.rdata` and
+/// `/MERGE:.rtc=.rdata`), and the guard's function pointers (`.00cfg`, which link.exe merges
+/// itself).
+pub(crate) const MERGED: &[&str] = &[CRT, ".rtc", ".00cfg"];
+
+/// Whether `class` is a section of its own in the image, as link.exe keeps each section name
+/// no `/MERGE` folds into another: every named class but the tables the writer gathers
+/// (`.pdata`, `.rsrc`) and [`MERGED`]'s. Its pages are its own ([`Writer::own_pages`]).
+pub(crate) fn own_section(class: &Class) -> bool {
+    match class {
+        Class::Named { name, .. } => {
+            let name: &str = name;
+            name != OBJ_PDATA && name != RSRC && !MERGED.contains(&name)
+        }
+        _ => false,
     }
 }
 
@@ -287,6 +319,14 @@ impl Writer for Pe {
             run.sort_by(|a, b| place(a).2.cmp(place(b).2));
         }
         classes.dedup();
+    }
+
+    fn own_pages(&self, class: &Class) -> bool {
+        own_section(class)
+    }
+
+    fn searched_roots(&self) -> &'static [&'static str] {
+        &["_load_config_used"]
     }
 
     fn prot(&self, class: &Class) -> Prot {
@@ -360,7 +400,7 @@ impl Writer for Pe {
     }
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
-        image::synthetic(counts, self.dev_run())
+        image::synthetic(counts, self.dev_run(), !self.output.link.pe.delay_load.is_empty())
     }
 
     fn apply(
@@ -392,6 +432,16 @@ impl Writer for Pe {
 
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
         image::file(self, placed)
+    }
+
+    fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        let mut slots = image::iat_slots(placed)?;
+        // A delay-loaded function's GOT cell holds its stub's address ([`delay`]).
+        if let Some(delay) = delay::tables(self, placed)? {
+            slots.extend(delay.cells);
+            radix::sort_by_key(&mut slots, |it: &(u64, u64)| it.0);
+        }
+        Ok(slots)
     }
 
     fn shared_entry(&self) -> Option<&'static str> {

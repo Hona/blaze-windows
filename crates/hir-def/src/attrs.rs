@@ -2292,6 +2292,42 @@ impl AttrFlags {
         }
     }
 
+    /// The ordinal `#[link_ordinal(n)]` imports a foreign item of a `raw-dylib` block by, as
+    /// written: `Err` of the text when it is no integer of 16 bits, the range a DLL's ordinals
+    /// have (rustc's `link_ordinal` refuses it the same way).
+    #[inline]
+    pub fn link_ordinal(db: &Db, owner: AttrDefId) -> Option<Result<u16, Box<str>>> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_ORDINAL) {
+            return None;
+        }
+        return link_ordinal(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn link_ordinal(db: &Db, owner: AttrDefId) -> Option<Result<u16, Box<str>>> {
+            collect_attrs(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && let Some(path) = attr.path()
+                    && is_one(path, "link_ordinal")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let value = match Itertools::exactly_one(TokenTreeChildren::new(tt)) {
+                        Ok(NodeOrToken::Token(value)) => match ast::IntNumber::cast(value) {
+                            Some(int) => int
+                                .value()
+                                .ok()
+                                .and_then(|it| u16::try_from(it).ok())
+                                .ok_or_else(|| Box::from(int.text())),
+                            None => Err(Box::from(value.text())),
+                        },
+                        Ok(NodeOrToken::Node(_)) | Err(_) => Err(Box::from("..")),
+                    };
+                    return ControlFlow::Break(value);
+                }
+                ControlFlow::Continue(())
+            })
+        }
+    }
+
     /// The diagnostic item `#[rustc_diagnostic_item = ".."]` names an item, rustc's
     /// `diagnostic_items` entry for it.
     #[inline]
@@ -2707,6 +2743,17 @@ impl AttrFlags {
                 }
             },
         )
+    }
+
+    /// `#![windows_subsystem = ".."]` of `krate`'s root, its `cfg_attr`s expanded (the
+    /// common `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`): `true` for
+    /// `"windows"`, a GUI program the loader gives no console, as rustc links it with
+    /// `/SUBSYSTEM:WINDOWS`; `false` for `"console"` or none. Another value is the attribute
+    /// check's error (E0539), never reached by a build.
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    pub fn windows_subsystem(db: &Db, krate: Crate) -> bool {
+        let root = crate::nameres::crate_def_map(db, krate).root_module_id();
+        symbol_attr(db, root.into(), "windows_subsystem").is_some_and(|it| it.as_str() == "windows")
     }
 
     #[inline]

@@ -209,6 +209,13 @@ fn member<'a>(
     name: Input<'_>,
     bytes: &'a [u8],
 ) -> Result<Parsed<'a>, String> {
+    if super::rsrc::is_res(bytes) {
+        return Err(fail(
+            name,
+            "a compiled resource file (.res) read as an object: the link merges the .res files on \
+             its line into one object of their resources (`target::locate`)",
+        ));
+    }
     if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0)
         && u16_at(bytes, 2) == Some(0xffff)
     {
@@ -400,7 +407,20 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
             index.push((names.push(&symbol_name).map_err(|e| fail(name, e))?, member));
         }
     }
-    if index.is_empty() && !members.is_empty() && !whole {
+    // No index: fine when no member defines a symbol one would name (rustc's rlib of a crate
+    // with no code of its own holds `lib.rmeta` and objects with no external definition).
+    let defines = |member: &Member| -> bool {
+        use object::{Object as _, ObjectSymbol as _};
+        let data = &bytes[member.bytes.clone()];
+        if u16_at(data, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0) && u16_at(data, 2) == Some(0xffff) {
+            return true;
+        }
+        match object::read::coff::CoffFile::<&[u8]>::parse(data) {
+            Ok(file) => file.symbols().any(|it| it.is_global() && it.is_definition()),
+            Err(_) => false,
+        }
+    };
+    if index.is_empty() && !whole && members.iter().any(defines) {
         return Err(fail(
             name,
             "an archive with no symbol index, so no member of it can be taken for a symbol (index it \
@@ -734,8 +754,6 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             SectionKind::Dropped
         } else if base == OBJ_PDATA {
             SectionKind::Unwind(super::named(OBJ_PDATA.into(), false, false))
-        } else if base == ".xdata" {
-            SectionKind::Unwind(Class::Rodata)
         } else {
             let write = flags & pe::IMAGE_SCN_MEM_WRITE.0 != 0;
             let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0;
@@ -1002,7 +1020,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                         self.sections.names[index]
                     ))
                 })?;
-            let name = if leader.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
+            let own = leader.storage_class() != pe::IMAGE_SYM_CLASS_EXTERNAL;
+            let name = if !own {
                 // An external symbol in a section is always one of the object's.
                 match read.map.get(second as usize).copied().filter(|it| *it != NONE) {
                     Some(symbol) => read.symbols[symbol as usize].name,
@@ -1022,7 +1041,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let group = object.groups.len() as u32;
             group_of[index] = group;
             members.push((group, index as u32));
-            object.groups.push(Group { name, sections: 0..0, largest });
+            object.groups.push(Group { name, sections: 0..0, largest, local: own });
         }
         for index in 0..count {
             if group_of[index] != ASSOCIATIVE {
@@ -1228,11 +1247,27 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 });
                 object.directives.push(Directive::NoDefaultLib(library));
             }
-            // These change nothing a program observes: section merging (every section of
-            // a protection is laid out together already), incremental-link padding, the
+            // The CRT's `/MERGE:.CRT=.rdata` and `/MERGE:.rtc=.rdata`: the writer lays those
+            // into `.rdata` already (`pe::MERGED`). Any other merge would change the image's
+            // sections.
+            b"merge" => {
+                let arg = arg.ok_or_else(need)?;
+                let merged = arg.split_once('=').is_some_and(|(from, to)| {
+                    to.eq_ignore_ascii_case(".rdata")
+                        && super::MERGED.iter().any(|it| it.eq_ignore_ascii_case(from))
+                });
+                if !merged {
+                    return Err(self.err(format_args!(
+                        "the .drectve option {word}: blaze merges only {} into .rdata",
+                        super::MERGED.join(", ")
+                    )));
+                }
+            }
+            // These change nothing a program observes: incremental-link padding, the
             // control-flow-guard tables of /guard:cf (off), a check that a library is not
-            // linked.
-            b"merge" | b"editandcontinue" | b"guardsym" | b"disallowlib" => {}
+            // linked, and the CRT's `new_scalar.obj` telling link.exe's whole-program
+            // optimizer (`/LTCG`, which blaze does not do) that `operator new` throws.
+            b"editandcontinue" | b"guardsym" | b"disallowlib" | b"throwingnew" => {}
             _ => {
                 return Err(self.err(format_args!(
                     "the .drectve option {word}, which blaze does not link (it would change the image \
@@ -1333,79 +1368,97 @@ fn default_library(name: &str) -> (&str, &'static str) {
 /// asking) and named as link.exe names it (`.lib` added when it has no extension). Only the
 /// section table and `.drectve` are read. An import member asks for nothing, and an anonymous
 /// object built for LTCG or `/clr` carries its directives in what blaze does not read; the
-/// engine refuses such a member if it is ever taken.
+/// engine refuses such a member if it is ever taken. A COFF object on the line (not an
+/// archive) is read as one member named `""`: link.exe follows its `/DEFAULTLIB`s alike.
 pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     let input = Input { file: name, member: None };
+    // alloc: once per library searched for its default libraries (setup, kept per process)
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut quoted = scratch::lend_string();
+    if !bytes.starts_with(b"!<arch>\n") {
+        asked_of(input, "", bytes, &mut out, &mut quoted)?;
+        return Ok(out);
+    }
     let file =
         ArchiveFile::parse(bytes).map_err(|e| fail(input, format_args!("not an archive: {e}")))?;
     if file.is_thin() {
         return Err(fail(input, "a thin archive, which link.exe does not read"));
     }
-    // alloc: once per library searched for its default libraries (setup, kept per process)
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut quoted = scratch::lend_string();
     for member in file.members() {
         let member = member.map_err(|e| fail(input, e))?;
         let member_name = text(member.name()).map_err(|e| fail(input, e))?;
         let at = Input { file: name, member: Some(&member_name) };
         let data = member.data(bytes).map_err(|e| fail(at, e))?;
-        let drectve = match (u16_at(data, 0).map(pe::Machine), u16_at(data, 2), u16_at(data, 4)) {
-            (Some(pe::IMAGE_FILE_MACHINE_UNKNOWN), Some(0xffff), Some(version)) => {
-                if version >= 2 && data.get(12..28) == Some(&BIGOBJ[..]) {
-                    drectve::<pe::AnonObjectHeaderBigobj>(at, data)?
-                } else {
-                    None
-                }
-            }
-            _ => drectve::<pe::ImageFileHeader>(at, data)?,
-        };
-        let Some(drectve) = drectve else { continue };
-        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve))
-            .map_err(|e| fail(at, e))?;
-        let start = out.len();
-        let mut none = false;
-        // alloc: none unless a member takes out more than four of its own libraries
-        let mut left_out: smallvec::SmallVec<[String; 4]> = smallvec::SmallVec::new();
-        words(&all, &mut quoted, |word| -> Result<(), String> {
-            let Some(option) = word.strip_prefix(['/', '-']) else { return Ok(()) };
-            let (option, arg) = match option.split_once(':') {
-                Some((option, arg)) => (option, Some(arg)),
-                None => (option, None),
-            };
-            if option.eq_ignore_ascii_case("defaultlib") {
-                let arg = arg
-                    .ok_or_else(|| fail(at, "the .drectve option /DEFAULTLIB needs an argument"))?;
-                let (stem, extension) = default_library(arg);
-                if !out.iter().any(|it| joins_ignoring_case(&it.1, stem, extension)) {
-                    // alloc: once per default library an archive's members name (setup)
-                    out.push((member_name.clone().into_owned(), join(stem, extension)));
-                }
-            } else if option.eq_ignore_ascii_case("nodefaultlib") {
-                match arg {
-                    None => none = true,
-                    Some(arg) => {
-                        let (stem, extension) = default_library(arg);
-                        // alloc: once per `/NODEFAULTLIB:lib` of a member (setup)
-                        left_out.push(join(stem, extension));
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        if none {
-            out.truncate(start);
-        } else if !left_out.is_empty() {
-            let mut kept = start;
-            for at in start..out.len() {
-                if !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(&out[at].1)) {
-                    out.swap(kept, at);
-                    kept += 1;
-                }
-            }
-            out.truncate(kept);
-        }
+        asked_of(at, &member_name, data, &mut out, &mut quoted)?;
     }
     Ok(out)
+}
+
+/// What the one object `data` (`member_name` of its archive, `""` for an object on the line)
+/// asks for, onto `out` ([`asked_libraries`]).
+fn asked_of(
+    at: Input<'_>,
+    member_name: &str,
+    data: &[u8],
+    out: &mut Vec<(String, String)>,
+    quoted: &mut String,
+) -> Result<(), String> {
+    let drectve = match (u16_at(data, 0).map(pe::Machine), u16_at(data, 2), u16_at(data, 4)) {
+        (Some(pe::IMAGE_FILE_MACHINE_UNKNOWN), Some(0xffff), Some(version)) => {
+            if version >= 2 && data.get(12..28) == Some(&BIGOBJ[..]) {
+                drectve::<pe::AnonObjectHeaderBigobj>(at, data)?
+            } else {
+                None
+            }
+        }
+        _ => drectve::<pe::ImageFileHeader>(at, data)?,
+    };
+    let Some(drectve) = drectve else { return Ok(()) };
+    let all =
+        text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve)).map_err(|e| fail(at, e))?;
+    let start = out.len();
+    let mut none = false;
+    // alloc: none unless a member takes out more than four of its own libraries
+    let mut left_out: smallvec::SmallVec<[String; 4]> = smallvec::SmallVec::new();
+    words(&all, quoted, |word| -> Result<(), String> {
+        let Some(option) = word.strip_prefix(['/', '-']) else { return Ok(()) };
+        let (option, arg) = match option.split_once(':') {
+            Some((option, arg)) => (option, Some(arg)),
+            None => (option, None),
+        };
+        if option.eq_ignore_ascii_case("defaultlib") {
+            let arg =
+                arg.ok_or_else(|| fail(at, "the .drectve option /DEFAULTLIB needs an argument"))?;
+            let (stem, extension) = default_library(arg);
+            if !out.iter().any(|it| joins_ignoring_case(&it.1, stem, extension)) {
+                // alloc: once per default library an archive's members name (setup)
+                out.push((member_name.to_owned(), join(stem, extension)));
+            }
+        } else if option.eq_ignore_ascii_case("nodefaultlib") {
+            match arg {
+                None => none = true,
+                Some(arg) => {
+                    let (stem, extension) = default_library(arg);
+                    // alloc: once per `/NODEFAULTLIB:lib` of a member (setup)
+                    left_out.push(join(stem, extension));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if none {
+        out.truncate(start);
+    } else if !left_out.is_empty() {
+        let mut kept = start;
+        for at in start..out.len() {
+            if !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(&out[at].1)) {
+                out.swap(kept, at);
+                kept += 1;
+            }
+        }
+        out.truncate(kept);
+    }
+    Ok(())
 }
 
 /// The `.drectve` of the COFF object `data`, if it has one.

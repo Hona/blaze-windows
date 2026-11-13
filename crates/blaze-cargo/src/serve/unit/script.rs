@@ -608,15 +608,28 @@ pub(crate) fn script_at(unit: &bs::Unit) -> Text {
 
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
-pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
+pub(crate) fn refused(
+    unit: &bs::Unit,
+    env: &[(OsString, OsString)],
+    stdout: &[u8],
+    link_dirs: &[PathBuf],
+) -> Option<Report> {
     // The store of pinned native inputs of the home this daemon lays them out in
     // ([`super::Real`]'s `native`): the same variables decide both.
     let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
+    let windows = unit.host.contains("windows");
+    let system = match windows {
+        true => crate::directives::windows_system_dirs(env),
+        false => Vec::new(),
+    };
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
         native: native.as_deref(),
+        system: &system,
+        msvc: unit.target.ends_with("-windows-msvc"),
+        windows,
     };
     let refused = crate::directives::refused(stdout, &ran);
     (!refused.is_empty())
@@ -658,7 +671,7 @@ pub(crate) fn judge(
         Ok(output) => {
             let diagnostics = warnings(&output.log_messages);
             if let Some(link_dirs) = checked
-                && let Some(report) = refused(unit, &value.stdout, link_dirs)
+                && let Some(report) = refused(unit, env, &value.stdout, link_dirs)
             {
                 return Judged { output: None, diagnostics, failure: Some(report) };
             }
@@ -1764,10 +1777,16 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
+        // the plan's; the script ran at the system's path of it.
+        let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
+            let what = format!("the build script run of unit {} has no OUT_DIR in its plan", self.unit);
+            return self.error(what, out);
+        };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
             env: output.env.clone(),
-            out_dir: out_dir.clone(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {

@@ -904,3 +904,28 @@ fn a_reused_input_converts_without_allocating() {
     });
     assert_eq!(input.len(), tokens);
 }
+
+/// A file with CRLF line endings converts to the tokens of the same file with LF: rustc reads a
+/// source file with each `\r\n` as `\n`, so a line doc comment has no `\r` at its end, a block
+/// doc comment and a string literal have `\n` between their lines, and a proc macro or a
+/// `macro_rules!` is handed the same tokens either way.
+#[test]
+fn a_file_with_crlf_line_endings_gives_the_tokens_of_the_same_file_with_lf() {
+    let lf = "//! Inner docs.\n/// Outer docs,\n/// two lines.\n/** A block\n   of docs. */\n\
+              #[derive(Debug)]\nstruct S { s: &'static str }\n\
+              const C: &str = \"one\ntwo\";\nconst R: &str = r#\"raw\nlines\"#;\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let of = |text: &str| parse_to_token_tree_static_span(Edition::CURRENT, DUMMY, text).unwrap();
+    assert_eq!(of(&crlf), of(lf), "the lexer's tokens");
+    for (mode, named) in
+        [(DocCommentDesugarMode::Mbe, "mbe"), (DocCommentDesugarMode::ProcMacro, "proc macro")]
+    {
+        let tree = |text: &str| {
+            let parse = ast::SourceFile::parse_shared(text.to_owned(), Edition::CURRENT);
+            call_input(parse.root(), StaticSpanMap, DUMMY, mode)
+        };
+        assert_eq!(tree(&crlf), tree(lf), "the syntax tree's tokens, {named}");
+    }
+    let docs = format!("{:?}", of(&crlf));
+    assert!(!docs.contains("\\r"), "{docs}");
+}

@@ -468,6 +468,33 @@ impl DefMap {
         }
     }
 
+    /// The module a path segment written with `ctxt` and looked up in a module `expn` made
+    /// ([`DefMap::module_expansion`]) is checked for privacy from, the path being written in
+    /// `here`: rustc's `resolve_ident_in_module_ext`, which checks it from the `expn_def_scope`
+    /// of the mark `normalize_to_macros_2_0_and_adjust` removes last, and from where the path
+    /// is (`None`) when it removes none. As [`privacy_scope`], but read from this def map, so a
+    /// def map being collected that has not met the macro yet checks from `here`, as rustc's
+    /// early resolution checks an import whose macro is not expanded yet.
+    pub(super) fn segment_privacy_scope(
+        &self,
+        db: &Db,
+        ctxt: SyntaxContext,
+        expn: Option<MacroCallId>,
+        here: ModuleId,
+    ) -> Option<ModuleId> {
+        if ctxt.is_root() {
+            return None;
+        }
+        let mut ctxt = ctxt.normalize_to_macros_2_0(db);
+        let scope = adjust(db, &mut ctxt, expn)?;
+        let mut module = self.map_for(db, here).macro_def_module(db, here, scope)?;
+        // rustc's `nearest_parent_mod`: each turn leaves one block, ending at the crate root.
+        while module.is_block_module(db) {
+            module = module.containing_module(db)?.to_static();
+        }
+        Some(module)
+    }
+
     /// The module defining the macro whose expansion is `expn`: rustc's `expn_def_scope`.
     /// A proc macro's is its crate's root. A macro declared by an item (`macro`, `macro_rules!`,
     /// a builtin's declaration in core) is looked for first in the modules around `module` (the

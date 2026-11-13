@@ -252,6 +252,8 @@ struct Disk {
     files: BTreeMap<FileName, Sparse>,
     modes: BTreeMap<FileName, u32>,
     fail_rename: bool,
+    /// A volume whose files share no blocks: every clone is refused, as NTFS refuses one.
+    unshared: bool,
     /// Each effect run: its kind and the bytes it wrote.
     log: Vec<(&'static str, usize)>,
 }
@@ -270,6 +272,9 @@ impl Disk {
                 self.log.push(("truncate", 0));
                 self.files.entry(file.clone()).or_default().truncate(*len);
                 Done::Truncated
+            }
+            Effect::Clone { .. } if self.unshared => {
+                Done::Failed(IoError("the volume's files share no blocks (NTFS)".into()))
             }
             Effect::Clone { from, to, .. } => {
                 self.log.push(("clone", 0));
@@ -484,6 +489,42 @@ fn an_incremental_link_puts_the_new_function_in_the_old_slot_and_writes_little()
     assert_eq!(b.at(new, 6), returns(2));
     assert_eq!(b.at(old, 6), returns(1), "a running program may still be in the old code");
     assert_eq!(image.slot(&key(2)), Some(slot));
+}
+
+/// On a volume whose files share no blocks (NTFS) an incremental link and its rollback ask for
+/// no clone (the volume refuses one) and write the whole file, which is byte for byte the file
+/// the same links make on a volume that clones.
+#[test]
+fn on_a_volume_that_shares_no_blocks_a_commit_writes_the_whole_file_and_never_clones() {
+    let (start, g) = program(Target::Function);
+    let g2 = function(3, &returns(2), Vec::new());
+    let run = |unshared: bool| {
+        let mut image = Image::new(name(TO), output(true)).unwrap();
+        if unshared {
+            image.set_sharing(blaze_core::Sharing::Unshared);
+        }
+        let mut disk = Disk { unshared, ..Disk::default() };
+        disk.link(&mut image, first(&start, &g)).unwrap();
+        disk.log.clear();
+        disk.link(&mut image, edit(&g2)).expect("the edit");
+        let edited = disk.file(TO).clone();
+        let kinds: Vec<&str> = disk.log.iter().map(|it| it.0).collect();
+        let written: usize = disk.log.iter().map(|it| it.1).sum();
+        disk.log.clear();
+        disk.roll_back(&mut image).expect("the rollback");
+        let rolled = disk.file(TO).clone();
+        let rollback: Vec<&str> = disk.log.iter().map(|it| it.0).collect();
+        (edited, rolled, kinds, rollback, written)
+    };
+    let (edited, rolled, kinds, rollback, written) = run(true);
+    let (cloned_edit, cloned_rollback, clone_kinds, _, _) = run(false);
+    assert!(clone_kinds.contains(&"clone"), "the control clones: {clone_kinds:?}");
+    assert!(!kinds.contains(&"clone") && !rollback.contains(&"clone"), "{kinds:?} {rollback:?}");
+    assert!(edited.same(&cloned_edit), "the edit's file is the cloning volume's");
+    assert!(rolled.same(&cloned_rollback), "the rollback's file is the cloning volume's");
+    // The whole file, every byte of it in the file's runs: more than an edit's few pages.
+    let in_file: usize = edited.pages.values().map(Vec::len).sum();
+    assert!(written >= in_file / 2, "{written} bytes written of {in_file} in the file");
 }
 
 /// The lineage's order, a radix sort by 8-byte prefix then a comparison within a prefix,
@@ -2304,6 +2345,9 @@ mod beside;
 mod eh_frame_reach;
 
 mod tls_desc;
+
+#[cfg(windows)]
+mod pe_run;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

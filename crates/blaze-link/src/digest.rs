@@ -192,6 +192,11 @@ impl Digest {
                 self.dirty.sort_unstable();
             }
             self.raise(Digest::height_of(old));
+            // The taller tree's nodes above the new top say nothing of the shorter file.
+            let top = Digest::height_of(new);
+            if top < Digest::height_of(old) {
+                self.nodes.retain(|at, _| (at >> 56) as usize <= top);
+            }
         }
         self.len = len;
         // A taller tree's new levels are over the old top and zeros beside it.
@@ -371,6 +376,14 @@ mod tests {
         if let Err(why) = kept_is_whole(&ops, false) {
             panic!("{why}");
         }
+    }
+
+    /// The case Hegel found: a file of two blocks (the second all zeros) cut to one byte kept
+    /// its tree's old top, a level the one-block file does not have.
+    #[test]
+    fn a_file_cut_below_a_level_keeps_no_node_above_its_top() {
+        let ops = [Op::Write { at: 0, bytes: vec![1] }, Op::Write { at: 4097, bytes: Vec::new() }, Op::Resize(1)];
+        kept_is_whole(&ops, false).unwrap();
     }
 
     /// A control of [`a_digest_kept_by_updates_is_the_files`]: with an update that skips a

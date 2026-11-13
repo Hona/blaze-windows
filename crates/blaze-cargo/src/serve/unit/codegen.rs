@@ -2114,6 +2114,14 @@ fn link_at(
     }
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
+    // `#![windows_subsystem = "windows"]` of the crate linked: rustc's `/SUBSYSTEM:WINDOWS`,
+    // entered at `mainCRTStartup` as before (the output's entry). Link arguments after it
+    // (`/SUBSYSTEM:CONSOLE`) win, as on rustc's link line.
+    if output.format == blaze_link::Format::Pe
+        && matches!(output.kind, blaze_link::OutputKind::Executable { .. })
+    {
+        output.windows_subsystem = generated.frontend.windows_subsystem(krate);
+    }
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
         // Each crate's libraries and assembly, asked of the front end; then where each
@@ -2629,6 +2637,11 @@ fn relink(
         )));
     }
     for it in located {
+        // One the link made (a `raw-dylib`'s import library) is no file: its id is its own.
+        if let Some((id, _)) = &it.made {
+            native_ids.push(*id);
+            continue;
+        }
         let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
             .map_err(LinkCause::Native)?
             // alloc: error path
@@ -2652,6 +2665,11 @@ fn relink(
     for (order, it) in located.iter().enumerate() {
         let order = assembled.len() + order;
         if added_natives.binary_search(&native_ids[order]).is_ok() {
+            if let Some((_, made)) = &it.made {
+                // clone: an `Arc`, the made library shared with the image
+                bytes_of.push((order, made.clone()));
+                continue;
+            }
             let bytes = std::fs::read(&it.path).map_err(|error| {
                 // alloc: error path
                 LinkCause::Native(blaze_usercode::inputs::Unreadable {
@@ -3280,6 +3298,6 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
     if name.is_empty() {
         return Err(format!("`-l {value}` names no library"));
     }
-    Ok(NativeLib { name: name.to_owned(), kind, verbatim })
+    Ok(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 

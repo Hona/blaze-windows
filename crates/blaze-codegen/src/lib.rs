@@ -473,6 +473,9 @@ pub struct NativeLib {
     pub kind: NativeLibKind,
     /// `+verbatim`: `name` is the file's, with no `lib` or extension added.
     pub verbatim: bool,
+    /// A [`NativeLibKind::RawDylib`]'s imports, in the order its `extern` block declares them;
+    /// empty for every other kind.
+    pub imports: Vec<RawImport>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -484,6 +487,23 @@ pub enum NativeLibKind {
     Static { whole: bool, bundle: bool },
     /// An Apple framework.
     Framework,
+    /// `raw-dylib` (Windows): the DLL `name` (`name.dll` unless `verbatim`) and the imports
+    /// [`NativeLib::imports`] lists, which the linker imports with no import library.
+    RawDylib,
+}
+
+/// One item of a `raw-dylib` block: what the code names it by, and how the DLL exports it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: as `NativeLib`
+pub struct RawImport {
+    /// The symbol the code calls or loads: the item's `link_name`, else its name. The DLL
+    /// exports it under this name too, unless `ordinal` says otherwise (x86-64 has no name
+    /// decoration, so `import_name_type` has nothing to say).
+    pub symbol: String,
+    /// `#[link_ordinal(n)]`: imported by its ordinal, not its name.
+    pub ordinal: Option<u16>,
+    /// A static: data, reached only through its import address table cell `__imp_<symbol>`,
+    /// as a function's code is through its thunk too.
+    pub data: bool,
 }
 
 /// Why a unit did not compile: names the instance and the item.
