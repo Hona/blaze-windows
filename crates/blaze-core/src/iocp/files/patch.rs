@@ -93,6 +93,18 @@ fn apply(
     let stage = crate::fs::temporary_next_to(path);
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     crate::lock::io_wait("detach base", &name, || rename_handle(raw, &stage, 0))?;
+    // Hard-link creation is a metadata operation: even a share-zero handle doesn't
+    // exclude it. Keep the detached name delete-pending while any bytes are partial.
+    // Recheck the link count *after* taking that protection, not just at open.
+    disposition(true)?;
+    // SAFETY: the same handle and output as at open, now protected from new names.
+    sys::check(unsafe { GetFileInformationByHandle(raw, &mut info) })?;
+    // Windows excludes the pending name from its count: zero means only our stage.
+    if info.nNumberOfLinks != 0 {
+        disposition(false)?;
+        rename_handle(raw, path, 0)?;
+        return Ok(false);
+    }
     // durable: the old public name must not roll back over partially changed sectors.
     crate::lock::io_wait("persist detached name", &name, || crate::fs::sync_dir(dir))?;
     phase("detached");
@@ -105,6 +117,7 @@ fn apply(
     // durable: publication cannot outrun any byte of the result.
     crate::lock::io_wait("persist patched bytes", &name, || file.sync_all())?;
     phase("synced");
+    disposition(false)?;
     crate::lock::io_wait("return patched file", &name, || rename_handle(raw, path, 0))?;
     crate::lock::io_wait("persist returned name", &name, || crate::fs::sync_dir(dir))?;
     phase("published");
@@ -158,6 +171,29 @@ mod tests {
                 assert_eq!(fs::read(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
             }
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_partial_stage_cannot_gain_a_public_link() {
+        let root = std::env::temp_dir().join(format!("blaze-patch-stage-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("out");
+        fs::write(&path, b"abc").unwrap();
+        let alias = root.join("alias");
+        let mut checked = false;
+        let delta = [(1, vec![b'z'])];
+        assert!(
+            apply(&path, 3, &delta, &[(0, b"azc".to_vec())], |phase| {
+                if phase == "range" {
+                    let stage = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+                    assert!(fs::hard_link(stage, &alias).is_err());
+                    checked = true;
+                }
+            })
+            .unwrap()
+        );
+        assert!(checked && !alias.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
