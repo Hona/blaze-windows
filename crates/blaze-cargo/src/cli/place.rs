@@ -178,44 +178,9 @@ pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(files)
 }
 
-/// A path as the API carries it.
+/// A path as the API carries it: its daemon name (`blaze_core::platform::path::daemon`).
 pub fn utf8(path: &Path) -> Result<String, String> {
-    path.to_str().map(api_path).ok_or_else(|| {
-        format!(
-            "the path {} is not UTF-8, which a request to the daemon can't carry",
-            path.display()
-        )
-    })
-}
-
-/// A path as the daemon names it: rooted at `/` with `/` between its parts. On Windows the
-/// drive is the first part (`C:\a` is `/C:/a`), so the daemon's one-root path model holds.
-#[cfg(windows)]
-pub fn api_path(text: &str) -> String {
-    let text = text.strip_prefix(r"\\?\").unwrap_or(text).replace('\\', "/");
-    let bytes = text.as_bytes();
-    match bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        true => format!("/{}{}", char::from(bytes[0].to_ascii_uppercase()), &text[1..]),
-        false => text,
-    }
-}
-
-#[cfg(not(windows))]
-pub fn api_path(text: &str) -> String {
-    text.to_owned()
-}
-
-/// A path the daemon named, as this system opens it: [`api_path`]'s inverse.
-#[cfg(windows)]
-pub fn host_path(text: &str) -> PathBuf {
-    let bytes = text.as_bytes();
-    let drive = bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':';
-    PathBuf::from(text[usize::from(drive)..].replace('/', "\\"))
-}
-
-#[cfg(not(windows))]
-pub fn host_path(text: &str) -> PathBuf {
-    PathBuf::from(text)
+    blaze_core::platform::path::daemon(path).map_err(|why| why.to_string())
 }
 
 /// The command's environment, sorted by name. A variable that is not UTF-8 is refused by its
@@ -366,7 +331,9 @@ mod refusals {
 
     #[test]
     fn a_second_target_is_refused_not_dropped() {
-        let place = Place { cwd: "/w".into(), manifest: "/w/Cargo.toml".into(), root: "/w".into() };
+        // An absolute path on every system: the daemon names none that is not.
+        let w = if cfg!(windows) { "C:\\w" } else { "/w" };
+        let place = Place { cwd: w.into(), manifest: Path::new(w).join("Cargo.toml"), root: w.into() };
         let made =
             |asked: &Invocation| cargo(asked, &place, Vec::new(), Vec::new(), false, None).unwrap();
         let mut asked = Invocation::default();

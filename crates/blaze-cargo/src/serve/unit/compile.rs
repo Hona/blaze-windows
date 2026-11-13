@@ -312,7 +312,7 @@ pub(crate) mod header {
         for _ in 0..natives {
             let hash: [u8; 32] = *read.array().ok()?;
             let path = read.str_u32().ok()?;
-            if file(std::path::Path::new(path))? != hash {
+            if file(&blaze_core::platform::path::host(path))? != hash {
                 return None;
             }
         }
@@ -1566,7 +1566,7 @@ fn filed_in<'g>(
         &job.input.config.invocation.env,
         &|manifest| job.units().is_primary_manifest(manifest),
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
-        |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
+        |path| base_db::IncludedFile::content_now(&blaze_core::platform::path::host(path)),
         |slot| match store.get(guard, slot) {
             Ok(it) => it.map(|it| it.bytes),
             Err(error) => {

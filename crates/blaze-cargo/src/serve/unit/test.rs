@@ -604,12 +604,12 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     let make = |sandboxed: bool| Binary {
         id: artifact.content,
         name: program.clone(),
-        program: PathBuf::from(program),
+        program: blaze_core::platform::path::host(program),
         env: env.clone(),
         dir: manifest_dir.clone(),
         read: vec![
-            PathBuf::from(&config.invocation.root),
-            PathBuf::from(&units.target_dir),
+            blaze_core::platform::path::host(&config.invocation.root),
+            blaze_core::platform::path::host(&units.target_dir),
             manifest_dir.clone(),
         ],
         write: Vec::new(),

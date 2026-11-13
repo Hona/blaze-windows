@@ -1,5 +1,6 @@
-//! A file under an advisory lock (`flock` on unix, `LockFileEx` on Windows, through std's
-//! [`File::lock`] family) that lets go of the lock when dropped, before the file closes.
+//! A file under an advisory lock (`flock` on unix, `LockFileEx` of one byte past any data on
+//! Windows, `blaze_core::platform::lock`) that lets go of the lock when dropped, before the file
+//! closes. Only another locker is kept out: every handle reads and writes the file.
 //!
 //! Closing a locked file is not enough to let go of its lock. A `flock` lock belongs to the open
 //! file, which every copy of the descriptor shares, and a process another thread starts has a
@@ -9,10 +10,12 @@
 //! unlock through any copy lets go of it for all of them, so [`Locked`] unlocks first.
 
 use std::{
-    fs::{File, TryLockError},
+    fs::File,
     io,
     ops::{Deref, DerefMut},
 };
+
+use blaze_core::platform::lock::{Mode, lock, unlock};
 
 /// A file this process holds locked (shared or exclusive), unlocked when this drops.
 ///
@@ -25,55 +28,30 @@ pub struct Locked(File);
 impl Locked {
     /// `file` locked exclusively, waiting for another holder to let go.
     pub fn lock(file: File) -> io::Result<Locked> {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
-        )]
-        file.lock()?;
+        lock(&file, Mode::Exclusive, true)?;
         Ok(Locked(file))
     }
 
     /// `file` locked shared, waiting for an exclusive holder to let go.
     pub fn lock_shared(file: File) -> io::Result<Locked> {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
-        )]
-        file.lock_shared()?;
+        lock(&file, Mode::Shared, true)?;
         Ok(Locked(file))
     }
 
     /// `file` locked exclusively if no one else holds it now: `Ok(Err(file))`, the file given
     /// back unlocked, while another holds it.
     pub fn try_lock(file: File) -> io::Result<Result<Locked, File>> {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
-        )]
-        let tried = file.try_lock();
-        Self::tried(file, tried)
+        let locked = lock(&file, Mode::Exclusive, false)?;
+        Ok(if locked { Ok(Locked(file)) } else { Err(file) })
     }
 
     /// `file` locked shared if no one holds it exclusively now: `Ok(Err(file))`, the file given
     /// back unlocked, while another does.
     pub fn try_lock_shared(file: File) -> io::Result<Result<Locked, File>> {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "the one place a file is locked: it is unlocked as `Locked` drops"
-        )]
-        let tried = file.try_lock_shared();
-        Self::tried(file, tried)
-    }
-
-    fn tried(file: File, tried: Result<(), TryLockError>) -> io::Result<Result<Locked, File>> {
-        match tried {
-            Ok(()) => Ok(Ok(Locked(file))),
-            Err(TryLockError::WouldBlock) => Ok(Err(file)),
-            Err(TryLockError::Error(error)) => Err(error),
-        }
+        let locked = lock(&file, Mode::Shared, false)?;
+        Ok(if locked { Ok(Locked(file)) } else { Err(file) })
     }
 }
-
 impl Deref for Locked {
     type Target = File;
 
@@ -91,7 +69,7 @@ impl DerefMut for Locked {
 impl Drop for Locked {
     fn drop(&mut self) {
         // An unlock that fails leaves the lock to the close, which is all that can be done.
-        _ = self.0.unlock();
+        _ = unlock(&self.0);
     }
 }
 
