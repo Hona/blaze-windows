@@ -2037,6 +2037,10 @@ pub enum Unhandled {
     /// Two functions or data objects under one name of the module's own ([`Symbol`]), which
     /// LLVM would tell apart by renaming one to a name no request has: what they are.
     Duplicate(String),
+    /// A constant whose relocation is none the code generator makes of a constant: an
+    /// address of a request (another constant or a function), as LLVM's relocation and target
+    /// say it.
+    Held(String),
 }
 
 impl fmt::Display for Unhandled {
@@ -2056,6 +2060,7 @@ impl fmt::Display for Unhandled {
             Unhandled::Duplicate(what) => {
                 write!(f, "two objects under one name of the module's own: {what}")
             }
+            Unhandled::Held(what) => write!(f, "a constant that holds {what}"),
         }
     }
 }
@@ -2423,6 +2428,108 @@ define i32 @"blaze.own"() {
         assert!(function.as_global_value().get_comdat().is_none());
         own_comdat(&module, crate::Target::x86_64_linux(), function).unwrap();
         assert!(function.as_global_value().get_comdat().is_some());
+    }
+
+    /// A `match` that picks one of several constants is a table of their addresses after
+    /// LLVM's optimizations (a switch made a lookup table), on each object format: on COFF an
+    /// absolute one with `IMAGE_REL_AMD64_ADDR64` relocations, which reads back as a constant
+    /// whose relocations name the constants.
+    #[test]
+    fn a_table_of_constants_reads_back_on_each_format() {
+        for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            table_of_constants(crate::Target::of(triple).unwrap());
+        }
+    }
+
+    fn table_of_constants(target: &'static crate::Target) {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::I64};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+
+        use super::super::fragment::FuncTarget;
+
+        let isa = super::super::isa_for(target).unwrap();
+        let mut wants = Wants::new(target, &**isa);
+        let datas: Vec<_> = (0..6)
+            .map(|at| {
+                let bytes = format!("the text of case {at}").into_bytes();
+                let blob = crate::ConstBlob { bytes, align: 1, ..crate::ConstBlob::default() };
+                wants.define_const(blob).unwrap()
+            })
+            .collect();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let request = wants.func(FuncTarget::Symbol("pick".into()), &sig);
+        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig);
+        let globals: Vec<_> = datas
+            .iter()
+            .map(|&it| {
+                let name = func.declare_imported_user_function(ir::UserExternalName {
+                    namespace: 1,
+                    index: it.as_u32(),
+                });
+                func.create_global_value(ir::GlobalValueData::Symbol {
+                    name: ir::ExternalName::user(name),
+                    offset: ir::immediates::Imm64::new(0),
+                    colocated: true,
+                    tls: false,
+                })
+            })
+            .collect();
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let index = builder.block_params(entry)[0];
+        let cases: Vec<_> = globals.iter().map(|_| builder.create_block()).collect();
+        let other = builder.create_block();
+        let mut switch = Switch::new();
+        for (at, &case) in cases.iter().enumerate() {
+            switch.set_entry(at as u128, case);
+        }
+        switch.emit(&mut builder, index, other);
+        for (&case, &global) in cases.iter().zip(&globals) {
+            builder.switch_to_block(case);
+            let address = builder.ins().symbol_value(I64, global);
+            builder.ins().return_(&[address]);
+        }
+        builder.switch_to_block(other);
+        let none = builder.ins().iconst(I64, 0);
+        // Cases that compute rather than pick: a jump table into the code.
+        let (computed, done) = (builder.create_block(), builder.create_block());
+        builder.append_block_param(done, I64);
+        let picked = builder.ins().icmp_imm(ir::condcodes::IntCC::Equal, index, -1);
+        builder.ins().brif(picked, done, &[none.into()], computed, &[]);
+        builder.switch_to_block(computed);
+        let arms: Vec<_> = (0..8).map(|_| builder.create_block()).collect();
+        let mut table = Switch::new();
+        for (at, &arm) in arms.iter().enumerate() {
+            table.set_entry(at as u128 + 100, arm);
+        }
+        let last = builder.create_block();
+        table.emit(&mut builder, index, last);
+        for (at, &arm) in arms.iter().enumerate() {
+            builder.switch_to_block(arm);
+            let scaled = builder.ins().imul_imm(index, at as i64 * 7 + 3);
+            let rotated = builder.ins().rotl_imm(scaled, at as i64 + 1);
+            let value = builder.ins().bxor_imm(rotated, at as i64 * 1_000_003);
+            builder.ins().jump(done, &[value.into()]);
+        }
+        builder.switch_to_block(last);
+        builder.ins().jump(done, &[none.into()]);
+        builder.switch_to_block(done);
+        let value = builder.block_params(done)[0];
+        builder.ins().return_(&[value]);
+        builder.seal_all_blocks();
+        builder.finalize(isa.frontend_config());
+        let members =
+            [Member { func: &func, named: &[], pointees: &[], request: request.as_u32() }];
+        let unit = emit_unit(&mut wants, &members, optimized_level(), &[]).unwrap();
+        let [code] = &unit.members[..] else { panic!("one member") };
+        if let Err(error) = code {
+            panic!("{}: {error}", target.triple());
+        }
     }
 
     fn reads_back_a_unit_of_two(target: &'static crate::Target) {

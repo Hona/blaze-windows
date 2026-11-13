@@ -713,8 +713,10 @@ fn stencil_pads(code: &blaze_stencil::CodeRef<'_>) -> Result<seh::Pads, String> 
         }
         // The call ends where it returns to, which may be where the next thing starts.
         let after = code.lines.partition_point(|(at, _)| *at <= call.ret - 1);
-        if after.checked_sub(1).is_some_and(|at| seh::is_guarded(code.lines[at].1)) {
-            pads.returning(call.ret);
+        if let Some(at) = after.checked_sub(1)
+            && seh::is_guarded(code.lines[at].1)
+        {
+            pads.returning(call.ret, seh::is_catching(code.lines[at].1));
         }
     }
     Ok(pads)
