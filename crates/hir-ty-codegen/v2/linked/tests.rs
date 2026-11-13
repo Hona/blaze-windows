@@ -365,6 +365,40 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
     );
 }
 
+/// The vtable shim of a method that tracks its caller where the trait's declaration does not
+/// names the place of that declaration, which no item of the build is: rune's `hello` failed
+/// to link on it (INTEGRATION I56).
+#[test]
+fn a_vtable_shim_names_its_trait_methods_declaration() {
+    let (db, frontend) = frontend(
+        "pub trait T { fn by_value(self) -> u32; }\n\
+         pub struct S(u32);\n\
+         impl T for S {\n    #[track_caller]\n    fn by_value(self) -> u32 { self.0 }\n}\n",
+    );
+    let imp = hir_def::test_items::impls(db, fixture::test_crate(db))[0];
+    let method = imp
+        .impl_items(db)
+        .items
+        .iter()
+        .find_map(|&(_, item)| match item {
+            hir_def::AssocItemId::FunctionId(it) => Some(it),
+            _ => None,
+        })
+        .unwrap();
+    let declared = crate::declared_method(db, method);
+    assert_ne!(declared, method);
+    let hashes = &frontend.hashes;
+    let place = hashes.declaration(db, declared).unwrap();
+    let built = Built {
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: place }]))],
+        items: vec![item_key(db, ItemId::Function(method))],
+        debug_names: vec![(InstanceKey(ContentId([1; 32])), "{vtable}".to_owned())],
+        ..Built::default()
+    };
+    let inputs = frontend.link_inputs(&built).unwrap();
+    assert!(inputs.tables.iter().any(|it| it.anchor == place.anchor), "the declaration's table");
+}
+
 #[test]
 fn a_reformat_changes_a_table_and_not_its_anchor() {
     let fx = fixture::db(SPANNED);
