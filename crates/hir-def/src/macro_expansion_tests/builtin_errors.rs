@@ -429,7 +429,8 @@ fn main() {{
         errors,
         [
             (
-                format!("couldn't read `{missing}`: No such file or directory (os error 2)"),
+                // The system's own words for a missing file (Windows has its own for error 2).
+                format!("couldn't read `{missing}`: {}", std::io::Error::from_raw_os_error(2)),
                 format!("include!({missing:?})")
             ),
             (

@@ -737,6 +737,22 @@ rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
 rules refuse none (counted 2026-10-27).
 
+For an MSVC target a `rustc-link-arg` may also be a link.exe option of the list `MSVC_OPTIONS`
+(`/NAME` or `-NAME`, any case) with the value its rule takes: a name or number
+(`/SUBSYSTEM:WINDOWS`, `/ENTRY:mainCRTStartup`, `/DELAYLOAD:comctl32.dll`, `/STACK:8388608`,
+`/OPT:REF`), text with no path (`/MANIFESTUAC:...`), a library's name or a file where a search
+may go (`/DEFAULTLIB:ucrt.lib`, `/WHOLEARCHIVE:...`, `/MANIFESTINPUT:...`, `/DEF:...`), or a
+directory a search may name (`/LIBPATH:...`); or a library, object, `.res` or `.exp` named by
+itself (`delayimp.lib`, winresource's `<OUT_DIR>\resource.res`). An option that writes a file
+(`/OUT`, `/PDB`, `/IMPLIB`, `/MANIFESTFILE`) or is not on the list is refused; the linker
+refuses by name what it does not do of the rest. On a Windows host a path is compared as
+Windows compares it (`C:\a`, `c:/A`, `\\?\C:\a` and the daemon's `/C:/a` are one), and the
+system directories are those of the toolchain: each of the script's `LIB` and the trees under
+`%ProgramFiles%` and `%ProgramFiles(x86)%` that Visual Studio and the Windows SDK install into.
+A library a script finds in a cache of the machine (rune-desktop's Ghostty, under
+`%LOCALAPPDATA%\seer\ghostty-vt`) goes in `build-script-link-dirs` under its variable:
+`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`.
+
 and, for a package of the workspace, in its own manifest:
 
 ```toml

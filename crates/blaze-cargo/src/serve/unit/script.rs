@@ -302,7 +302,8 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .out_dir
         .clone()
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
-    let manifest_path = PathBuf::from(&package.manifest_path);
+    // The script sees the system's paths: the daemon's names (/C:/a on Windows) turned so.
+    let manifest_path = blaze_core::platform::path::host(&package.manifest_path);
     let manifest_dir =
         manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
     let targets = targets(units, &unit.pkg_id);
@@ -339,7 +340,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         })
         .collect::<Result<_, String>>()?;
     // `<profile>/build/<package>-<hash>/out`, or `<profile>/build/<package>/<hash>/out`.
-    let profile_dir = Path::new(&out_dir)
+    let profile_dir = blaze_core::platform::path::host(&out_dir)
         .ancestors()
         .find(|it| it.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
@@ -396,7 +397,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         rustflags: plan.rustflags.clone(),
         jobs,
         script: of.program.clone(),
-        out_dir: PathBuf::from(&out_dir),
+        out_dir: blaze_core::platform::path::host(&out_dir),
         tools: bs::Tools {
             cargo: of.launcher.to_path_buf(),
             rustc: exe("rustc"),
@@ -523,15 +524,28 @@ pub(crate) fn script_at(unit: &bs::Unit) -> Text {
 
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
-pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
+pub(crate) fn refused(
+    unit: &bs::Unit,
+    env: &[(OsString, OsString)],
+    stdout: &[u8],
+    link_dirs: &[PathBuf],
+) -> Option<Report> {
     // The store of pinned native inputs of the home this daemon lays them out in
     // ([`super::Real`]'s `native`): the same variables decide both.
     let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
+    let windows = unit.host.contains("windows");
+    let system = match windows {
+        true => crate::directives::windows_system_dirs(env),
+        false => Vec::new(),
+    };
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
         native: native.as_deref(),
+        system: &system,
+        msvc: unit.target.ends_with("-windows-msvc"),
+        windows,
     };
     let refused = crate::directives::refused(stdout, &ran);
     (!refused.is_empty())
@@ -573,7 +587,7 @@ pub(crate) fn judge(
         Ok(output) => {
             let diagnostics = warnings(&output.log_messages);
             if let Some(link_dirs) = checked
-                && let Some(report) = refused(unit, &value.stdout, link_dirs)
+                && let Some(report) = refused(unit, env, &value.stdout, link_dirs)
             {
                 return Judged { output: None, diagnostics, failure: Some(report) };
             }
@@ -943,7 +957,7 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
         .ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
     plan.outputs
         .first()
-        .map(PathBuf::from)
+        .map(|it| blaze_core::platform::path::host(it))
         .ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
 }
 
@@ -957,11 +971,11 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's.
 pub(crate) fn build_roots(job: &Job) -> RootMap {
     RootMap::default()
-        .with(Role::Target, Path::new(&job.units().target_dir))
-        .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
+        .with(Role::Target, &blaze_core::platform::path::host(&job.units().target_dir))
+        .with(Role::Workspace, &blaze_core::platform::path::host(&job.input.config.invocation.root))
         .with(Role::Tools, &job.shared.tools)
         .with(Role::Launcher, &job.shared.launcher)
-        .with_sources(Path::new(&job.input.config.sources))
+        .with_sources(&blaze_core::platform::path::host(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
@@ -996,7 +1010,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         },
     };
     let script_path = match &program {
-        Some((path, _)) => PathBuf::from(path),
+        Some((path, _)) => blaze_core::platform::path::host(path),
         None => named_program(units, compile)?,
     };
     let of = Of {
@@ -1017,8 +1031,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
-        PathBuf::from(&job.input.config.invocation.root),
-        PathBuf::from(&units.target_dir),
+        blaze_core::platform::path::host(&job.input.config.invocation.root),
+        blaze_core::platform::path::host(&units.target_dir),
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
@@ -1678,10 +1692,16 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
+        // the plan's; the script ran at the system's path of it.
+        let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
+            let what = format!("the build script run of unit {} has no OUT_DIR in its plan", self.unit);
+            return self.error(what, out);
+        };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
             env: output.env.clone(),
-            out_dir: out_dir.clone(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {

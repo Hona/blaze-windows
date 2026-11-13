@@ -51,22 +51,7 @@ pub struct Volume {
 /// The volume `path` is on, judged by the nearest of it and its ancestors that exists (a
 /// directory not made yet is made on its parent's volume). An error names the path.
 pub fn volume(path: &Path) -> io::Result<Volume> {
-    let mut at = path;
-    loop {
-        match std::fs::symlink_metadata(at) {
-            Ok(_) => break,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                at = at.parent().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        // alloc: an error path.
-                        format!("no ancestor of {} exists to say its volume", path.display()),
-                    )
-                })?;
-            }
-            Err(error) => return Err(named(at, error)),
-        }
-    }
+    let at = existing(path)?;
     let (system, shares) = ask(at).map_err(|error| named(at, error))?;
     let sharing = if shares { Sharing::Blocks } else { Sharing::Unshared };
     Ok(Volume { system, sharing })
@@ -112,5 +97,67 @@ fn ask(_: &Path) -> io::Result<(String, bool)> {
     Ok(("WASI".into(), false))
 }
 
+/// Whether `a` and `b` are on one volume, each judged by the nearest of it and its ancestors
+/// that exists (a directory not made yet is made on its parent's): their volumes' ids, never
+/// their drive letters, which a mounted folder shares with another volume.
+pub fn same_volume(a: &Path, b: &Path) -> io::Result<bool> {
+    Ok(file_id(existing(a)?)?.volume == file_id(existing(b)?)?.volume)
+}
+
+/// The nearest of `path` and its ancestors that exists.
+fn existing(path: &Path) -> io::Result<&Path> {
+    let mut at = path;
+    loop {
+        match std::fs::symlink_metadata(at) {
+            Ok(_) => return Ok(at),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                at = at.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        // alloc: an error path.
+                        format!("no ancestor of {} exists to say its volume", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(named(at, error)),
+        }
+    }
+}
+/// Which file a path names, as its volume knows it: two paths name one file (one is a hard
+/// link of the other) exactly when their ids are equal. Windows: the volume's serial number
+/// and the file's 128-bit id (`FileIdInfo`, which ReFS needs); Unix: the device and inode.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FileId {
+    pub volume: u64,
+    pub file: u128,
+}
+
+/// The id of the file at `path`, a symbolic link followed. An error names the path.
+pub fn file_id(path: &Path) -> io::Result<FileId> {
+    id_of(path).map_err(|error| {
+        // alloc: an error path.
+        io::Error::new(error.kind(), format!("the file id of {}: {error}", path.display()))
+    })
+}
+
+#[cfg(windows)]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    let (volume, file) = crate::iocp::files::file_id(path)?;
+    Ok(FileId { volume, file })
+}
+
+#[cfg(unix)]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    Ok(FileId { volume: meta.dev(), file: u128::from(meta.ino()) })
+}
+
+#[cfg(target_os = "wasi")]
+fn id_of(path: &Path) -> io::Result<FileId> {
+    use std::os::wasi::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)?;
+    Ok(FileId { volume: meta.dev(), file: u128::from(meta.ino()) })
+}
 #[cfg(test)]
 mod tests;

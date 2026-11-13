@@ -288,6 +288,7 @@ pub fn universal_newlines(text: String) -> String {
 /// Where `shutil.which(name)` finds the program `name`: `name` itself when it has a `/`, else
 /// the first `<dir>/<name>` along `PATH` (the default path when it is unset) that is a file
 /// this process may execute.
+#[cfg(unix)]
 pub fn which(name: &str) -> Option<PathBuf> {
     #[allow(clippy::disallowed_methods, reason = "shutil.which reads the harness's own PATH")]
     let path = std::env::var_os("PATH");
@@ -304,12 +305,35 @@ pub fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&dirs).map(|dir| dir.join(name)).find(|at| runnable(at))
 }
 
+#[cfg(unix)]
 const X_OK: i32 = 1;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
 }
 
+/// `shutil.which(name)` on Windows: `name` itself when it names a directory (a `/` or `\`),
+/// else the first `<dir>\<name>` along `PATH`; a name without one of `PATHEXT`'s extensions
+/// is tried with each of them, in order, as Python does.
+#[cfg(windows)]
+pub fn which(name: &str) -> Option<PathBuf> {
+    #[allow(clippy::disallowed_methods, reason = "shutil.which reads the harness's own PATH and PATHEXT")]
+    let (path, pathext) = (std::env::var_os("PATH"), std::env::var("PATHEXT"));
+    let pathext = pathext.unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let exts: Vec<&str> = pathext.split(';').filter(|it| !it.is_empty()).collect();
+    let has_ext = exts.iter().any(|ext| name.len() >= ext.len() && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext));
+    let found = |at: PathBuf| -> Option<PathBuf> {
+        if has_ext && at.is_file() {
+            return Some(at);
+        }
+        exts.iter().map(|ext| PathBuf::from(format!("{}{ext}", at.display()))).find(|it| it.is_file())
+    };
+    if name.contains(['/', '\\']) {
+        return found(PathBuf::from(name));
+    }
+    std::env::split_paths(&path?).find_map(|dir| found(dir.join(name)))
+}
 /// A new empty directory under the system's temporary directory, removed with all it holds
 /// when this is dropped: Python's `tempfile.TemporaryDirectory(prefix=...)`.
 #[derive(Debug)]
