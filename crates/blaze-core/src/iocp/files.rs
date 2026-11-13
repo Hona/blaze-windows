@@ -134,7 +134,9 @@ pub(super) fn size(handle: HANDLE) -> io::Result<u64> {
 }
 
 fn moved(from: &Path, to: &Path) -> io::Result<()> {
-    moved_unsynced(from, to)?;
+    // A durable rename is one namespace operation. The two-name protocol for a running
+    // NTFS executable is only for replaceable, unsynced build outputs.
+    posix_rename(from, to)?;
     fn parent(p: &Path) -> &Path {
         p.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
     }
@@ -187,6 +189,10 @@ fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
             _ => aside(from, to),
         };
     }
+    posix_rename(from, to)
+}
+
+fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
     let (wide_from, wide_to) = (sys::path(from)?, sys::path(to)?);
     // Replace the name, never the backing data of a mapped pack or image. MoveFileExW
     // can return success but leave an older view faulting zero pages under memory pressure.
@@ -205,7 +211,7 @@ fn moved_unsynced(from: &Path, to: &Path) -> io::Result<()> {
     // SAFETY: the buffer has room and alignment for the fixed header and every name unit.
     // RootDirectory is null (absolute path). FileRenameInfoEx takes Flags, not ReplaceIfExists.
     sys::check(unsafe {
-        (*info).Anonymous.Flags = 1 | 2; // FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
         (*info).FileNameLength = bytes as u32;
         std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast(), name.len());
         SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
@@ -245,39 +251,6 @@ fn directory(dir: &Path) -> io::Result<OwnedHandle> {
 const RENAME_REPLACE: u32 = 0x1;
 /// `FILE_RENAME_FLAG_POSIX_SEMANTICS`: the name is taken from a file open elsewhere too.
 const RENAME_POSIX: u32 = 0x2;
-
-/// `from` renamed to `to`, replacing what is there, with POSIX semantics
-/// (`FileRenameInfoEx`): the replaced file may be open, or (on ReFS) running.
-fn posix_rename(from: &Path, to: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_RENAME_INFO, FileRenameInfoEx};
-    let file = plain(from, DELETE, OPEN_EXISTING)?;
-    let name = sys::path(to)?;
-    let name = &name[..name.len() - 1];
-    let size = size_of::<FILE_RENAME_INFO>() + size_of_val(name);
-    // alloc: once per image placed, the rename's information (`u64`s, for its alignment).
-    let mut buffer = vec![0u64; size.div_ceil(8)];
-    let info: *mut FILE_RENAME_INFO = buffer.as_mut_ptr().cast();
-    // SAFETY: `buffer` is `size` bytes, aligned for the struct, which is plain integers and a
-    // trailing name of `name.len()` units that the size leaves room for.
-    unsafe {
-        (*info).Anonymous.Flags = RENAME_REPLACE | RENAME_POSIX;
-        (*info).RootDirectory = std::ptr::null_mut();
-        (*info).FileNameLength = size_of_val(name) as u32;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-    }
-    // SAFETY: an open handle with DELETE access and the information of the class named, of
-    // the size given.
-    sys::check(unsafe {
-        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfoEx, info.cast(), size as u32)
-    })
-    // alloc: an error path.
-    .map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("renaming {} to {}: {error}", from.display(), to.display()),
-        )
-    })
-}
 
 /// The suffix of an image renamed aside ([`aside`]).
 const ASIDE: &str = ".blaze-old-";
@@ -863,6 +836,7 @@ mod image_tests {
             let (w_new, w_at) = (sys::path(&new).unwrap(), sys::path(&at).unwrap());
             // SAFETY: two NUL-terminated paths.
             let refused = unsafe {
+                use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
                 MoveFileExW(w_new.as_ptr(), w_at.as_ptr(), MOVEFILE_REPLACE_EXISTING)
             };
             assert_eq!(refused, 0, "{system}: the control: a plain replace of a running image");
