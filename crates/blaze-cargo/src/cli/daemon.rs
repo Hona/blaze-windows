@@ -194,9 +194,11 @@ impl std::fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {}
 
 /// Whether a connect failed because nothing listens at the socket: no file there, or one a
-/// daemon that is gone left.
+/// daemon that is gone left. On Windows an `AF_UNIX` connect to a name whose directory is not
+/// there (a home no daemon has run in yet) fails with `WSAENETDOWN` (10050, `NetworkDown`), measured.
 pub fn nothing_listens(error: &ClientError) -> bool {
-    matches!(error, ClientError::Io(it) if matches!(it.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused))
+    matches!(error, ClientError::Io(it) if matches!(it.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+        || (cfg!(windows) && it.kind() == io::ErrorKind::NetworkDown))
 }
 
 /// A connection to the daemon; `None` when none answers and none was to be started.
@@ -2177,5 +2179,25 @@ mod refusals {
                 && !running.contains("SIGKILL"),
             "{running}"
         );
+    }
+}
+
+#[cfg(all(test, windows, feature = "native"))]
+mod windows_tests {
+    use super::*;
+
+    /// A connect where no daemon ever ran (no directory), where the socket's directory is
+    /// there with no socket, and where a name is no socket is each "nothing listens", so a
+    /// command starts the daemon.
+    #[test]
+    fn nothing_listens_where_no_daemon_ran() {
+        let dir = std::env::temp_dir().join(format!("blaze-no-daemon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let missing = Client::unix(&dir.join("home").join("v2.sock")).err().expect("no daemon");
+        assert!(nothing_listens(&missing), "{missing}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let none = Client::unix(&dir.join("v2.sock")).err().expect("no daemon");
+        assert!(nothing_listens(&none), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

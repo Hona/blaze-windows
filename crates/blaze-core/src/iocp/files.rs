@@ -28,7 +28,7 @@ use windows_sys::Win32::{
         Ioctl::{
             DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
             FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
-            FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER,
+            FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER, FSCTL_SET_SPARSE,
         },
         SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING,
     },
@@ -613,6 +613,11 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
             Flags: integrity.Flags,
         };
         control::<_, ()>(&target, FSCTL_SET_INTEGRITY_INFORMATION, Some(&set), None)?;
+        // Sparse before its length is set, so the length allocates no clusters the clone then
+        // drops: measured on ReFS (D:, 64 MiB, 16 files), a clone into a sparse target 18.8 GB/s,
+        // into one whose length allocated first 3.5-8.7 GB/s. A sparse target of a source that
+        // is not is what the call allows (the other way round it refuses).
+        control::<(), ()>(&target, FSCTL_SET_SPARSE, None, None)?;
         let end = FILE_END_OF_FILE_INFO { EndOfFile: len as i64 };
         // SAFETY: an open handle and the information of the class named, of its size.
         sys::check(unsafe {
