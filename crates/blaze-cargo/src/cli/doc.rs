@@ -138,7 +138,8 @@ fn opened(page: &Path) -> Result<(), String> {
         None if cfg!(windows) => "explorer".into(),
         None => "xdg-open".into(),
     };
-    let status = std::process::Command::new(&opener).arg(page).status();
+    let cwd = std::env::current_dir().map_err(|why| format!("opening {}: {why}", page.display()))?;
+    let status = blaze_core::platform::command::command(&opener, &cwd).arg(page).status();
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("{} exited with {status}", opener.to_string_lossy())),

@@ -415,7 +415,7 @@ fn serve(loaded: &Loaded, source: &str, addr: &str) -> Result<(), Refused> {
     println!("serving {source} at {url}\n{link}");
     match open_page(&link) {
         Ok((program, page)) => {
-            if let Err(why) = std::process::Command::new(program).arg(&page).status() {
+            if let Err(why) = blaze_core::platform::command::command(program, &std::env::temp_dir()).arg(&page).status() {
                 eprintln!("the link was not opened (`{program}`: {why}): open it in a browser");
             }
         }

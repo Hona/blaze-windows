@@ -932,7 +932,8 @@ fn facts(run: u32, wall_ms: f64, t0: i64, t1: i64, ours: &str) -> Result<Built, 
 fn build(exe: &Path, args: &[String], run: u32, ours: &str) -> Result<Built, String> {
     let t0 = blaze_profile::clock::mono_ns();
     let started = std::time::Instant::now();
-    let output = std::process::Command::new(exe)
+    let cwd = std::env::current_dir().map_err(|why| format!("the workspace directory: {why}"))?;
+    let output = blaze_core::platform::command::command(exe, &cwd)
         .arg("build")
         .args(args)
         .stdin(std::process::Stdio::null())
