@@ -25,7 +25,7 @@ fn given(args: &[&str]) -> Vec<GivenArg> {
 }
 
 fn lib(name: &str, kind: NativeLibKind, verbatim: bool) -> LinkOption {
-    LinkOption::Lib(NativeLib { name: name.to_owned(), kind, verbatim })
+    LinkOption::Lib(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 
 fn options(spelling: Spelling, kind: Kind, args: &[&str]) -> Vec<LinkOption> {

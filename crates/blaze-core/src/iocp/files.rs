@@ -475,6 +475,27 @@ pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
     .map_err(named)
 }
 
+/// The file system `dir` is on and whether its files can share blocks
+/// ([`crate::platform::volume`]): `dir`, a directory or file that exists, opened for its
+/// attributes alone (a directory needs `FILE_FLAG_BACKUP_SEMANTICS` to be opened at all) and
+/// its volume asked. One open and one call: no file is made.
+pub(crate) fn volume(dir: &Path) -> io::Result<(String, bool)> {
+    let wide = sys::path(dir)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    file_system(&sys::owned(handle)?)
+}
+
 /// The name of the file system `handle` is on, and whether it shares blocks between files.
 fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
     let mut name = [0u16; 64];

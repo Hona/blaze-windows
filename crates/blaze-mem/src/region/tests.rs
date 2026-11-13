@@ -173,7 +173,8 @@ fn the_tag_follows_reuses_and_evictions(tc: TestCase) {
         assert_eq!(region.held(), holds, "the region's held bytes after {n} steps");
         assert_eq!(
             tag::snapshot().get(Tag::Pool).live,
-            before + holds as u64,
+            // Windows commits a readable sparse region whole as it is reserved, and counts it.
+            before + holds as u64 + if region.whole { region.reserved() as u64 } else { 0 },
             "Tag::Pool after {n} steps"
         );
         for (it, byte) in held.iter().enumerate() {

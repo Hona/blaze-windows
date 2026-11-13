@@ -19,7 +19,12 @@ fn name(it: &str) -> FileName {
 }
 
 fn config(dir: &str) -> Config {
-    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped }
+    Config { dir: name(dir), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped, sharing: blaze_core::Sharing::Blocks }
+}
+
+/// The store in `store`, on a volume that shares blocks or one that does not.
+fn sharing_config(sharing: Sharing) -> Config {
+    Config { sharing, ..config("store") }
 }
 
 fn key(n: u64) -> Key {
@@ -2583,6 +2588,94 @@ fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
     assert!(!sim.exists(&name("out/b")));
 }
 
+/// The invariant: on a volume that shares no blocks ([`Sharing::Unshared`]: NTFS, ext4) every
+/// value is placed by writing the file it is where it goes, the first place and the next alike:
+/// a short output, a chunked one past [`CLONE_FROM`], a hot value kept as a file of its own and
+/// a derived value (the file its chain gives). None is a clone (the simulation refuses every
+/// one), the store writes no whole file under `placed/`, each place counts its bytes as copied,
+/// an unplace asks for nothing and a patch over a clone of a path's file is refused by name.
+/// The control, the cause taken out: the same places on the same volume by a store told it
+/// shares blocks fail, saying the store does not copy.
+#[test]
+fn on_a_volume_that_shares_no_blocks_every_place_writes_its_file_and_none_clones() {
+    for sharing in [Sharing::Unshared, Sharing::Blocks] {
+        let mut sim = Sim::new(16, Faults { no_clone: true, ..Faults::default() });
+        sim.record(vec![name("store/placed")]);
+        let mut store = open_with(&mut sim, sharing_config(sharing));
+        let short = noise(100, 160);
+        let long = noise(CHUNK_FROM as usize + 10, 161);
+        let hot = noise(EXTERNAL_FROM, 162);
+        let writes = vec![(10u64, b"edit".to_vec()), (CHUNK_FROM as u64, b"more".to_vec())];
+        let len = long.len() as u64 + 7;
+        let derived = derived::applied(&long, len, writes.iter().map(|(at, it)| (*at, it)));
+        store.put(key(1), Kind::Output, &short).unwrap();
+        store.put(key(2), Kind::Output, &long).unwrap();
+        store.put(key(3), Kind::Query, &hot).unwrap();
+        store.put(key(4), Kind::Derived, &derived::encode(&key(2), len, &writes).unwrap()).unwrap();
+        flush(&mut sim, &mut store);
+        let mut effects = Vec::new();
+        let mut failed = Vec::new();
+        for round in 0..2 {
+            for (n, bytes) in [(1, &short), (2, &long), (3, &hot), (4, &derived)] {
+                let to = name(&format!("out/{round}/{n}"));
+                // clone: the test's own name of the path
+                let tag = store.place(&key(n), to.clone(), &mut effects).unwrap();
+                drive(&mut sim, &mut store, &mut effects);
+                let placed = store.placed();
+                assert_eq!(placed.iter().map(|it| it.tag).collect::<Vec<_>>(), [tag]);
+                match (&placed[0].result, sharing) {
+                    (Ok(()), _) => {
+                        assert_eq!(sim.contents(&to), **bytes, "{to}");
+                        if sharing == Sharing::Unshared {
+                            let copied = bytes.len() as u64;
+                            assert_eq!(placed[0].bytes, PlacedBytes { cloned: 0, written: 0, copied }, "{to}");
+                        }
+                    }
+                    (Err(why), Sharing::Blocks) => failed.push(why.clone()),
+                    (Err(why), Sharing::Unshared) => panic!("{to}: {why}"),
+                }
+            }
+        }
+        if sharing == Sharing::Blocks {
+            assert!(
+                failed.iter().any(|why| why.contains("does not copy")),
+                "the control: a store told it shares blocks clones, and the volume refuses: {failed:?}"
+            );
+            continue;
+        }
+        assert_eq!(sim.recorded(), &[] as &[(Duration, FileName, bool)], "nothing written under placed/");
+        store.unplace(&key(2), &key(4), &mut effects);
+        store.unplace_made(&key(2), &mut effects);
+        assert!(effects.is_empty(), "no whole file to let go of: {effects:?}");
+        let runs = Sparse { len: 4, runs: vec![(0, b"abcd".to_vec())] };
+        let tag = store.place_patched(name("out/0/2"), runs, &mut effects);
+        drive(&mut sim, &mut store, &mut effects);
+        let placed = store.placed();
+        assert_eq!(placed[0].tag, tag);
+        assert!(matches!(&placed[0].result, Err(why) if why.contains("shares no blocks")), "{placed:?}");
+        assert_eq!(sim.contents(&name("out/0/2")), long, "a refused patch leaves the path as it was");
+        assert_eq!(store.problems(), &[] as &[String]);
+    }
+}
+
+/// The whole files an earlier run kept under `placed/` (a store moved from a volume that
+/// shares blocks) are swept as a store on a volume that shares none opens: nothing will clone
+/// from them. On a volume that shares, the same file is kept.
+#[test]
+fn a_store_on_a_volume_that_shares_no_blocks_sweeps_the_whole_files_it_finds() {
+    for (sharing, kept, swept) in [(Sharing::Blocks, 1, 0), (Sharing::Unshared, 0, 1)] {
+        let mut sim = Sim::new(17, quiet());
+        let (store, out, file) = placed_once(&mut sim, 170);
+        drop(store);
+        assert!(sim.exists(&file));
+        let store = open_with(&mut sim, sharing_config(sharing));
+        let found = store.placed_on_open();
+        assert_eq!((found.kept, found.swept), (kept, swept), "{sharing:?}");
+        assert_eq!(sim.exists(&file), sharing == Sharing::Blocks, "{sharing:?}");
+        assert_eq!(bytes_of(&store, &key(1)).unwrap(), out, "the value stays");
+    }
+}
+
 #[test]
 fn a_layer_is_read_after_the_store_and_never_written() {
     let mut sim = Sim::new(11, quiet());
@@ -2594,7 +2687,7 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     let before = sim.contents(&name("base/head"));
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped, sharing: blaze_core::Sharing::Blocks },
     );
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
@@ -2613,7 +2706,7 @@ fn a_missing_layer_stops_the_store() {
     let mut sim = Sim::new(12, quiet());
     let mut effects = Vec::new();
     let mut store = Store::open(
-        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("nowhere")], tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped, sharing: blaze_core::Sharing::Blocks },
         &mut effects,
     );
     drive(&mut sim, &mut store, &mut effects);
@@ -2632,6 +2725,7 @@ fn shared(n: u64) -> SharedConfig {
         tags: (1 << 40) + (n << 33),
         load_tags: ((1 << 40) + (n << 33)) + (1 << 32),
         loader: Loader::Pumped,
+        sharing: blaze_core::Sharing::Blocks,
     }
 }
 
@@ -3116,7 +3210,7 @@ fn machine_code_is_never_kept_from_a_fetch_and_a_value_says_its_directory() {
     drop(base);
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped },
+        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped, sharing: blaze_core::Sharing::Blocks },
     );
     store.put(key(8), Kind::Machine, b"my code").unwrap();
     let mut remote = Recorded(Vec::new(), Vec::new());

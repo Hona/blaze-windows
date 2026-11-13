@@ -977,6 +977,22 @@ mod sys {
     }
 }
 
+/// No mapping is made off unix ([`Mapping::create`] says so), so nothing is reserved either.
+/// windows: a file mapping cannot outgrow its file, so the stores' range must be a section of its
+/// final size made up front (`CreateFileMappingW` with the whole `FILE_MOST`), not mapped past
+/// the end and grown as on unix.
+#[cfg(not(unix))]
+mod sys {
+    use std::{fs::File, io};
+
+    pub(super) fn reserve(_file: &File, _from: u64, _to: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "windows: the flight recorder's mapping is written for unix only",
+        ))
+    }
+}
+
 // --- The process's mapping --------------------------------------------------------------
 
 /// This process's mapping, once [`persist`] made it.

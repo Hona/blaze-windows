@@ -2292,6 +2292,42 @@ impl AttrFlags {
         }
     }
 
+    /// The ordinal `#[link_ordinal(n)]` imports a foreign item of a `raw-dylib` block by, as
+    /// written: `Err` of the text when it is no integer of 16 bits, the range a DLL's ordinals
+    /// have (rustc's `link_ordinal` refuses it the same way).
+    #[inline]
+    pub fn link_ordinal(db: &Db, owner: AttrDefId) -> Option<Result<u16, Box<str>>> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_ORDINAL) {
+            return None;
+        }
+        return link_ordinal(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn link_ordinal(db: &Db, owner: AttrDefId) -> Option<Result<u16, Box<str>>> {
+            collect_attrs(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && let Some(path) = attr.path()
+                    && is_one(path, "link_ordinal")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let value = match Itertools::exactly_one(TokenTreeChildren::new(tt)) {
+                        Ok(NodeOrToken::Token(value)) => match ast::IntNumber::cast(value) {
+                            Some(int) => int
+                                .value()
+                                .ok()
+                                .and_then(|it| u16::try_from(it).ok())
+                                .ok_or_else(|| Box::from(int.text())),
+                            None => Err(Box::from(value.text())),
+                        },
+                        Ok(NodeOrToken::Node(_)) | Err(_) => Err(Box::from("..")),
+                    };
+                    return ControlFlow::Break(value);
+                }
+                ControlFlow::Continue(())
+            })
+        }
+    }
+
     /// The diagnostic item `#[rustc_diagnostic_item = ".."]` names an item, rustc's
     /// `diagnostic_items` entry for it.
     #[inline]

@@ -63,7 +63,13 @@ unsafe extern "C" {
     /// mimalloc 3's two-level page map (`page-map.c`; hidden, which a static link still
     /// resolves): for each 512 MiB of address space a sub-map, null until mimalloc maps pages
     /// there, of a page pointer per 64 KiB slice. Set once, when mimalloc starts, before its
-    /// first block.
+    /// first block. With MSVC libmimalloc-sys compiles mimalloc as C++ (MSVC's C has no C11
+    /// atomics), so the name is C++'s: `std::atomic<mi_page_t**>* _mi_page_map`, which has the
+    /// same layout.
+    #[cfg_attr(
+        all(windows, target_env = "msvc"),
+        link_name = "?_mi_page_map@@3PEAU?$atomic@PEAPEAUmi_page_s@@@std@@EA"
+    )]
     static _mi_page_map: AtomicPtr<AtomicPtr<*const u8>>;
 }
 

@@ -2831,13 +2831,17 @@ pub(super) fn protected(
 /// most [`blaze_gc::lease::GIVE_WAY`]. Runs on the pool: it may sync a record.
 pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> super::work::Leased {
     let now = blaze_gc::record::now_ns();
-    let builds = std::path::Path::new(builds);
+    // The daemon names paths /D:/a on Windows; the disk is asked at the host's name.
+    let builds = crate::cli::place::host_path(builds);
+    let builds = builds.as_path();
     let root = builds.parent().unwrap_or(builds);
-    let checkout_path = std::path::Path::new(checkout);
+    let checkout_path = crate::cli::place::host_path(checkout);
+    let checkout_path = checkout_path.as_path();
     // alloc: once per job, a lease or two
     let mut leases = Vec::new();
-    for dir in [units.target_dir.as_str(), units.build_dir.as_str()] {
-        let dir = std::path::Path::new(dir);
+    for named in [units.target_dir.as_str(), units.build_dir.as_str()] {
+        let host = crate::cli::place::host_path(named);
+        let dir = host.as_path();
         if leases.iter().any(|it: &blaze_gc::lease::Lease| it.dir() == dir) {
             continue;
         }
@@ -2874,7 +2878,7 @@ pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> s
             .plans
             .iter()
             .flat_map(|plan| plan.outputs.iter())
-            .filter_map(|out| std::path::Path::new(out).strip_prefix(dir).ok())
+            .filter_map(|out| std::path::Path::new(out).strip_prefix(named).ok())
             .filter_map(|rest| rest.components().next())
             .filter_map(|first| first.as_os_str().to_str())
             .collect();
@@ -6857,7 +6861,10 @@ impl<S: Steps> Jobs<S> {
     /// ([`Jobs::place_made_as`]). A patch of the file before it ([`Made::Patch`]) goes as
     /// the patch where the path's record says it holds that file: the file is looked at
     /// first ([`Own::LookBase`]), since a file changed or removed since it was placed is no
-    /// base. Where the record names another value or none, the whole file is placed.
+    /// base. Where the record names another value or none, the whole file is placed, and so
+    /// it is wherever the store's volume shares no blocks: a patch is written into a clone of
+    /// the path's file, and there a copy of that file would write as much as the whole file
+    /// does, and read it too.
     fn place_made(
         &mut self,
         w: &mut World<'_, S>,
@@ -6868,6 +6875,7 @@ impl<S: Steps> Jobs<S> {
         made: Arc<Made>,
     ) {
         let based = match &*made {
+            Made::Patch { .. } if w.store.sharing() == blaze_core::Sharing::Unshared => false,
             Made::Patch { base, .. } => self.paths.placed[path as usize]
                 .as_ref()
                 .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),

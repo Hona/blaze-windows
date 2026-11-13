@@ -121,6 +121,20 @@ pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
     reserve(bytes, false)
 }
 
+/// [`reserve_sparse`] for a region whose owner makes each range its own with [`reuse`] before it
+/// touches it ([`crate::Region::reserve_sparse_ranges`]). Windows has no overcommit, so committing
+/// a store pool's terabytes up front fails (`ERROR_COMMITMENT_LIMIT`): there the range is only
+/// reserved and [`reuse`] commits it. Elsewhere it is [`reserve_sparse`].
+#[cfg(windows)]
+pub(crate) fn reserve_sparse_ranges(bytes: usize) -> io::Result<NonNull<u8>> {
+    reserve(bytes, false)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reserve_sparse_ranges(bytes: usize) -> io::Result<NonNull<u8>> {
+    reserve_sparse(bytes)
+}
+
 /// [`reserve`] with the pages' protection `prot`.
 #[cfg(unix)]
 fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNull<u8>> {
@@ -988,8 +1002,8 @@ pub(crate) const EVICT_BATCH: usize = 256;
 /// - macOS: `MADV_FREE_REUSABLE` per range, which takes the pages out of `phys_footprint` at
 ///   once; their contents are unspecified after, and [`reuse`] (`MADV_FREE_REUSE`) counts them
 ///   back before they are written.
-/// - Windows: `MEM_DECOMMIT` per range, which also returns their commit charge. A decommitted
-///   page faults when read, unlike the others: see [`crate::Region::evict`].
+/// - Windows: `DiscardVirtualMemory` per range: out of the working set at once, still committed
+///   and readable (see below).
 ///
 /// Never plain `MADV_FREE`: it is lazy, and the kernel goes on counting the pages (macOS's
 /// footprint, Linux's resident set and cgroup charge) until it gets round to them, the "freed but
@@ -1076,15 +1090,21 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
     given
 }
 
+/// Windows: `DiscardVirtualMemory`, not `MEM_DECOMMIT`. A decommitted page faults when read,
+/// and the store's pool reads a page it does not pin with an optimistic copy checked after
+/// (`racy::copy_out`): its pages must stay readable once reused, as they do on every other
+/// system. Discarded pages leave the working set at once and keep their commit charge; their
+/// bytes are unspecified until written.
 #[cfg(windows)]
 pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    use windows_sys::Win32::System::Memory::DiscardVirtualMemory;
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
-        // SAFETY: the caller says the range is inside a live reservation of ours that nothing
-        // references or reads.
-        if unsafe { VirtualFree(at.cast(), range.len(), MEM_DECOMMIT) } == 0 {
+        // SAFETY: the caller says the range is committed, inside a live reservation of ours,
+        // and that nothing references it or reads it but atomically.
+        let rc = unsafe { DiscardVirtualMemory(at.cast(), range.len()) };
+        if rc != 0 {
             break;
         }
         given += range.len();

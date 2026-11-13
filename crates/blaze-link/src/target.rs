@@ -82,6 +82,9 @@ pub struct Located {
     /// names it is matched against.
     pub name: String,
     pub kind: NativeKind,
+    /// A file the link made rather than found (a `raw-dylib`'s import library): its content's
+    /// id and its bytes, which no path on the machine holds. `path` is then only its name.
+    pub made: Option<(ContentId, Arc<[u8]>)>,
 }
 
 /// The main thread's stack where the format says it: link.exe's default, which rustc keeps,
@@ -442,8 +445,15 @@ fn locate_with<A: Ask>(
     if target == Target::Msvc {
         vc_runtime(output.link.pe.crt_static, libs)?;
     }
+    // Each DLL `raw-dylib`s name, and where its import library goes on the line: the place of
+    // the first to name it.
+    let mut dlls: Vec<(usize, crate::pe::raw_dylib::Dll)> = Vec::new();
     for CrateLibs { libs, search: own } in libs {
         for lib in *libs {
+            if lib.kind == NativeLibKind::RawDylib {
+                raw_dylib(&mut line, &mut dlls, lib)?;
+                continue;
+            }
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
                 continue;
             }
@@ -463,7 +473,44 @@ fn locate_with<A: Ask>(
     for name in target.end() {
         line.object(name)?;
     }
+    for (at, dll) in dlls {
+        let made = dll.library().map_err(fail)?;
+        line.out[at].made = Some(made);
+    }
     Ok(line.out)
+}
+
+/// A `raw-dylib` library on the line: its imports join its DLL's, whose import library the
+/// link makes ([`crate::pe::raw_dylib`]) and puts where the DLL is first named. Only PE has
+/// DLLs; the front end refuses a `raw-dylib` for another target, and so does this.
+fn raw_dylib(
+    line: &mut Line<'_>,
+    dlls: &mut Vec<(usize, crate::pe::raw_dylib::Dll)>,
+    lib: &NativeLib,
+) -> Result<(), LinkError> {
+    if line.output.format != Format::Pe {
+        // alloc: error path
+        return Err(fail(format!(
+            "the `raw-dylib` `{}`: a `raw-dylib` is a Windows DLL, and this links {:?}",
+            lib.name, line.output.format
+        )));
+    }
+    let name = crate::pe::raw_dylib::dll_name(lib);
+    let at = match dlls.iter().position(|(_, it)| it.name.eq_ignore_ascii_case(&name)) {
+        Some(at) => at,
+        None => {
+            line.out.push(Located {
+                path: PathBuf::from(&name),
+                // alloc: once per DLL `raw-dylib`s name, what errors call its import library
+                name: format!("raw-dylib {name}"),
+                kind: NativeKind::Archive { whole: false },
+                made: None,
+            });
+            dlls.push((line.out.len() - 1, crate::pe::raw_dylib::Dll::new(name)));
+            dlls.len() - 1
+        }
+    };
+    dlls[at].1.add(lib).map_err(fail)
 }
 
 /// MSVC's VC runtime libraries, the dynamic ones (the DLLs' import libraries and their static
@@ -1714,7 +1761,7 @@ impl Line<'_> {
             self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
-        self.out.push(Located { path, name, kind });
+        self.out.push(Located { path, name, kind, made: None });
         let at = self.out.len() - 1;
         if script {
             self.follow(at)?;
@@ -1994,6 +2041,13 @@ fn files(
             // alloc: error path
             return Err(fail(format!(
                 "the framework `{name}`: frameworks are Apple's, and this links {format:?}"
+            )));
+        }
+        NativeLibKind::RawDylib => {
+            // alloc: error path
+            return Err(fail(format!(
+                "the `raw-dylib` `{name}` searched for as a file: the link makes its import \
+                 library, and no file is looked for"
             )));
         }
         NativeLibKind::Framework => {

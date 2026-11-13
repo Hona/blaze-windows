@@ -4,7 +4,8 @@
 mod db;
 
 use blaze_codegen::{
-    Arch, BuiltId, Changes, CompiledFunction, Delta, Line, NativeLib, NativeLibKind, driver::Built,
+    Arch, BuiltId, Changes, CompiledFunction, Delta, Line, NativeLib, NativeLibKind, RawImport,
+    driver::Built,
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -30,7 +31,82 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 }
 
 fn lib(name: &str, kind: NativeLibKind) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind, verbatim: false }
+    NativeLib { name: name.to_owned(), kind, verbatim: false, imports: Vec::new() }
+}
+
+fn import(symbol: &str, ordinal: Option<u16>, data: bool) -> RawImport {
+    RawImport { symbol: symbol.to_owned(), ordinal, data }
+}
+
+/// A `raw-dylib` block's library lists its items as the code names them (a `link_name` over
+/// the item's name), by ordinal where `#[link_ordinal]` says, statics as data; another kind's
+/// lists none.
+#[test]
+fn a_raw_dylib_lists_the_items_of_its_block() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+#[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "system" {
+    fn GetLastError() -> u32;
+    #[link_name = "SetLastError"]
+    fn set_last_error(code: u32);
+}
+#[link(name = "bcryptprimitives", kind = "raw-dylib")]
+extern "system" {
+    #[link_ordinal(7)]
+    fn by_ordinal();
+    static Exported: u32;
+}
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW();
+}
+"#,
+    );
+    let mut libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    for lib in &mut libs {
+        lib.imports.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    }
+    let raw = |name: &str, verbatim, imports| NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::RawDylib,
+        verbatim,
+        imports,
+    };
+    assert_eq!(
+        libs,
+        [
+            raw(
+                "kernel32.dll",
+                true,
+                vec![import("GetLastError", None, false), import("SetLastError", None, false)]
+            ),
+            raw(
+                "bcryptprimitives",
+                false,
+                vec![import("Exported", None, true), import("by_ordinal", Some(7), false)]
+            ),
+            lib("user32", NativeLibKind::Dylib),
+        ]
+    );
+}
+
+/// An ordinal that is no 16-bit integer is an error naming it, as rustc's.
+#[test]
+fn an_ordinal_past_16_bits_is_an_error() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+#[link(name = "k", kind = "raw-dylib")]
+extern "C" {
+    #[link_ordinal(65536)]
+    fn far();
+}
+"#,
+    );
+    let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+    assert!(error.what.contains("`#[link_ordinal(65536)]` on `far`"), "{}", error.what);
 }
 
 /// A block's `wasm_import_module` names its imports' module, no library.
@@ -57,7 +133,12 @@ extern "C" {}
             lib("z", NativeLibKind::Dylib),
             lib("ssl", NativeLibKind::Static { whole: true, bundle: false }),
             lib("Foundation", NativeLibKind::Framework),
-            NativeLib { name: "exact.so".to_owned(), kind: NativeLibKind::Dylib, verbatim: true },
+            NativeLib {
+                name: "exact.so".to_owned(),
+                kind: NativeLibKind::Dylib,
+                verbatim: true,
+                imports: Vec::new(),
+            },
         ]
     );
 }
@@ -65,7 +146,10 @@ extern "C" {}
 #[test]
 fn a_link_blaze_cannot_make_is_an_error_naming_it() {
     for (text, named) in [
-        ("#[link(name = \"kernel32\", kind = \"raw-dylib\")]\nextern \"C\" {}", "raw-dylib"),
+        (
+            "#[link(name = \"kernel32\", kind = \"raw-dylib\")]\nextern \"C\" {}",
+            "`raw-dylib` links only on Windows",
+        ),
         ("#[link(name = \"m\", modifiers = \"+whole-archive\")]\nextern \"C\" {}", "whole-archive"),
         ("#[link(name = \"-Wl,-z\", kind = \"link-arg\")]\nextern \"C\" {}", "kind = \"link-arg\""),
         ("#[link(name = \"m\", modifiers = \"+as-needed\")]\nextern \"C\" {}", "+as-needed"),

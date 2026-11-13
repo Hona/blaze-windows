@@ -407,7 +407,7 @@ pub fn parse(
 /// A library linked as `-l` links it.
 fn lib(name: &str, kind: NativeLibKind, verbatim: bool) -> LinkOption {
     // alloc: once per library among the link arguments, the name the link line owns
-    LinkOption::Lib(NativeLib { name: name.to_owned(), kind, verbatim })
+    LinkOption::Lib(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 
 /// `-lNAME` (`-l:FILE` verbatim, GNU only).

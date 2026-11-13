@@ -511,17 +511,30 @@ fn encode_component(s: &str) -> String {
 /// user's own on a local volume that keeps ownership, owner-only mode and no ACL (one inherited
 /// from a parent of `TMPDIR` included). With the program that opens it.
 fn open_page(link: &str) -> Result<(&'static str, PathBuf), String> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        // The shell's default handler of the file, as `open` and `xdg-open` are.
+        "explorer"
+    } else {
+        "xdg-open"
+    };
     // A random name of its own, not the token.
     let name =
         ix_prof::token::new().map_err(|why| format!("naming the page's directory: {why}"))?;
     let dir = std::env::temp_dir().join(format!("blaze-pprof-{}-{name}", std::process::id()));
     // Not recursive: a directory someone else made there first is refused, not used.
-    std::fs::DirBuilder::new()
-        .mode(0o700)
+    #[cfg(unix)]
+    let made = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)
+    };
+    // The same by access control list: closed to all but the user before the page is in it.
+    #[cfg(windows)]
+    let made = std::fs::DirBuilder::new()
         .create(&dir)
-        .map_err(|why| format!("making {}: {why}", dir.display()))?;
+        .and_then(|()| crate::socket::windows::only_the_user_opens(&dir));
+    made.map_err(|why| format!("making {}: {why}", dir.display()))?;
     let page = dir.join("open.html");
     let html_link =
         link.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
@@ -609,21 +622,29 @@ mod tests {
 
     /// S2 (round 3): the `--http` page, which holds the serve token, is written through
     /// `PrivateDir`: a 0600 regular file, the link in it, in a new 0700 directory of its own.
+    #[cfg(unix)]
     #[test]
     fn the_explorer_page_is_written_private() {
-        use std::os::unix::fs::PermissionsExt as _;
         let link = "https://ix.dev/explore#profile=http%3A%2F%2F127.0.0.1%3A1%2Fprofile.ixprof%3Ftoken%3Dabc&x";
         let (_, page) = super::open_page(link).unwrap();
         let dir = page.parent().unwrap().to_owned();
-        let (html, file_mode, dir_mode) = (
-            std::fs::read_to_string(&page).unwrap(),
-            std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-        );
+        #[cfg(unix)]
+        let private = {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            ((mode(&page), mode(&dir)) == (0o600, 0o700)).then_some(()).ok_or_else(|| "not 0600 in 0700".to_owned())
+        };
+        // Windows: the directory's access control list opens it to the user, SYSTEM and the
+        // administrators alone, and the page inherits it.
+        #[cfg(windows)]
+        let private = crate::socket::windows::the_users_alone(&dir)
+            .and_then(|()| crate::socket::windows::the_users_alone(&page))
+            .map_err(|why| why.to_string());
+        let html = std::fs::read_to_string(&page).unwrap();
         let names: Vec<_> =
             std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().file_name()).collect(); // alloc: test
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!((file_mode, dir_mode), (0o600, 0o700));
+        assert_eq!(private, Ok(()));
         assert_eq!(names, ["open.html"]);
         assert!(html.contains(&link.replace('&', "&amp;")), "{html}");
     }

@@ -48,7 +48,7 @@ fn output(kind: OutputKind) -> Output {
     }
 }
 
-fn exe() -> Output {
+pub(super) fn exe() -> Output {
     output(OutputKind::Executable { entry: "mainCRTStartup".into() })
 }
 
@@ -56,7 +56,7 @@ fn dll() -> Output {
     output(OutputKind::Shared { name: "lib.dll".into(), exports: Vec::new() })
 }
 
-fn pe(output: Output) -> Pe {
+pub(super) fn pe(output: Output) -> Pe {
     let last = output.incremental.then(|| Lock::new("link.pe.last", Default::default()));
     Pe { output, descriptors: Lock::new("link.pe.descriptors", Default::default()), last }
 }

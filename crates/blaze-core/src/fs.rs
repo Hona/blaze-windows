@@ -309,9 +309,28 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 
 /// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
 /// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
+/// On Windows the store seals a file read-only before it asks for its write-back, and the
+/// read-only attribute refuses the handle to write that `FlushFileBuffers` needs (os error 5):
+/// the attribute is lifted for the flush and put back. windows: the real fix is to flush through
+/// the handle that wrote the file before the seal (or to not need the flush before a ReFS block
+/// clone), so the sealed file is never writable again.
+#[cfg(windows)]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    let sealed = std::fs::metadata(path)?.permissions();
+    if !sealed.readonly() {
+        return OpenOptions::new().write(true).open(path)?.sync_data();
+    }
+    let mut open = sealed.clone();
+    open.set_readonly(false);
+    std::fs::set_permissions(path, open)?;
+    let flushed = OpenOptions::new().write(true).open(path).and_then(|file| file.sync_data());
+    std::fs::set_permissions(path, sealed)?;
+    flushed
 }
 
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
