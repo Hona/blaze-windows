@@ -6299,6 +6299,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-script",
  "regex",
+ "serde",
  "serde_json",
  "toml",
 ]
