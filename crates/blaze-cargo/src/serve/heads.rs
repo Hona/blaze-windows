@@ -37,6 +37,7 @@ use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_vfs::{Outside, Vfs, Watched, Watcher};
 use std::alloc::Global;
+use std::time::Duration;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
 const WATCHER_TAGS: u64 = 1 << 32;
@@ -55,6 +56,7 @@ pub enum Out {
 /// A request whose checkouts' watchers, or the watches outside views, have not caught up with
 /// it.
 struct Held {
+    since: Duration,
     from: RequestRef,
     request: Request,
     /// Each checkout it names, by slot, and the flush it waits for there.
@@ -231,6 +233,7 @@ impl Heads {
     /// have caught up with it.
     pub fn arrive(
         &mut self,
+        now: Duration,
         vfs: &Vfs,
         arrived: Arrived,
         effects: &mut Vec<Effect>,
@@ -286,8 +289,30 @@ impl Heads {
             checkouts = waits.len(),
             outside,
         );
-        self.held.push(Held { from, request, waits, outside, _waiting });
+        self.held.push(Held { since: now, from, request, waits, outside, _waiting });
         self.release(out);
+    }
+
+    /// These clients do not yet have a session job. A lost driver completion must not leave
+    /// them out of reach of every watchdog. Do not disturb the outstanding watch or another
+    /// client's newer fence when a wait expires.
+    pub fn expire(&mut self, now: Duration, bound: Duration, out: &mut Vec<Out>) {
+        for held in self.held.extract_if(.., |it| now.saturating_sub(it.since) >= bound) {
+            let mut what = format!("waiting {:?} for the filesystem watches for request {}", bound, held.from.id);
+            for (slot, number) in held.waits {
+                if let Some(checkout) = self.checkouts[slot as usize].as_deref() {
+                    what.push_str(&format!("; {} flush {number} (flushed: {}, scan idle: {})", checkout.head,
+                        checkout.flushes.get(&number) == Some(&true), checkout.watcher.idle()));
+                }
+            }
+            if held.outside && !self.outside.flushed() {
+                what.push_str("; external input watches not flushed");
+            }
+            if let Some(panic) = super::observe::last_panic() {
+                what.push_str(&format!("; most recent daemon panic: {panic}"));
+            }
+            answer(out, held.from, Some(ApiError::new(what, Some("watch deadline".into()))), false);
+        }
     }
 
     /// A flush of `head`'s checkout's watch, its watcher started first if it has none: the
@@ -601,11 +626,11 @@ mod tests {
                 .collect()
         };
 
-        heads.arrive(&vfs, build(1), &mut effects, &mut out);
+        heads.arrive(Duration::ZERO, &vfs, build(1), &mut effects, &mut out);
         assert_eq!(passed(&mut out), [1], "nothing is watched: the round is in at once");
 
         dirs.want(std::path::Path::new("/usr/include"));
-        heads.arrive(&vfs, build(2), &mut effects, &mut out);
+        heads.arrive(Duration::ZERO, &vfs, build(2), &mut effects, &mut out);
         assert_eq!(passed(&mut out), [2], "a watch not yet confirmed has nothing to flush");
         let stat = effects
             .iter()
@@ -623,7 +648,7 @@ mod tests {
         );
         effects.clear();
 
-        heads.arrive(&vfs, build(3), &mut effects, &mut out);
+        heads.arrive(Duration::ZERO, &vfs, build(3), &mut effects, &mut out);
         let flush = effects
             .iter()
             .find_map(|it| match it {
@@ -634,6 +659,7 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(heads.waiting(), 1);
         heads.arrive(
+            Duration::ZERO,
             &vfs,
             Arrived::Request { from: from(4), request: Request::Status },
             &mut effects,
@@ -744,5 +770,32 @@ mod tests {
         }
         heads.sweep();
         assert_eq!(heads.checkouts[0].as_deref().unwrap().flushes.len(), 13);
+    }
+
+    #[test]
+    fn a_lost_checkout_completion_fails_only_clients_whose_deadline_passed() {
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
+        let (mut effects, mut out) = (Vec::new(), Vec::new());
+        let mut vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
+        let open = |id| Arrived::Request {
+            from: RequestRef { conn: Conn(1), id },
+            request: Request::Open { view: ViewRef::Head("/w".into()) },
+        };
+        let bound = Duration::from_secs(10);
+        heads.arrive(Duration::ZERO, &vfs, open(1), &mut effects, &mut out);
+        heads.arrive(bound / 2, &vfs, open(2), &mut effects, &mut out);
+        heads.expire(bound / 2, bound, &mut out);
+        assert!(out.is_empty());
+        heads.expire(bound, bound, &mut out);
+        assert!(matches!(&out[..], [Out::Answer(e), Out::Answer(d)] if e.to.id == 1 &&
+            matches!(&e.response, Response::Error(e) if e.what.contains("/w flush 0")) &&
+            d.response == Response::Done { ok: false }));
+        out.clear();
+        let failed = Completion { tag: Tag(1 << 32), done: Done::Failed(blaze_core::IoError("the IOCP worker panicked naming a USN record: planted".into())) };
+        heads.complete(&mut vfs, failed, &mut effects, &mut out);
+        assert!(matches!(&out[..], [Out::Answer(e), Out::Answer(d)] if e.to.id == 2 &&
+            matches!(&e.response, Response::Error(e) if e.what.contains("USN record: planted")) &&
+            d.response == Response::Done { ok: false }));
+        assert_eq!(heads.waiting(), 0);
     }
 }

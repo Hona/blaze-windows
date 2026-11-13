@@ -2336,6 +2336,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// every thread is inside is written to the log first, so a client's own watchdog that
     /// stops the daemon sooner still finds it; so it is too once a step runs [`LONG_STEP`].
     fn watch(&mut self) {
+        if self.heads.waiting() != 0 {
+            let mut out = self.spare.out.pop().unwrap_or_default();
+            self.heads.expire(self.driver.now(), self.watchdog.bound(), &mut out);
+            self.outs(out);
+        }
         self.still();
         if self.failed.is_some() {
             return;
@@ -2823,7 +2828,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             Arrived::Gone { conn } => self.answering.retain(|(to, _)| to.conn != *conn),
         }
         let mut out = self.spare.out.pop().unwrap_or_default();
-        self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
+        self.heads.arrive(self.driver.now(), &self.vfs, arrived, &mut self.effects, &mut out);
         self.outs(out);
     }
 
