@@ -35,6 +35,10 @@ struct Matrix {
     engine: PathBuf,
     blaze_commit: String,
     cargo: PathBuf,
+    /// Inputs only. Never seed a daemon image, compiled std or build output.
+    toolchains: PathBuf,
+    library: Option<PathBuf>,
+    sources: Option<PathBuf>,
     volumes: Vec<PathBuf>,
     out: PathBuf,
     runs: u32,
@@ -218,6 +222,24 @@ fn edit_path(project: &Path, name: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 
+/// Copy only from the explicitly named, pre-fetched input tree, never follow links.
+fn seed(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest = to.join(entry.file_name());
+        if ty.is_file() {
+            fs::copy(entry.path(), dest)?;
+        } else if ty.is_dir() {
+            seed(&entry.path(), &dest)?;
+        } else {
+            return Err(format!("unsupported seed file: {}", entry.path().display()).into());
+        }
+    }
+    Ok(())
+}
+
 fn changed(text: &str, edit: &Edit, tick: u32) -> Result<String> {
     let after = edit.after.replace("{tick}", &tick.to_string());
     if edit.before.is_empty() || text.matches(&edit.before).count() != 1 || edit.before == after {
@@ -247,6 +269,15 @@ fn trial(
     let result = (|| -> Result<()> {
         for s in &sides {
             fs::create_dir(&s.root)?;
+            if s.blaze {
+                seed(&m.toolchains, &s.root.join("local/blaze/toolchains"))?;
+                if let Some(lib) = &m.library {
+                    seed(lib, &s.root.join("home/library"))?;
+                }
+                if let Some(src) = &m.sources {
+                    seed(src, &s.root.join("home/sources"))?;
+                }
+            }
             output(
                 Command::new("git")
                     .args(["clone", "--no-hardlinks", "--no-checkout"])
@@ -279,6 +310,11 @@ fn trial(
                 ));
                 if kind != "cold" {
                     s.invoke(&args, &log.with_extension("settle"))?;
+                }
+                // The first walk after work was done establishes the reusable answer. It
+                // is not the warm no-op; time the following invocation against cargo's.
+                if kind == "noop" {
+                    s.invoke(&args, &log.with_extension("warm"))?;
                 }
                 if kind == "restart" {
                     s.stop()?;

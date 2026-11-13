@@ -41,6 +41,15 @@ pub(super) fn readable(
     })
 }
 
+/// Absolute QPC ticks, the time base an external launch timer also reads. Instant's epoch
+/// is private to std; this clock is comparable across the parent and child processes.
+pub(super) fn counter() -> i64 {
+    let mut at = 0;
+    // SAFETY: QPC writes one i64 and is always supported on Windows x64.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut at) };
+    at
+}
+
 pub(super) fn run(cmd: &mut Command) -> io::Result<ExitCode> {
     let status = cmd.status()?;
     Ok(code(status.code().unwrap_or(101) as u32))
