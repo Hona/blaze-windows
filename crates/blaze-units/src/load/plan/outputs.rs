@@ -212,20 +212,33 @@ fn file_types(
     Ok(Some(out))
 }
 
+/// The crate types a library unit of `crate_types` is built as
+/// ([`crate::schema::builds_only_its_rlib`], the one rule).
+fn built_crate_types(crate_types: &[CrateType], is_root: bool) -> impl Iterator<Item = &CrateType> {
+    let only_rlib =
+        crate::schema::builds_only_its_rlib(crate_types.iter().map(CrateType::as_str), is_root);
+    crate_types.iter().filter(move |it| !only_rlib || crate::schema::is_rlib(it.as_str()))
+}
+
 /// cargo's `TargetInfo::rustc_outputs`, with `calc_outputs_rustc`'s errors when the target
 /// has none of the crate types. `embed-metadata` is always on (`-Zno-embed-metadata` unstable).
+/// A library the build only depends on (`is_root` false) has the files of its rlib alone
+/// ([`built_crate_types`]).
 pub(super) fn rustc_outputs(
     mode: CompileMode,
     kind: &TargetKind,
     triple: &str,
     package: &str,
+    is_root: bool,
 ) -> Result<Vec<FileType>, LoadError> {
     let (types, unsupported) = match mode {
         CompileMode::Build => {
-            let crate_types = kind.rustc_crate_types();
+            // alloc: a handful of crate types, once per unit planned
+            let crate_types: Vec<&CrateType> =
+                built_crate_types(kind.rustc_crate_types(), is_root).collect();
             let mut unsupported = Vec::new();
             let mut types = Vec::new();
-            for crate_type in crate_types {
+            for &crate_type in &crate_types {
                 let flavor =
                     if crate_type.is_linkable() { Flavor::Linkable } else { Flavor::Normal };
                 match file_types(crate_type, flavor, triple)? {
@@ -233,7 +246,7 @@ pub(super) fn rustc_outputs(
                     None => unsupported.push(crate_type.clone()),
                 }
             }
-            if !types.is_empty() && !crate_types.iter().any(CrateType::requires_upstream_objects) {
+            if !types.is_empty() && !crate_types.iter().any(|it| it.requires_upstream_objects()) {
                 types.push(FileType::rmeta());
             }
             (types, unsupported)
@@ -304,7 +317,7 @@ pub(super) fn output_dir(it: &CompileFiles<'_>) -> PathBuf {
 /// dep-info, and of a root unit `output_depinfo`'s `.d` beside each copy.
 pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, LoadError> {
     let out_dir = output_dir(it);
-    let types = rustc_outputs(it.mode, it.kind, it.triple, it.package)?;
+    let types = rustc_outputs(it.mode, it.kind, it.triple, it.package, it.is_root)?;
     let mut outputs = Vec::with_capacity(types.len() * 2 + 2);
     let mut depinfo = Vec::new();
     for file in &types {
@@ -400,7 +413,7 @@ pub(super) fn bin_link(
     name: &str,
     bin_name: Option<&str>,
 ) -> Result<PathBuf, LoadError> {
-    let types = rustc_outputs(CompileMode::Build, &TargetKind::Bin, triple, name)?;
+    let types = rustc_outputs(CompileMode::Build, &TargetKind::Bin, triple, name, true)?;
     let file = types
         .iter()
         .find(|it| it.flavor == Flavor::Normal)

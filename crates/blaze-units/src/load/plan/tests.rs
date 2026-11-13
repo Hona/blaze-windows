@@ -966,6 +966,34 @@ fn uplifted_on_windows() {
     );
 }
 
+/// A library that lists a `cdylib` or `staticlib` beside its rlib (rav1d's `["staticlib",
+/// "rlib"]`, betteroffice's `["cdylib", "rlib"]`) has the files of its rlib alone where the build
+/// only depends on it, and every crate type's where it is asked for.
+#[test]
+fn a_dependency_with_an_rlib_plans_only_the_rlib() {
+    let msvc = "x86_64-pc-windows-msvc";
+    let out = format!("/w/build/{msvc}/debug/build/app/{H}/out");
+    for other in [CrateType::Cdylib, CrateType::Staticlib, CrateType::Dylib] {
+        let kind = TargetKind::Lib(vec![other.clone(), CrateType::Rlib]);
+        assert_eq!(
+            files(msvc, hash::CompileMode::Build, &kind, "foo", Some(H), false),
+            [
+                format!("{out}/libfoo-{H}.rlib"),
+                format!("{out}/libfoo-{H}.rmeta"),
+                format!("{out}/foo-{H}.d"),
+            ],
+            "{other}"
+        );
+        // Control: asked for, it has the other crate type's file too.
+        let asked = files(msvc, hash::CompileMode::Build, &kind, "foo", Some(H), true);
+        let suffix = match other {
+            CrateType::Staticlib => format!("foo-{H}.lib"),
+            _ => format!("foo-{H}.dll"),
+        };
+        assert!(asked.contains(&format!("{out}/{suffix}")), "{other}: {asked:?}");
+    }
+}
+
 /// A directory of the test's own under the system's temporary one, removed after.
 struct Scratch(PathBuf);
 

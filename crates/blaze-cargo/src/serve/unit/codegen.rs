@@ -69,32 +69,33 @@ pub(crate) fn makes(unit: &Unit, asked: bool) -> Result<Makes, String> {
     if target.is_proc_macro() {
         return Ok(Makes::Shared { proc_macro: true });
     }
+    // cargo writes every crate type a library lists, a dependency's too, but a dependency's
+    // `cdylib`, `staticlib` or `dylib` is a file no step of the build reads: a library a build
+    // only depends on, which is also an `rlib` (`lib`), is built as that rlib and nothing else
+    // (`schema::builds_only_its_rlib`, which its planned files follow too); the programs that
+    // link it behave as under cargo (tree-sitter-highlight's `crate-type = ["lib",
+    // "staticlib"]`, betteroffice's `["cdylib", "rlib"]`).
+    let kinds = target.crate_types.iter().chain(&target.kind).map(String::as_str);
+    if schema::builds_only_its_rlib(kinds, asked) {
+        return Ok(Makes::Library);
+    }
     if has("cdylib") {
         return Ok(Makes::Shared { proc_macro: false });
     }
     if has("staticlib") || has("dylib") {
         let kind = if has("staticlib") { "staticlib" } else { "dylib" };
-        // cargo writes every crate type a library lists, a dependency's too, but a dependency's
-        // `staticlib` or `dylib` is a file no step of the build reads: what depends on the
-        // library links its `rlib`, and an archive or dylib in `deps/` is no output a program
-        // links (only an artifact dependency would name one). So a library a
-        // build only depends on, which is also an `rlib` (`lib`), is built as that rlib and
-        // nothing else; the programs that link it behave as under cargo (tree-sitter-highlight's
-        // `crate-type = ["lib", "staticlib"]`). Where the build is asked for the library itself,
-        // or it has no rlib to link, the file is what is asked for, and this linker does not
-        // write it: an error naming it, never a build that quietly leaves it out.
-        let rlib = has("lib") || has("rlib");
-        if asked || !rlib {
-            let why = match asked {
-                true => "the build is asked for this library",
-                false => "it has no `lib` or `rlib` its dependents could link instead",
-            };
-            return Err(format!(
-                "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
-                 types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
-                target.name
-            ));
-        }
+        // The build is asked for the library itself, or it has no rlib to link: the file is
+        // what is asked for, and this linker does not write it: an error naming it, never a
+        // build that quietly leaves it out.
+        let why = match asked {
+            true => "the build is asked for this library",
+            false => "it has no `lib` or `rlib` its dependents could link instead",
+        };
+        return Err(format!(
+            "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
+             types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
+            target.name
+        ));
     }
     Ok(Makes::Library)
 }

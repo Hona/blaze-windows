@@ -2863,6 +2863,24 @@ fn a_dependencys_staticlib_or_dylib_is_built_as_its_rlib_and_refused_where_asked
     }
 }
 
+/// A dependency that lists a `cdylib` beside its rlib (betteroffice's `crate-type = ["cdylib",
+/// "rlib"]`) is built as that rlib: the DLL is no file the build reads. Asked for itself, or
+/// with no rlib, it links the shared library, as a `cdylib` is linked.
+#[test]
+fn a_dependencys_cdylib_is_built_as_its_rlib_and_linked_where_asked_for() {
+    let mut lib = target("docx_parse", "lib", "src/lib.rs");
+    lib.kind = vec!["cdylib".to_owned(), "rlib".to_owned()];
+    lib.crate_types = lib.kind.clone(); // clone: the test's target
+    let dep = unit("git+betteroffice-docx-parse", lib, Mode::Build, &[]);
+    assert_eq!(codegen::makes(&dep, false), Ok(codegen::Makes::Library));
+    assert_eq!(codegen::makes(&dep, true), Ok(codegen::Makes::Shared { proc_macro: false }));
+    // Control: a `cdylib` alone is what its dependents get, and is linked.
+    let mut only = dep.clone(); // clone: the test's unit
+    only.target.kind = vec!["cdylib".to_owned()];
+    only.target.crate_types = vec!["cdylib".to_owned()];
+    assert_eq!(codegen::makes(&only, false), Ok(codegen::Makes::Shared { proc_macro: false }));
+}
+
 /// A file's text by name, for [`compile::placed_from`] and [`compile::replaced_from`].
 fn one_file(text: &'static str) -> impl Fn(&str) -> Option<String> {
     move |name| (name == "src/lib.rs").then(|| text.to_owned())
