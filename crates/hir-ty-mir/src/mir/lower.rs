@@ -3403,14 +3403,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             // reference in a generic function; not promoted, the vtable was a slot of the frame
             // the function returned a reference to, and the borrow checker refused it (E0515).
             [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }] => {
-                matches!(
-                    self.store.expr(expr),
-                    Expr::Closure { closure_kind: ClosureKind::Closure, .. }
-                ) && self
-                    .infer
-                    .closures_data
-                    .get(&expr)
-                    .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+                self.infer.constant_closure_pointer(expr)
             }
             // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
             // rustc's `promote_consts::Validator::validate_rvalue`.
