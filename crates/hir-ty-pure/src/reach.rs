@@ -203,9 +203,31 @@ struct Imp {
 /// hold and the implications between atoms. Sorted, so equal states are equal values.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct State {
-    vals: Vec<TermId>,
+    vals: Slots,
     facts: Vec<Atom>,
     imps: Vec<Imp>,
+}
+
+/// Local values differ from the entry state at just the places a path wrote. Entry
+/// unknowns are interned in slot order before any other term; a missing slot is its own ID.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Slots(Vec<(u32, TermId)>);
+
+impl Slots {
+    fn get(&self, slot: usize) -> TermId {
+        let slot = slot as u32;
+        self.0.binary_search_by_key(&slot, |it| it.0).map_or(slot, |i| self.0[i].1)
+    }
+
+    fn set(&mut self, slot: usize, value: TermId) {
+        let slot = slot as u32;
+        match self.0.binary_search_by_key(&slot, |it| it.0) {
+            Ok(i) if slot == value => { self.0.remove(i); }
+            Ok(i) => self.0[i].1 = value,
+            Err(i) if slot != value => self.0.insert(i, (slot, value)),
+            Err(_) => {}
+        }
+    }
 }
 
 impl State {
@@ -270,7 +292,7 @@ fn saturate(state: &mut State, mut entails: impl FnMut(&State, Atom) -> bool) ->
 #[test]
 fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
     let key = |n| Atom::new(Rel::Le, n, n + 1);
-    let mut state = State { vals: vec![], facts: vec![key(2)], imps: vec![] };
+    let mut state = State { vals: Slots::default(), facts: vec![key(2)], imps: vec![] };
     for i in 3..103 { state.put_imp((key(1), key(i))); }
     state.put_imp((key(2), key(1)));
     let mut tries = 0;
@@ -286,6 +308,7 @@ fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
 /// in the same order, and so adds the same facts and finds the same contradictions, as the
 /// table kept by premise it replaced (here, the reference), for an entailment that reads
 /// through `<` to `<=` and a contradiction that is a negated fact.
+#[cfg(test)]
 #[hegel::test(test_cases = 300)]
 fn saturating_by_conclusion_is_saturating_by_premise(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -319,7 +342,7 @@ fn saturating_by_conclusion_is_saturating_by_premise(tc: hegel::TestCase) {
         let b = tc.draw(gs::integers::<u32>().max_value(3));
         Atom::new(rel, a, b)
     };
-    let mut state = State { vals: vec![], facts: vec![], imps: vec![] };
+    let mut state = State { vals: Slots::default(), facts: vec![], imps: vec![] };
     for _ in 0..tc.draw(gs::integers::<usize>().max_value(4)) {
         state.put(atom(&tc));
     }
@@ -544,6 +567,8 @@ pub fn prove<'db>(
         }
     }
     span.record("visits", solver.visits.get());
+    #[cfg(test)]
+    PROOF_VISITS.set(solver.visits.get());
     sites.sort();
     Reach {
         dead: dead.into_boxed_slice(),
@@ -561,6 +586,11 @@ struct Out {
     safe: bool,
     /// What the block's site needs and the state did not entail.
     goal: Option<Atom>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROOF_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 struct Solver<'a, 'db> {
@@ -585,6 +615,9 @@ struct Solver<'a, 'db> {
     exposed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
+    /// Forward priority in an acyclic body; otherwise the original FIFO, as loop bounds
+    /// widen against the previous visit and their precision depends on visit order.
+    rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
     joined: Vec<Vec<u32>>,
@@ -631,6 +664,12 @@ impl<'a, 'db> Solver<'a, 'db> {
                 cyclic[block as usize] = true;
             }
         }
+        let mut rank = vec![0; count]; // alloc: the worklist rank of each block, once per proof
+        let read = hir_ty_mir::mir::ReadOnEntry::in_order(body, |order| {
+            if !cyclic.contains(&true) {
+                for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
+            }
+        });
         let mut solver = Solver {
             db,
             infcx,
@@ -647,9 +686,10 @@ impl<'a, 'db> Solver<'a, 'db> {
             models: HashMap::new_in(Global),
             exposed: Vec::new(),
             cyclic,
+            rank,
             predecessors,
             joined: vec![Vec::new(); count], // alloc: one list per block, once per proof
-            read: hir_ty_mir::mir::ReadOnEntry::of(body),
+            read,
             word,
             at: (0, 0),
             made: 0,
@@ -1246,12 +1286,12 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     fn entry(&mut self) -> State {
         let slots = self.epoch_slot() + 1;
-        let mut vals = Vec::with_capacity(slots); // alloc: one value per slot, the first state
         for slot in 0..slots {
             let ty = self.local_ty(slot);
-            vals.push(self.unknown(Key::Entry(slot as u32), ty));
+            let id = self.unknown(Key::Entry(slot as u32), ty);
+            debug_assert_eq!(id, slot as u32);
         }
-        State { vals, facts: Vec::new(), imps: Vec::new() }
+        State { vals: Slots::default(), facts: Vec::new(), imps: Vec::new() }
     }
 
     /// Forgets what statement `at` made the last time it ran: the facts that mention it, and
@@ -1271,10 +1311,11 @@ impl<'a, 'db> Solver<'a, 'db> {
         state.imps.retain(|Imp { then, premise }| {
             ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
         });
-        for slot in 0..state.vals.len() {
-            if self.mentions(state.vals[slot], of) {
+        for (slot, value) in &mut state.vals.0 {
+            if self.mentions(*value, of) {
+                let slot = *slot as usize;
                 let ty = self.local_ty(slot);
-                state.vals[slot] = self.unknown(stale(slot as u32), ty);
+                *value = self.unknown(stale(slot as u32), ty);
             }
         }
     }
@@ -1284,11 +1325,11 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn bump(&mut self, state: &mut State) {
         let (block, stmt) = self.at;
         let epoch = self.epoch_slot();
-        state.vals[epoch] = self.unknown(Key::At(block, stmt, EPOCH), None);
+        state.vals.set(epoch, self.unknown(Key::At(block, stmt, EPOCH), None));
         for slot in 0..epoch {
             if self.exposed[slot] {
                 let ty = self.local_ty(slot);
-                state.vals[slot] = self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty);
+                state.vals.set(slot, self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty));
             }
         }
     }
@@ -1358,7 +1399,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn deref(&mut self, state: &State, pointer: TermId, ty: Ty<'db>) -> TermId {
         match self.terms[pointer as usize] {
             Term::RefTo(value) => return value,
-            Term::MutRef(_, value, epoch) if epoch == state.vals[self.epoch_slot()] => {
+            Term::MutRef(_, value, epoch) if epoch == state.vals.get(self.epoch_slot()) => {
                 return value;
             }
             _ => {}
@@ -1370,12 +1411,12 @@ impl<'a, 'db> Solver<'a, 'db> {
                 if fixed || mutability == rustc_type_ir::Mutability::Not {
                     self.term(Term::Deref(pointer), ANY)
                 } else {
-                    let epoch = state.vals[self.epoch_slot()];
+                    let epoch = state.vals.get(self.epoch_slot());
                     self.term(Term::DerefAt(pointer, epoch), ANY)
                 }
             }
             TyKind::Adt(def, _) if def.is_box() => {
-                let epoch = state.vals[self.epoch_slot()];
+                let epoch = state.vals.get(self.epoch_slot());
                 self.term(Term::DerefAt(pointer, epoch), ANY)
             }
             _ => self.fresh(None),
@@ -1384,7 +1425,7 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// The value `place` holds in `state`.
     fn read(&mut self, state: &State, place: &StoredPlace) -> TermId {
-        let mut term = state.vals[local_index(place.local)];
+        let mut term = state.vals.get(local_index(place.local));
         let mut ty = PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
         let mut variant = None;
         for elem in place.projection.as_slice() {
@@ -1425,7 +1466,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         let slot = local_index(place.local);
         let projection = place.projection.as_slice();
         if projection.is_empty() {
-            state.vals[slot] = value;
+            state.vals.set(slot, value);
             if self.named[slot] && !self.names.contains_key(&value) {
                 self.names.insert(value, slot as u32);
             }
@@ -1438,7 +1479,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A part of the local: one field of a known aggregate is replaced, anything else
         // leaves the local unknown.
         let (block, stmt) = self.at;
-        let replaced = match (projection, &self.terms[state.vals[slot] as usize]) {
+        let replaced = match (projection, &self.terms[state.vals.get(slot) as usize]) {
             ([ProjectionElem::Field(field)], Term::Agg(variant, fields))
                 if *variant == NO_VARIANT && (field.0 as usize) < fields.len() =>
             {
@@ -1448,13 +1489,14 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
             _ => None,
         };
-        state.vals[slot] = match replaced {
+        let value = match replaced {
             Some(term) => self.term(term, ANY),
             None => {
                 let ty = self.local_ty(slot);
                 self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty)
             }
         };
+        state.vals.set(slot, value);
     }
 
     fn rvalue(&mut self, state: &mut State, to: &StoredPlace, rvalue: &Rvalue) -> TermId {
@@ -1468,7 +1510,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                     _ if raw => self.fresh(None),
                     BorrowKind::Shared | BorrowKind::Shallow => self.term(Term::RefTo(value), ANY),
                     BorrowKind::Mut { .. } if place.projection.as_slice().is_empty() => {
-                        let epoch = state.vals[self.epoch_slot()];
+                        let epoch = state.vals.get(self.epoch_slot());
                         let local = local_index(place.local) as u32;
                         self.term(Term::MutRef(local, value, epoch), ANY)
                     }
@@ -1476,7 +1518,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                     BorrowKind::Mut { .. }
                         if matches!(place.projection.as_slice(), [ProjectionElem::Deref]) =>
                     {
-                        state.vals[local_index(place.local)]
+                        state.vals.get(local_index(place.local))
                     }
                     BorrowKind::Mut { .. } => self.fresh(None),
                 }
@@ -1806,7 +1848,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                             runs = self.assume(&mut returned, goal);
                         }
                         if let Some((local, value)) = call.sets {
-                            returned.vals[local as usize] = value;
+                            returned.vals.set(local as usize, value);
                         }
                         self.write(&mut returned, destination, call.result);
                         for (premise, then) in call.implies {
@@ -1887,25 +1929,36 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// edge is feasible. `prior` is its entry state the last time, which the joined slots'
     /// bounds are widened against.
     fn join(&mut self, block: u32, incoming: &mut [State], prior: Option<&State>) -> Option<State> {
-        let first = incoming.first()?;
-        let slots = first.vals.len();
+        // Nothing to merge or recreate on an edge that carries the only state and has
+        // never joined a slot. In particular don't walk every local of every basic block.
+        if let [only] = incoming && self.joined[block as usize].is_empty() {
+            return Some(only.clone());
+        }
+        incoming.first()?;
+        // An unwritten slot is its entry unknown on every path. Only a slot present on an
+        // incoming path, or previously joined here, can differ or mention this join.
+        let mut slots: Vec<usize> = incoming.iter().flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize)).collect();
+        slots.extend(self.joined[block as usize].iter().map(|&k| if k >= FIELD { ((k - FIELD) / 64) as usize } else { k as usize }));
+        slots.sort_unstable();
+        slots.dedup();
         let before = self.joined[block as usize].len();
         // A slot whose values differ is joined; so is one that holds an unknown this join
         // makes again, until no more are found (each turn adds a slot).
         loop {
             let mut grew = false;
-            for slot in 0..slots {
+            for &slot in &slots {
                 let whole = slot as u32;
                 if self.joined[block as usize].contains(&whole) {
                     continue;
                 }
-                let value = incoming[0].vals[slot];
-                let differ = incoming.iter().any(|it| it.vals[slot] != value);
+                let value = incoming[0].vals.get(slot);
+                let differ = incoming.iter().any(|it| it.vals.get(slot) != value);
                 let joined = &self.joined[block as usize];
                 let stale = |key: Key| {
                     matches!(key, Key::Join(at, of) if at == block && joined.contains(&of))
                 };
-                let holds_stale = incoming.iter().any(|it| self.mentions(it.vals[slot], &stale));
+                let holds_stale = self.cyclic[block as usize]
+                    && incoming.iter().any(|it| self.mentions(it.vals.get(slot), &stale));
                 if !differ && !holds_stale {
                     continue;
                 }
@@ -1919,7 +1972,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                             if self.joined[block as usize].contains(&key) {
                                 continue;
                             }
-                            let of = |state: &State| match &self.terms[state.vals[slot] as usize] {
+                            let of = |state: &State| match &self.terms[state.vals.get(slot) as usize] {
                                 Term::Agg(_, fields) => fields[field],
                                 _ => unreachable!("`same_shape` saw an aggregate"),
                             };
@@ -1949,7 +2002,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         // forget what this join makes again: a path round a loop proves it from what held of
         // the last turn's values.
         let mut invariants = Vec::new(); // alloc: the joined slots' relations, few
-        for slot in 0..slots {
+        for &slot in &slots {
             let whole = slot as u32;
             let integer = self
                 .local_ty(slot)
@@ -1958,14 +2011,14 @@ impl<'a, 'db> Solver<'a, 'db> {
                 continue;
             }
             for at in 0..incoming.len().min(4) {
-                let anchor = incoming[at].vals[slot];
-                let repeated = incoming[..at].iter().any(|it| it.vals[slot] == anchor);
+                let anchor = incoming[at].vals.get(slot);
+                let repeated = incoming[..at].iter().any(|it| it.vals.get(slot) == anchor);
                 if repeated || self.mentions(anchor, &made) || self.const_of(anchor).is_some() {
                     continue;
                 }
                 for below in [true, false] {
                     let holds = incoming.iter().all(|it| {
-                        let value = it.vals[slot];
+                        let value = it.vals.get(slot);
                         let atom = match below {
                             true => Atom::new(Rel::Le, value, anchor),
                             false => Atom::new(Rel::Le, anchor, value),
@@ -1996,18 +2049,20 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // The joined slots' values, with the bounds every path gives them.
         let mut bounds = Vec::new(); // alloc: the joined slots' bounds, few
-        for slot in 0..slots {
+        for &slot in &slots {
             let whole = slot as u32;
             let ty = self.local_ty(slot);
             if joined.contains(&whole) {
                 let value = self.unknown(Key::Join(block, whole), ty);
                 let (mut low, mut high) = (i128::MAX, i128::MIN);
                 for it in incoming.iter() {
-                    let (least, most) = self.bounds(it, it.vals[slot]);
+                    let (least, most) = self.bounds(it, it.vals.get(slot));
                     (low, high) = (low.min(least), high.max(most));
+                    let (floor, ceiling) = self.ranges[value as usize];
+                    if low <= floor && high >= ceiling { break; }
                 }
                 bounds.push((value, low, high));
-                state.vals[slot] = value;
+                state.vals.set(slot, value);
                 continue;
             }
             let low_key = FIELD.wrapping_add(whole.wrapping_mul(64));
@@ -2016,7 +2071,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             if !any {
                 continue;
             }
-            let (variant, mut fields) = match &self.terms[state.vals[slot] as usize] {
+            let (variant, mut fields) = match &self.terms[state.vals.get(slot) as usize] {
                 Term::Agg(variant, fields) => (*variant, fields.clone()), // clone: rebuilt with its joined fields
                 _ => continue,
             };
@@ -2029,11 +2084,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
             if changed {
-                state.vals[slot] = self.term(Term::Agg(variant, fields), ANY);
+                state.vals.set(slot, self.term(Term::Agg(variant, fields), ANY));
             }
         }
         for (slot, anchor, below) in invariants {
-            let value = state.vals[slot as usize];
+            let value = state.vals.get(slot as usize);
             state.put(match below {
                 true => Atom::new(Rel::Le, value, anchor),
                 false => Atom::new(Rel::Le, anchor, value),
@@ -2064,18 +2119,19 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A joined `bool` keeps what each of its values meant on the paths that gave it (`a &&
         // b` is lowered to a temporary both arms write): what every path that can give the
         // value holds, once its own value is taken to be that, is implied by the value.
-        for slot in 0..slots {
+        for &slot in &slots {
             let is_bool = self.local_ty(slot).is_some_and(|ty| ty.is_bool());
             if !is_bool || !joined.contains(&(slot as u32)) || !self.read.contains(block as usize, slot) {
                 continue;
             }
-            let value = state.vals[slot];
+            let value = state.vals.get(slot);
             for case in [0, 1] {
                 let case = self.constant(case);
                 let mut common: Option<Vec<Atom>> = None;
                 for it in incoming.iter() {
+                    if common.as_ref().is_some_and(Vec::is_empty) { break; }
                     let mut given = it.clone(); // clone: the path with the value assumed
-                    if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals[slot], case)) {
+                    if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals.get(slot), case)) {
                         continue;
                     }
                     common = Some(match common {
@@ -2100,11 +2156,11 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// How many fields the aggregates all of `incoming` hold in `slot` have, when they are
     /// aggregates of one variant and length.
     fn same_shape(&self, incoming: &[State], slot: usize) -> Option<usize> {
-        let Term::Agg(variant, fields) = &self.terms[incoming[0].vals[slot] as usize] else {
+        let Term::Agg(variant, fields) = &self.terms[incoming[0].vals.get(slot) as usize] else {
             return None;
         };
         let same = incoming.iter().all(|it| {
-            matches!(&self.terms[it.vals[slot] as usize],
+            matches!(&self.terms[it.vals.get(slot) as usize],
                 Term::Agg(other, others) if other == variant && others.len() == fields.len())
         });
         (same && fields.len() <= 64).then_some(fields.len())
@@ -2120,12 +2176,15 @@ impl<'a, 'db> Solver<'a, 'db> {
         let mut edges: Vec<Vec<(u32, State)>> = vec![Vec::new(); count];
         let mut grown = vec![0usize; count]; // alloc: once per proof
         let mut queued = vec![false; count]; // alloc: once per proof
-        let mut queue = std::collections::VecDeque::new(); // alloc: the worklist, once per proof
+        // All feasible predecessors of an acyclic join run before the join. FIFO alone
+        // propagated each partial match down the shared cleanup before the next arm arrived.
+        let mut queue = std::collections::BinaryHeap::new(); // alloc: once per proof
+        let mut serial = 0usize;
         let entry = self.entry();
-        queue.push_back(start);
+        queue.push(std::cmp::Reverse((self.rank[start], serial, start)));
         queued[start] = true;
         let mut budget = count * 8 + 64;
-        while let Some(block) = queue.pop_front() {
+        while let Some(std::cmp::Reverse((_, _, block))) = queue.pop() {
             queued[block] = false;
             if budget == 0 {
                 return None;
@@ -2168,7 +2227,9 @@ impl<'a, 'db> Solver<'a, 'db> {
                 for target in targets {
                     if !queued[target as usize] {
                         queued[target as usize] = true;
-                        queue.push_back(target as usize);
+                        serial += 1;
+                        let block = target as usize;
+                        queue.push(std::cmp::Reverse((self.rank[block], serial, block)));
                     }
                 }
             }
@@ -2523,7 +2584,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let Term::MutRef(local, value, epoch) = self.terms[receiver as usize] else {
                     return None;
                 };
-                if epoch != state.vals[self.epoch_slot()] || state.vals[local as usize] != value {
+                if epoch != state.vals.get(self.epoch_slot()) || state.vals.get(local as usize) != value {
                     return None;
                 }
                 let (start, end) = (self.field(value, 0), self.field(value, 1));

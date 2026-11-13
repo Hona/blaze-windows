@@ -256,3 +256,55 @@ fn the_oracle_catches_a_model_that_says_first_is_always_some() {
     let Err(what) = caught else { panic!("the planted model was not caught: {caught:?}") };
     assert!(what.contains("is discharged, and the run panics"), "{what}");
 }
+
+
+/// A `match` of `arms` arms, each through `Option::and_then` and a
+/// `let .. else`, like rune's `dispatch_action`.
+fn dispatch_source(arms: usize) -> String {
+    let mut variants = String::new();
+    let mut fields = String::new();
+    let mut body = String::new();
+    for i in 0..arms {
+        variants += &format!("A{i}(P, bool), ");
+        fields += &format!("h{i}: Option<fn(u32) -> bool>, ");
+        body += &format!(
+            "Action::A{i}(p, b) => {{ let Some(f) = node(s, p.0).and_then(|n| n.h{i}) else {{ return false }}; let k = p.0; if b {{ s.held = {i}; s.keep = Some(p); }} f(k) }}\n"
+        );
+    }
+    format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub enum Action {{ {variants} }}\n\
+         pub struct Node {{ {fields} }}\n\
+         pub struct P(u32);\nimpl Drop for P {{ fn drop(&mut self) {{}} }}\npub struct S {{ nodes: Option<Node>, held: u32, keep: Option<P> }}\n\
+         fn node(s: &S, p: u32) -> Option<&Node> {{ if p == 0 {{ None }} else {{ match &s.nodes {{ Some(n) => Some(n), None => None }} }} }}\n\
+         pub fn probe(s: &mut S, a: Action) -> bool {{\n\
+         let repeat = match a {{ Action::A1(..) => true, _ => false }};\n\
+         let ran = match a {{\n{body}}};\n\
+         ran && !repeat\n}}\n"
+    )
+}
+
+#[test]
+fn a_wide_dispatch_proof_scales() {
+    for arms in [20usize, 40, 80, 160, 320] {
+        let source = dispatch_source(arms);
+        let db = fixture::db(&source).into_db();
+        let krate = crate_named(&db, "kernel");
+        blaze_query::db::attach(&db, || {
+            let probe = fn_named(&db, krate, "probe");
+            let def = DefWithBodyId::FunctionId(probe);
+            let body = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers");
+            let blocks = body.basic_blocks.len();
+            let start = std::time::Instant::now();
+            let reach = reach::of_body(&db, def);
+            let visits = reach::PROOF_VISITS.get();
+            eprintln!("{arms} arms, {blocks} blocks: {visits} visits, {:?}", start.elapsed());
+            assert_eq!(reach.refused, None);
+            assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
+            // A wide dispatch can carry one exclusion per preceding arm. Inspecting these
+            // along the dispatch is quadratic; rejoining the shared exits for each partial
+            // set of predecessors instead took cubic or worse work. No clock threshold.
+            assert!(visits <= 2 * (blocks as u64).pow(2), "{blocks} blocks, {visits} visits");
+        });
+    }
+}

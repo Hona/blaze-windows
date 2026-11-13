@@ -595,8 +595,14 @@ impl ReadOnEntry {
     /// Which incoming local values any continuation of each block can read. Calls may
     /// unwind before writing their destination; a partial assignment keeps the rest.
     pub fn of(body: &MirBody<'_>) -> Self {
+        Self::in_order(body, |_| {})
+    }
+
+    /// Share the reverse postorder with a forward analysis of the same body.
+    pub fn in_order(body: &MirBody<'_>, order: impl FnOnce(&[BasicBlockId])) -> Self {
         frame::task(Tag::Mir, |frame| {
             let rpo = reverse_postorder(body, frame);
+            order(&rpo);
             let reads = |live: &mut Bits<'_>, local, mention, _| {
                 if !matches!(mention, Mention::Storage | Mention::Assigned) {
                     live.insert(local_index(local));
