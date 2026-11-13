@@ -267,9 +267,15 @@ pub(super) fn head_before_syncs_caught() -> (u64, String) {
 fn the_oracle_catches_a_head_written_before_its_syncs() {
     let (seed, why) = head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        missing_committed_bytes(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
+}
+
+/// A short pack can be detected by the pool's first read, before the checks file is read.
+pub(super) fn missing_committed_bytes(why: &str) -> bool {
+    why.contains("did not open") && (why.contains("its head names") ||
+        (why.contains("store/pack-000000") && why.contains("committed there; the file was cut")))
 }
 
 /// Each pack is open in the store's pool as far as it is committed, from its tier's opening and

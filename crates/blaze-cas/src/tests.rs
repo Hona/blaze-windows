@@ -1896,7 +1896,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
     let (seed, why) = block_checks::head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        block_checks::missing_committed_bytes(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
@@ -3341,6 +3341,9 @@ fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack()
     let last = bytes.len() - 1;
     bytes[last] = 1;
     sim.change(&pack, &bytes);
+    // The block check precedes the recovery scan. Exercise the padding rule even for a
+    // writer that checksummed these bytes, not just a disk that changed a sector.
+    sim.change(&name("store/checks-000000"), &checks::encode(&checks::of(&bytes)));
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);
@@ -3873,6 +3876,7 @@ fn a_pack_whose_header_names_another_unit_stops_the_store() {
     let mut bytes = sim.contents(&pack);
     bytes[8] = 0;
     sim.change(&pack, &bytes);
+    sim.change(&name("store/checks-000000"), &checks::encode(&checks::of(&bytes)));
     let mut effects = Vec::new();
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);
