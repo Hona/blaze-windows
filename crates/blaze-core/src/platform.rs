@@ -8,6 +8,9 @@
 pub mod command;
 pub mod env;
 pub mod home;
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "Win32 has the peer PID, token SID and DACL, not std")]
+pub mod identity;
 pub mod lock;
 pub mod msvc;
 pub mod path;
