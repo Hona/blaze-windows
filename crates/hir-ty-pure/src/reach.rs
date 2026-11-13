@@ -617,8 +617,7 @@ struct Solver<'a, 'db> {
     addressed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
-    /// Forward priority in an acyclic body; otherwise the original FIFO, as loop bounds
-    /// widen against the previous visit and their precision depends on visit order.
+    /// Forward priority, including the acyclic arms of a body that also contains a loop.
     rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
@@ -677,9 +676,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         let mut rank = vec![0; count]; // alloc: the worklist rank of each block, once per proof
         let read = hir_ty_mir::mir::ReadOnEntry::in_order(body, |order| {
-            if !cyclic.contains(&true) {
-                for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
-            }
+            for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
         });
         let mut solver = Solver {
             db,
@@ -1951,7 +1948,14 @@ impl<'a, 'db> Solver<'a, 'db> {
         incoming.first()?;
         // An unwritten slot is its entry unknown on every path. Only a slot present on an
         // incoming path, or previously joined here, can differ or mention this join.
-        let mut slots: Vec<usize> = incoming.iter().flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize)).collect();
+        // A local overwritten before any read needs no phi. Addresses and the epoch are
+        // implicit reads (notably RangeNext through MutRef). This drops no path facts:
+        // their operands are immutable term IDs, not references to local slots.
+        let live = |slot: usize| slot == self.epoch_slot() || self.addressed[slot]
+            || self.read.contains(block as usize, slot);
+        let mut slots: Vec<usize> = incoming.iter()
+            .flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize))
+            .filter(|&slot| live(slot)).collect(); // alloc: written and live incoming slots
         slots.extend(self.joined[block as usize].iter().map(|&k| if k >= FIELD { ((k - FIELD) / 64) as usize } else { k as usize }));
         slots.sort_unstable();
         slots.dedup();

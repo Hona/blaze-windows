@@ -362,3 +362,18 @@ fn a_body_with_no_loop_walks_each_block_once() {
         assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
     });
 }
+
+#[test]
+fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
+    let source = dispatch_source(32).replace("ran && !repeat", "let mut i = s.held; while i > 0 { i -= 1; } ran && !repeat");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).unwrap().basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks < blocks + 100, "{walks} walks of {blocks} blocks");
+    });
+}
