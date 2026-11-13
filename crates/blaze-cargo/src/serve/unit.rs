@@ -178,8 +178,17 @@ fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), St
         #[cfg(unix)]
         std::os::unix::fs::symlink(launcher, &at)
             .map_err(|error| format!("{}: {error}", at.display()))?;
+        // A symbolic link as on unix, so `read_link` above finds it again: a hard link is no link
+        // `read_link` reads (every start then failed on the one made before), and none can cross
+        // volumes (a BLAZE_HOME on another drive than the launcher). windows: unprivileged
+        // symbolic links need Developer Mode; without it this fails naming the link.
         #[cfg(windows)]
-        std::fs::hard_link(launcher, &at).map_err(|error| format!("{}: {error}", at.display()))?;
+        std::os::windows::fs::symlink_file(launcher, &at).map_err(|error| {
+            format!(
+                "{}: {error} (a symbolic link to blaze; Windows makes one without elevation only in Developer Mode)",
+                at.display()
+            )
+        })?;
     }
     Ok(())
 }

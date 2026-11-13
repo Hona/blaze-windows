@@ -84,6 +84,14 @@ pub use machine::Machine;
 #[cfg(not(all(unix, feature = "native")))]
 pub enum Machine {}
 
+#[cfg(not(all(unix, feature = "native")))]
+impl Machine {
+    /// What the machine's ledger says of this daemon: there is none to say it.
+    pub(crate) fn says(&self) -> Option<&str> {
+        match *self {}
+    }
+}
+
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
 /// last start by it, and harness/storelib.py's `LISTENING` that it listens.
@@ -1424,7 +1432,11 @@ fn listen(
     // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
+    #[cfg(unix)]
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
+    // windows: no stop guard yet. `serve::stop` blocks on the signal pipe of `signals`; Windows
+    // needs it on an event that a console control handler and `stop_begun` set, so a stuck stop
+    // or a stuck turn and the memory ceiling are not watched here.
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
     #[cfg(unix)]
@@ -1467,6 +1479,7 @@ fn listen(
             break;
         }
     }
+    #[cfg(unix)]
     guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),
