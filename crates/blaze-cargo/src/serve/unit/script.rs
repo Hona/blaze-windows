@@ -312,8 +312,20 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     };
     let target = triple_of(unit, of.host).to_owned();
     let config_env = native_env(of, &package.name, &target, &unit.features)?;
-    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
-    let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
+    // The run's kind's rustflags, as its plan gives them to the script (cargo's
+    // `CARGO_ENCODED_RUSTFLAGS`; a run compiles nothing, so its plan's own `rustflags` are
+    // none), and the cfg cargo's probe of the kind gives with them (`TargetInfo`'s `--print
+    // cfg`, which asks as for a proc macro too): `CARGO_CFG_TARGET_FEATURE` has `crt-static`
+    // when the flags turn it on, so `cc` compiles with `/MT`.
+    let run_flags: Vec<String> = var(plan, "CARGO_ENCODED_RUSTFLAGS")
+        .filter(|it| !it.is_empty())
+        .map(|it| it.split('\x1f').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&run_flags)?;
+    let target_cfgs = blaze_units::stdlib::target::target_cfg(
+        &target,
+        &blaze_units::stdlib::target::CfgArgs { proc_macro: true, ..cfg_args },
+    )?;
     let profile = &unit.profile;
     let release = var(plan, "PROFILE").ok_or_else(|| {
         UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string()
@@ -390,7 +402,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         target,
         host: of.host.to_owned(),
         target_cfgs,
-        rustflags: plan.rustflags.clone(),
+        rustflags: run_flags,
         jobs,
         script: of.program.clone(),
         out_dir: blaze_core::platform::path::host(&out_dir),

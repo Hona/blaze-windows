@@ -764,16 +764,17 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
             }
         }
     };
-    let platform = |triple: &str| -> Result<(Platformed, Vec<String>), LoadError> {
+    let platform = |kind: Option<&str>| -> Result<(Platformed, Vec<String>), LoadError> {
+        let triple = kind.unwrap_or(&spec.host);
         let rustflags =
-            super::plan::platform_rustflags(config, triple, &spec.host, target.as_deref())?;
+            super::plan::platform_rustflags(config, &spec.host, target.as_deref(), kind)?;
         let args = CfgArgs::from_flags(&rustflags).map_err(error)?;
         let cfg =
             platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)?;
         Ok((Platformed { triple: triple.to_owned(), cfg }, rustflags))
     };
-    let (host, host_flags) = platform(&spec.host)?;
-    let (target, target_flags) = match target.as_deref().map(platform).transpose()? {
+    let (host, host_flags) = platform(None)?;
+    let (target, target_flags) = match target.as_deref().map(|it| platform(Some(it))).transpose()? {
         Some((it, flags)) => (Some(it), flags),
         None => (None, Vec::new()),
     };
