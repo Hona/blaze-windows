@@ -204,9 +204,9 @@ pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
 
 /// Whether the variable `name` makes a command the engine's ([`env`]).
 pub fn refuses(name: &str) -> bool {
-    // SCRIPT_READ is part of the invocation environment. Its checks and the sandbox
-    // grants stay in the daemon; the launcher neither parses it nor grants a path.
-    (name.starts_with("BLAZE_") && name != HOME && name != "BLAZE_SCRIPT_READ")
+    // SCRIPT_READ and SCRIPT_CACHES are part of the invocation environment. Their checks and
+    // the sandbox grants stay in the daemon; the launcher neither parses them nor grants a path.
+    (name.starts_with("BLAZE_") && name != HOME && name != "BLAZE_SCRIPT_READ" && name != "BLAZE_SCRIPT_CACHES")
         || name == "IX_PROF"
         || name == "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"
 }

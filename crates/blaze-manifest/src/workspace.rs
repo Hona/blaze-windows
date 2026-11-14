@@ -183,13 +183,10 @@ impl<'c, F: Files> Workspace<'c, F> {
             return Ok(dir.clone());
         }
         let config = &self.ctx.config;
-        let root = crate::home::root(|name| config.env(name).map(std::ffi::OsString::from));
-        let root = root.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps the build \
-                 directory of the workspace at {}",
-                self.root().display()
-            )
+        let homes = blaze_core::platform::home::homes(|name| config.env(name).map(std::ffi::OsString::from));
+        // The variables a root is named by differ by system: the error names this one's.
+        let root = homes.map(|it| it.root).map_err(|why| {
+            anyhow::anyhow!("{why}: the build directory of the workspace at {} is under it", self.root().display())
         })?;
         Ok(crate::home::build_dir(&crate::home::builds(&root), self.root()))
     }

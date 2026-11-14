@@ -1798,3 +1798,19 @@ outside the script's own package, grant just the sibling inputs with `BLAZE_SCRI
 A read grant remains read-only;
 a link-search permission is not a filesystem grant. Neither the script nor a child gets
 the invoking user's unrestricted filesystem access. The sandbox-off path is not cached.
+
+### A build script's own writable state
+
+A script writes its `OUT_DIR`, whose files are its run's and kept under its key, and a
+temporary directory of its run alone. Nothing else it writes outlives the run: on Windows its
+`LOCALAPPDATA` is the run's own AppContainer profile, made fresh and removed after it.
+
+A download cache, which a script fills once and reads in later runs, is declared by whoever
+runs blaze, never by the project: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
+entries are each `VARIABLE=DIRECTORY`, such as
+`GHOSTTY_VT_CACHE_DIR=C:\Users\me\AppData\Local\seer\ghostty-vt` for rune-desktop's terminal.
+Every build script is told each variable, naming its directory, which blaze makes if missing
+and the script may read and write. What is in it is in no key, only the variable's name: by
+declaring it the caller says its contents change no script's output, as a download cache's
+do not. On Windows the directory is written through a capability of its own, granted once
+and kept, so a large cache is not walked again at each run.

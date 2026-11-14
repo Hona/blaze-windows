@@ -252,8 +252,10 @@ fn a_compiler_message_as_cargo_writes_it_again() {
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
     let said = message(&unit, &unused(rendered), false, &mut sources);
+    // The root as a JSON string writes it: a Windows path's `\` escaped.
+    let json = root.replace('\\', r"\\");
     let target = format!(
-        r#"{{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_path":"{root}/src/main.rs","edition":"2021","doc":true,"doctest":false,"test":true}}"#
+        r#"{{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_path":"{json}/src/main.rs","edition":"2021","doc":true,"doctest":false,"test":true}}"#
     );
     let text = r#"[{"highlight_end":10,"highlight_start":9,"text":"    let x = 1;"}]"#;
     let expected = format!(
@@ -266,7 +268,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
             r#""spans":[{{"byte_end":21,"byte_start":20,"column_end":10,"column_start":9,"expansion":null,"file_name":"src/main.rs","is_primary":true,"label":null,"line_end":2,"line_start":2,"suggested_replacement":null,"suggestion_applicability":null,"text":{text}}}],"#,
             r#""code":{{"code":"unused_variables","explanation":null}}}}}}"#,
         ),
-        root = root,
+        root = json,
         target = target,
         text = text,
     );

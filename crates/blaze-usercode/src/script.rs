@@ -72,6 +72,13 @@ pub struct Place {
     /// whatever directory it is laid out in; empty adds no part, and leaves every other
     /// script's key as it was.
     pub pinned: Vec<(String, String)>,
+    /// The declared caches it is given (`BLAZE_SCRIPT_CACHES`, docs/cargo.md): each a variable
+    /// it is told and the directory that variable names, which every run given it may read and
+    /// write and which is kept across runs, as a download cache is. Outside every key but the
+    /// variable's name: the caller who declares one says what is in it changes no output. The
+    /// sandbox is given each to read and write ([`prepare`]); none is one of `read`, whose
+    /// roots are in the key.
+    pub caches: Vec<(String, PathBuf)>,
     /// Whether its package's manifest lets it reach the network: then what it reached is
     /// untraceable, and it is kept by cargo's rule.
     pub network: bool,
@@ -182,6 +189,14 @@ pub fn prepare(
         }
         given.part("pinned native inputs", &bytes);
     }
+    if !place.caches.is_empty() {
+        let mut bytes = Vec::new(); // alloc: setup, a run's few caches
+        for (name, _) in &place.caches {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        given.part("declared caches", &bytes);
+    }
     bound = bound.union(view.left(&program)).union(view.left(&dir));
     let key = RunKey { code: place.code, given: given.finish() };
     roots.bind(bound);
@@ -192,6 +207,10 @@ pub fn prepare(
     // traced as it is read.
     let mut command_env = Vec::with_capacity(vars.len() + 2); // alloc: setup, the command's environment
     command_env.extend(vars.iter().cloned()); // clone: setup, as above; the check keeps its own
+    for (name, dir) in &place.caches {
+        command_env.retain(|(it, _)| !same_name(it, name));
+        command_env.push((name.into(), dir.into())); // alloc: setup, a cache's variable
+    }
     command_env.push((
         GIVEN.into(),
         crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?,
@@ -214,8 +233,10 @@ pub fn prepare(
         dir: unit.package.manifest_dir.clone(), // clone: setup, the command owns its directory
         stdin: Vec::new(),                      // alloc: none, empty
         sandbox: Sandbox::On {
-            read: place.read.clone(), // clone: setup, the sandbox owns what it may read
-            write: vec![unit.out_dir.clone()], // clone: setup, the sandbox owns what it may write
+            // clone: setup, the sandbox owns what it may read: `read`, then each cache
+            read: place.read.iter().chain(place.caches.iter().map(|(_, dir)| dir)).cloned().collect(),
+            // clone: setup, the sandbox owns what it may write: `OUT_DIR`, then each cache
+            write: std::iter::once(unit.out_dir.clone()).chain(place.caches.iter().map(|(_, dir)| dir.clone())).collect(),
             network: place.network,
             trace: true,
             services: Vec::new(), // alloc: none, an empty list
@@ -228,6 +249,13 @@ pub fn prepare(
     Ok(Prepared { spec, env: checked, given: names, made: given })
 }
 
+/// Whether the variable `it` is `name`: Windows' names are one whatever their case.
+fn same_name(it: &OsStr, name: &str) -> bool {
+    match cfg!(windows) {
+        true => it.eq_ignore_ascii_case(name),
+        false => it == name,
+    }
+}
 /// `vars`, the script's environment, as a check of its inputs sees it ([`Prepared::env`]):
 /// without the names `given` and of the run alone, sorted by name, each name once, make's
 /// variables without their jobserver ([`make_flags`]).
@@ -456,6 +484,7 @@ mod tests {
             code: ContentId::of("blaze v2 test 1", b"script"),
             read: vec!["/ws/p".into()],
             pinned: Vec::new(),
+            caches: Vec::new(),
             network: false,
             memory: None,
             mode: Mode::Normal,
@@ -963,5 +992,35 @@ mod tests {
             link: None,
         });
         assert!(verify_elided(&value, &wrote).is_err());
+    }
+
+    /// The invariant: a declared cache is told to the run by its variable, is written by it
+    /// beside `OUT_DIR`, and is in its key by the variable's name alone: another directory is
+    /// the same run (what is in a cache changes no output, as its caller declared), no cache is
+    /// another. The variable's own value the job had is replaced, never kept twice.
+    #[test]
+    fn a_declared_cache_is_told_written_and_keyed_by_its_name_alone() {
+        let cached = |dir: &str| Place {
+            caches: vec![("GHOSTTY_VT_CACHE_DIR".into(), PathBuf::from(dir))],
+            ..place()
+        };
+        let mut job = inherited("/a");
+        job.push(("GHOSTTY_VT_CACHE_DIR".into(), "/elsewhere".into()));
+        let one = prepare(&unit(), &job, &cached("/c/one")).unwrap();
+        let told: Vec<_> = one
+            .spec
+            .command
+            .env
+            .iter()
+            .filter(|(name, _)| name == "GHOSTTY_VT_CACHE_DIR")
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(told, [OsString::from("/c/one")]);
+        let Sandbox::On { write, .. } = &one.spec.command.sandbox else { panic!("sandboxed") };
+        assert_eq!(write, &[unit().out_dir, PathBuf::from("/c/one")]);
+        let other = prepare(&unit(), &job, &cached("/c/two")).unwrap();
+        assert_eq!(one.spec.key, other.spec.key);
+        let none = prepare(&unit(), &job, &place()).unwrap();
+        assert_ne!(one.spec.key, none.spec.key);
     }
 }

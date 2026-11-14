@@ -386,6 +386,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         code: ContentId::of("blaze v2 test 1", b"script"),
         read: vec!["/w".into()],
         pinned: Vec::new(),
+        caches: Vec::new(),
         network: false,
         memory: None,
         mode: blaze_usercode::run::Mode::Normal,

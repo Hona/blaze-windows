@@ -142,7 +142,12 @@ mod tests {
     /// A home with no cargo configuration, so the machine's own decides nothing.
     fn env(home: &Path) -> Vec<(String, String)> {
         let home = home.to_str().unwrap().to_owned();
-        vec![("HOME".to_owned(), home.clone()), ("CARGO_HOME".to_owned(), format!("{home}/.cargo"))]
+        // Where blaze's root is on each system: `HOME` on Unix, `LOCALAPPDATA` on Windows.
+        vec![
+            ("HOME".to_owned(), home.clone()),
+            ("LOCALAPPDATA".to_owned(), home.clone()),
+            ("CARGO_HOME".to_owned(), format!("{home}/.cargo")),
+        ]
     }
 
     #[test]

@@ -1225,6 +1225,9 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             read.push(resolved);
         }
     }
+    // Each declared cache is read and written where the caller says ([`Place::caches`]): not a
+    // read root of its key.
+    let caches = declared_caches(&job.input.config.invocation.env)?;
     // Each pinned native input it is given is read where it is laid out, and its digest is
     // part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
@@ -1250,6 +1253,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         code,
         read,
         pinned,
+        caches,
         network: false,
         memory: None,
         mode: match (declared, rechecks(job)?) {
@@ -1713,10 +1717,50 @@ fn live_record(
 }
 
 /// `path` as the driver names it, under its root `/`.
+/// The caches the caller declares to every build script it runs (`BLAZE_SCRIPT_CACHES`, its own
+/// environment, never the project's): a list of the system's paths whose entries are each
+/// `VARIABLE=DIRECTORY`. A script is told each variable, naming its directory, which it may
+/// read and write and which is kept across runs: a download cache (rune-desktop's
+/// `GHOSTTY_VT_CACHE_DIR`). What is in one is in no key ([`Place::caches`]). Each directory is
+/// made if missing, and named as the system resolves it; an entry that is not a variable's
+/// name and an absolute directory below a volume's root, or a variable named twice, is refused,
+/// naming it.
+fn declared_caches(env: &[(String, String)]) -> Result<Vec<(String, PathBuf)>, ApiError> {
+    const NAME: &str = "BLAZE_SCRIPT_CACHES";
+    let Some((_, list)) = env.iter().find(|(name, _)| name == NAME) else { return Ok(Vec::new()) };
+    // alloc: an error path.
+    let refused = |what: String| ApiError::new(format!("{NAME}: {what}"), None);
+    let mut caches: Vec<(String, PathBuf)> = Vec::new(); // alloc: the caller's few caches, once a run
+    for entry in std::env::split_paths(list) {
+        let text = entry.to_string_lossy();
+        let Some((name, dir)) = text.split_once('=') else {
+            return Err(refused(format!("`{text}` is no VARIABLE=DIRECTORY")));
+        };
+        if name.is_empty() || !name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_') {
+            return Err(refused(format!("`{name}` is no variable's name")));
+        }
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() || dir.parent().is_none() {
+            return Err(refused(format!("{} is not an absolute directory below a volume's root", dir.display())));
+        }
+        std::fs::create_dir_all(&dir).map_err(|error| refused(format!("making {}: {error}", dir.display())))?;
+        let dir = std::fs::canonicalize(&dir).map_err(|error| refused(format!("{}: {error}", dir.display())))?;
+        if caches.iter().any(|(it, _)| it.eq_ignore_ascii_case(name)) {
+            return Err(refused(format!("`{name}` is named twice")));
+        }
+        caches.push((name.to_owned(), dir));
+    }
+    caches.sort();
+    Ok(caches)
+}
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
-        format!("{} is not a path blaze can write cargo's files of a run at", path.display())
-    })
+    let refused = || format!("{} is not a path blaze can write cargo's files of a run at", path.display());
+    let text = path.to_str().ok_or_else(refused)?;
+    // A name is `/`-separated on every system; a path joined on Windows has `\` between its
+    // parts, which no Windows file name holds.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/"); // alloc: a name, three a run written
+    FileName::new(text.trim_start_matches('/')).ok_or_else(refused)
 }
 
 pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {

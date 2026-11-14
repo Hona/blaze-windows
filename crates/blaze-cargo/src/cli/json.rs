@@ -789,6 +789,22 @@ impl Sources {
     }
 }
 
+/// What [`Texts`] knows a file by: its path's bytes, with Windows' two separators one, so a
+/// file is read once whether a span names it `C:\w/src/main.rs` or `C:\w\src\main.rs`.
+fn path_key(path: &Path) -> u64 {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    #[cfg(windows)]
+    {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut hasher = FixedState.build_hasher();
+        for &byte in bytes {
+            hasher.write_u8(if byte == b'/' { b'\\' } else { byte });
+        }
+        hasher.finish()
+    }
+    #[cfg(not(windows))]
+    FixedState.hash_one(bytes)
+}
 impl Texts {
     /// The file `file` names from `dir` (as [`Sources::file`]), read the first time: each place
     /// it may be is opened, with no `stat` before.
@@ -815,7 +831,7 @@ impl Texts {
     /// The file at `path`, read the first time; `None` for no file there.
     fn read(&mut self) -> Option<u32> {
         let Texts { at, files, text, starts, path, bytes, .. } = self;
-        let slot = match at.entry(FixedState.hash_one(path.as_os_str().as_encoded_bytes())) {
+        let slot = match at.entry(path_key(path)) {
             Entry::Occupied(found) => return Some(*found.get()),
             Entry::Vacant(slot) => slot,
         };
