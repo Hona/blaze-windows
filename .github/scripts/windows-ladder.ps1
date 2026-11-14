@@ -91,6 +91,17 @@ fn json() -> anyhow::Result<String> {
 }
 '@)
 
+if ($env:DRIVER_REF -like 'windows/ladder/fixture-*') {
+    $file = Join-Path $withdeps 'src/main.rs'
+    $text = Get-Content -Raw $file
+    switch ($env:DRIVER_REF.Split('/')[-1]) {
+        'fixture-import' { $text = "use serde::Serialize;`n" + $text.Replace('derive(serde::Serialize)', 'derive(Serialize)') }
+        'fixture-old' { $text = Get-Content -Raw (Join-Path $PSScriptRoot 'withdeps-reference.rs') }
+        'fixture-order' { $text = $text.Substring($text.IndexOf('#[derive')) + "`n" + $main }
+    }
+    Set-Content $file $text
+}
+
 $serverLog = Join-Path $Out 'serve.stderr.log'
 # Auto-starting clients install the pinned sysroot first; a directly launched server requires
 # it to be whole already. Install with blaze's own verifier, not the runner's rustup default.

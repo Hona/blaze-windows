@@ -9,8 +9,10 @@ on:
         required: false
 permissions:
   contents: read
+  actions: read
 jobs:
   build:
+    if: ${{ !startsWith(github.ref_name, 'windows/ladder/fixture-') }}
     runs-on: windows-2025
     timeout-minutes: 150
     env:
@@ -46,6 +48,7 @@ jobs:
           if-no-files-found: error
   ladder:
     needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || startsWith(github.ref_name, 'windows/ladder/fixture-')) }}
     runs-on: windows-2025
     timeout-minutes: 90
     strategy:
@@ -61,10 +64,18 @@ jobs:
         with:
           arch: x64
           toolset: '14.5'
-      - uses: actions/download-artifact@v4
+      - if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
         with:
           name: release-engine
           path: target/release
+      - if: startsWith(github.ref_name, 'windows/ladder/fixture-')
+        uses: actions/download-artifact@v4
+        with:
+          name: release-engine
+          path: target/release
+          run-id: 43583128576
+          github-token: ${{ github.token }}
       - name: Provision the scratch volume change journal
         run: |
           $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
@@ -73,6 +84,7 @@ jobs:
       - name: Run the ladder with runner memory telemetry
         env:
           FIXTURE: ${{ matrix.fixture }}
+          DRIVER_REF: ${{ github.ref_name }}
         run: |
           . ./.github/scripts/windows-memory.ps1
           $p = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList @('-NoProfile','-File','.github/scripts/windows-ladder.ps1','-Blaze',"$PWD/target/release/blaze.exe",'-Out',"$env:RUNNER_TEMP/ladder",'-Fixture',$env:FIXTURE)
