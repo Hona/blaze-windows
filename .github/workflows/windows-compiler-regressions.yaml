@@ -1,0 +1,20 @@
+name: ELF patch assertion on the upstream base
+on:
+  push:
+    branches: [windows/compiler-check/int31-upstream-elf]
+permissions:
+  contents: read
+jobs:
+  upstream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 07783b963dc425ed579862ab058ec8f1644f16ca
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+      - name: Run only the ELF size assertion on the unmodified upstream checkout
+        run: |
+          git rev-parse HEAD
+          cargo test --locked -p blaze-link --lib tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant -- --exact
