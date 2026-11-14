@@ -97,6 +97,8 @@ pub struct CrateDelta {
     pub traits: Vec<(TraitId, Weight)>,
     /// The names of modules whose meaning changed.
     pub bindings: Vec<(ModuleId, Name)>,
+    /// Scope changes without a binding (notably a derive adding an unnamed constant).
+    pub changed_scopes: Vec<ModuleId>,
     /// The items and impls of the modules whose source was written or whose log changed: their
     /// headers and signatures may differ with no binding changed.
     pub touched: Vec<ModuleDefId>,
@@ -1080,7 +1082,10 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
     for &((module, name), _) in &changed {
         match name {
             Some(name) => crate_delta.bindings.push((module, name)),
-            None => state.pass.modules_changed.push(module),
+            None => {
+                state.pass.modules_changed.push(module);
+                crate_delta.changed_scopes.push(module);
+            }
         }
     }
     state.crates.insert(krate, cs);
@@ -1281,6 +1286,7 @@ fn empty_delta(krate: Crate) -> CrateDelta {
         derive_impls: Vec::new(),  // alloc: as above
         traits: Vec::new(),        // alloc: as above
         bindings: Vec::new(),      // alloc: as above
+        changed_scopes: Vec::new(), // alloc: as above
         touched: Vec::new(),       // alloc: as above
         touched_impls: Vec::new(), // alloc: as above
     }

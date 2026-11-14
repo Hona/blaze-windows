@@ -42,6 +42,7 @@ pub(super) fn keys(
                 || old.children(db) != new.children(db)
                 || !os.legacy_macros().eq(ns.legacy_macros())
                 || !unnamed(os).eq(unnamed(ns))
+                || !os.unnamed_consts().eq(ns.unnamed_consts())
                 || os.glob_ambiguities() != ns.glob_ambiguities();
             if whole {
                 out.push(((module, None), true));

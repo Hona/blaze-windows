@@ -1512,6 +1512,9 @@ fn bodies_to_read(
         modules.extend(delta.touched.iter().filter_map(|def| def.module(db)));
         modules.extend(delta.touched_impls.iter().map(|imp| imp.loc(db).container));
         modules.extend(delta.bindings.iter().map(|&(module, _)| module));
+        // No named binding changes when a newly available derive writes `const _: ()`
+        // containing its trait impl. The containing module's body index still changed.
+        modules.extend(delta.changed_scopes.iter().copied());
     }
     modules.extend(crate_state.bodies.keys().copied());
     modules.sort_unstable();
