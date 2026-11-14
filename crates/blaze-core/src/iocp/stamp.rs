@@ -4,35 +4,40 @@
 //! A name is stamped by a handle that asks for its attributes only, with every opener let in
 //! and a link or junction opened itself: its file index (the NTFS file reference number), its
 //! size, `LastWriteTime` and `ChangeTime`. A directory's entries come from the directory
-//! listing itself (`FileIdBothDirectoryInfo`, 64 KiB of entries per call), which has every one
-//! of those, so no entry is opened.
+//! listing itself (`FileIdBothDirectoryInformation`, 64 KiB of entries per call), which has
+//! every one of those, so no entry is opened. Every handle is an observer's
+//! ([`super::observe`]): it is never in the way of a rename of a directory above it.
 
 use std::{
     io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
     path::{Path, PathBuf},
 };
 
-use windows_sys::Win32::{
-    Foundation::{
-        ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
-        ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
-    },
-    Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileAttributeTagInfo, FileBasicInfo, FileIdBothDirectoryInfo,
-        FileIdBothDirectoryRestartInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        OPEN_EXISTING,
+use windows_sys::{
+    Wdk::Storage::FileSystem::FileIdBothDirectoryInformation,
+    Win32::{
+        Foundation::{
+            ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
+            ERROR_PATH_NOT_FOUND, HANDLE,
+        },
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+            FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+            FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx,
+        },
     },
 };
 
-use super::sys;
+use super::{
+    observe::{self, At, Open},
+    sys,
+};
 use crate::{FileName, Names, S_IFDIR, S_IFLNK, S_IFREG, Stamp};
 
-const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+/// How a stamp opens a name: its attributes, a link or junction itself.
+const LOOK: Open = Open { access: FILE_READ_ATTRIBUTES, link_itself: true };
 
 /// How many names one thread of a sweep stamps.
 const CHUNK: usize = 2048;
@@ -96,21 +101,6 @@ fn trim(wide: &mut Vec<u16>) {
     }
 }
 
-fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
-    debug_assert_eq!(wide.last(), Some(&0));
-    // SAFETY: a NUL-terminated path; no security attributes or template.
-    sys::owned(unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            rights,
-            SHARE_ALL,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            flags,
-            std::ptr::null_mut(),
-        )
-    })
-}
 
 /// Whether a name has a character Windows keeps out of names, so nothing is there by it: a
 /// `\` or `:` would name another file or a stream of one.
@@ -130,8 +120,7 @@ fn drive(name: &str) -> Option<(&str, &str)> {
 }
 
 /// The stamp of what `handle` is open on.
-fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
-    let raw = handle.as_raw_handle();
+fn stamp_of(raw: HANDLE) -> io::Result<Stamp> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: an open handle and room for one `BY_HANDLE_FILE_INFORMATION`.
     sys::check(unsafe { GetFileInformationByHandle(raw, &mut info) })?;
@@ -187,12 +176,8 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
         name.encode_utf16().map(|it| if it == u16::from(b'/') { u16::from(b'\\') } else { it }),
     );
     path.push(0);
-    match open(
-        path,
-        FILE_READ_ATTRIBUTES,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-    ) {
-        Ok(handle) => stamp_of(&handle).unwrap_or(Stamp::UNKNOWN),
+    match observe::open(At::Path(path), LOOK) {
+        Ok(handle) => stamp_of(handle.raw()).unwrap_or(Stamp::UNKNOWN),
         Err(error) => match error.raw_os_error().map(|it| it as u32) {
             Some(
                 ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_DIRECTORY | ERROR_INVALID_NAME
@@ -207,9 +192,7 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
 /// [`crate::fs::stamp`].
 pub(crate) fn stamp_path(path: &Path) -> io::Result<Stamp> {
     let wide = sys::path(path)?;
-    let handle =
-        open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)?;
-    stamp_of(&handle)
+    stamp_of(observe::open(At::Path(&wide), LOOK)?.raw())
 }
 
 /// How many threads stamp `names` names: one per [`CHUNK`] of them, at most one per core. A
@@ -226,7 +209,8 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     let named =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", root.display()));
     let mut prefix = sys::path(root).map_err(named)?;
-    open(&prefix, 0, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
+    observe::open(At::Path(&prefix), Open { access: FILE_READ_ATTRIBUTES, link_itself: false })
+        .map_err(named)?;
     trim(&mut prefix);
     // alloc: the stamps the sweep answers with, once per sweep.
     let mut out = vec![Stamp::GONE; names.len()];
@@ -305,32 +289,18 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
     let named =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
     let wide = sys::path(dir).map_err(named)?;
-    let handle = open(&wide, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
-    let mut class = FileIdBothDirectoryRestartInfo;
+    let how = Open { access: FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, link_itself: false };
+    let handle = observe::open(At::Path(&wide), how).map_err(named)?;
+    let mut restart = true;
     // alloc: the entries the listing answers with, once per listing.
     let mut found = Vec::new();
     let mut text = String::with_capacity(name.as_str().len() + 256);
     loop {
-        // SAFETY: an open directory handle and a buffer of the length given, 8-aligned as the
-        // class's entries are.
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                handle.as_raw_handle(),
-                class,
-                buffer.as_mut_ptr().cast(),
-                LISTING as u32,
-            )
-        };
-        if ok == 0 {
-            return match sys::last() {
-                ERROR_NO_MORE_FILES => {
-                    found.sort_unstable_by(|a: &(FileName, Stamp), b| a.0.cmp(&b.0));
-                    Ok(found)
-                }
-                _ => Err(named(io::Error::last_os_error())),
-            };
+        if !handle.list(&mut buffer[..LISTING / 8], FileIdBothDirectoryInformation, restart).map_err(named)? {
+            found.sort_unstable_by(|a: &(FileName, Stamp), b| a.0.cmp(&b.0));
+            return Ok(found);
         }
-        class = FileIdBothDirectoryInfo;
+        restart = false;
         // SAFETY: the call filled the buffer, which is read as bytes while it is not written.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), LISTING) };
         let mut at = 0;

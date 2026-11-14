@@ -68,8 +68,8 @@ pub(crate) struct Server {
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
     forced_keywords: bool,
-    /// Whether the expansion learned of a span what its key does not say.
-    pub(crate) asked: bool,
+    /// The first fact about a span the expansion learned that its key does not say.
+    pub(crate) asked: Option<&'static str>,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
     pub(crate) tracked: Vec<String>,
     pub(crate) emitted: Vec<Emitted>,
@@ -219,7 +219,7 @@ impl Server {
             sites,
             edition,
             forced_keywords,
-            asked: false,
+            asked: None,
             tracked: Vec::new(), // alloc: once per expansion, as above
             emitted: Vec::new(), // alloc: once per expansion, as above
             text: String::new(), // alloc: once per expansion, as above
@@ -311,7 +311,16 @@ impl Server {
     }
 
     fn ask(&mut self, db: &(impl Answer + ?Sized), req: SubRequest) -> SubResponse {
-        self.asked = true;
+        self.asked.get_or_insert(match req {
+            SubRequest::FilePath { .. } => "it read a span's display path",
+            SubRequest::LocalFilePath { .. } => "it read a span's local path",
+            SubRequest::SourceText { .. } => "it read a span's source text",
+            SubRequest::LineColumn { .. } => "it read a span's line or column",
+            SubRequest::ByteRange { .. } => "it read a span's absolute byte range",
+            SubRequest::SpanSource { .. } => "it read a span's source expansion",
+            SubRequest::SpanParent { .. } => "it read a span's parent expansion",
+            SubRequest::SpanJoin { .. } => "it joined spans of different items",
+        });
         match db.answer(req) {
             Ok(it) => it,
             Err(stop) => {
@@ -715,7 +724,9 @@ impl Server {
                         calling
                     })
                 });
-                self.asked |= asked;
+                if asked {
+                    self.asked.get_or_insert("it read a span's edition while printing tokens");
+                }
                 if let Some(stop) = lost {
                     self.lost.get_or_insert(stop);
                 }
@@ -788,7 +799,7 @@ impl Server {
             Method::SpanDebug => {
                 let span = self.read_span(&mut r)?;
                 // What it says is of the database's numbering, which the key does not have.
-                self.asked = true;
+                self.asked.get_or_insert("it read a span's database numbering for Debug");
                 let mut text = std::mem::take(&mut self.text);
                 text.clear();
                 _ = write!(text, "{span:?}");

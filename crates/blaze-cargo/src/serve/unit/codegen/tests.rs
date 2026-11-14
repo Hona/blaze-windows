@@ -40,6 +40,21 @@ fn only_immutable_build_scripts_need_no_edit_space() {
 }
 
 #[test]
+fn an_unchanged_compact_script_image_keeps_its_build_id() {
+    let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, blaze_link::Debug::Lines, false).unwrap();
+    assert!(!output.incremental);
+    let mut linked = kept("/w/build_script.exe", &output).kept;
+    let inputs = ContentId([3; 32]);
+    assert!(!linked.keeps_file(inputs), "nothing linked yet");
+    linked.given = Some(inputs);
+    assert!(linked.keeps_file(inputs));
+    assert!(!linked.keeps_file(ContentId([4; 32])), "changed inputs must stage a generation");
+    output.live = Some(blaze_link::Live);
+    linked.output = output;
+    assert!(!linked.keeps_file(inputs), "a live image still handles its slots");
+}
+
+#[test]
 fn test_mode_keeps_the_users_entry_without_a_harness() {
     use super::{Makes, Mode, RootKind, root_kind};
     let kind = |harness| root_kind(Mode::Test, "printed", &Makes::Executable, false, harness).unwrap();

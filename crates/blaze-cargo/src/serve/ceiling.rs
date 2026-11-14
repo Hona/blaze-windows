@@ -169,7 +169,8 @@ fn kernel(bytes: u64) -> anyhow::Result<Bound> {
 fn kernel(_: u64) -> anyhow::Result<Bound> {
     Ok(Bound::Watch {
         // alloc: once a ceiling is set
-        why: "blaze sets the kernel's memory limit on macOS and Linux alone".to_owned(),
+        why: "blaze sets the kernel's memory limit on macOS and Linux alone; on Windows the watch reads the commit charge"
+            .to_owned(),
     })
 }
 
