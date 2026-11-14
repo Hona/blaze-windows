@@ -1232,20 +1232,13 @@ mod sys {
 }
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    // SAFETY: all zeros is a valid `MEMORYSTATUSEX`, whose `dwLength` is set as the call asks.
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-    // SAFETY: `status` is live for the call to write, and its length is set.
-    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
-        let why = io::Error::last_os_error();
+    let capacity = blaze_mem::address_capacity().map_err(|why| {
         // alloc: the error's message
-        return Err(io::Error::new(why.kind(), format!("GlobalMemoryStatusEx: {why}")));
-    }
+        io::Error::new(why.kind(), format!("GlobalMemoryStatusEx: {why}"))
+    })?;
     // alloc: the limits and their names, once per daemon start
-    Ok(vec![(status.ullTotalPhys, "GlobalMemoryStatusEx ullTotalPhys".to_owned())])
+    Ok(vec![(capacity.physical, "GlobalMemoryStatusEx ullTotalPhys".to_owned())])
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

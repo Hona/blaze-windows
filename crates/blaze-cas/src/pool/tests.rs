@@ -143,12 +143,18 @@ impl Poison {
 }
 
 impl Give for Poison {
-    fn reuse(&self, _: &Pool<Self>, from: usize, len: usize) -> Result<(), MemError> {
+    fn reuse(&self, pool: &Pool<Self>, from: usize, len: usize) -> Result<(), MemError> {
         for page in from as u64 / PAGE..(from + len) as u64 / PAGE {
             if !self.held.borrow_mut().insert(page) {
                 self.note(format!("page {page} made the process's while it already was: given back late, or never"));
             }
         }
+        // Windows reserves the pool's pages alone: a range is readable only once the kernel
+        // commits it, so the stand-in has the real region commit it too.
+        #[cfg(windows)]
+        pool.pages.reuse(from, len)?;
+        #[cfg(not(windows))]
+        let _ = pool;
         Ok(())
     }
 
@@ -166,6 +172,14 @@ impl Give for Poison {
                 pool.fill(page, POISON);
             }
             given += range.len();
+        }
+        // And the real region discards them, as Windows' kernel does (their bytes are then the
+        // poison or zeros), and its count of what the process holds falls.
+        #[cfg(windows)]
+        // SAFETY: the caller's contract: every page is Evicting with no pin, reused and not
+        // given back since.
+        unsafe {
+            pool.pages.evict(ranges)?;
         }
         Ok(given)
     }

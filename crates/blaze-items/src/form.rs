@@ -1200,7 +1200,25 @@ impl<'db> Cx<'db> {
         let f = &mut form;
         match db.field_types(variant).get(field) {
             Some(it) => {
-                self.ty_in(f, it.ty().skip_binder());
+                let ty = it.ty().skip_binder();
+                self.ty_in(f, ty);
+                // The type a projection with no parameter in it is, beside it as written: the
+                // form of `<Flags as PublicFlags>::Internal` names the trait's `type Internal;`
+                // alone, and the impl that says what it is (bitflags' `InternalBitFlags(u32)`
+                // or `(u8)`) is in no slot, so two crates' `Flags` had one interface, one layout
+                // and one code (`#[derive(Clone)]`'s `*self` copies four bytes or one), and a
+                // build that compiled both was refused (rule 21). As the form of a constant
+                // alias with no parameter is its value (`args`, below).
+                match self.leak_free {
+                    true => f.u8(LEAK),
+                    false => match concrete_normal(db, variant_module(db, variant).krate(db), ty) {
+                        Some(normal) => {
+                            f.u8(1);
+                            self.ty_in(f, normal);
+                        }
+                        None => f.u8(0),
+                    },
+                }
                 match it.default() {
                     Some(default) => {
                         f.u8(1);
@@ -1721,6 +1739,8 @@ impl<'db> Cx<'db> {
                     f.bool(lib.bundle);
                     f.debug(&lib.as_needed);
                     f.symbol(lib.import_name_type);
+                    // The `cfg(..)` the linking crate decides it by: part of what it is.
+                    f.debug(&lib.cfg);
                 }
                 f.symbol(AttrFlags::wasm_import_module(db, it));
             }
@@ -3450,6 +3470,31 @@ fn store_item(db: &Db, loc: InternedClosure<'_>) -> ItemId {
         ExpressionStoreOwnerId::VariantFields(VariantId::StructId(it)) => ItemId::Adt(it.into()),
         ExpressionStoreOwnerId::VariantFields(VariantId::UnionId(it)) => ItemId::Adt(it.into()),
     }
+}
+
+/// `ty` normalized in `krate` with no parameter environment, where it holds an alias and no
+/// parameter, inference variable, placeholder, escaping bound variable or error, and the
+/// normalized type is another: what a field declared through a projection (`<T as Tr>::A` with
+/// `T` concrete) is laid out as, as rustc's layout normalizes it. `None` otherwise, and where
+/// it does not normalize (the code generator then refuses what reads it).
+fn concrete_normal<'db>(db: &'db Db, krate: base_db::Crate, ty: Ty<'db>) -> Option<Ty<'db>> {
+    if !ty.has_aliases()
+        || ty.has_non_region_param()
+        || ty.has_infer()
+        || ty.has_placeholders()
+        || ty.has_escaping_bound_vars()
+        || ty.references_error()
+    {
+        return None;
+    }
+    let interner = DbInterner::new_with(db, krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+    let reset = rustc_type_ir::set_aliases_to_non_rigid(interner, ty).skip_normalization();
+    let normal = infcx
+        .at(&hir_ty::next_solver::infer::traits::ObligationCause::dummy(), ParamEnv::empty())
+        .deeply_normalize(reset)
+        .ok()?;
+    (normal != ty && !references_non_lt_error(&normal)).then_some(normal)
 }
 
 fn variant_module(db: &Db, variant: VariantId) -> ModuleId {

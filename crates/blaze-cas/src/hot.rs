@@ -42,7 +42,7 @@ use blaze_reclaim::Grace;
 use crate::{
     pool::{
         Append, Ended, FileId, Kernel, Load, LoadFailure, Loads, Opened, PAGE, Pins, Pool,
-        PoolError, Rank, ReadStep, Reading, Run, Tail, WINDOW, WINDOWS, Window, Windows, counts,
+        PoolError, Rank, ReadStep, Reading, Run, Tail, WINDOW, Window, Windows, counts, store_windows,
         drive,
         evict::{Census, Sweep, Swept, census},
         loads::DEMAND_SLOTS,
@@ -579,49 +579,48 @@ impl Hot {
     /// reservation the system refused, or a loader that did not start, is kept as why
     /// ([`Hot::refused`]): the store stops, naming it, and nothing is read another way.
     pub(crate) fn new(load_tags: u64, loader: &crate::Loader) -> Hot {
-        let open = Pool::new(WINDOWS, Kernel)
+        let open = store_windows().and_then(|windows| {
             // alloc: the error that stops the store
-            .map_err(|err| err.to_string())
-            .and_then(|pool| {
-                // alloc: the pool's count, once per store
-                let pool = Arc::new(pool);
-                let (loader, loads) = match loader {
-                    crate::Loader::Pumped => {
-                        // Around the page cache: the pool is the one copy of what it reads.
-                        (None, Some(Loads::new(load_tags, Cache::Bypassed)))
-                    }
-                    crate::Loader::Thread { root } => {
-                        // clone: the loader's thread owns its driver's root, once per store
-                        let root: PathBuf = root.clone();
-                        let started = drive::Loader::start_shared(
-                            // clone: a count of the pool, the loader's
-                            pool.clone(),
-                            move || blaze_core::native(&root, LOADER_THREADS),
-                            load_tags,
-                            Cache::Bypassed,
-                        );
-                        // alloc: the error that stops the store
-                        (Some(started.map_err(|err| err.to_string())?), None)
-                    }
-                };
-                let gate = Gate { windows: Windows::new(WINDOWS), sweep: Sweep::new() };
-                Ok(Open {
-                    // alloc: what the store and its readers share of the pool, once per store
-                    side: Arc::new(Side { pool, loader, gate: Lock::new("store.pool.windows", gate) }),
-                    loads,
-                    // alloc: the commit's load slots, once per store
-                    free: (OPEN_SLOT + 1..DEMAND_SLOTS as u16).rev().collect(),
-                    // alloc: empty, allocates nothing
-                    tails: Vec::new(),
-                    opens: VecDeque::new(),
-                    commits: 0,
-                    written: BTreeMap::new(),
-                    // alloc: empty, allocates nothing
-                    openings: Vec::new(),
-                    // alloc: empty, allocates nothing
-                    retiring: Vec::new(),
-                })
-            });
+            let pool = Pool::new(windows, Kernel).map_err(|err| err.to_string())?;
+            // alloc: the pool's count, once per store
+            let pool = Arc::new(pool);
+            let (loader, loads) = match loader {
+                crate::Loader::Pumped => {
+                    // Around the page cache: the pool is the one copy of what it reads.
+                    (None, Some(Loads::new(load_tags, Cache::Bypassed)))
+                }
+                crate::Loader::Thread { root } => {
+                    // clone: the loader's thread owns its driver's root, once per store
+                    let root: PathBuf = root.clone();
+                    let started = drive::Loader::start_shared(
+                        // clone: a count of the pool, the loader's
+                        pool.clone(),
+                        move || blaze_core::native(&root, LOADER_THREADS),
+                        load_tags,
+                        Cache::Bypassed,
+                    );
+                    // alloc: the error that stops the store
+                    (Some(started.map_err(|err| err.to_string())?), None)
+                }
+            };
+            let gate = Gate { windows: Windows::new(windows), sweep: Sweep::new() };
+            Ok(Open {
+                // alloc: what the store and its readers share of the pool, once per store
+                side: Arc::new(Side { pool, loader, gate: Lock::new("store.pool.windows", gate) }),
+                loads,
+                // alloc: the commit's load slots, once per store
+                free: (OPEN_SLOT + 1..DEMAND_SLOTS as u16).rev().collect(),
+                // alloc: empty, allocates nothing
+                tails: Vec::new(),
+                opens: VecDeque::new(),
+                commits: 0,
+                written: BTreeMap::new(),
+                // alloc: empty, allocates nothing
+                openings: Vec::new(),
+                // alloc: empty, allocates nothing
+                retiring: Vec::new(),
+            })
+        });
         Hot { open }
     }
 

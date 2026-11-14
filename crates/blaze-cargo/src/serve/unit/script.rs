@@ -102,6 +102,8 @@ fn rechecks_in(env: &[(String, String)]) -> Result<bool, ApiError> {
 /// What a build script's run told cargo, for what depends on it.
 #[derive(Debug)]
 pub(crate) struct Applied {
+    #[cfg(windows)]
+    pub(crate) result: blaze_ids::ContentId,
     /// The run's package.
     pub(crate) package_id: String,
     pub(crate) links: Option<String>,
@@ -154,12 +156,19 @@ fn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {
     }
     let units = job.units();
     let Some(u) = units.graph.units.get(compile) else { return Ok(None) };
-    let root = u.target.src_path.to_string_lossy().into_owned();
+    let root = script_root(&u.target.src_path);
     // A root file whose bytes fail their check stopped the job as it was lowered.
-    let Ok(Some((_, _, bytes))) = job.mounted.read(&root) else { return Ok(None) };
+    let Some((_, _, bytes)) = job.mounted.read(&root).map_err(|why| format!("reading build script {root}: {why}"))? else { return Ok(None) };
     let Some(plan) = units.plans.get(compile) else { return Ok(None) };
-    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
-    Ok(script::inert(Path::new(&root), &files, &plan.rustflags))
+    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(root.as_ref()), bytes.to_vec())].into();
+    Ok(script::inert(Path::new(root.as_ref()), &files, &plan.rustflags))
+}
+
+/// A target's `src_path` is a daemon name, but its PathBuf may have acquired a native
+/// separator on the join with the target's relative path. Mounted reads use `/`.
+fn script_root(path: &Path) -> std::borrow::Cow<'_, str> {
+    let root = path.to_string_lossy();
+    if cfg!(windows) && root.contains('\\') { root.replace('\\', "/").into() } else { root }
 }
 
 /// What std's own build script compiled by unit `compile` prints, from blaze's port of it
@@ -173,9 +182,7 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
         units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
     let package = package_of(units, u).map_err(|it| it.what)?;
     let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
-    let root = u.target.src_path.to_string_lossy();
-    // On Windows a `Path::join` puts a `\` in the daemon's `/`-separated names.
-    let root = if cfg!(windows) { root.replace('\\', "/").into() } else { root };
+    let root = script_root(&u.target.src_path);
     let read = |path: &str| match job.mounted.read(path) {
         Ok(Some((_, _, bytes))) => Ok(bytes),
         Ok(None) => Err(format!("{path} is not among the build's files")),
@@ -213,11 +220,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
-    let env = inherited(
-        &job.input.config.invocation.env,
-        job.plan(run).map_err(|it| it.what)?,
-        !outside(job, run),
-    );
+    let env = started_in(job, run, &unit)?;
     let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
     Ok((unit, vars))
 }
@@ -302,7 +305,8 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .out_dir
         .clone()
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
-    let manifest_path = PathBuf::from(&package.manifest_path);
+    // The script sees the system's paths: the daemon's names (/C:/a on Windows) turned so.
+    let manifest_path = blaze_core::platform::path::host(&package.manifest_path);
     let manifest_dir =
         manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
     let targets = targets(units, &unit.pkg_id);
@@ -315,8 +319,20 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     };
     let target = triple_of(unit, of.host).to_owned();
     let config_env = native_env(of, &package.name, &target, &unit.features)?;
-    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
-    let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
+    // The run's kind's rustflags, as its plan gives them to the script (cargo's
+    // `CARGO_ENCODED_RUSTFLAGS`; a run compiles nothing, so its plan's own `rustflags` are
+    // none), and the cfg cargo's probe of the kind gives with them (`TargetInfo`'s `--print
+    // cfg`, which asks as for a proc macro too): `CARGO_CFG_TARGET_FEATURE` has `crt-static`
+    // when the flags turn it on, so `cc` compiles with `/MT`.
+    let run_flags: Vec<String> = var(plan, "CARGO_ENCODED_RUSTFLAGS")
+        .filter(|it| !it.is_empty())
+        .map(|it| it.split('\x1f').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&run_flags)?;
+    let target_cfgs = blaze_units::stdlib::target::target_cfg(
+        &target,
+        &blaze_units::stdlib::target::CfgArgs { proc_macro: true, ..cfg_args },
+    )?;
     let profile = &unit.profile;
     let release = var(plan, "PROFILE").ok_or_else(|| {
         UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string()
@@ -339,7 +355,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         })
         .collect::<Result<_, String>>()?;
     // `<profile>/build/<package>-<hash>/out`, or `<profile>/build/<package>/<hash>/out`.
-    let profile_dir = Path::new(&out_dir)
+    let profile_dir = blaze_core::platform::path::host(&out_dir)
         .ancestors()
         .find(|it| it.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
@@ -393,10 +409,10 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         target,
         host: of.host.to_owned(),
         target_cfgs,
-        rustflags: plan.rustflags.clone(),
+        rustflags: run_flags,
         jobs,
         script: of.program.clone(),
-        out_dir: PathBuf::from(&out_dir),
+        out_dir: blaze_core::platform::path::host(&out_dir),
         tools: bs::Tools {
             cargo: of.launcher.to_path_buf(),
             rustc: exe("rustc"),
@@ -497,6 +513,102 @@ pub(crate) fn inherited(
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
 
+/// The environment run `run`, of script `unit`, is started in: [`inherited`], and on Windows,
+/// for a sandboxed script built for an MSVC target when the job's environment is not a
+/// developer prompt's (it has no `VCINSTALLDIR`), that prompt's variables over it, its `PATH`
+/// in front of the job's ([`blaze_core::platform::msvc`]): in the AppContainer a C compiler can
+/// find Visual Studio by them alone. An unsandboxed run finds it as it would outside blaze.
+pub(crate) fn started_in(
+    job: &Job,
+    run: usize,
+    unit: &bs::Unit,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let sandboxed = !outside(job, run);
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "only Windows adds to it"))]
+    let mut env = inherited(
+        &job.input.config.invocation.env,
+        job.plan(run).map_err(|it| it.what)?,
+        sandboxed,
+    );
+    #[cfg(windows)]
+    if sandboxed {
+        developer_prompt(job, unit, &mut env)?;
+        // The stand-in is a link under the daemon's state directory, not beside its std
+        // sources; the AppContainer also has its own LOCALAPPDATA. Give it the daemon's std.
+        let std = crate::toolchain::library::found()?;
+        env.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::toolchain::library::VAR));
+        env.push((crate::toolchain::library::VAR.into(), std.dir.as_os_str().to_owned()));
+    }
+    #[cfg(not(windows))]
+    let _ = unit;
+    Ok(env)
+}
+
+/// [`started_in`]'s developer prompt, set over `env`.
+#[cfg(windows)]
+fn developer_prompt(
+    job: &Job,
+    unit: &bs::Unit,
+    env: &mut Vec<(OsString, OsString)>,
+) -> Result<(), String> {
+    use blaze_core::platform::msvc;
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let Some(target) = msvc::targets(&unit.target).then(|| msvc::arch(&unit.target)).flatten()
+    else {
+        return Ok(());
+    };
+    if named(env, "VCINSTALLDIR").is_some() {
+        return Ok(());
+    }
+    let host = msvc::arch(std::env::consts::ARCH)
+        .ok_or_else(|| format!("blaze runs on {}, which has no MSVC tools", std::env::consts::ARCH))?;
+    let developer = job.msvc.get_or_init(|| {
+        let _span = tracing::info_span!(target: "blaze", "build script: discover the MSVC installation").entered();
+        msvc::find()
+    }).as_ref().map_err(|why| {
+        format!(
+            "the build script of `{}` for {} is started with a Visual Studio developer prompt's \
+             variables, as the sandbox can't find Visual Studio on its own, and {why}",
+            unit.package.name, unit.target
+        )
+    })?;
+    prompted(env, developer, host, target)
+}
+
+/// `env` with `developer`'s prompt for `host` and `target` over it. The job's `PATH`, under
+/// whatever case of its name the job gave it (`Path`, as Windows keeps it), is the prompt's tail
+/// and keeps that name, as every name the prompt sets replaces the job's of any case: Windows
+/// reads a name in any case, and of two that differ only so a program sees one.
+#[cfg(windows)]
+fn prompted(
+    env: &mut Vec<(OsString, OsString)>,
+    developer: &blaze_core::platform::msvc::Developer,
+    host: &str,
+    target: &str,
+) -> Result<(), String> {
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let (path_name, path) = match named(env, "PATH") {
+        Some(at) => {
+            let (name, value) = env.swap_remove(at);
+            (name, Some(value))
+        }
+        None => ("PATH".into(), None),
+    };
+    for (name, value) in developer.variables(host, target, path.as_ref())? {
+        let name = if name == "PATH" { path_name.clone() } else { name };
+        if let Some(at) = named(env, &name.to_string_lossy()) {
+            env.swap_remove(at);
+        }
+        env.push((name, value));
+    }
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
 /// How a run ended, judged as cargo judges it.
 #[derive(Debug)]
 pub(crate) struct Judged {
@@ -523,15 +635,28 @@ pub(crate) fn script_at(unit: &bs::Unit) -> Text {
 
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
-pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
+pub(crate) fn refused(
+    unit: &bs::Unit,
+    env: &[(OsString, OsString)],
+    stdout: &[u8],
+    link_dirs: &[PathBuf],
+) -> Option<Report> {
     // The store of pinned native inputs of the home this daemon lays them out in
     // ([`super::Real`]'s `native`): the same variables decide both.
     let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
+    let windows = unit.host.contains("windows");
+    let system = match windows {
+        true => crate::directives::windows_system_dirs(env),
+        false => Vec::new(),
+    };
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
         native: native.as_deref(),
+        system: &system,
+        msvc: unit.target.ends_with("-windows-msvc"),
+        windows,
     };
     let refused = crate::directives::refused(stdout, &ran);
     (!refused.is_empty())
@@ -573,7 +698,7 @@ pub(crate) fn judge(
         Ok(output) => {
             let diagnostics = warnings(&output.log_messages);
             if let Some(link_dirs) = checked
-                && let Some(report) = refused(unit, &value.stdout, link_dirs)
+                && let Some(report) = refused(unit, env, &value.stdout, link_dirs)
             {
                 return Judged { output: None, diagnostics, failure: Some(report) };
             }
@@ -685,14 +810,21 @@ fn checkout_without_git(dir: &Path, stderr: &[u8]) -> Option<PathBuf> {
     if !stderr.windows(SAID.len()).any(|it| it == SAID) {
         return None;
     }
-    let root = dir.ancestors().find(|root| {
+    let root = git_checkout(dir)?;
+    (!root.join(".git").exists()).then(|| root.to_owned())
+}
+
+/// The root of blaze's checkout of a git dependency that the package directory `dir` is in:
+/// `<sources>/git/checkouts/<ident>/<commit>`, the commit's whole tree
+/// ([`crate::serve::fetch::keep_on_disk`]).
+fn git_checkout(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|root| {
         let commit = root.file_name().and_then(|it| it.to_str()).is_some_and(|it| {
             matches!(it.len(), 40 | 64) && it.bytes().all(|it| it.is_ascii_hexdigit())
         });
         commit
             && root.parent().and_then(Path::parent).is_some_and(|it| it.ends_with("git/checkouts"))
-    })?;
-    (!root.join(".git").exists()).then(|| root.to_owned())
+    })
 }
 
 /// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact
@@ -782,7 +914,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
+        How::Sandboxed(prepared) if !matches!(prepared.spec.mode, blaze_usercode::run::Mode::Normal | blaze_usercode::run::Mode::Declared { verify: false, .. }) => {
             false
         }
         How::Sandboxed(prepared) => {
@@ -943,7 +1075,7 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
         .ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
     plan.outputs
         .first()
-        .map(PathBuf::from)
+        .map(|it| blaze_core::platform::path::host(it))
         .ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
 }
 
@@ -957,11 +1089,11 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's.
 pub(crate) fn build_roots(job: &Job) -> RootMap {
     RootMap::default()
-        .with(Role::Target, Path::new(&job.units().target_dir))
-        .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
+        .with(Role::Target, &blaze_core::platform::path::host(&job.units().target_dir))
+        .with(Role::Workspace, &blaze_core::platform::path::host(&job.input.config.invocation.root))
         .with(Role::Tools, &job.shared.tools)
         .with(Role::Launcher, &job.shared.launcher)
-        .with_sources(Path::new(&job.input.config.sources))
+        .with_sources(&blaze_core::platform::path::host(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
@@ -969,6 +1101,41 @@ pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
     build_roots(job)
         .with(Role::Package, &unit.package.manifest_dir)
         .with(Role::OutDir, &unit.out_dir)
+}
+
+/// The source payload containing `package`, if Blaze fetched it. A Git dependency's
+/// payload is its checkout: a member may read assets beside it. A registry package is
+/// one archive. Never walk up looking for `.git` on disk or leave the verified payload.
+#[cfg(windows)]
+fn fetched_input(sources: &Path, package: &Path) -> Option<PathBuf> {
+    use std::path::Component::Normal;
+    let mut parts = package.strip_prefix(sources).ok()?.components();
+    let (Some(Normal(kind)), Some(Normal(sub)), Some(Normal(index)), Some(Normal(revision))) =
+        (parts.next(), parts.next(), parts.next(), parts.next()) else { return None };
+    if parts.any(|p| !matches!(p, Normal(_))) { return None; }
+    ((kind == "git" && sub == "checkouts") || (kind == "registry" && sub == "src"))
+        .then(|| sources.join(kind).join(sub).join(index).join(revision))
+}
+
+/// Bundled native sources may live in a build-dependency: its code, inside the script,
+/// opens files relative to its own compile-time CARGO_MANIFEST_DIR (e.g. luau0-src).
+#[cfg(windows)]
+fn script_inputs(job: &Job, compile: usize, read: &mut Vec<PathBuf>) -> Result<(), ApiError> {
+    let units = job.units();
+    let sources = blaze_core::platform::path::host(&job.input.config.sources);
+    let mut seen = vec![false; units.graph.units.len()]; // alloc: visit each compiled dependency once
+    let mut pending = vec![compile]; // alloc: the script's dependency walk
+    while let Some(index) = pending.pop() {
+        let unit = job.unit(index)?;
+        if std::mem::replace(&mut seen[index], true) { continue; }
+        let package = package_of(units, unit)?;
+        let dir = manifest_dir(&package.name, &package.manifest_path)?;
+        if let Some(input) = fetched_input(&sources, &dir) { read.push(input); }
+        pending.extend(unit.dependencies.iter().map(|dep| dep.index));
+    }
+    let std = crate::toolchain::library::found().map_err(|why| ApiError::new(why, None))?;
+    read.push(std.dir.clone()); // clone: the launch spec owns its roots
+    Ok(())
 }
 
 /// Run `run` ready to begin; none while its script is not built.
@@ -996,7 +1163,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         },
     };
     let script_path = match &program {
-        Some((path, _)) => PathBuf::from(path),
+        Some((path, _)) => blaze_core::platform::path::host(path),
         None => named_program(units, compile)?,
     };
     let of = Of {
@@ -1010,18 +1177,57 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let unit = script_unit(&of, run)
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
+    let env = started_in(job, run, &unit)
+        .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new());
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
-        PathBuf::from(&job.input.config.invocation.root),
-        PathBuf::from(&units.target_dir),
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // Don't grant a Windows script the entire mutable workspace or build tree under
+    // a package-scoped key. Sibling inputs require a separately keyed read grant.
+    if !cfg!(windows) {
+        read.push(blaze_core::platform::path::host(&job.input.config.invocation.root));
+        read.push(blaze_core::platform::path::host(&units.target_dir));
+    }
+    #[cfg(windows)]
+    for dep in &job.unit(run)?.dependencies {
+        if let Some(output) = job.scripts[dep.index].get() { read.push(PathBuf::from(&output.out_dir)); }
+    }
+    #[cfg(windows)]
+    let mut mutable = Vec::new(); // alloc: explicit mutable grants only
+    // A git dependency's script reads its repository at the commit, as cargo's checkout (the
+    // whole repository) lets it: an asset beside its package (betteroffice-fonts-intl reads
+    // `../../packages/fonts-intl/assets`). The tree is the commit's, fixed by it, and in
+    // blaze's sources, which every checkout of the build shares ([`build_roots`]).
+    if let Some(root) = git_checkout(&unit.package.manifest_dir) {
+        read.push(root.to_owned());
+    }
+    #[cfg(windows)]
+    if !outside(job, run) { script_inputs(job, compile, &mut read)?; }
+    #[cfg(windows)]
+    if let Some((_, paths)) = job.input.config.invocation.env.iter().find(|(name, _)| name == "BLAZE_SCRIPT_READ") {
+        // A checkout cannot choose these via a gitfile, PATH or Cargo's [env]. This is the
+        // caller's environment, before any values from the project are applied.
+        for path in std::env::split_paths(paths) {
+            if !path.is_absolute() || path.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} is not an absolute file or directory below a volume root", path.display()), None));
+            }
+            let resolved = std::fs::canonicalize(&path).map_err(|e| ApiError::new(format!("BLAZE_SCRIPT_READ: {}: {e}", path.display()), None))?;
+            if resolved.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} resolves to a volume root", path.display()), None));
+            }
+            mutable.push(resolved.clone());
+            read.push(resolved);
+        }
+    }
+    // Each declared cache is read and written where the caller says ([`Place::caches`]): not a
+    // read root of its key.
+    let caches = declared_caches(&job.input.config.invocation.env)?;
     // Each pinned native input it is given is read where it is laid out, and its digest is
     // part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
@@ -1030,16 +1236,31 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
         })
         .collect();
+    read.sort_unstable();
     read.dedup();
+    #[cfg(windows)]
+    let declared_inputs = if outside(job, run) || crate::sandbox::v2::OBSERVES_READS { None } else {
+        let why = |what| ApiError::new(what, Some(unit.package.descr()));
+        let roots = declared::roots(&read).map_err(why)?;
+        let host = declared::given(job, run, &unit, &env, &roots, mutable).map_err(why)?;
+        Some((host, roots))
+    };
+    #[cfg(windows)]
+    let declared = declared_inputs.as_ref().map(|(host, _)| *host);
+    #[cfg(not(windows))]
+    let declared = None;
     let place = Place {
         code,
         read,
         pinned,
+        caches,
         network: false,
         memory: None,
-        mode: match rechecks(job)? {
-            true => blaze_usercode::run::Mode::Verify,
-            false => blaze_usercode::run::Mode::Normal,
+        mode: match (declared, rechecks(job)?) {
+            (Some(host), verify) => blaze_usercode::run::Mode::Declared { verify, host },
+            _ if !crate::sandbox::v2::OBSERVES_READS => blaze_usercode::run::Mode::Unobserved,
+            (_, true) => blaze_usercode::run::Mode::Verify,
+            (_, false) => blaze_usercode::run::Mode::Normal,
         },
         roots: build_roots(job),
     };
@@ -1068,6 +1289,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         }
     }
     let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
+    #[cfg(windows)]
+    let disk = match declared_inputs { Some((_, roots)) => disk.declared_inputs(roots), None => disk };
     let how = match outside(job, run) {
         true => {
             // Outside the sandbox nothing is lent: the program is given its whole environment,
@@ -1346,6 +1569,10 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
             // alloc: once a miss
             .collect();
         let mut miss = blaze_kernel::Miss::of_parts(RUN, subject, item, hasher.finish(), parts);
+        if prepared.spec.mode == blaze_usercode::run::Mode::Unobserved {
+            miss.missed = blaze_kernel::Missed::Always(crate::sandbox::v2::NOT_TRACED_ON_WINDOWS.into());
+            return miss;
+        }
         miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
         miss
     })
@@ -1490,10 +1717,50 @@ fn live_record(
 }
 
 /// `path` as the driver names it, under its root `/`.
+/// The caches the caller declares to every build script it runs (`BLAZE_SCRIPT_CACHES`, its own
+/// environment, never the project's): a list of the system's paths whose entries are each
+/// `VARIABLE=DIRECTORY`. A script is told each variable, naming its directory, which it may
+/// read and write and which is kept across runs: a download cache (rune-desktop's
+/// `GHOSTTY_VT_CACHE_DIR`). What is in one is in no key ([`Place::caches`]). Each directory is
+/// made if missing, and named as the system resolves it; an entry that is not a variable's
+/// name and an absolute directory below a volume's root, or a variable named twice, is refused,
+/// naming it.
+fn declared_caches(env: &[(String, String)]) -> Result<Vec<(String, PathBuf)>, ApiError> {
+    const NAME: &str = "BLAZE_SCRIPT_CACHES";
+    let Some((_, list)) = env.iter().find(|(name, _)| name == NAME) else { return Ok(Vec::new()) };
+    // alloc: an error path.
+    let refused = |what: String| ApiError::new(format!("{NAME}: {what}"), None);
+    let mut caches: Vec<(String, PathBuf)> = Vec::new(); // alloc: the caller's few caches, once a run
+    for entry in std::env::split_paths(list) {
+        let text = entry.to_string_lossy();
+        let Some((name, dir)) = text.split_once('=') else {
+            return Err(refused(format!("`{text}` is no VARIABLE=DIRECTORY")));
+        };
+        if name.is_empty() || !name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_') {
+            return Err(refused(format!("`{name}` is no variable's name")));
+        }
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() || dir.parent().is_none() {
+            return Err(refused(format!("{} is not an absolute directory below a volume's root", dir.display())));
+        }
+        std::fs::create_dir_all(&dir).map_err(|error| refused(format!("making {}: {error}", dir.display())))?;
+        let dir = std::fs::canonicalize(&dir).map_err(|error| refused(format!("{}: {error}", dir.display())))?;
+        if caches.iter().any(|(it, _)| it.eq_ignore_ascii_case(name)) {
+            return Err(refused(format!("`{name}` is named twice")));
+        }
+        caches.push((name.to_owned(), dir));
+    }
+    caches.sort();
+    Ok(caches)
+}
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
-        format!("{} is not a path blaze can write cargo's files of a run at", path.display())
-    })
+    let refused = || format!("{} is not a path blaze can write cargo's files of a run at", path.display());
+    let text = path.to_str().ok_or_else(refused)?;
+    // A name is `/`-separated on every system; a path joined on Windows has `\` between its
+    // parts, which no Windows file name holds.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/"); // alloc: a name, three a run written
+    FileName::new(text.trim_start_matches('/')).ok_or_else(refused)
 }
 
 pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {
@@ -1639,7 +1906,12 @@ impl ScriptRun {
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
-            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
+            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env).and_then(
+                |mut it| {
+                    it.extend(crate::directives::machine_link_dirs(&start.env)?);
+                    Ok(it)
+                },
+            ) {
                 // The layouts of the pinned native inputs it was given may be searched and
                 // be an rpath: each is the verified unpacking of its pinned archive.
                 Ok(mut it) => {
@@ -1668,6 +1940,8 @@ impl ScriptRun {
             self.state = State::Done;
             return Some(false);
         };
+        #[cfg(windows)]
+        let mut result = declared::result(&value);
         let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {
@@ -1678,10 +1952,23 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        #[cfg(windows)]
+        if matches!(start.how, How::Outside(_)) {
+            let mut hash = blaze_ids::Hasher::new("Windows outside dependency result 1");
+            hash.id(&result);
+            for (path, bytes) in &files { hash.part(path.as_bytes()).part(bytes); }
+            result = hash.finish();
+        }
+        // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
+        // the plan's; the script ran at the system's path of it.
+        let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
+            let what = format!("the build script run of unit {} has no OUT_DIR in its plan", self.unit);
+            return self.error(what, out);
+        };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
             env: output.env.clone(),
-            out_dir: out_dir.clone(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {
@@ -1700,7 +1987,7 @@ impl ScriptRun {
         };
         out.push(Response::BuildScript(executed(&package_id, &output, &out_dir)));
         let links = start.unit.package.links.clone();
-        let applied = Applied { package_id, links, output, out_dir };
+        let applied = Applied { package_id, links, output, out_dir, #[cfg(windows)] result };
         if job.scripts[self.unit].set(applied).is_err() {
             return self.error(
                 format!("the build script run of unit {} ended twice in one job", self.unit),
@@ -2068,7 +2355,14 @@ impl ScriptRun {
                     completion,
                     store,
                     disk,
-                    |exit| script::cargo_rule(unit, env, exit),
+                    |exit| {
+                        let mut rule = script::cargo_rule(unit, env, exit)?;
+                        if matches!(prepared.spec.mode, blaze_usercode::run::Mode::Declared { .. }) {
+                            // Whole environment already in the key, including absent variables.
+                            rule.env.clear();
+                        }
+                        Ok(rule)
+                    },
                     |traced| {
                         // What the run read and who read it, as events of the build's
                         // profile, before its key takes anything out of the trace.
@@ -2246,6 +2540,8 @@ impl ScriptRun {
 }
 
 pub(crate) mod pure;
+#[cfg(windows)]
+mod declared;
 mod said;
 
 #[cfg(test)]

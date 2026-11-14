@@ -498,6 +498,15 @@ pub(super) fn macro_call_to_macro_id(
 ) -> Option<MacroId> {
     let db = ctx.s2d.db;
     let loc = macro_call_id.loc(db);
+    if let hir_expand::MacroDefKind::ProcMacro(id, expander, kind) = loc.def.kind {
+        use hir_def::{Intern as _, ProcMacroLoc};
+        // A proc macro is exported from its defining crate's root. Its definition
+        // carries every field `export_proc_macro` interned there. Looking up the
+        // function syntax in the caller's modules searches the wrong crate.
+        let container = hir_def::nameres::crate_def_map(db, loc.def.krate).root_module_id();
+        let proc_macro = ProcMacroLoc { container, id, expander, kind, edition: loc.def.edition };
+        return Some(proc_macro.intern(db).into());
+    }
     match loc.def.ast_id() {
         Either::Left(it) => {
             let node = it.to_view(db);

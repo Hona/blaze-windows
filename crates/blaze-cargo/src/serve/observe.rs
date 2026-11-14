@@ -87,6 +87,21 @@ pub const DUCKDB_PINS: &[(&str, Pin)] = &[
             sha256: "cbd6e7d472c33083db32e1e78d71ab9eefb32da872c349423294de370b8f4ca9",
         },
     ),
+    // DuckDB releases its Windows CLI as a zip alone (`duckdb.exe` in it).
+    (
+        "x86_64-windows",
+        Pin {
+            asset: "duckdb_cli-windows-amd64.zip",
+            sha256: "e1428b7114a841626b5054723731cbf45c6df91b42ae1a6c355f88fad1f6dc4c",
+        },
+    ),
+    (
+        "aarch64-windows",
+        Pin {
+            asset: "duckdb_cli-windows-arm64.zip",
+            sha256: "9d0370d085684e1619ecc5efb2656cde930c50f1418380f0ae9d0379ddf06b12",
+        },
+    ),
 ];
 
 impl Pin {
@@ -109,7 +124,8 @@ impl Pin {
     pub fn laid_out(&self, state: &Path) -> PathBuf {
         let short = self.sha256.get(..16).unwrap_or(self.sha256);
         // alloc: once per lookup
-        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join("duckdb")
+        let program = format!("duckdb{}", std::env::consts::EXE_SUFFIX);
+        state.join("duckdb").join(format!("{DUCKDB_VERSION}-{short}")).join(program)
     }
 }
 
@@ -199,7 +215,7 @@ pub fn hot(top: u32, since: blaze_api::HotSince) -> Result<blaze_api::Hot, ApiEr
 pub fn bugs() -> Vec<blaze_api::Bug> {
     let mut sites = stdx::assert::reported::sites();
     sites.sort_unstable_by_key(|it| (it.at.file(), it.at.line(), it.at.column(), it.kind, it.what));
-    sites
+    let mut bugs: Vec<_> = sites
         .into_iter()
         .map(|it| blaze_api::Bug {
             kind: it.kind.to_owned(), // alloc: the answer's copy, once a Status a site
@@ -208,7 +224,22 @@ pub fn bugs() -> Vec<blaze_api::Bug> {
             count: it.count,
             thread: it.thread.as_deref().map(str::to_owned), // alloc: as above
         })
-        .collect() // alloc: the answer's rows; none for none
+        .collect(); // alloc: the answer's rows; none for none
+    if let Some(bug) = last_panic() {
+        bugs.push(bug);
+    }
+    bugs
+}
+
+pub(super) fn last_panic() -> Option<blaze_api::Bug> {
+    let (thread, at, what) = blaze_profile::panics::latest()?;
+    Some(blaze_api::Bug {
+        kind: "last panic".into(),
+        at: at.unwrap_or_else(|| "unknown site".into()),
+        what: what.unwrap_or_else(|| "non-text payload".into()),
+        thread: Some(thread),
+        count: 1,
+    })
 }
 
 /// The profile history and the DuckDB that queries it, as `blaze serve` gives them to its
@@ -983,7 +1014,7 @@ fn take(
                 _ = failed.send(error);
             }
             if row.commit.is_none() {
-                row.commit = commit_of(Path::new(&row.workspace));
+                row.commit = commit_of(&blaze_core::platform::path::host(&row.workspace));
             }
             // `builds.misses` is what `misses` lists of the build, counted from the very
             // rows written (one-concept-one-home): `blaze slow` holds the two equal.

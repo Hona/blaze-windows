@@ -54,7 +54,7 @@ pub(crate) mod said;
 pub mod settings;
 pub(crate) mod signals;
 mod still;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 mod stop;
 #[cfg(test)]
 mod tests;
@@ -83,6 +83,14 @@ pub use machine::Machine;
 /// to hold, so [`Options::machine`] is always `None`.
 #[cfg(not(all(unix, feature = "native")))]
 pub enum Machine {}
+
+#[cfg(not(all(unix, feature = "native")))]
+impl Machine {
+    /// What the machine's ledger says of this daemon: there is none to say it.
+    pub(crate) fn says(&self) -> Option<&str> {
+        match *self {}
+    }
+}
 
 /// What the line a daemon writes to its log once it listens starts with, then where and its
 /// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
@@ -150,60 +158,26 @@ pub fn root() -> anyhow::Result<PathBuf> {
 /// there is cloned from the daemon's store, and a clone does not cross file systems (blaze
 /// never copies instead), so daemons share it only within one file system.
 pub fn machine() -> anyhow::Result<PathBuf> {
-    let dir = user_shared()?;
     let root = root()?;
-    if same_file_system(&dir, &root)? { Ok(dir) } else { Ok(root.join("shared")) }
+    match user_shared()? {
+        Some(dir) if same_file_system(&dir, &root)? => Ok(dir),
+        _ => Ok(root.join("shared")),
+    }
 }
 
-/// Whether `a` and `b` are on one file system, each judged by the nearest of it and its
-/// ancestors that exists (a directory not made yet is made on its parent's).
-#[cfg(unix)]
+/// Whether `a` and `b` are on one volume (`blaze_core::platform::volume::same_volume`).
 fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-    let device = |path: &Path| -> anyhow::Result<u64> {
-        let mut at = path;
-        loop {
-            match std::fs::metadata(at) {
-                Ok(it) => return Ok(it.dev()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    at = at.parent().with_context(|| {
-                        format!("no ancestor of {} exists to say its file system", path.display())
-                    })?;
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("the file system of {}", at.display()));
-                }
-            }
-        }
-    };
-    Ok(device(a)? == device(b)?)
+    Ok(blaze_core::platform::volume::same_volume(a, b)?)
 }
 
-/// Whether `a` and `b`, both absolute, are on one volume: the same drive or share prefix
-/// (ReFS clones within a volume alone).
-#[cfg(not(unix))]
-fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
-    let prefix = |path: &Path| match path.components().next() {
-        Some(std::path::Component::Prefix(it)) => Ok(it.as_os_str().to_ascii_uppercase()),
-        _ => Err(anyhow::anyhow!("{} names no volume to say its file system", path.display())),
-    };
-    Ok(prefix(a)? == prefix(b)?)
-}
-
-/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`), absolute.
-fn user_shared() -> anyhow::Result<PathBuf> {
-    let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
-        Some(caches) => PathBuf::from(caches).join("blaze"),
-        None => {
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-            PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
-                .join(".cache/blaze")
-        }
-    };
+/// The directory every daemon of the user shares (`blaze_core::platform::home`'s `machine`:
+/// `blaze` in the user's cache directory, `%LOCALAPPDATA%\blaze` on Windows), absolute.
+fn user_shared() -> anyhow::Result<Option<PathBuf>> {
+    let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
+    let Some(dir) = found.machine else { return Ok(None) };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
-    std::path::absolute(&dir).with_context(|| {
+    std::path::absolute(&dir).map(Some).with_context(|| {
         format!("the machine's shared directory {} against the current directory", dir.display())
     })
 }
@@ -755,22 +729,19 @@ impl std::fmt::Display for Before {
 /// What a daemon adds to its pid in `serve.lock` once its stop wrote its image.
 const STOPPED: &str = "stopped";
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn hold(
     state: &Path,
     ready: Option<&Ready>,
 ) -> anyhow::Result<(stdx::file_lock::Locked, Before)> {
-    use std::{
-        io::{Read as _, Seek as _, Write as _},
-        os::unix::fs::OpenOptionsExt as _,
-    };
+    use std::io::{Read as _, Seek as _, Write as _};
     let lock = state.join("serve.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    // The state's directory is the user's alone on Windows (`platform::home`'s ACL).
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
         .open(&lock)
         .with_context(|| format!("opening the daemon's lock {}", lock.display()))?;
     let tried = stdx::file_lock::Locked::try_lock(file)
@@ -841,7 +812,7 @@ pub(crate) struct Ready {
 
 impl Ready {
     /// The pipe, its reporter started: the calling thread is the start's, which it reports on.
-    #[cfg(all(unix, feature = "native"))]
+    #[cfg(all(any(unix, windows), feature = "native"))]
     fn new(pipe: std::fs::File) -> anyhow::Result<Ready> {
         let pipe = Arc::new(blaze_core::lock::Lock::new("serve.ready.pipe", Some(pipe)));
         let starting = blaze_profile::starting::Starting::here();
@@ -883,20 +854,20 @@ fn say(ready: Option<&Ready>, phase: Phase) {
 }
 
 /// How often [`Ready`]'s reporter says what the start's thread is inside.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 const REPORT_EVERY: Duration = Duration::from_millis(500);
 
 /// The most reports [`Ready`]'s reporter writes: a start's phases are bounded (the CLI waits
 /// [`BEFORE_ENDS`] and a minute a phase), so a start still going past ten minutes on top of
 /// that has long been given up on, and the reporter stops, saying so in the log.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 const REPORTS_MAX: u64 = (BEFORE_ENDS.as_secs() + 600) * 1000 / REPORT_EVERY.as_millis() as u64;
 
 /// [`Ready`]'s reporter: every [`REPORT_EVERY`], an [`INSIDE`] record of what `starting` is
 /// inside, until the pipe is gone (the daemon listens, or its start failed), a write fails (the
 /// CLI that waited is gone) or [`REPORTS_MAX`]. Each tick waits for an absolute deadline taken
 /// as the tick before ended, so nothing restarts a wait that is interrupted.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(any(unix, windows), feature = "native"))]
 fn report(
     pipe: &blaze_core::lock::Lock<Option<std::fs::File>>,
     starting: blaze_profile::starting::Starting,
@@ -951,6 +922,34 @@ fn ready(fd: i32) -> anyhow::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
+/// The pipe of `blaze serve --ready-fd N` on Windows, `N` the number of the handle this process
+/// inherited ([`crate::cli::daemon`]'s start): checked to be a pipe, made this process's alone
+/// (no process it starts inherits it).
+#[cfg(all(windows, feature = "native"))]
+fn ready(handle: i32) -> anyhow::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation},
+        Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType},
+    };
+    let raw = usize::try_from(handle)
+        .ok()
+        .filter(|it| *it != 0)
+        .with_context(|| format!("blaze serve --ready-fd {handle}: no handle's number"))?
+        as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: asks of a number and reads no memory of this process; one that is no open
+    // handle is FILE_TYPE_UNKNOWN, refused below.
+    if unsafe { GetFileType(raw) } != FILE_TYPE_PIPE {
+        bail!("blaze serve --ready-fd {handle}: not a pipe this process was started with");
+    }
+    // SAFETY: as above; clears a flag of an open handle.
+    if unsafe { SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        bail!("blaze serve --ready-fd {handle}: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: open (a pipe, found above), passed for this alone by the CLI that started the
+    // process, and owned by nothing else in it: `serve` takes it before it opens anything.
+    Ok(unsafe { std::fs::File::from_raw_handle(raw) })
+}
 /// `blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]`.
 #[cfg(feature = "native")]
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
@@ -980,13 +979,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         );
     }
     // First too: nothing this process starts may inherit the pipe.
-    #[cfg(unix)]
     let ready = args.ready.map(ready).transpose()?.map(Ready::new).transpose()?;
-    #[cfg(not(unix))]
-    let ready = match args.ready {
-        Some(_) => bail!("blaze serve --ready-fd: the CLI starts the daemon so on Unix only"),
-        None => None,
-    };
     let socket = match args.socket {
         Some(socket) => std::path::absolute(&socket)
             .with_context(|| format!("the socket {}", socket.display()))?,
@@ -1053,7 +1046,7 @@ pub(crate) struct Engine {
 /// What the engine holds for its life: the state's lock, which the next engine on it waits on,
 /// and the lease of the shared standard library's store.
 struct Held {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     lock: stdx::file_lock::Locked,
     /// How the daemon before this one on the state ended, as its lock said.
     before: Before,
@@ -1070,9 +1063,9 @@ pub(crate) fn engine(
     std::fs::create_dir_all(&state)
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
     // Held until the engine ends: the next one on this state waits on it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let (lock, before) = hold(&state, ready)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let (_, before) = (ready, Before::None);
     // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
     // directories.
@@ -1192,8 +1185,20 @@ pub(crate) fn engine(
         blaze_graph::arena::machine_budget(1 << 30, told)
             .context("the memory the daemon's tasks may hold")?,
     );
+    // How outputs get to their paths is the volume's to say, once: a clone where its files
+    // share blocks (ReFS, APFS, Btrfs, XFS with reflinks), their bytes written where they
+    // share none (NTFS, ext4).
+    let sharing_of = |dir: &Path| -> anyhow::Result<blaze_core::Sharing> {
+        let volume = blaze_core::platform::volume(dir)?;
+        tracing::info!(target: "blaze", dir = %dir.display(), system = %volume.system, sharing = volume.sharing.name(), "a store's volume");
+        Ok(volume.sharing)
+    };
+    let store_sharing = sharing_of(&paths.state)?;
+    let std_sharing = sharing_of(&std)?;
     let options = Options {
         state: file_name(&paths.state)?,
+        store_sharing,
+        std_sharing,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,
         sources: file_name(&sources)?,
@@ -1279,7 +1284,7 @@ pub(crate) fn engine(
             format!("making {}, where each sandboxed spawn gets its directory", scratch.display())
         })?;
     let held = Held {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         lock,
         before,
         _std_lease: std_lease,
@@ -1303,7 +1308,7 @@ pub(crate) struct Running {
 impl Running {
     /// Its stop wrote its image: its lock says so to the daemon after it ([`Before`]).
     pub(crate) fn stopped(&mut self) -> anyhow::Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             use std::io::{Seek as _, Write as _};
             let file = &mut *self.held.lock;
@@ -1378,7 +1383,13 @@ fn begin(
     if !started.whole() || matches!(before, Before::Ended(_)) {
         eprintln!("{who}: {STARTED}{started}; {before}");
     }
-    daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
+    let store = daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
+    // Use the actual linker's producer even in a dev process assuming other toolchain IDs.
+    let producer = match dev_toolchain::dev() {
+        Some(dev) => dev.built.record,
+        None => record_code().map_err(anyhow::Error::msg)?.0,
+    };
+    blaze_link::target::keep_coff_requests(store, producer).map_err(anyhow::Error::msg)?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
     let root = builds()?
@@ -1424,7 +1435,13 @@ fn listen(
     // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
+    #[cfg(unix)]
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
+    // windows: no stop guard yet. `serve::stop` blocks on the signal pipe of `signals`; Windows
+    // needs it on an event that a console control handler and `stop_begun` set, so a stuck stop
+    // or a stuck turn are not watched here. The memory ceiling is, by a thread of its own.
+    #[cfg(windows)]
+    stop::watch_ceiling()?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
     #[cfg(unix)]
@@ -1467,6 +1484,7 @@ fn listen(
             break;
         }
     }
+    #[cfg(unix)]
     guard.disarm();
     match daemon.failed() {
         Some(why) => bail!("{why}"),

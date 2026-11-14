@@ -458,7 +458,7 @@ impl ImageMap {
     /// `Err`; a read past the section is a record naming bytes [`write`] never wrote: a bug.
     fn read(&self, section: &Section, at: u64, len: u64) -> Result<&[u8], Corrupt> {
         self.image.range(section, at, len).map_err(|corrupt| match corrupt.cause {
-            Cause::Crc { .. } | Cause::CrcTable { .. } => corrupt,
+            Cause::Crc { .. } | Cause::CrcTable { .. } | Cause::Content { .. } => corrupt,
             Cause::Bounds { .. } | Cause::Misaligned { .. } => {
                 panic!("the daemon image's records name bytes the database never wrote: {corrupt}")
             }

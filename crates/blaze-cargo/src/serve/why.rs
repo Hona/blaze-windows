@@ -1655,7 +1655,8 @@ mod tests {
         assert_eq!(Ledger::restore(&whole).ledger.file(), whole);
         let torn = Ledger::restore(&file[..file.len() - 1]);
         assert!(
-            matches!(&torn.fault, Some(Fault::Tail { why, .. }) if why.contains("record 1")),
+            // Records count from 0: the third, the build after the failed one, is the torn one.
+            matches!(&torn.fault, Some(Fault::Tail { why, .. }) if why.contains("record 2,")),
             "{:?}",
             torn.fault
         );

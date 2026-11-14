@@ -249,7 +249,7 @@ pub struct Storage {
     /// views.
     written: [Summary; HISTORY],
     /// Each ingredient's row-page directory, null until first use.
-    dirs: Box<[AtomicPtr<AtomicPtr<u8>>; MAX_INGREDIENTS]>,
+    dirs: Box<[AtomicPtr<super::row::DirEntry>; MAX_INGREDIENTS]>,
     /// Each ingredient's table, null until first use.
     tables: Box<[AtomicPtr<()>; MAX_INGREDIENTS]>,
     #[expect(clippy::disallowed_types, reason = "held only while an ingredient's table or page directory is made, once each")]
@@ -1258,11 +1258,13 @@ impl Storage {
         self.hook.is_some()
     }
 
-    /// The row-page directory of ingredient `index`, null before its first use: once published,
-    /// a [`Pages::dir`], valid for every index below `MAX_PAGES`.
+    /// A row page of ingredient `index`, null before its table or page was published.
     #[inline(always)]
-    pub(crate) fn dir(&self, index: u32) -> *const AtomicPtr<u8> {
-        self.dirs[index as usize].load(Ordering::Acquire)
+    pub(crate) fn row_page(&self, index: u32, id: Id) -> *mut u8 {
+        let dir = self.dirs[index as usize].load(Ordering::Acquire);
+        if dir.is_null() { return ptr::null_mut(); }
+        // SAFETY: make_table published this boxed table's directory. Only &mut can remove it.
+        unsafe { Pages::lookup(dir, id) }
     }
 
     /// The table of ingredient `index` as `T`, if made. The caller names the `T` the

@@ -2,8 +2,8 @@
 //! every workspace's build directory (`build/`), so that a build writes nothing into the
 //! checkout (docs/cargo.md, "Where a build writes").
 //!
-//! The root is `$BLAZE_HOME`, else `blaze` in `$XDG_CACHE_HOME`, else `.cache/blaze` in the
-//! user's home (`HOME`, or `USERPROFILE`). A workspace builds into
+//! The root is `$BLAZE_HOME`, else `%LOCALAPPDATA%\blaze` on Windows, else `blaze` in
+//! `$XDG_CACHE_HOME`, else `.cache/blaze` in `$HOME` (`blaze_core::platform::home`). A workspace builds into
 //! `<root>/build/<name>-<id>`, its name the last part of its root's path and its id
 //! [`workspace_id`] of that path, unless `--target-dir`, `CARGO_TARGET_DIR` or
 //! `build.target-dir` names a directory: tools and scripts that pass one keep it.
@@ -20,19 +20,11 @@ pub const WORKSPACE_ID_DOMAIN: &str = "blaze workspace build dir 1";
 /// query's fingerprint, so two roots on one machine never share one.
 const ID_DIGITS: usize = 32;
 
-/// blaze's root on this machine, from the variables `var` reads: `$BLAZE_HOME`, else
-/// `$XDG_CACHE_HOME/blaze`, else `$HOME/.cache/blaze` (`USERPROFILE` on Windows). An empty
-/// variable is unset. None when no variable names one; the caller says what needed it.
+/// blaze's root on this machine, from the variables `var` reads: `blaze_core::platform::home`'s
+/// (`$BLAZE_HOME`, else `%LOCALAPPDATA%\blaze` on Windows, else `$XDG_CACHE_HOME/blaze`, else
+/// `$HOME/.cache/blaze`). None when no variable names one; the caller says what needed it.
 pub fn root(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let set = |name: &str| var(name).filter(|it| !it.is_empty());
-    if let Some(home) = set("BLAZE_HOME") {
-        return Some(PathBuf::from(home));
-    }
-    if let Some(caches) = set("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(caches).join("blaze"));
-    }
-    let home = set("HOME").or_else(|| set("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".cache/blaze"))
+    blaze_core::platform::home::homes(var).ok().map(|it| it.root)
 }
 
 /// [`root`] of this process's environment, `Ok(None)` when no variable names one. A relative
@@ -89,8 +81,19 @@ pub fn build_dir(builds: &Path, workspace_root: &Path) -> PathBuf {
     let kept = |it: char| it.is_ascii_alphanumeric() || matches!(it, '-' | '_' | '.');
     let name: String = name.chars().map(|it| if kept(it) { it } else { '_' }).collect();
     match name.is_empty() {
-        true => builds.join(&id[..ID_DIGITS]),
-        false => builds.join(format!("{name}-{}", &id[..ID_DIGITS])),
+        true => joined(builds, &id[..ID_DIGITS]),
+        false => joined(builds, &format!("{name}-{}", &id[..ID_DIGITS])),
+    }
+}
+
+/// `base` joined with one part. A `/`-rooted base (the daemon's name, `/C:/a` on Windows) stays
+/// `/`-separated: `Path::join` would put a `\` in it on Windows.
+fn joined(base: &Path, part: &str) -> PathBuf {
+    match base.to_str() {
+        Some(text) if text.starts_with('/') => {
+            PathBuf::from(format!("{}/{part}", text.trim_end_matches('/')))
+        }
+        _ => base.join(part),
     }
 }
 
@@ -118,6 +121,7 @@ mod tests {
         assert_eq!(build_dir(builds, Path::new("/")).parent(), Some(builds));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn the_root_is_blaze_home_then_the_cache_directory() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {

@@ -227,9 +227,14 @@ example, a test or a build script is an executable; a `cdylib` (a native Node ad
 extension, a plugin) or a proc macro is a shared library, at cargo's path
 (`target/debug/lib<name>.so`, `.dylib` on macOS), linked with the package's
 `cargo:rustc-link-arg` and `cargo:rustc-cdylib-link-arg`; a library (`lib`, `rlib`) is written
-with no object code, its functions kept in the store for the programs that link it. A crate
-type of `staticlib` or `dylib` fails the build, naming the target: blaze's linker writes
-neither yet ([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
+with no object code, its functions kept in the store for the programs that link it. A library
+the build only depends on that also lists an rlib (`lib` or `rlib`) is built as that rlib
+alone, its `cdylib`, `staticlib` or `dylib` not made: what depends on it links the rlib, and
+no step of the build reads the other files, which cargo writes all the same into `deps/`
+(`blaze_units::schema::builds_only_its_rlib`; rav1d's `["staticlib", "rlib"]`, a plugin's
+`["cdylib", "rlib"]`). Asked for itself, or with no rlib, a crate type of `staticlib` or
+`dylib` fails the build, naming the target: blaze's linker writes neither yet
+([#262](https://github.com/indexable-inc/blaze/issues/262)). So does what else
 blaze's load does not build, saying what: an artifact dependency (`-Z bindeps`), a
 `metabuild`, a target spec file, a target blaze has no data of, and a rustc `-Z` flag in
 `RUSTFLAGS` that `crates/blaze-cargo/src/unstable.rs` refuses.
@@ -408,9 +413,39 @@ Among those refused today: weak and re-exported libraries (`-weak_framework`, `-
 of an executable and export lists (`-rdynamic`, `--export-dynamic`, `-export_dynamic`,
 `-exported_symbols_list`, `--version-script`, `--dynamic-list`), layout scripts (`-T`), static and
 start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `-ObjC`,
-`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path (give it as
-`cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
-wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
+`-no_compact_unwind`, `-sectcreate`, `--wrap`, an object or archive given by path on Linux and
+macOS (give it as `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument
+of a wasm target, which rustc gives `wasm-ld` directly.
+
+On Windows (`x86_64-pc-windows-msvc`) rustc gives the arguments to `link.exe` directly, and
+blaze reads them in its spelling (`crates/blaze-link/src/args/msvc.rs`): `/NAME[:value]` or
+`-NAME[:value]`, the name in any case, one option a word.
+
+| Option | What blaze's linker does |
+|---|---|
+| `/SUBSYSTEM:WINDOWS`, `/SUBSYSTEM:CONSOLE`, either with `,major[.minor]` | the GUI or console subsystem and its least Windows version |
+| `/ENTRY:symbol` | an executable's entry (rustc's `mainCRTStartup` with `#![windows_subsystem = "windows"]`) |
+| `/DELAYLOAD:dll` | the DLL's imports load on first call, through `delayimp.lib` |
+| `/DEFAULTLIB:lib`, `/NODEFAULTLIB[:lib]` | a library linked, a default library (an input's `/DEFAULTLIB`) not linked |
+| `/WHOLEARCHIVE:lib`, `/LIBPATH:dir` | a library linked whole, a directory searched |
+| a bare `foo.lib`, `foo.a`, `foo.obj`, `foo.o`, `foo.res` | an input file, searched for in the link's directories when not absolute |
+| `/STACK:reserve[,commit]`, `/HEAP:reserve[,commit]` | the main thread's stack and the process heap (decimal, or hex after `0x`) |
+| `/BASE:address`, `/VERSION:major[.minor]` | the preferred base (a multiple of 64 KiB) and the image version |
+| `/DYNAMICBASE:NO`, `/FIXED`, `/HIGHENTROPYVA:NO`, `/NXCOMPAT:NO`, `/LARGEADDRESSAWARE:NO`, `/TSAWARE:NO` | that property of the image off |
+| `/INCLUDE:symbol` | the symbol must be defined, and is kept |
+| `/EXPORT:name[,DATA]`, `/DEF:file` (a DLL's) | exports; a `.def` file's `LIBRARY` must be the crate's DLL |
+
+Taken because blaze's linker always does it: `/DYNAMICBASE`, `/HIGHENTROPYVA`, `/NXCOMPAT`,
+`/LARGEADDRESSAWARE`, `/TSAWARE`, `/MACHINE:X64`, `/OPT:REF`, `/GUARD:NO`, `/CETCOMPAT:NO`,
+`/FIXED:NO`. Taken because it asks nothing of the image: `/NOLOGO`, `/OPT:NOREF`, `/OPT:ICF`,
+`/OPT:NOICF`, `/DEBUG[:...]` and `/PDB*` (the profile decides debug info), `/NATVIS`,
+`/INCREMENTAL[:NO]`, `/MANIFEST:NO`, `/MANIFESTUAC` (which shapes only a generated manifest),
+`/SAFESEH`, `/LARGEPAGES`, `/WX`, `/IGNORE`, `/VERBOSE`, `/TIME`, `/MERGE:.CRT=.rdata` and
+`/MERGE:.rtc=.rdata`. Refused, by name: other subsystems, `/MACHINE` other than x64, `/OUT`,
+`/DLL`, `/IMPLIB`, exports of an executable, renamed or ordinal exports, a generated or
+side-by-side manifest (`/MANIFEST`, `/MANIFEST:EMBED`, `/MANIFESTINPUT`; embed one with a `.res`),
+`/GUARD:CF`, `/CETCOMPAT`, `/LTCG`, `/RELEASE`, other `/MERGE`s, response files and every other
+option.
 
 A crate's bundled static libraries (`static` without `-bundle`, from its rustflags' `-l`s, its
 build script's `cargo:rustc-link-lib`s or its `#[link]`s) are found first in the directories its
@@ -437,7 +472,8 @@ The rest of the rustflags that are the link's, rather than the code's, are read 
 | `split-debuginfo` (the profile's) | **differs from cargo**: unset, `packed` and `unpacked` all put the debug info of an image blaze links in one file beside it, on Linux too (cargo's default there is `off`): `NAME.debug`, named by the executable's `.gnu_debuglink` and carrying its build id, or on macOS `NAME.dSYM`, found by `LC_UUID`. The executable keeps its code, data, unwind tables, symbol table and build id, so a panic's backtrace and a debugger show what they showed. `off` puts the debug info inside the executable, as before. Windows and wasm images are as before. The side file is written beside the executable by the link that made it, and is not in the store ([debug-side-file.md](v2/plan/design/debug-side-file.md)) |
 | `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
 | `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
-| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic`, `-C target-feature=+crt-static` | off is taken; on is refused |
+| `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic` | off is taken; on is refused |
+| `-C target-feature=+crt-static` | on Windows, MSVC's static VC runtime: the crates ask for `libcmt` under that cfg, and a crate that asks for the dynamic one (`msvcrt`, `vcruntime`), or one for `libcmt` without it, fails the link (link.exe's `LNK2038`). The UCRT may stay the DLL's: `/NODEFAULTLIB:libucrt.lib /DEFAULTLIB:ucrt.lib`. Elsewhere off is taken and on is refused |
 
 A refused option fails the link with an error naming the flag as written, that it came from the
 rustflags, the target and why. A unit that links nothing (a library) is not refused for one, as
@@ -629,7 +665,9 @@ one place a run is made. A script is given the command's whole environment with 
 sets for scripts over it (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), as cargo
 gives it (`script.rs`, `inherited`). The variables are the command's, not those of whoever
 started the daemon: `SDK_DIR=/opt/sdk blaze build` gives the script `SDK_DIR` with a daemon
-started without it. What the run read, its files and its variables, the sandbox traces, and the run is kept in
+started without it. On Windows the AppContainer enforces read grants and blaze uses
+[Cargo's rerun rules](#windows-build-script-reuse). On Linux and macOS, what the run
+read, its files and its variables, the sandbox traces, and the run is kept in
 the store by its code, what it was given and what it read (`blaze_usercode::run`), so a
 command whose inputs to it are as they were finds it there and runs nothing. On Linux and
 macOS the variables passed through from the command (all but what cargo sets) are lent to the
@@ -653,8 +691,10 @@ The root manifest is the one of the workspace built, also for a path dependency 
 workspace of its own. The machine is read-only; it writes
 its `OUT_DIR` for real, which is the one directory the Cargo book lets a script write ("Scripts
 should not modify any files outside of that directory"); the temporary directories start empty;
-there is no network but the sandbox's own loopback. Its package's directory, the workspace and
-the target directory are seen as they are, even below `/tmp` or `/dev/shm`. On macOS the
+there is no network but the sandbox's own loopback. On Unix its package's directory, the workspace
+and the target directory are seen as they are, even below `/tmp` or `/dev/shm`; a git dependency's
+script sees its whole repository at the commit (blaze's checkout of it), as cargo's checkout
+lets it read an asset beside its package (`../../packages/fonts/assets`). On macOS the
 per-user cache directory (`getconf DARWIN_USER_CACHE_DIR`, `/var/folders/../C`) is writable
 too: clang's module cache, `xcrun`'s and the Metal compiler's live there, are found by
 `confstr` and not by a variable a private one could be named in, and check what they cache.
@@ -705,6 +745,28 @@ build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it m
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
 rules refuse none (counted 2026-10-27).
+
+For an MSVC target a `rustc-link-arg` may also be a link.exe option of the list `MSVC_OPTIONS`
+(`/NAME` or `-NAME`, any case) with the value its rule takes: a name or number
+(`/SUBSYSTEM:WINDOWS`, `/ENTRY:mainCRTStartup`, `/DELAYLOAD:comctl32.dll`, `/STACK:8388608`,
+`/OPT:REF`), text with no path (`/MANIFESTUAC:...`), a library's name or a file where a search
+may go (`/DEFAULTLIB:ucrt.lib`, `/WHOLEARCHIVE:...`, `/MANIFESTINPUT:...`, `/DEF:...`), or a
+directory a search may name (`/LIBPATH:...`); or a library, object, `.res` or `.exp` named by
+itself (`delayimp.lib`, winresource's `<OUT_DIR>\resource.res`). An option that writes a file
+(`/OUT`, `/PDB`, `/IMPLIB`, `/MANIFESTFILE`) or is not on the list is refused; the linker
+refuses by name what it does not do of the rest. On a Windows host a path is compared as
+Windows compares it (`C:\a`, `c:/A`, `\\?\C:\a` and the daemon's `/C:/a` are one), and the
+system directories are those of the toolchain: each of the script's `LIB` and the trees under
+`%ProgramFiles%` and `%ProgramFiles(x86)%` that Visual Studio and the Windows SDK install into.
+A library a script finds in a cache of the machine (rune-desktop's Ghostty, under
+`%LOCALAPPDATA%\seer\ghostty-vt`) goes in `build-script-link-dirs` under its variable:
+`["${LOCALAPPDATA}/seer/ghostty-vt"]` with `build-script-env = ["LOCALAPPDATA"]`; or, for every
+workspace of the machine, in blaze's settings (`config.toml` in blaze's home):
+
+```toml
+[sandbox]
+build-script-link-dirs = ["${LOCALAPPDATA}/seer/ghostty-vt"]   # read as each run is checked
+```
 
 and, for a package of the workspace, in its own manifest:
 
@@ -908,6 +970,24 @@ no system call blaze has no shim for. The glue's `getenv` replaces wasi-libc's, 
 whole environment on its first call, and asks the host one variable at a time (the bridge's
 `env_var`). So `env::var` keys an expansion by the variables it read, and a per-run variable it
 never reads (`BLAZE_PROFILE`) never makes it miss. Only `env::vars` reads them all.
+
+On Windows the daemon names a path `/C:/a` (`blaze_core::platform::path`), which is also how
+wasi-libc names it, and a macro walks and is keyed by that name. A path cargo gives a crate
+(`CARGO_MANIFEST_DIR`, `OUT_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_TARGET_TMPDIR`,
+`CARGO_BIN_EXE_*`) reaches the program as Windows names it, `C:\a`, as cargo gives it to rustc:
+from `env!` and `option_env!`, and from a macro's `env::var` (`base_db::given_value`). A macro
+may name a file in either spelling (`C:\a\b`, `C:\a/b`, `/C:/a/b`, and `C:\a` after its working
+directory, as wasi-libc hands a path it takes for relative): each is the one walked name
+(`src/os/host.rs`). `include!`, `include_str!` and `include_bytes!` of such a path resolve at
+the daemon's name (`base_db::named_path`).
+
+A source file with CRLF line endings is read as rustc reads it: each `\r\n` is a `\n` in a
+string, byte string or C string literal (a `\` before the line's end continues it), in a doc
+comment's attribute, and in what a proc macro or `macro_rules!` is handed; `line!`, `column!` and
+a diagnostic's line and column count no `\r`. `include_str!` and `include_bytes!` read the file's
+bytes as they are. The text blaze keeps, hashes and gives spans into is the file's own bytes:
+the reading happens where text becomes a value (`parser::cook::as_read`,
+`syntax_bridge::doc_text_as_read`).
 
 Each expansion runs in a fresh instance under a fuel budget (`src/wasm/host.rs`, `FUEL`) and a
 memory budget. The instance runs on a kept expansion thread, never on a fiber, because a
@@ -1702,3 +1782,35 @@ What is not done:
 - Ported in part, each file saying what it leaves out: `needless_borrow` (a receiver, a callee
   or a field's base, and chains of `&` and `*`), `map_clone` (`Clone::clone` as a path),
   `needless_borrows_for_generic_args` (bounds through projections or other parameters).
+
+### Windows build-script reuse
+
+On Windows a successful confined script reruns when Cargo would: a `rerun-if-changed`
+file or directory tree changes, a `rerun-if-env-changed` variable changes, or (with
+neither directive) the package changes. A missing declared path is not a reusable
+result. When a script declares other paths, an **undeclared** read within the package,
+including one made by its native compiler, is not observed. Declare that header or its
+directory. This is Cargo-level freshness, not a filesystem read trace.
+
+Blaze also keys the executable, build environment (Windows name comparison), resolved
+tools, mutable external grants and dependency outputs. For mutable workspace files
+outside the script's own package, grant just the sibling inputs with `BLAZE_SCRIPT_READ`.
+A read grant remains read-only;
+a link-search permission is not a filesystem grant. Neither the script nor a child gets
+the invoking user's unrestricted filesystem access. The sandbox-off path is not cached.
+
+### A build script's own writable state
+
+A script writes its `OUT_DIR`, whose files are its run's and kept under its key, and a
+temporary directory of its run alone. Nothing else it writes outlives the run: on Windows its
+`LOCALAPPDATA` is the run's own AppContainer profile, made fresh and removed after it.
+
+A download cache, which a script fills once and reads in later runs, is declared by whoever
+runs blaze, never by the project: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
+entries are each `VARIABLE=DIRECTORY`, such as
+`GHOSTTY_VT_CACHE_DIR=C:\Users\me\AppData\Local\seer\ghostty-vt` for rune-desktop's terminal.
+Every build script is told each variable, naming its directory, which blaze makes if missing
+and the script may read and write. What is in it is in no key, only the variable's name: by
+declaring it the caller says its contents change no script's output, as a download cache's
+do not. On Windows the directory is written through a capability of its own, granted once
+and kept, so a large cache is not walked again at each run.

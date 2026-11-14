@@ -210,6 +210,12 @@ fn image(file: &Path) -> Check {
     }
     let sections = opened.sections().len();
     let whole = format!("{} in {sections} sections, every group's checksum holds", size(len));
+    let vfs = match blaze_vfs::Vfs::check_image(opened.clone()) {
+        Ok(None) => "the VFS tree and its file content IDs hold".to_owned(),
+        Ok(Some(why)) => format!("unused VFS section: {why}"),
+        Err(why) => return check(Verdict::Fault, why),
+    };
+    let whole = format!("{whole}; {vfs}");
     // clone: a count of the image, once a check
     match Database::check_image(opened.clone()) {
         Ok(checked) => check(
@@ -348,14 +354,17 @@ mod tests {
         assert!(!report.ok, "{report:?}");
         let image = &report.checks[0];
         assert_eq!(image.verdict, Verdict::Fault, "{report:?}");
-        assert!(image.file.ends_with("db/image") && image.said.contains("is corrupt"), "{image:?}");
+        assert!(Path::new(&image.file).ends_with("db/image") && image.said.contains("is corrupt"), "{image:?}");
         let db = dir.path().join("db").display().to_string();
-        assert_eq!(report.quarantine, ["blaze stop".to_owned(), format!("mv {db} {db}.suspect-1762850000")]);
+        let aside = format!("{db}.suspect-1762850000");
+        assert_eq!(report.quarantine, ["blaze stop".to_owned(), format!("mv {} {}", quoted(Path::new(&db)), quoted(Path::new(&aside)))]);
         // Nothing was moved or deleted.
         assert!(image_file(dir.path()).exists());
         let said = text(&report);
         assert!(said.starts_with("1 fault in the persisted state under "), "{said}");
-        assert!(said.contains(&format!("  blaze stop && mv {db} {db}.suspect-1762850000\n")), "{said}");
+        // Quoted as a shell needs it: a Windows path's `\` and `:` are.
+        let command = format!("  blaze stop && mv {} {}\n", quoted(Path::new(&db)), quoted(Path::new(&aside)));
+        assert!(said.contains(&command), "{said}");
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["checks"][0]["verdict"], "fault");

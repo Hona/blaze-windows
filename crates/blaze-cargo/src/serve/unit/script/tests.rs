@@ -9,11 +9,12 @@ use blaze_usercode::run::OutFile;
 
 use super::{
     BYTES, CUT, LOOK, LOOK_EVERY, QUIET_MOST, Quiet, Stuck, TICK, TIMED, Writing,
-    checkout_without_git, failure, file_name, out_files, rechecks_in, verifies_in, with_reads,
+    checkout_without_git, failure, file_name, git_checkout, out_files, rechecks_in, verifies_in, with_reads,
 };
 
 const RUN: Tag = Tag(5 << 32);
-const BEGAN_NS: u64 = 1_761_782_400_123_456_789;
+/// A time every system's clock holds exactly: Windows' counts 100 ns.
+const BEGAN_NS: u64 = 1_761_782_400_123_456_700;
 
 fn unit() -> bs::Unit {
     let mut unit = bs::Unit::default();
@@ -384,6 +385,26 @@ fn a_package_watch_is_named_and_many_reads_are_folded() {
     assert!(changed[0].starts_with("its other "), "{changed:?}");
 }
 
+/// A git dependency's package is read with its checkout's whole commit, found from the
+/// package's directory in the system's spelling; a registry package or one of the workspace is in
+/// no checkout.
+#[test]
+fn a_git_dependencys_package_is_in_its_checkout_of_the_commit() {
+    let root = "/h/.cache/blaze/sources/git/checkouts/betteroffice-041eea77ca348fb3/ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+    let dir = PathBuf::from(format!("{root}/crates/betteroffice-fonts-intl"));
+    assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    assert_eq!(git_checkout(Path::new(root)), Some(Path::new(root)));
+    let registry = "/h/.cache/blaze/sources/registry/src/index.crates.io-1949cf8c6b5b557f/cc-1.2.0";
+    assert_eq!(git_checkout(Path::new(registry)), None);
+    assert_eq!(git_checkout(Path::new("/w/ed0a3cea5bd24119c4f2e144a978849177e06fcd/app")), None);
+    #[cfg(windows)]
+    {
+        let root = r"C:\Users\u\.blaze\sources\git\checkouts\betteroffice-041eea77ca348fb3\ed0a3cea5bd24119c4f2e144a978849177e06fcd";
+        let dir = PathBuf::from(format!(r"{root}\crates\betteroffice-fonts-intl"));
+        assert_eq!(git_checkout(&dir), Some(Path::new(root)));
+    }
+}
+
 /// A script of a git dependency whose `git` found no repository is said to have failed for
 /// blaze's checkout having no `.git`, naming the checkout; any other failure there, and the
 /// same words of a package that is in no checkout, say nothing of it.
@@ -406,4 +427,64 @@ fn a_git_dependencys_script_that_found_no_repository_names_blazes_checkout() {
     let cause = report.facts.iter().find(|it| it.key == "cause").expect("the cause is a fact");
     let cause = format!("{:?}", cause.text);
     assert!(cause.contains(root) && cause.contains("has no `.git`"), "{cause}");
+}
+
+/// The invariant: a developer prompt's variables replace the job's of any case, the job's
+/// `Path` (as Windows names it) is the prompt's `PATH` tail and keeps its name, nothing else of
+/// the job's changes, and the environment stays sorted by name with no name twice in any case.
+#[cfg(windows)]
+#[test]
+fn a_developer_prompt_is_set_over_the_jobs_environment_once_per_name() {
+    use std::ffi::OsString;
+    let developer = blaze_core::platform::msvc::Developer {
+        install: PathBuf::from(r"C:\VS"),
+        tools: "14.44.35207".to_owned(),
+        kits: PathBuf::from(r"C:\Kits\10"),
+        sdk: "10.0.26100.0".to_owned(),
+    };
+    let mut env: Vec<(OsString, OsString)> = [
+        ("CARGO_PKG_NAME", "z-sys"),
+        ("Include", r"C:\old"),
+        ("Path", r"C:\Windows;C:\bin"),
+        ("TARGET", "x86_64-pc-windows-msvc"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.into(), value.into()))
+    .collect();
+    super::prompted(&mut env, &developer, "x64", "x64").unwrap();
+    let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, it)| it.to_str().unwrap());
+    assert_eq!(get("CARGO_PKG_NAME"), Some("z-sys"));
+    assert_eq!(get("TARGET"), Some("x86_64-pc-windows-msvc"));
+    assert_eq!(get("Include"), None, "the job's INCLUDE is the prompt's, under the prompt's name");
+    assert!(get("INCLUDE").unwrap().starts_with(r"C:\VS\VC\Tools\MSVC\14.44.35207\include;"));
+    assert_eq!(get("PATH"), None);
+    assert!(get("Path").unwrap().ends_with(r"\x64;C:\Windows;C:\bin"), "{:?}", get("Path"));
+    assert_eq!(get("VCINSTALLDIR"), Some(r"C:\VS\VC\"));
+    let names: Vec<String> = env.iter().map(|(it, _)| it.to_str().unwrap().to_owned()).collect();
+    assert!(names.is_sorted(), "{names:?}");
+    let mut folded: Vec<String> = names.iter().map(|it| it.to_ascii_uppercase()).collect();
+    folded.sort();
+    folded.dedup();
+    assert_eq!(folded.len(), names.len(), "{names:?}");
+}
+#[cfg(windows)]
+#[test]
+fn a_joined_build_script_name_is_a_mounted_name_before_elision() {
+    let path = Path::new("/C:/src").join("build.rs");
+    assert_eq!(super::script_root(&path), "/C:/src/build.rs");
+}
+
+#[cfg(windows)]
+#[test]
+fn fetched_native_inputs_stop_at_the_archive_or_git_revision() {
+    let sources = std::path::Path::new(r"D:\sources");
+    for (package, payload) in [
+        (r"git\checkouts\font-packs\123abcd\crates\latin", r"git\checkouts\font-packs\123abcd"),
+        (r"registry\src\index\native-src-1.0", r"registry\src\index\native-src-1.0"),
+    ] {
+        assert_eq!(super::fetched_input(sources, &sources.join(package)), Some(sources.join(payload)));
+    }
+    for path in [r"D:\elsewhere", r"D:\sources\git\db\a", r"D:\sources\git\checkouts\x\..\elsewhere"] {
+        assert_eq!(super::fetched_input(sources, std::path::Path::new(path)), None);
+    }
 }

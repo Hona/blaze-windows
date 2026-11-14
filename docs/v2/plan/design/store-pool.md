@@ -187,6 +187,13 @@ that needs more stops, with an error that names the store, its live files and th
 already reserves thousands of GiB there), and lane 1's reservation test keeps it so; were it ever
 refused, the fallback-free answer is a smaller default and the same error.
 
+On Windows, choose the window count once per store, before reserving either region. Allow eight
+windows per GiB of physical memory or available process commit (the lesser), and spend at most
+1/16 of the remaining virtual address space on one pool. Clamp that target to 32–4096 windows.
+A 16 GiB machine thus asks for at most 128 GiB per store, not 4 TiB. This is address capacity,
+not a resident budget: the state-word prefix and pages are still committed only on use. A
+fragmented address space can still refuse the contiguous range; do not relocate or retry.
+
 ### The page state word
 
 The state words are a second sparse region, one `AtomicU64` per page of the reservation. That is

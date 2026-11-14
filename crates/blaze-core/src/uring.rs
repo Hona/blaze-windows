@@ -2401,6 +2401,8 @@ impl Driver for Uring {
             }
             self.in_flight += 1;
             let started = match effect {
+                Effect::TryPatch { .. } => Ok(Some(Done::Patched(false))),
+                new @ Effect::SparseFile { .. } => self.off_ring(new).map(|()| None),
                 Effect::Write { file, bytes, .. } => {
                     self.write(tag, file, bytes, 0).map(|()| None)
                 }

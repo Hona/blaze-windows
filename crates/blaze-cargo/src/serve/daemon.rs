@@ -463,6 +463,12 @@ pub struct Options {
     /// daemon's driver is the simulation and its files are in no file system, as effects of
     /// the store's that the daemon's driver completes.
     pub store_loader: blaze_cas::Loader,
+    /// Whether the volumes of its store and of the shared store of the standard library share
+    /// blocks ([`blaze_cas::Config::sharing`]), each asked once as the daemon starts
+    /// ([`blaze_core::platform::volume`]): where they do not (NTFS), every output is written
+    /// where it goes and none is cloned.
+    pub store_sharing: blaze_core::Sharing,
+    pub std_sharing: blaze_core::Sharing,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -1061,9 +1067,9 @@ impl fmt::Display for MemoryLine<'_> {
 /// [`MEMORY_LOG_EVERY`], at a stop, and first in the postmortem of a daemon past its memory
 /// ceiling (`serve::stop`).
 pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     let resident = crate::raw::memory::footprint(std::process::id());
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let resident = None;
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
@@ -1381,6 +1387,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 load_tags: LOADS,
                 // clone: once per daemon started, a path
                 loader: options.store_loader.clone(),
+                sharing: options.store_sharing,
             };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
@@ -1392,6 +1399,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             load_tags: STD_LOADS,
             // clone: once per daemon started, a path
             loader: options.store_loader.clone(),
+            sharing: options.std_sharing,
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1649,7 +1657,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         let mut mounts = Mounts::recover(&vfs);
         let forgotten = mounts.forget_unwritten(&mut vfs, &format!("/{}", options.sources), |at| {
-            crate::serve::fetch::on_disk_mark(std::path::Path::new(at))
+            crate::serve::fetch::on_disk_mark(&blaze_core::platform::path::host(at))
         });
         if let Some((first, why)) = forgotten.first() {
             tracing::info!(target: "blaze", packages = forgotten.len(), first = %first, why = %why, "fetched packages whose copy on disk is not their mount's are fetched again");
@@ -2328,6 +2336,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// every thread is inside is written to the log first, so a client's own watchdog that
     /// stops the daemon sooner still finds it; so it is too once a step runs [`LONG_STEP`].
     fn watch(&mut self) {
+        if self.heads.waiting() != 0 {
+            let mut out = self.spare.out.pop().unwrap_or_default();
+            self.heads.expire(self.driver.now(), self.watchdog.bound(), &mut out);
+            self.outs(out);
+        }
         self.still();
         if self.failed.is_some() {
             return;
@@ -2606,7 +2619,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if let Some(bytes) = crate::raw::memory::own_footprint() {
             blaze_profile::plot(Plot::Footprint, bytes);
             let kept = blaze_graph::arena::kept_of(&memory, bytes);
@@ -2815,7 +2828,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             Arrived::Gone { conn } => self.answering.retain(|(to, _)| to.conn != *conn),
         }
         let mut out = self.spare.out.pop().unwrap_or_default();
-        self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
+        self.heads.arrive(self.driver.now(), &self.vfs, arrived, &mut self.effects, &mut out);
         self.outs(out);
     }
 

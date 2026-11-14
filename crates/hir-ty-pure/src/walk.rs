@@ -558,7 +558,9 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
     match body {
         Ok(body) => {
             let cx = Cx::new(db, env);
-            summarize(&cx, body, instance.def)
+            let proof = crate::reach::worth(body)
+                .then(|| instance_reach(db, cx.stored.clone(), instance.clone())); // clone: the proof query's key
+            summarize(&cx, body, instance.def, proof)
         }
         Err(error) => {
             let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
@@ -774,14 +776,24 @@ struct Walk<'a, 'db> {
     owned_dyns: HashMap<Ty<'db>, bool, Global>,
 }
 
-fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
+/// An instance's site proofs do not depend on any callee's effect summary. In particular
+/// do not repeat the proof each time a recursive group iterates its summaries.
+#[blaze_query::tracked(returns(ref))]
+fn instance_reach(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> crate::reach::Reach {
+    let body = body_of(db, &env, &instance)
+        .expect("a body with sites")
+        .expect("the caller lowered this instance in this view");
+    let cx = Cx::new(db, env);
+    crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[])
+}
+
+fn summarize<'db>(
+    cx: &Cx<'db>, body: &MirBody<'db>, def: Def, reach: Option<&crate::reach::Reach>,
+) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
     // What is proved dead or unable to fail is not a panic of this body
     // (docs/v2/plan/design/proved-unreachable.md): asked only of a body with a branch or a check.
-    let reach = crate::reach::worth(body)
-        .then(|| crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[]));
-    let reach = reach.as_ref();
     walk.gather(body, reach);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.

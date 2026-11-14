@@ -82,7 +82,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
-use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Tag};
+use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Sharing, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -522,6 +522,11 @@ pub struct Config {
     pub load_tags: u64,
     /// How its reads' misses are loaded.
     pub loader: Loader,
+    /// Whether the volume of its directory, and of every path it places at, shares blocks
+    /// (`blaze_core::platform::volume`, asked of the store's directory once as it opens). On
+    /// [`Sharing::Unshared`] it keeps no whole file to clone from and asks for no clone: every
+    /// place writes the value's bytes where they go ([`Store::place`]).
+    pub sharing: Sharing,
 }
 
 impl Config {
@@ -904,13 +909,10 @@ pub struct Store {
     draining: Batch,
     /// Batches committed whose mappings have not all come, oldest first.
     pending: VecDeque<Batch>,
-    /// Each key a drained record stands in for another's as the home of, while its move waits
-    /// in `draining` or `pending`, with the place the move is from: a copy (`copy_home`), or
-    /// a writer's record of the value another writer's record not yet drained holds the key
-    /// for (`record_home`). The record there, drained after, is a duplicate and never written
-    /// to a pack (`drain_record`). At most one a key: a key stays where it is until a move is
-    /// made, and a second record standing in from there is a duplicate too.
-    copy_homes: ByHash<Key, Seg, Global>, // alloc: the store's own table, for its life
+    /// Undrained originals for which a stand-in has already been written. The original
+    /// may drain before its move, or after the move and several index flips. Track its
+    /// address, not the key's current home; remove it on drain, before the chunk is freed.
+    copy_homes: HashSet<(ChunkRef, u64), Global>, // alloc: the store's own table, for its life
     next_batch: u64,
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
@@ -1115,55 +1117,7 @@ impl Reader {
     /// gives the recipe, never the file. Bounded by [`derived::CHAIN_MOST`]; a longer chain,
     /// a base the store lacks and a recipe that cannot be read are errors naming the key.
     pub fn file_of(&self, guard: &Guard, key: &Key) -> Result<Option<Vec<u8>>, String> {
-        let look = self.look(guard);
-        // alloc: the recipes' keys, newest first; once per file read back
-        let mut chain: Vec<Key> = Vec::new();
-        let mut at = *key;
-        let mut out = loop {
-            // alloc: the error of a corrupt value
-            let entry = look.get(&at).map_err(|corrupt| corrupt.to_string())?;
-            let entry = match entry {
-                Some(entry) => entry,
-                None if chain.is_empty() => return Ok(None),
-                // alloc: an error, once
-                None => {
-                    return Err(format!(
-                        "the derived value {key:?} is made from {at:?}, which the store does not hold"
-                    ));
-                }
-            };
-            if entry.kind != Kind::Derived {
-                // alloc: the file, which the caller owns
-                break entry.bytes.to_vec();
-            }
-            if chain.len() as u32 > derived::CHAIN_MOST {
-                // alloc: an error, once
-                return Err(format!(
-                    "the derived value {key:?} is the last of more than {} derived values in a row",
-                    derived::CHAIN_MOST
-                ));
-            }
-            let recipe = derived::decode(entry.bytes)
-                // alloc: an error, once
-                .map_err(|why| format!("the derived value {at:?} holds {why}"))?;
-            chain.push(at);
-            at = recipe.base;
-        };
-        // Oldest first: each recipe over the file before it.
-        for at in chain.iter().rev() {
-            // alloc: the error of a corrupt value
-            let entry = look.get(at).map_err(|corrupt| corrupt.to_string())?;
-            let recipe = entry
-                .and_then(|entry| derived::decode(entry.bytes).ok())
-                // alloc: an error, once
-                .ok_or_else(|| format!("the derived value {at:?} went while its file was made"))?;
-            out.resize(recipe.len as usize, 0);
-            for (offset, bytes) in recipe.ranges() {
-                let offset = offset as usize;
-                out[offset..offset + bytes.len()].copy_from_slice(bytes);
-            }
-        }
-        Ok(Some(out))
+        file_of(self.look(guard), key)
     }
 
     /// Whether the put that got `ticket` is durable.
@@ -1174,6 +1128,60 @@ impl Reader {
     fn look<'g>(&'g self, guard: &'g Guard) -> Look<'g> {
         Look::new(&self.shared, Held::task(guard))
     }
+}
+
+/// [`Reader::file_of`] as `look` finds it: the file the value of `key` is, its own bytes or a
+/// derived value's made down its chain. Also what a place on a volume that shares no blocks
+/// writes ([`Store::place`]).
+fn file_of(look: Look<'_>, key: &Key) -> Result<Option<Vec<u8>>, String> {
+    // alloc: the recipes' keys, newest first; once per file read back
+    let mut chain: Vec<Key> = Vec::new();
+    let mut at = *key;
+    let mut out = loop {
+        // alloc: the error of a corrupt value
+        let entry = look.get(&at).map_err(|corrupt| corrupt.to_string())?;
+        let entry = match entry {
+            Some(entry) => entry,
+            None if chain.is_empty() => return Ok(None),
+            // alloc: an error, once
+            None => {
+                return Err(format!(
+                    "the derived value {key:?} is made from {at:?}, which the store does not hold"
+                ));
+            }
+        };
+        if entry.kind != Kind::Derived {
+            // alloc: the file, which the caller owns
+            break entry.bytes.to_vec();
+        }
+        if chain.len() as u32 > derived::CHAIN_MOST {
+            // alloc: an error, once
+            return Err(format!(
+                "the derived value {key:?} is the last of more than {} derived values in a row",
+                derived::CHAIN_MOST
+            ));
+        }
+        let recipe = derived::decode(entry.bytes)
+            // alloc: an error, once
+            .map_err(|why| format!("the derived value {at:?} holds {why}"))?;
+        chain.push(at);
+        at = recipe.base;
+    };
+    // Oldest first: each recipe over the file before it.
+    for at in chain.iter().rev() {
+        // alloc: the error of a corrupt value
+        let entry = look.get(at).map_err(|corrupt| corrupt.to_string())?;
+        let recipe = entry
+            .and_then(|entry| derived::decode(entry.bytes).ok())
+            // alloc: an error, once
+            .ok_or_else(|| format!("the derived value {at:?} went while its file was made"))?;
+        out.resize(recipe.len as usize, 0);
+        for (offset, bytes) in recipe.ranges() {
+            let offset = offset as usize;
+            out[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+    }
+    Ok(Some(out))
 }
 
 /// A store's pool as one walk of its pages' state words found it ([`Store::pool_census`]):
@@ -1486,6 +1494,7 @@ enum Op {
         asked: Tag,
         step: publish::Step,
     },
+    Lease { to: FileName, len: u64, wrote: u64, whole: Arc<Vec<(u64, Vec<u8>)>> },
     /// The name the derived whole file `id` is made under ([`Store::deriving_file`]) removed,
     /// so the whole file of its base, `base` (`from`), can be cloned there.
     DeriveClear {
@@ -1924,7 +1933,7 @@ impl Store {
             drains,
             draining: Batch::default(),
             pending: VecDeque::new(),
-            copy_homes: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            copy_homes: HashSet::new_in(Global), // alloc: the store's own table, for its life
             next_batch: 0,
             commit: None,
             flush_wanted: false,
@@ -2744,6 +2753,12 @@ impl Store {
     /// (as the store's own file of it is, beside that); anything else is written. A clone
     /// fails where the file system cannot share blocks, naming it, and nothing copies instead.
     ///
+    /// On a volume that shares no blocks ([`Config::sharing`], [`Sharing::Unshared`]: NTFS,
+    /// ext4) every value is written where it goes, a derived one as the file its chain gives
+    /// ([`Reader::file_of`]): no whole file is kept and no clone asked. That is the floor there,
+    /// one write of the output's bytes, where a whole file kept would be a second write of
+    /// them and a second copy on disk.
+    ///
     /// No clone is ever of a file with data not written back: a file the store wrote is
     /// cloned from only once its write-back completed ([`publish::Flushed`]). A place that can
     /// be made of nothing else (a derived value whose base's file is not there and written
@@ -2773,38 +2788,51 @@ impl Store {
         }
         let look = self.look();
         let found = look.find(key)?;
-        let plan = match found.and_then(|found| Ok((found, look.record(found, key)?.0))) {
+        let plan = match (self.config.sharing, found) {
             // alloc: the error of a corrupt value
-            Err(corrupt) => Plan::Refused(corrupt.to_string()),
-            Ok((found, header)) if clones_from_file(&header, found.place.form()) => {
-                Plan::File(header.content, header.raw)
-            }
-            // A recipe is never placed as its own bytes: what is placed is the file it gives.
-            Ok((found, header)) if header.kind == Kind::Derived => {
-                match look.read(found, key).map(|entry| derived::decode(entry.bytes)) {
-                    Ok(Ok(recipe)) => Plan::Derived(recipe.len),
-                    // alloc: the error of a value that is no recipe
-                    Ok(Err(why)) => Plan::Refused(format!("the derived value {key:?} holds {why}")),
-                    // alloc: the error of a corrupt value
-                    Err(corrupt) => Plan::Refused(corrupt.to_string()),
-                }
-            }
-            Ok((found, _)) => match look.read(found, key) {
+            (_, Err(corrupt)) => Plan::Refused(corrupt.to_string()),
+            // A volume that shares no blocks: the file the value is, written where it goes,
+            // whatever its kind, form and length. No whole file is kept to clone from, so
+            // none is written beside it either.
+            (Sharing::Unshared, Ok(_)) => match file_of(look, key) {
+                Ok(Some(bytes)) => Plan::Write(bytes),
+                // alloc: the error of a value that went between its find and its read
+                Ok(None) => Plan::Refused(format!("the value of {key:?} went as it was placed")),
+                Err(why) => Plan::Refused(why),
+            },
+            (Sharing::Blocks, Ok(found)) => match look.record(found, key).map(|it| (found, it.0)) {
                 // alloc: the error of a corrupt value
                 Err(corrupt) => Plan::Refused(corrupt.to_string()),
-                Ok(entry) => match self.tiers[found.tier].externals.get(&entry.content) {
-                    Some(external)
-                        if matches!(found.place, Place::Pack(loc) if loc.form == Form::External)
-                            && external.committed =>
-                    {
-                        // clone: the clone effect owns the name it clones from; once per place
-                        Plan::Clone(external.file.clone(), entry.bytes.len() as u64, entry.content)
+                Ok((found, header)) if clones_from_file(&header, found.place.form()) => {
+                    Plan::File(header.content, header.raw)
+                }
+                // A recipe is never placed as its own bytes: what is placed is the file it gives.
+                Ok((found, header)) if header.kind == Kind::Derived => {
+                    match look.read(found, key).map(|entry| derived::decode(entry.bytes)) {
+                        Ok(Ok(recipe)) => Plan::Derived(recipe.len),
+                        // alloc: the error of a value that is no recipe
+                        Ok(Err(why)) => Plan::Refused(format!("the derived value {key:?} holds {why}")),
+                        // alloc: the error of a corrupt value
+                        Err(corrupt) => Plan::Refused(corrupt.to_string()),
                     }
-                    _ => {
-                        let mut bytes = Vec::with_capacity(entry.bytes.len());
-                        copy::append(&mut bytes, entry.bytes);
-                        Plan::Write(bytes)
-                    }
+                }
+                Ok((found, _)) => match look.read(found, key) {
+                    // alloc: the error of a corrupt value
+                    Err(corrupt) => Plan::Refused(corrupt.to_string()),
+                    Ok(entry) => match self.tiers[found.tier].externals.get(&entry.content) {
+                        Some(external)
+                            if matches!(found.place, Place::Pack(loc) if loc.form == Form::External)
+                                && external.committed =>
+                        {
+                            // clone: the clone effect owns the name it clones from; once per place
+                            Plan::Clone(external.file.clone(), entry.bytes.len() as u64, entry.content)
+                        }
+                        _ => {
+                            let mut bytes = Vec::with_capacity(entry.bytes.len());
+                            copy::append(&mut bytes, entry.bytes);
+                            Plan::Write(bytes)
+                        }
+                    },
                 },
             },
         };
@@ -2915,7 +2943,9 @@ impl Store {
     /// clone, and the clone renamed onto `to`, unsynced ([`publish::Writing`]): the file a
     /// program may be running is never written, and what is written is the patch, whatever
     /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
-    /// not there, or on a volume that shares no blocks, fails the place, naming it.
+    /// not there, or on a volume that shares no blocks, fails the place, naming it: on
+    /// [`Sharing::Unshared`] the caller places the whole file ([`Store::place_made`]), which
+    /// writes no more than a copy of the path's file would and reads nothing.
     pub fn place_patched(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
         assert!(
             !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
@@ -2923,6 +2953,15 @@ impl Store {
         );
         self.tidy();
         let tag = self.tags.fresh();
+        if self.config.sharing == Sharing::Unshared {
+            // alloc: an error, once per place refused
+            let why = format!(
+                "{to} was to be patched over a clone of its own file, and the store's volume \
+                 shares no blocks: its whole file is placed (Store::place_made)"
+            );
+            self.answer(Placed { tag, to, result: Err(why), bytes: PlacedBytes::default() });
+            return tag;
+        }
         // As [`Store::place`]'s: open until the answer, with no parent.
         let span = tracing::info_span!(
             target: "blaze",
@@ -2935,6 +2974,27 @@ impl Store {
         );
         self.place_spans.insert(tag, span);
         self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        tag
+    }
+
+    /// On a volume without block sharing, publish by exclusive custody when the bytes
+    /// prove the base; otherwise start a new generation. `whole` is the independent
+    /// witness from the linker, not bytes read from the destination.
+    pub fn place_edit(&mut self, to: FileName, patch: Sparse, whole: Sparse, effects: &mut Vec<Effect>) -> Tag {
+        assert!(!self.tiers.iter().any(|tier| to.is_under(&tier.dir)));
+        self.tidy();
+        let tag = self.tags.fresh();
+        let valid = patch.check().and_then(|()| whole.check());
+        if patch.len != whole.len || valid.is_err() {
+            self.answer(Placed { tag, to, result: Err(valid.err().unwrap_or_else(|| "patch length differs from whole output".into())), bytes: PlacedBytes::default() });
+            return tag;
+        }
+        let wrote = patch.bytes();
+        let whole = Arc::new(whole.runs); // alloc: shared witness until custody is decided
+        let span = tracing::info_span!(target: "blaze", parent: None, "place", %to, how = "exclusive edit", bytes = tracing::field::Empty);
+        self.place_spans.insert(tag, span);
+        self.tags.ops.insert(tag, Op::Lease { to: to.clone(), len: patch.len, wrote, whole: whole.clone() });
+        effects.push(Effect::TryPatch { file: to, len: patch.len, delta: patch.runs, whole, tag });
         tag
     }
 
@@ -2958,12 +3018,16 @@ impl Store {
                 // What the path's file holds that is only in memory is begun on its way to
                 // the device, and nothing waits for it: the clone the path's next patch
                 // starts from ([`Store::place_patched`]) then finds the file written back,
-                // or waits for what is left of these bytes and no more. The planted bug of
-                // a control asks for none.
+                // or waits for what is left of these bytes and no more. On a volume that
+                // shares no blocks no patch clones it, so none is asked: on Windows a
+                // write-back is a flush of the file and the drive's cache, 4 to 20 ms a file
+                // (measured on NTFS, 16 KiB to 64 MiB), for nothing. The planted bug of a
+                // control asks for none.
+                let shares = self.config.sharing == Sharing::Blocks;
                 #[cfg(test)]
-                let back = self.plant != PlacePlant::MadeNoWriteBack;
+                let back = shares && self.plant != PlacePlant::MadeNoWriteBack;
                 #[cfg(not(test))]
-                let back = true;
+                let back = shares;
                 if back {
                     // clone: the effect owns the name; once per place
                     let file = to.clone();
@@ -2993,6 +3057,10 @@ impl Store {
     /// has none, and one an earlier run left under `placed/` is the open's to keep.
     pub fn unplace_made(&mut self, key: &Key, effects: &mut Vec<Effect>) {
         self.tidy();
+        // A volume that shares no blocks has no whole files to let go of.
+        if self.config.sharing == Sharing::Unshared {
+            return;
+        }
         let Ok(Ok(Whole { id, len, base })) = whole_of(self.look(), key) else { return };
         if !self.files.contains_key(&id) {
             return;
@@ -3259,6 +3327,11 @@ impl Store {
     /// ([`Kind::Derived`]), `now`'s whole file is made of a clone of this one first.
     pub fn unplace(&mut self, key: &Key, now: &Key, effects: &mut Vec<Effect>) {
         self.tidy();
+        // A volume that shares no blocks has no whole files: none to let go of, and none
+        // begun of what replaces it.
+        if self.config.sharing == Sharing::Unshared {
+            return;
+        }
         let look = self.look();
         // The whole file each is placed from, if one is kept of it; else its content alone.
         let file_of = |key: &Key| match whole_of(look, key) {
@@ -3321,6 +3394,12 @@ impl Store {
     /// ([`Kind::Derived`]), which are made again from their recipes.
     pub fn placed_on_open(&self) -> PlacedOnOpen {
         self.placed_on_open
+    }
+
+    /// Whether its volume shares blocks ([`Config::sharing`]): on one that does not, an
+    /// output is placed whole, never patched over a clone ([`Store::place_patched`]).
+    pub fn sharing(&self) -> Sharing {
+        self.config.sharing
     }
 
     /// The directory of the whole files outputs are cloned from ([`CLONE_FROM`]).
@@ -3433,6 +3512,9 @@ impl Store {
             #[cfg(test)]
             let named = named
                 || (self.plant == PlacePlant::KeepsDerived && name.ends_with(DERIVED_SUFFIX));
+            // On a volume that shares no blocks nothing is cloned from them: what an earlier
+            // run left (a store moved from a volume that shares) goes too.
+            let named = named && self.config.sharing == Sharing::Blocks;
             if named {
                 self.placed_on_open.kept += 1;
                 self.placed_on_open.kept_bytes += meta.len;
@@ -4764,6 +4846,14 @@ impl Store {
                 self.patch_step(op, done, effects);
             }
             Op::Runs { asked, step } => self.runs_step(asked, step, &done, effects),
+            Op::Lease { to, len, wrote, whole } => match done {
+                Done::Patched(false) => {
+                    let runs = Arc::unwrap_or_clone(whole);
+                    self.publish(completion.tag, to, Content::Sparse(Sparse { len, runs }), Durable::No, 0, effects);
+                }
+                Done::Patched(true) => self.answer(Placed { tag: completion.tag, to, result: Ok(()), bytes: PlacedBytes { copied: wrote, ..PlacedBytes::default() } }),
+                other => self.answer(Placed { tag: completion.tag, to, result: Err(describe(&other)), bytes: PlacedBytes::default() }),
+            },
             // Nothing waits for it, and one that fails is of a path placed again or removed
             // since: the next clone of the path's file writes out what it left.
             Op::OutputBack => {}
@@ -5001,12 +5091,12 @@ impl Store {
             // the index and a retire's rewrite (`live_records`), which keep only what a key
             // finds, keep it: found only by the scan past the index, it would be lost to the
             // next index write or retire.
-            self.copy_homes.insert(header.key, from);
+            self.copy_homes.insert((from.chunk, from.offset));
         } else {
             if from != here {
                 // A record that is the home of another writer's record of the same value, not
                 // drained yet (`record_home`): that record, drained after, is the duplicate.
-                self.copy_homes.insert(header.key, from);
+                self.copy_homes.insert((from.chunk, from.offset));
             }
             if number != 0 && header.kind.cold() && header.form == Form::Raw {
                 // The store's own puts were sampled as they were put.
@@ -5038,7 +5128,7 @@ impl Store {
     /// A duplicate written for `prev`'s spot would be dropped with it by `end_migration`, and
     /// skipped, the key could be left with no durable record.
     fn record_home(
-        &self,
+        &mut self,
         number: usize,
         at_chunk: ChunkRef,
         at: u64,
@@ -5047,7 +5137,7 @@ impl Store {
         batch: &Batch,
     ) -> Result<Option<Seg>, String> {
         let key = &header.key;
-        if self.copy_homes.get(key) == Some(&here) {
+        if self.copy_homes.remove(&(here.chunk, here.offset)) {
             return Ok(None);
         }
         let held = Held::writer(&*self.shared);
@@ -5081,7 +5171,7 @@ impl Store {
             Place::Segment(other)
                 if first.content == header.content
                     && !self.drained(number, at_chunk, at, other, batch)
-                    && !self.copy_homes.contains_key(key) =>
+                    && !self.copy_homes.contains(&(other.chunk, other.offset)) =>
             {
                 Some(other)
             }
@@ -5110,7 +5200,7 @@ impl Store {
             .chain(&own.prev)
             .find_map(|table| table.get(held, key).map(|(_, spot)| spot.place));
         let Some(Place::Segment(seg)) = place else { return None };
-        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains_key(key))
+        (!self.drained(number, at_chunk, at, seg, batch) && !self.copy_homes.contains(&(seg.chunk, seg.offset)))
             .then_some(seg)
     }
 
@@ -5209,9 +5299,6 @@ impl Store {
                                 });
                             }
                         }
-                    }
-                    if self.copy_homes.get(&it.key) == Some(&it.from) {
-                        self.copy_homes.remove(&it.key);
                     }
                 }
                 if lost.is_some() {

@@ -45,6 +45,10 @@ pub enum FrontRef<I, S> {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per function described
 pub struct Described<I, S> {
     pub item: ItemKey,
+    /// This body may consume a fact closed over the whole program. Even when its
+    /// current describe reads no such fact, introducing the first consumer requires
+    /// closing the world before the build can use the patched walk.
+    pub takes_world: bool,
     /// Its code, with the key of the store its body is written in: what its instance key
     /// ([`crate::Instance::key`]) and so the link name it by, so two bodies written alike in
     /// two places are two functions, each reporting its own positions.
@@ -224,6 +228,9 @@ pub enum Changed<I, S> {
 
 /// The front end of a build: which instances there are and what they refer to.
 pub trait Frontend: Sync {
+    /// Proof of the inputs to both rounds of this program's closed-world walk, held
+    /// only beside its database. `()` for a front end that never resumes a world.
+    type World: Send + Sync;
     /// A function instance, as the front end holds it. Never hashed: its content is
     /// [`Described::code`] and [`Described::args`].
     type Instance: Clone + Eq + Hash + Send + Sync + Debug;
@@ -335,13 +342,26 @@ pub trait Frontend: Sync {
         true
     }
 
-    /// Whether a walk of this front end may close facts of the whole program
+    /// Whether a walk of this front end may close facts of the whole program even
+    /// when no described function sets `takes_world`
     /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached,
     /// so a walk patched from a kept one, which holds only what changed, is for a front end
     /// that says `false`. The default is `true`.
     fn closes(&self) -> bool {
         true
     }
+
+    fn kept_world(&self) -> Option<Self::World> {
+        None
+    }
+
+    /// Install the world only if both the plain walk and the closed walk still yield it.
+    fn resume_world(&self, _: &Self::World, _: u64) -> Result<(), &'static str> {
+        Err("the front end does not resume a closed world")
+    }
+
+    /// A structural walk starts without a world, including after an attempted patch.
+    fn abandon_resumed_world(&self) {}
 
     /// Told that the walk has reached everything, with no error: `functions` (each with whose
     /// code asked for it) and `statics` are all it reached, each once, in the walk's order,

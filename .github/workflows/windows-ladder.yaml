@@ -1,0 +1,87 @@
+name: Windows release ladder
+on:
+  push:
+    branches: [windows/int, 'windows/ladder/*']
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Engine revision (defaults to the workflow checkout)
+        required: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select the engine, independently of the driver
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          $ref = $env:REVISION
+          if ($env:GITHUB_REF_NAME -match '^windows/ladder/([0-9a-f]{9,40})$') { $ref = $Matches[1] }
+          if ($ref) { git checkout --detach $ref; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          git rev-parse HEAD
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - run: cargo build --locked --release -p blaze-engine --bin blaze
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-engine
+          path: target/release/blaze.exe
+          retention-days: 3
+          if-no-files-found: error
+  ladder:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: ${{ fromJSON(startsWith(github.ref_name, 'windows/ladder/') && '["withdeps"]' || '["hello","withdeps","rune-cstr"]') }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-engine
+          path: target/release
+      - name: Provision the scratch volume change journal
+        run: |
+          $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
+          fsutil usn queryjournal $volume
+          if ($LASTEXITCODE) { fsutil usn createjournal m=33554432 a=4194304 $volume }
+      - name: Run the ladder with runner memory telemetry
+        env:
+          FIXTURE: ${{ matrix.fixture }}
+        run: |
+          . ./.github/scripts/windows-memory.ps1
+          $p = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList @('-NoProfile','-File','.github/scripts/windows-ladder.ps1','-Blaze',"$PWD/target/release/blaze.exe",'-Out',"$env:RUNNER_TEMP/ladder",'-Fixture',$env:FIXTURE)
+          Wait-WithHeadroom $p
+          exit $p.ExitCode
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ladder-${{ matrix.fixture }}
+          path: |
+            ${{ runner.temp }}/ladder/*.log
+            ${{ runner.temp }}/ladder/*.csv

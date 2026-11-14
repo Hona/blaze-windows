@@ -693,8 +693,10 @@ fn not_const_checked(db: &Db, func: FunctionId) -> bool {
 }
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a
-/// function that is not `const`: it is `const`, or a method of a trait or of an `impl` of one
-/// (conditionally const), or `#[rustc_comptime]` (always const to rustc: `size_of`,
+/// function that is not `const`: it is `const` (a `const fn`, or a method of an inherent `const
+/// impl`, whose `[const]` bounds the caller checks first: `hir_ty::effects::fn_is_const`), or a
+/// method of a trait or of an `impl` of one (conditionally const), or `#[rustc_comptime]`
+/// (always const to rustc: `size_of`,
 /// `align_of`, `needs_drop` and the reflection intrinsics are written so). An intrinsic is
 /// otherwise callable only when it is declared `const`, as the nightly declares the others const
 /// eval runs (`atomic_load` and the rest of the atomics, `transmute`, ..).
@@ -702,7 +704,7 @@ fn not_const_checked(db: &Db, func: FunctionId) -> bool {
 /// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
 /// check reports only what rustc reports.
 fn is_const_callable(db: &Db, func: FunctionId) -> bool {
-    FunctionSignature::of(db, func).is_const()
+    hir_ty::effects::fn_is_const(db, func)
         || of_a_trait(db, func)
         || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
 }

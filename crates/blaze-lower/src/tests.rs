@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod std_mir;
+
 use std::path::PathBuf;
 
 use base_db::{Crate, CrateType, SourceRoot, SourceRootId, TargetKind, VfsPath};
@@ -846,6 +848,18 @@ fn a_run_is_refused_for_what_is_no_run() {
     assert!(built.lowered.ran(RUN, &elsewhere).is_err());
     assert!(built.lowered.macros(LIB, Ok(Vec::new())).is_err());
     assert!(built.lowered.macros(MACRO, Ok(Vec::new())).is_ok());
+}
+
+#[test]
+fn a_miss_explains_the_identity_of_its_lookup_after_a_sibling_writes() {
+    let mut built = lowered(&units()).unwrap();
+    let id = built.lowered.identity(LIB).unwrap();
+    built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
+    let parts = built.lowered.identity_parts(LIB, id).unwrap();
+    assert!(!parts.is_empty());
+    let changed = Ran { cfgs: vec!["has_gen".into()], out_dir: OUT_DIR.into(), ..Default::default() };
+    built.lowered.ran(RUN, &changed).unwrap();
+    assert!(matches!(built.lowered.identity_parts(LIB, id), Err(why) if why.contains("changed since its record lookup")));
 }
 
 /// A member proc macro under `blaze check` is two units of one crate: its `Check` unit (the
@@ -2558,6 +2572,27 @@ fn units_with_a_registry_lib() -> Units {
 
 /// What a store holds of library crates' narrowed identities, by key.
 type KeptNarrows = Vec<(ContentId, Vec<u8>)>;
+
+#[test]
+fn a_librarys_code_key_is_independent_of_its_file_parse_order() {
+    let extra: Vec<_> = (0..32).map(|n| (format!("a/src/file{n}.rs"), format!("pub fn f{n}() {{}}"))).collect();
+    let mut files = FILES.to_vec();
+    files.extend(extra.iter().map(|(name, text)| (name.as_str(), text.as_bytes())));
+    let key = |order| {
+        let tree = MemTree::default();
+        let root = tree.root(&files);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front = lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+        let previous = base_db::set_run_order(order);
+        front.library_narrows(LIB, &FRONT_END, |_| Ok(None)).unwrap();
+        base_db::set_run_order(previous);
+        let made = front.take_library_narrows();
+        assert_eq!(made.len(), 1);
+        made
+    };
+    assert_eq!(key(base_db::RunOrder::LeftToReaders), key(base_db::RunOrder::Reversed));
+}
 
 /// The lib, a registry crate with its root as `lib`, and the bin above it, lowered from
 /// nothing and given their library crates' narrowed identities from `store`, which is given

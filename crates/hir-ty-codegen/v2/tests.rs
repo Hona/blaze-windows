@@ -55,7 +55,7 @@ fn stencils() -> Option<String> {
 }
 
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
-fn policy(level: OptLevel) -> Policy {
+pub(super) fn policy(level: OptLevel) -> Policy {
     let toolchain =
         Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {
@@ -1236,6 +1236,36 @@ pub fn holds(x: u32) -> u32 {
     callee(x)
 }
 "#;
+
+/// On Windows the ABI boundary itself must claim a panic. A cleanup-only pad is never
+/// entered if there is no handler farther up the stack (a C main or a foreign thread).
+#[test]
+fn a_windows_c_boundary_catches_a_call_that_can_unwind() {
+    let (db, frontend) = frontend(r#"
+//- target: x86_64-pc-windows-msvc
+//- minicore: sized
+#[inline(never)] pub fn may_panic() { loop {} }
+pub extern "C" fn boundary() { may_panic(); }
+pub extern "C-unwind" fn transparent() { may_panic(); }
+"#);
+    let target = crate::Target::of("x86_64-pc-windows-msvc").unwrap();
+    let catches = |name, panic| {
+        let root = frontend.root(function(db, name));
+        frontend.with(|db| {
+            let build = Build::of(&Spec { panic, ..spec() });
+            let super::Built::Ir(code) = built(db, &root, target, false, build).unwrap() else {
+                panic!("{name} has an IR body")
+            };
+            let func = &code.func;
+            func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).any(|i| {
+                crate::unwind::seh::is_catching(func.srcloc(i))
+            })
+        })
+    };
+    assert!(catches("boundary", Panic::Unwind));
+    assert!(!catches("transparent", Panic::Unwind));
+    assert!(!catches("boundary", Panic::Abort));
+}
 
 /// One function built under two units' settings in one database gives two IRs, and neither
 /// build reuses the other's: the settings are an argument of the compile and the key of every
@@ -4072,6 +4102,54 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
         assert!(refused.what.contains("found others (none)"), "{}", refused.what);
         assert_eq!(frontend.devirt.world(), Some(world));
     });
+}
+
+/// The invariant: after a literal edit the plain and closed walk still support the same
+/// world. Changing the graph to reach another closure does not validate that checkpoint.
+#[test]
+fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
+    use blaze_codegen::backend::Frontend as _;
+    let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
+    let fixture = fixture::db(DYN_FN_BUILT_IN);
+    let file = fixture.file_at("/main.rs");
+    let mut db = fixture.into_db();
+    let file = file.file_id(&db);
+    let krate = fixture::test_crate(&db);
+    let policy = policy(OptLevel::O3);
+    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default()).with_policy(policy);
+        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
+        f
+    }
+    let (kept, view) = {
+        let f = front(&db, &policy, krate);
+        let view = f.view().unwrap();
+        for closed in [true, false] {
+            let root = f.root(function(&db, "roots"));
+            let origin = f.with(|db| f.origin(db, krate));
+            let mut reached = Vec::new();
+            let mut queue = vec![(root,origin)];
+            while let Some((i,o)) = queue.pop() {
+                if reached.contains(&(i.clone(),o)) { continue; }
+                let d = f.describe(&i,&o).unwrap();
+                for r in d.refs { if let FrontRef::Function(callee) = r { queue.push((callee,d.origin)); } }
+                reached.push((i,o));
+            }
+            assert_eq!(f.closed(&reached,&[]).unwrap(),closed);
+        }
+        (f.kept_world().unwrap(),view)
+    };
+    db.set_file_text(file,&source.replace("y * 3", "y * 4"));
+    let since = {
+        let f = front(&db,&policy,krate);
+        f.resume_world(&kept,view).unwrap();
+        assert!(f.devirt.world().is_some());
+        f.abandon_resumed_world();
+        assert!(f.devirt.world().is_none());
+        f.view().unwrap()
+    };
+    db.set_file_text(file, &source.replace("dep::resize::<K>(x, &|y| y * 3)", "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)"));
+    assert!(front(&db,&policy,krate).resume_world(&kept,since).is_err());
 }
 
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at

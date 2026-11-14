@@ -8,7 +8,7 @@ use super::*;
 use crate::cli::{
     args::{Asked, Invocation},
     say::Ended,
-    test::tests::{Fake, built},
+    test::tests::{Fake, built_in},
 };
 
 fn os(words: &[&str]) -> impl Iterator<Item = OsString> {
@@ -22,12 +22,25 @@ fn invocation(words: Vec<OsString>) -> Invocation {
     }
 }
 
+/// The workspace the commands here run in, as the host names it: absolute on its system.
+#[cfg(windows)]
+const W: &str = r"C:\w";
+#[cfg(not(windows))]
+const W: &str = "/w";
+/// [`W`] as the daemon names it (`blaze_core::platform::path::daemon`).
+#[cfg(windows)]
+const WN: &str = "/C:/w";
+#[cfg(not(windows))]
+const WN: &str = "/w";
+
+/// `rel`, a path from the workspace written with `/`, as this system shows it (cargo shows
+/// `target\debug\foo` on Windows).
+fn shown(rel: &str) -> String {
+    rel.split('/').collect::<PathBuf>().display().to_string()
+}
+
 fn place() -> Place {
-    Place {
-        cwd: PathBuf::from("/w"),
-        manifest: PathBuf::from("/w/Cargo.toml"),
-        root: PathBuf::from("/w"),
-    }
+    Place { cwd: PathBuf::from(W), manifest: PathBuf::from(W).join("Cargo.toml"), root: PathBuf::from(W) }
 }
 
 fn request_of(asked: &Invocation) -> Request {
@@ -56,13 +69,13 @@ fn cargo_blaze_and_blaze_are_the_same_command() {
     let request = request_of(&invocation(direct));
     assert_eq!(request, request_of(&invocation(through_cargo)));
     let Request::Build { view, targets } = request else { panic!("not a build: {request:?}") };
-    assert_eq!(view, ViewRef::Head("/w".to_owned()));
+    assert_eq!(view, ViewRef::Head(WN.to_owned()));
     assert_eq!(targets.packages, ["foo"]);
     assert_eq!(targets.profile, "release");
     let cargo = targets.cargo.unwrap();
     assert_eq!(cargo.command, "build");
     assert_eq!(cargo.args, ["--release", "-p", "foo"]);
-    assert_eq!((cargo.root.as_str(), cargo.cwd.as_str()), ("/w", "/w"));
+    assert_eq!((cargo.root.as_str(), cargo.cwd.as_str()), (WN, WN));
 }
 
 #[test]
@@ -128,7 +141,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
 #[test]
 fn ub_results_print_as_libtest_prints_them() {
     let failed = TestResult {
-        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        binary: format!("{WN}/target/debug/deps/foo-1"),
         name: "tests::aliasing".to_owned(),
         outcome: TestOutcome::Failed,
         output:
@@ -161,7 +174,7 @@ fn ub_results_print_as_libtest_prints_them() {
 #[test]
 fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
-        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        binary: format!("{WN}/target/debug/deps/foo-1"),
         name: name.to_owned(),
         outcome: TestOutcome::Passed,
         output: Vec::new(),
@@ -245,7 +258,8 @@ fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
 #[test]
 fn every_command_suggested_is_one() {
     // `blaze daemon` alone is no command: it takes a verb.
-    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+    // `blaze serve` is taken before the command line is read (`cli::main`), as the daemon it is.
+    for name in COMMANDS.iter().filter(|it| !matches!(**it, "daemon" | "serve")) {
         assert_ne!(
             args::parse(vec![OsString::from(*name)]),
             Ok(Asked::Unknown((*name).to_owned())),
@@ -310,7 +324,7 @@ fn tests_built() -> Vec<Response> {
         foo_compiling(),
         Response::Built {
             members: 1,
-            artifacts: built(),
+            artifacts: built_in(WN),
             profile: "`test` profile [unoptimized + debuginfo]".to_owned(),
         },
         Response::Done { ok: true },
@@ -345,7 +359,7 @@ fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
     assert_eq!(
         &lines[2..],
         [
-            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
+            format!("     Running unittests src/lib.rs ({})", shown("target/debug/deps/foo-0123abcd")).as_str(),
             "error: test failed, to rerun pass `--lib`",
         ]
     );
@@ -446,7 +460,7 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
         assert_eq!(then, Then::Exit(101), "{words:?}");
         assert_eq!(programs.ran.len(), 4, "{words:?}: {err}");
         assert!(
-            err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"),
+            err.contains(&format!("     Running unittests src/lib.rs ({})", shown("target/debug/deps/foo-0123abcd"))),
             "{err}"
         );
     }
@@ -461,7 +475,7 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
 
 #[test]
 fn run_becomes_its_program() {
-    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let foo = crate::cli::run::tests::artifact_in(WN, "foo", "bin", "foo", false, Some("foo"));
     let built = Response::Built {
         members: 1,
         artifacts: vec![foo],
@@ -473,12 +487,12 @@ fn run_becomes_its_program() {
     let Then::Exec(exec) = then else { panic!("{then:?}: {err}") };
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
-    assert_eq!(exec.cwd, PathBuf::from("/w"));
-    assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
+    assert_eq!(exec.cwd, PathBuf::from(W));
+    assert!(err.ends_with(&format!("     Running `{} a b`\n", shown("target/debug/foo"))), "{err}");
 
     let two = [
-        crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
-        crate::cli::run::tests::artifact("foo", "bin", "bar", false, Some("bar")),
+        crate::cli::run::tests::artifact_in(WN, "foo", "bin", "foo", false, Some("foo")),
+        crate::cli::run::tests::artifact_in(WN, "foo", "bin", "bar", false, Some("bar")),
     ];
     let built = Response::Built {
         members: 1,
@@ -547,7 +561,11 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         lines[2].starts_with("    Finished `dev` profile [unoptimized + debuginfo] target(s) in "),
         "{err}"
     );
-    assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
+    assert_eq!(
+        lines[3],
+        format!("   Generated {}", dir.join("foo").join("index.html").display()),
+        "{err}"
+    );
     assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
     assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
     let listed = std::fs::read_to_string(dir.join("crates.js")).unwrap();
@@ -601,6 +619,9 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
     let files = vec![("/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())];
     let table: &[&[&str]] = &[
         &["build"],
+        &["check", "-p", "opencode-desktop"],
+        &["check", "--locked", "-p", "opencode-desktop"],
+        &["build", "--package", "rune", "-p", "rune-kit"],
         &["b"],
         &["build", "-q"],
         &["build", "--quiet", "-r"],
@@ -616,12 +637,15 @@ fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
         let thin = thin_asked(typed);
         let asked = invocation(typed.iter().map(OsString::from).collect());
         for (color, width) in [(false, None), (true, Some(100))] {
+            let root=std::env::current_dir().unwrap();
+            let host=Place {cwd:root.clone(), root:root.clone(),manifest:root.join("Cargo.toml")};
+            let wire=place::utf8(&root).unwrap();
             let cargo =
-                place::cargo(&asked, &place(), env.clone(), files.clone(), color, width).unwrap();
+                place::cargo(&asked, &host, env.clone(), files.clone(), color, width).unwrap();
             let cli = request(&asked, cargo).unwrap();
             let sent = blaze_thin::request::Sent {
-                cwd: "/w".to_owned(),
-                root: "/w".to_owned(),
+                cwd: wire.clone(),
+                root: wire,
                 env: env.clone(),
                 files: files.clone(),
                 color,
@@ -695,7 +719,7 @@ fn plain_answer() -> Vec<Response> {
         green: 4,
         links: vec![blaze_api::Linked {
             how: blaze_api::LinkHow::Unchanged,
-            path: "/w/target/debug/foo".to_owned(),
+            path: format!("{WN}/target/debug/foo"),
         }],
         reran: 0,
         misses: 0,
@@ -732,14 +756,14 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
         let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
         assert_eq!(out, "", "{typed:?}");
         match thin.command {
-            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Build | blaze_thin::route::Command::Check => assert_eq!(then, Then::Exit(0), "{typed:?}"),
             blaze_thin::route::Command::Run => {
                 let program = plain.program().expect("the one bin runs");
                 let exec = Exec::of(
                     program.executable.as_deref().unwrap(),
                     &program.env,
                     &thin.program,
-                    std::path::Path::new("/w"),
+                    std::path::Path::new(W),
                 );
                 if !thin.quiet {
                     said.push_str(&exec.running(false));

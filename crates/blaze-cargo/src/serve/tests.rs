@@ -39,8 +39,8 @@ use super::{
     plane::{Inline, Runner},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
-        Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
-        applying_fallible,
+        Library, Output, Phase, PhaseDone, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps,
+        Writer, applying_fallible,
     },
 };
 
@@ -93,6 +93,8 @@ thread_local! {
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
     static PHASES: RefCell<Vec<(usize, Phase)>> = const { RefCell::new(Vec::new()) };
+    static PROBED_FRESH: Cell<Option<usize>> = const { Cell::new(None) };
+    static REPLAYED_NAMES: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each reach's runs applied in the front ends it read: its view's from, then its to.
     static REACHED: RefCell<Vec<(Vec<usize>, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each edit's and each build ahead's choice's runs applied in the front end it read.
@@ -723,6 +725,14 @@ pub(super) struct FakeWriter {
 /// A shared reference to the inputs, as the loop posted a task with it.
 pub(super) struct FakeReader(Arc<FakeInputs>);
 
+#[test]
+fn final_diagnostics_observe_writes_queued_by_the_last_unit() {
+    let mut writer = FakeWriter { inputs: Arc::new(FakeInputs::default()), asked: vec![3], broke: Vec::new() };
+    assert!(writer.reader().is_none());
+    let reader = writer.final_reader().unwrap();
+    assert_eq!(reader.0.runs, [3]);
+}
+
 /// A kept image as the kept images' budget sees it: what it weighs and whether a run maps it.
 /// The fakes' compiles link nothing, so only a test of the budget ([`super::job`]'s `Paths`)
 /// makes one.
@@ -1150,8 +1160,8 @@ impl Runs<Fake> for Over {
 }
 
 impl Front<Fake> for FakeFront {
-    fn fresh(&self, _: usize) -> bool {
-        false
+    fn fresh(&self, unit: usize) -> bool {
+        PROBED_FRESH.get() == Some(unit)
     }
 
     fn compile(
@@ -1160,7 +1170,7 @@ impl Front<Fake> for FakeFront {
         unit: usize,
         phase: Phase,
         _: &mut Vec<Image<Fake>>,
-    ) -> Result<Option<Compiled>, Failed> {
+    ) -> Result<PhaseDone, Failed> {
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
         assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
         if ERRS_COMPILE.get() == Some(unit) {
@@ -1171,12 +1181,15 @@ impl Front<Fake> for FakeFront {
         }
         if phase == Phase::Names {
             SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
+            if REPLAYED_NAMES.get() == Some(unit) {
+                return Ok(PhaseDone::ReplayedNames);
+            }
             if unit == 0 && KEEP.get() {
                 HOLD.with(|it| it.borrow_mut().push(reader));
             }
         }
         if phase != Phase::Store {
-            return Ok(None);
+            return Ok(PhaseDone::Continue);
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if SCRIPT_OUTPUT.get() == Some(unit) {
@@ -1209,7 +1222,7 @@ impl Front<Fake> for FakeFront {
             }],
             false => Vec::new(),
         };
-        Ok(Some(Compiled {
+        Ok(PhaseDone::Compiled(Compiled {
             diagnostics,
             ok: true,
             open: false,
@@ -1402,6 +1415,8 @@ fn options() -> Options {
         // The simulation's files are in no file system a loader's thread could read: the
         // stores load their packs through the daemon's driver.
         store_loader: blaze_cas::Loader::Pumped,
+        store_sharing: blaze_core::Sharing::Blocks,
+        std_sharing: blaze_core::Sharing::Blocks,
         socket: Some(name(SOCKET)),
         http: None,
         budget: None,
@@ -2071,6 +2086,42 @@ fn a_units_compile_runs_each_of_its_phases_once_in_order() {
             );
         }
     }
+}
+
+/// A record can appear or cease to validate between the loop's probe and the worker's
+/// lookup. Only the latter can eliminate work; replay must still feed dependents and place
+/// the final artifact.
+#[test]
+fn replayed_names_settle_empty_phases_but_a_freshness_probe_does_not() {
+    for seed in [7, 17, 31] {
+        PHASES.with_borrow_mut(Vec::clear);
+        PROBED_FRESH.set(Some(0)); // The dependency missed when names looked again.
+        REPLAYED_NAMES.set(Some(3)); // The root's record appeared after its probe.
+        OUTPUT.set(true);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:?}");
+        let ran = PHASES.with(|it| it.take());
+        let phases = |at| {
+            ran.iter().filter_map(|&(u, p)| (u == at).then_some(p)).collect::<Vec<_>>()
+        };
+        assert_eq!(phases(3), [Phase::Names, Phase::Link, Phase::Store], "seed {seed}");
+        let mut dep = phases(0);
+        dep.sort_unstable_by_key(|p| *p as u8);
+        assert_eq!(dep, Phase::BUILD, "seed {seed}");
+        assert_eq!(daemon.driver().contents(&name(&APP_AT[1..])), APP, "seed {seed}");
+    }
+    PROBED_FRESH.set(None);
+    REPLAYED_NAMES.set(None);
+    OUTPUT.set(false);
 }
 
 #[test]

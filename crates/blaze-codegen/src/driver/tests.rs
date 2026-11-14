@@ -304,6 +304,7 @@ fn static_item(id: u32) -> ItemKey {
 }
 
 impl Frontend for Program {
+    type World = ();
     type Instance = u32;
     type Static = u32;
 
@@ -358,6 +359,7 @@ impl Frontend for Program {
             None => code,
         };
         Ok(Described {
+            takes_world: self.dyn_sites.contains_key(id),
             owner: function.owner,
             identity: ContentId::of(
                 "blaze v2 test identity 1",
@@ -523,13 +525,13 @@ impl Frontend for Program {
     }
 
     fn closes(&self) -> bool {
-        !self.dyn_sites.is_empty()
+        false
     }
 
     /// A program with a call through a `dyn` closes its dyn facts when its first walk ends,
     /// and the walk runs again against them; the second walk's facts are the first's.
-    fn closed(&self, _: &[(u32, Origin)], _: &[u32]) -> Result<bool, CodegenError> {
-        if self.dyn_sites.is_empty() {
+    fn closed(&self, functions: &[(u32, Origin)], _: &[u32]) -> Result<bool, CodegenError> {
+        if !functions.iter().any(|(id, _)| self.dyn_sites.contains_key(id)) {
             return Ok(false);
         }
         Ok(!self.engine.against.swap(true, Ordering::Relaxed))

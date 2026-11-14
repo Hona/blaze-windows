@@ -457,6 +457,8 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
             Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
+        #[cfg(feature = "native")]
+        Asked::Status(words) if words.as_slice() == ["--start"] => said(daemon::connect(daemon::Start::IfMissing).map(|_| 0)),
         Asked::Status(words) => match json_flag("status", words) {
             Ok(json) => said(daemon::status(
                 &mut io::stdout().lock(),

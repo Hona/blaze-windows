@@ -496,7 +496,7 @@ fn line_has(names: &HashSet<&str, std::alloc::Global>, wanted: &str) -> bool {
 
 /// Whether `a` and `b` name one library as link.exe matches a `/DEFAULTLIB`: by file name,
 /// case-insensitively, with or without `.lib`.
-fn same_library(a: &str, b: &str) -> bool {
+pub(crate) fn same_library(a: &str, b: &str) -> bool {
     fn stem(it: &str) -> &str {
         let file = it.rsplit(['/', '\\']).next().unwrap_or(it);
         match file.len().checked_sub(4) {
@@ -511,10 +511,18 @@ fn same_library(a: &str, b: &str) -> bool {
 
 /// link.exe's default libraries: every `/DEFAULTLIB` of the objects and archive members
 /// `graph` loaded is on the line (`inputs`), but those a loaded one's `/NODEFAULTLIB` takes
-/// out, and none after a bare `/NODEFAULTLIB`. The linker reads no file itself:
+/// out, and none after a bare `/NODEFAULTLIB`, nor those the link arguments' `/NODEFAULTLIB`s
+/// take out (`given`). The linker reads no file itself:
 /// [`crate::target::locate`] puts them on the line, so one missing is an error naming it and
 /// the member that asked.
-fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
+fn default_libraries(
+    graph: &Graph,
+    inputs: &[Input],
+    given: &crate::output::NoDefaultLibs,
+) -> Result<(), LinkError> {
+    if *given == crate::output::NoDefaultLibs::All {
+        return Ok(());
+    }
     let mut left_out: SmallVec<[&str; 4]> = SmallVec::new();
     for load in &graph.loads {
         for directive in &load.parsed.object().directives {
@@ -533,6 +541,7 @@ fn default_libraries(graph: &Graph, inputs: &[Input]) -> Result<(), LinkError> {
             }
             checked.push(library);
             if left_out.iter().any(|it| same_library(it, library))
+                || given.excludes(library)
                 || inputs.iter().any(|it| same_library(&it.name, library))
             {
                 continue;
@@ -1932,6 +1941,9 @@ pub(crate) struct Resolved {
     wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
+    /// Moves when what native code the image keeps may have: a resolution rebuilt or grown.
+    /// What a PDB's publics are of (`Resolved::native_functions`).
+    pub(crate) natives_version: u64,
     /// Of each name resolved, by [`Symbols::dense`]: `O_*` bits.
     outcomes: CowVec<u8>,
     /// The names `outcomes` holds.
@@ -1947,6 +1959,35 @@ pub(crate) struct Resolved {
 impl Resolved {
     fn outcome(&self, sym: Sym) -> u8 {
         self.outcomes.get(Symbols::dense(sym)).copied().unwrap_or(0)
+    }
+
+    /// The functions of the native code `state` keeps, each `(name, address)`, globals and
+    /// statics, as their objects name them: what a PDB names native code by (its publics).
+    /// MSVC's own labels (`$LN12`, `$unwind$...`) are left out.
+    pub(crate) fn native_functions<'r>(&'r self, state: &crate::state::State) -> Vec<(&'r str, u64)> {
+        let Some(graph) = self.graph.as_deref() else { return Vec::new() };
+        // alloc: once per PDB written, a name per native function
+        let mut out = Vec::new();
+        for (load, it) in graph.loads.iter().enumerate() {
+            let parsed = &it.parsed;
+            let object = parsed.object();
+            for symbol in &object.symbols {
+                let SymbolDef::Section { section, value, .. } = symbol.def else { continue };
+                if symbol.kind != SymbolKind::Function
+                    || !self.marks.sections.get(graph.flat(load as u32, section))
+                {
+                    continue;
+                }
+                let name = object.name(symbol.name);
+                if name.is_empty() || name.starts_with('$') {
+                    continue;
+                }
+                let Some((piece, offset)) = state.home(parsed.section_sym(section)) else { continue };
+                let Some(piece) = state.piece(piece).filter(|it| it.placed()) else { continue };
+                out.push((name, piece.addr + offset + value));
+            }
+        }
+        out
     }
 
     /// The global names the natives define, each once, as resolution chose them: neither
@@ -2545,6 +2586,9 @@ impl<'a> Stage<'a> {
                 .map_or(0, |it| object.sections[*it as usize].data.len())
         };
         for (index, group) in object.groups.iter().enumerate() {
+            if group.local {
+                continue;
+            }
             let index = index as u32;
             let name = object.name(group.name);
             let entry = b.group_list.len() as u32;
@@ -2668,13 +2712,13 @@ impl<'a> Stage<'a> {
                     }
                     continue;
                 }
-                SymbolDef::Fallback { search, .. } => {
+                SymbolDef::Fallback { symbol: default, search } => {
                     if search {
                         b.flag(slot, PULL);
                     }
                     let it = &mut b.graph.slots[slot as usize];
                     if it.fallback == NONE64 {
-                        it.fallback = pack(load, at as u32);
+                        it.fallback = pack(load, default);
                     }
                     continue;
                 }
@@ -3164,6 +3208,10 @@ impl<'a> Stage<'a> {
             Some(it) => it,
             None => self.rebuild(&old, &refs, outside)?,
         };
+        if rebuild || !gained.is_empty() {
+            static VERSIONS: AtomicU64 = AtomicU64::new(1);
+            next.natives_version = VERSIONS.fetch_add(1, Ordering::Relaxed);
+        }
         next.refs = refs;
         next.pieces = self.new.piece_count();
         next.removals = self.new.removals();
@@ -3620,6 +3668,15 @@ impl<'a> Stage<'a> {
             let slot = b.slot(self.symbols.sym_name(name));
             b.flag(slot, LOOSE);
         }
+        for name in self.writer.searched_roots() {
+            let slot = b.slot(self.symbols.sym_name(name));
+            b.flag(slot, PULL | LOOSE);
+        }
+        // link.exe's `/INCLUDE:symbol` given as a link argument, as a `.drectve`'s is.
+        for name in &output.link.pe.include {
+            let slot = b.slot(self.symbols.sym_name(name));
+            b.flag(slot, PULL | REQUIRED | ROOT);
+        }
 
         // Load: the line's objects and whole archives, then members for what is strongly
         // undefined, round by round.
@@ -3707,7 +3764,7 @@ impl<'a> Stage<'a> {
             }
         }
         match output.format {
-            Format::Pe => default_libraries(&b.graph, &inputs)?,
+            Format::Pe => default_libraries(&b.graph, &inputs, &output.link.pe.no_default_libs)?,
             Format::MachO => linker_options(&b.graph, &inputs)?,
             Format::Elf | Format::Wasm => {}
         }
@@ -4185,6 +4242,8 @@ impl<'a> Stage<'a> {
             // alloc: once per graph built
             commons: Arc::new(commons),
             marks,
+            // Set by the stage that made it (`Stage::resolve`).
+            natives_version: 0,
             outcomes: table,
             named,
             defined: list,
@@ -4412,7 +4471,7 @@ mod tests {
         assert!(check_object(&bad, 16).unwrap_err().contains("past the object's 1"));
 
         let mut bad = good();
-        bad.groups = vec![Group { name: bad.symbols[0].name, sections: 0..1, largest: false }];
+        bad.groups = vec![Group { name: bad.symbols[0].name, sections: 0..1, largest: false, local: false }];
         bad.grouped = vec![4];
         assert!(check_object(&bad, 16).unwrap_err().contains("COMDAT"));
 

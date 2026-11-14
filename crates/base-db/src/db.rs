@@ -312,15 +312,21 @@ impl Db {
             moved = tracing::field::Empty,
         )
         .entered();
-        let mut read = 0_u64;
-        let db: &Db = self;
-        let mut moved: Vec<AbsPathBuf> = files
+        // Probe independent inputs on the build's existing pool. A task drops its read
+        // before the next one; no second copy of the whole include set is retained.
+        let mut probes: Vec<_> = files
             .included_paths()
-            .inspect(|_| read += 1)
-            .filter(|path| !files.included_is_read(db, path))
+            .map(|path| (path, false))
+            .collect(); // alloc: borrowed paths and one result bit per included file
+        self.run_each(Tag::Vfs, &mut probes, |db, (path, moved)| {
+            *moved = !files.included_is_read(db, path);
+        });
+        span.record("files", probes.len() as u64);
+        let mut moved: Vec<AbsPathBuf> = probes
+            .into_iter()
+            .filter_map(|(path, moved)| moved.then_some(path))
             .map(|path| path.to_path_buf()) // alloc: a path that moved, the result
             .collect(); // alloc: none unless a file moved; the paths are the result
-        span.record("files", read);
         if moved.is_empty() {
             span.record("moved", 0_u64);
             return moved;

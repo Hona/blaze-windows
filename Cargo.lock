@@ -706,6 +706,8 @@ dependencies = [
  "serde",
  "sonic-rs",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1443,6 +1445,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-bytes",
+ "blaze-cas",
  "blaze-codegen",
  "blaze-core",
  "blaze-format",
@@ -1547,6 +1550,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
+ "blaze-mem",
  "blaze-query",
  "blaze-units",
  "blaze-vfs",
@@ -1554,7 +1558,9 @@ dependencies = [
  "hegeltest",
  "hir-def",
  "hir-expand",
+ "hir-ty",
  "hir-ty-mir",
+ "hir-ty-pure",
  "intern",
  "proc-macro-api",
  "span",
@@ -1613,6 +1619,7 @@ version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-resolve",
@@ -2099,6 +2106,8 @@ dependencies = [
  "blaze-report",
  "libc",
  "tracing",
+ "uds_windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2146,6 +2155,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-core",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
@@ -4011,6 +4021,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
  "blaze-query",
@@ -4283,6 +4294,7 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
+ "tracing",
  "triomphe",
 ]
 
@@ -6295,6 +6307,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-script",
  "regex",
+ "serde",
  "serde_json",
  "toml",
 ]

@@ -144,7 +144,8 @@ use super::{
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
-        Linking, LocalRead, Made, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
+        Linking, LocalRead, Made, Phase, PhaseDone, Readers, RunPuts, Runs, Selection, Source, Steps,
+        Writer,
     },
 };
 use crate::cli::print::Format;
@@ -183,6 +184,8 @@ pub enum Value<S: Steps> {
     /// A phase of a unit's compile before its last, done, and the images it relinked: its
     /// link's, which the loop keeps at once.
     Phase(usize, Vec<Image<S>>),
+    /// Names replayed the record on the worker (not just a positive freshness probe).
+    ReplayedNames(usize),
     Answer(Result<Response, ApiError>),
     /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
     Answers(Result<Vec<Response>, ApiError>),
@@ -597,7 +600,7 @@ impl<S: Steps> plane::Work for Step<S> {
                         images.clear();
                         let refused =
                             front.refused(unit, format!("blaze {panic}, making this unit")); // alloc: a panic, once
-                        Ok(Some(Compiled {
+                        Ok(PhaseDone::Compiled(Compiled {
                             diagnostics: vec![refused], // alloc: a panic, once
                             ok: false,
                             open: false,
@@ -621,13 +624,19 @@ impl<S: Steps> plane::Work for Step<S> {
                     return None;
                 }
                 let compiled = match compiled {
-                    Ok(None) => {
+                    Ok(PhaseDone::ReplayedNames) => {
+                        return Some(Did {
+                            outcome: Outcome::Built,
+                            value: Value::ReplayedNames(unit),
+                        });
+                    }
+                    Ok(PhaseDone::Continue) => {
                         return Some(Did {
                             outcome: Outcome::Built,
                             value: Value::Phase(unit, images),
                         });
                     }
-                    Ok(Some(compiled)) => Ok(compiled),
+                    Ok(PhaseDone::Compiled(compiled)) => Ok(compiled),
                     // An error of one unit's compile (a codegen error that is no refusal, a
                     // record that does not read, a toolchain it can't be made for) fails that
                     // unit, as a panic does, never the job: its siblings build under
@@ -1296,9 +1305,12 @@ pub(super) fn output_dirs_of<'a>(
 ) -> Result<Vec<std::path::PathBuf>, std::path::PathBuf> {
     use std::path::Path;
     let mut dirs = Vec::new(); // alloc: once a build that asks for a replay, a directory or two
+    // The system's paths: what a watch is asked of and the disk is looked at.
+    let roots: Vec<std::path::PathBuf> = roots.iter().map(|it| blaze_core::platform::path::host(it)).collect();
     for output in outputs {
-        let output = Path::new(output);
-        let dir = roots.iter().map(Path::new).find_map(|root| {
+        let output = blaze_core::platform::path::host(output);
+        let output = output.as_path();
+        let dir = roots.iter().find_map(|root| {
             let mut parts = output.strip_prefix(root).ok()?.components();
             let first = parts.next()?;
             // Right in the root: only a watch of the root itself would hear of it.
@@ -1404,7 +1416,7 @@ fn config_id(encoded: &[u8]) -> ContentId {
 /// Whether the watch of `dir`, a path dependency's directory outside the view, vouches that
 /// nothing under it changed since `generation` was read ([`Mounts::stale_locals`]).
 fn vouched_local(dir: &str, generation: u64) -> bool {
-    blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation)
+    blaze_vfs::outside::unchanged_since(&blaze_core::platform::path::host(dir), generation)
 }
 
 /// The directory of a build's layout profiles under its target directory
@@ -1438,12 +1450,16 @@ fn recorded_dirs(
         dirs = dirs.len(),
     )
     .entered();
-    let canonical = |dir: &Path| std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+    // Canonical: the system's own name of it, verbatim prefix and all, names the same path.
+    let canonical = |dir: &Path| {
+        let named = |it: &Path| blaze_core::platform::path::daemon(it).ok();
+        std::fs::canonicalize(dir).is_ok_and(|it| named(&it).is_some_and(|it| Some(it) == named(dir)))
+    };
     if let Some(dir) = dirs.iter().find(|dir| !canonical(dir.as_path())) {
         // clone: a reason, once a build whose answer is not kept
         return Err(Unkept::Outputs(dir.clone()));
     }
-    let layout = Path::new(&units.target_dir).join(LAYOUT);
+    let layout = blaze_core::platform::path::host(&units.target_dir).join(LAYOUT);
     let mut absent = Vec::new(); // alloc: once a build that walks, a path
     match std::fs::symlink_metadata(&layout) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent.push(layout),
@@ -1889,6 +1905,9 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// Names finished installing the record. Distinct from `fresh`: a native input or a
+    /// proc-macro read can have moved since the loop probed the record.
+    replayed_names: BitSet<u32>,
     /// What became of each unit by its place in the plan, as its nodes settle: what the
     /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
     verdicts: Vec<Verdict>,
@@ -2831,13 +2850,17 @@ pub(super) fn protected(
 /// most [`blaze_gc::lease::GIVE_WAY`]. Runs on the pool: it may sync a record.
 pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> super::work::Leased {
     let now = blaze_gc::record::now_ns();
-    let builds = std::path::Path::new(builds);
+    // The daemon names paths /D:/a on Windows; the disk is asked at the host's name.
+    let builds = blaze_core::platform::path::host(builds);
+    let builds = builds.as_path();
     let root = builds.parent().unwrap_or(builds);
-    let checkout_path = std::path::Path::new(checkout);
+    let checkout_path = blaze_core::platform::path::host(checkout);
+    let checkout_path = checkout_path.as_path();
     // alloc: once per job, a lease or two
     let mut leases = Vec::new();
-    for dir in [units.target_dir.as_str(), units.build_dir.as_str()] {
-        let dir = std::path::Path::new(dir);
+    for named in [units.target_dir.as_str(), units.build_dir.as_str()] {
+        let host = blaze_core::platform::path::host(named);
+        let dir = host.as_path();
         if leases.iter().any(|it: &blaze_gc::lease::Lease| it.dir() == dir) {
             continue;
         }
@@ -2874,7 +2897,7 @@ pub(super) fn lease_build_dirs(units: &Units, checkout: &str, builds: &str) -> s
             .plans
             .iter()
             .flat_map(|plan| plan.outputs.iter())
-            .filter_map(|out| std::path::Path::new(out).strip_prefix(dir).ok())
+            .filter_map(|out| std::path::Path::new(out).strip_prefix(named).ok())
             .filter_map(|rest| rest.components().next())
             .filter_map(|first| first.as_os_str().to_str())
             .collect();
@@ -4513,6 +4536,16 @@ impl<S: Steps> Jobs<S> {
                     build.held.push((task, again));
                     return;
                 };
+                // The worker that replayed names installed neither a check nor code to build.
+                // Settle these empty nodes on this turn, after the usual refusal/write gates.
+                // Link and store still consume the record and publish the unit normally.
+                if matches!(task.kind, kinds::UNIT_BODIES | kinds::COMPILE | kinds::PROGRAM)
+                    && build.replayed_names.contains(Phase::of(task.arg).0 as u32)
+                    && !build.input.cancelled.load(Ordering::Acquire)
+                {
+                    w.plane.ended(w.now, task.id, Outcome::Built);
+                    return;
+                }
                 let images = match task.kind == kinds::UNIT_LINK || task.kind == kinds::PROGRAM_LINK
                 {
                     true => self.paths.take_images(build.outputs.of(Phase::of(task.arg).0)),
@@ -4868,6 +4901,13 @@ impl<S: Steps> Jobs<S> {
                 self.compiled(w, node, unit, result);
             }
             Value::Phase(unit, images) => self.keep_images(node, unit, images),
+            Value::ReplayedNames(unit) => {
+                if let Some(Job { stage: Stage::Units(build), .. }) =
+                    self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
+                {
+                    build.replayed_names.insert(unit as u32);
+                }
+            }
             Value::Evaluated(result) => {
                 let Some(id) = self.batches.job_of(node) else { return };
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -6018,6 +6058,7 @@ impl<S: Steps> Jobs<S> {
         // not built. A unit's first node waits for the last of each unit it depends on.
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
         let fresh_units = vec![None; all.len()]; // alloc: once per build
+        let replayed_names = BitSet::new(all.len()); // alloc: one bit per unit, once per build
         let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         // Each package's `name version` by its id, what a node is named by.
@@ -6227,9 +6268,12 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            replayed_names,
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
             made_wait: (count > 0).then(|| {
+                // Opened on the loop, not inside a worker's build context.
+                let _build = job.request.map(|id| blaze_profile::flight::building(id.0));
                 tracing::info_span!(
                     target: "blaze",
                     "the build's first made unit waits behind the units found kept"
@@ -6857,7 +6901,9 @@ impl<S: Steps> Jobs<S> {
     /// ([`Jobs::place_made_as`]). A patch of the file before it ([`Made::Patch`]) goes as
     /// the patch where the path's record says it holds that file: the file is looked at
     /// first ([`Own::LookBase`]), since a file changed or removed since it was placed is no
-    /// base. Where the record names another value or none, the whole file is placed.
+    /// base. Where the record names another value or none, the whole file is placed, and so
+    /// it is on unshared volumes without exclusive file custody. On Windows an unshared
+    /// volume can patch the leased file: the driver checks the result's bytes before writing.
     fn place_made(
         &mut self,
         w: &mut World<'_, S>,
@@ -6868,6 +6914,7 @@ impl<S: Steps> Jobs<S> {
         made: Arc<Made>,
     ) {
         let based = match &*made {
+            Made::Patch { .. } if !cfg!(windows) && w.store.sharing() == blaze_core::Sharing::Unshared => false,
             Made::Patch { base, .. } => self.paths.placed[path as usize]
                 .as_ref()
                 .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
@@ -6934,6 +6981,9 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let tag = match (made, over) {
+            (Made::Patch { file: patch, whole, .. }, true) if w.store.sharing() == blaze_core::Sharing::Unshared => {
+                w.store.place_edit(file, patch.clone(), whole(), w.effects)
+            }
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
             (Made::Patch { file: patch, .. }, true) => {

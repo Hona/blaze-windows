@@ -63,7 +63,7 @@ use super::{
     files::Mounted,
     graph, reads, say, script,
 };
-use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, Put};
+use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, PhaseDone, Put};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -312,7 +312,7 @@ pub(crate) mod header {
         for _ in 0..natives {
             let hash: [u8; 32] = *read.array().ok()?;
             let path = read.str_u32().ok()?;
-            if file(std::path::Path::new(path))? != hash {
+            if file(&blaze_core::platform::path::host(path))? != hash {
                 return None;
             }
         }
@@ -1013,7 +1013,7 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
         .map_err(|error| error.what)?;
         // In place of its crate's identity as one part: what that identity is made of, so the
         // file, setting or dependency that changed is the one named.
-        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit, identity)?)?);
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
@@ -1566,7 +1566,7 @@ fn filed_in<'g>(
         &job.input.config.invocation.env,
         &|manifest| job.units().is_primary_manifest(manifest),
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
-        |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
+        |path| base_db::IncludedFile::content_now(&blaze_core::platform::path::host(path)),
         |slot| match store.get(guard, slot) {
             Ok(it) => it.map(|it| it.bytes),
             Err(error) => {
@@ -2019,7 +2019,7 @@ pub(crate) fn compile(
     unit: usize,
     phase: Phase,
     images: &mut Vec<Image>,
-) -> Result<Option<Compiled>, Failed> {
+) -> Result<PhaseDone, Failed> {
     let Some(slot) = job.phases.get(unit) else {
         // alloc: error path
         return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
@@ -2036,13 +2036,13 @@ pub(crate) fn compile(
         Phase::Store => span::UnitStore { krate, unit: unit_name }.open(),
     };
     match phase {
-        Phase::Names => names(job, reader, unit, slot)?,
+        Phase::Names => return names(job, reader, unit, slot),
         Phase::Bodies => bodies(job, reader, unit, slot)?,
         Phase::Codegen => generate(job, reader, unit, slot)?,
         Phase::Link => link(job, reader, unit, &mut lock(slot), images)?,
-        Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(Some),
+        Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(PhaseDone::Compiled),
     }
-    Ok(None)
+    Ok(PhaseDone::Continue)
 }
 
 /// A unit as its phase spans name it in `unit`: its package, the package's version and its
@@ -2083,16 +2083,27 @@ fn lock(slot: &Lock<Phases>) -> LockGuard<'_, Phases> {
 /// [`Phase::Names`]: the unit's record, replayed when the store keeps it; otherwise its
 /// lint flags, its crate's def map, what it does, and its check: served from the store, none
 /// (what a program reaches of the crate is type-checked by its walk), or of every body.
-fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Result<(), Failed> {
+fn names(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    slot: &Lock<Phases>,
+) -> Result<PhaseDone, Failed> {
     let kept = {
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
     };
-    if kept.is_none() {
-        let miss = missed(job, reader, unit);
-        lock(slot).misses.push(miss);
-    }
     if let Some(Kept { record, mut puts, profiles }) = kept {
+        // The compile record carries the program; the run's cache is independently keyed.
+        // A hit for the compiler must still set up this job's proof and look up its runs,
+        // otherwise a script proved pure only finds its result after a *compile miss*.
+        // A compiled Windows script also has an independently complete Cargo-rule key.
+        // Rewalking the MIR proof for every already-built program defeats that cache.
+        // Explicit verification still asks both how the run was proved and what it gave.
+        if job.unit(unit)?.target.is_custom_build() && !elided_unbuilt(job, unit)?
+            && (!cfg!(windows) || script::pure::verifies(job)? || script::rechecks(job)?) {
+            script::pure::unbuilt(job, reader, unit)?;
+        }
         puts.extend(library_puts(job));
         // What it said, drawn for this job's client from the files as they are: the record
         // holds no text drawn for the client of the build that made it.
@@ -2132,11 +2143,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             let _ = made.set(record.made);
         }
         lock(slot).kept = Some(compiled);
-        return Ok(());
+        return Ok(PhaseDone::ReplayedNames);
     }
     let u = job.unit(unit)?;
     if u.mode == Mode::Doctest {
-        return doctest::names(job, unit, slot);
+        let miss = missed(job, reader, unit);
+        lock(slot).misses.push(miss);
+        return doctest::names(job, unit, slot).map(|()| PhaseDone::Continue);
     }
     let krate = crate_of(job, unit, u)?;
     let db = reader.db();
@@ -2199,13 +2212,50 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
         },
     };
+    // No executable or check is required for a dependency script when every run was
+    // served by its purity proof. There is deliberately no compile record in this case:
+    // don't compute its miss explanation, collect its closure's reads, or file an empty
+    // program. A workspace check, a served diagnostic and a requested verification must
+    // still take their usual path.
+    if reached
+        && inert
+        && checking.is_none()
+        && diags.as_ref().is_some_and(Vec::is_empty)
+        && script::pure::built_nothing(job, unit)
+    {
+        if let Some(slot) = job.counted.get(unit) {
+            slot.get_or_init(Box::default);
+        }
+        if let Some(slot) = job.made.get(unit) {
+            slot.get_or_init(Made::default);
+        }
+        let served = Compiled {
+            diagnostics: Vec::new(),
+            ok: true,
+            open: false,
+            why: None,
+            puts: library_puts(job),
+            share: Vec::new(),
+            outputs: Vec::new(),
+            artifact: None,
+            macros: None,
+            gpu_msl: None,
+            links: Vec::new(),
+            misses: Vec::new(),
+        };
+        lock(slot).kept = Some(served);
+        // The purity proof supplied the result; names did not replay a compile record.
+        return Ok(PhaseDone::Continue);
+    }
+    let miss = missed(job, reader, unit);
     let unmounted =
         diags.as_deref().map_or_else(Vec::new, |diags| unmounted(reader, &job.mounted, diags));
     let mut phases = lock(slot);
+    phases.misses.push(miss);
     phases.does = Some(Does { inert, builds_code });
     (phases.checking, phases.diags, phases.unmounted, phases.items_broken) =
         (checking, diags, unmounted, items_broken);
-    Ok(())
+    Ok(PhaseDone::Continue)
 }
 
 /// The text of each file `diags` point into that no mount of the build holds (a build script's

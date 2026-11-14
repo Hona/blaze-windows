@@ -20,6 +20,7 @@ use crate::say;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Build,
+    Check,
     Run,
 }
 
@@ -28,6 +29,7 @@ impl Command {
     pub const fn name(self) -> &'static str {
         match self {
             Command::Build => "build",
+            Command::Check => "check",
             Command::Run => "run",
         }
     }
@@ -41,6 +43,8 @@ pub struct Asked {
     pub args: Vec<String>,
     pub quiet: bool,
     pub release: bool,
+    /// Package selectors as cargo's target selection receives them, in argument order.
+    pub packages: Vec<String>,
     /// `run`'s arguments of the program.
     pub program: Vec<OsString>,
 }
@@ -95,6 +99,7 @@ pub fn words(words: &[OsString]) -> Route {
     let command = match first.to_str() {
         Some("--version" | "-V") if rest.is_empty() => return Route::Version,
         Some("build" | "b") => Command::Build,
+        Some("check" | "c") => Command::Check,
         Some("run" | "r") => Command::Run,
         _ => return Route::Engine(Why::Command(shown(first))),
     };
@@ -103,11 +108,26 @@ pub fn words(words: &[OsString]) -> Route {
         args: Vec::new(), // alloc: once a command, its words
         quiet: false,
         release: false,
+        packages: Vec::new(),
         program: Vec::new(), // alloc: once a command, the program's arguments
     };
     let mut rest = rest.iter();
+    let mut locked = false;
     while let Some(word) = rest.next() {
         let text = word.to_str();
+        if matches!(text, Some("-p" | "--package")) {
+            let Some(package) = rest.next().and_then(|it| it.to_str()) else {
+                return Route::Engine(Why::Word(shown(word)));
+            };
+            // More complex package specs and patterns remain the full parser's.
+            if package.is_empty() || !package.starts_with(|c: char| c.is_ascii_alphanumeric())
+                || !package.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+                return Route::Engine(Why::Word(shown(word)));
+            }
+            asked.packages.push(package.to_owned());
+            asked.args.extend([shown(word), package.to_owned()]);
+            continue;
+        }
         // `run`'s program has the rest once its first argument comes (clap's
         // `trailing_var_arg`), the first `--` among them dropped; after a `--` it has all.
         let (program, drops) = match text {
@@ -119,7 +139,7 @@ pub fn words(words: &[OsString]) -> Route {
             }
         };
         if program {
-            if command == Command::Build {
+            if command != Command::Run {
                 return Route::Engine(match text {
                     Some("--") => Why::Trailing,
                     _ => Why::Word(shown(word)),
@@ -138,6 +158,7 @@ pub fn words(words: &[OsString]) -> Route {
         let flag = match text {
             Some("-q" | "--quiet") => &mut asked.quiet,
             Some("-r" | "--release") => &mut asked.release,
+            Some("--locked") => &mut locked,
             _ => return Route::Engine(Why::Word(shown(word))),
         };
         if *flag {
@@ -169,7 +190,7 @@ const HOME: &str = "BLAZE_HOME";
 pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
     for name in names {
         let refused = match name.to_str() {
-            Some(name) => refuses(name),
+            Some(name) => refuses(&blaze_core::platform::env::name(name)),
             // No variable blaze reads has a name that is not UTF-8; the request can't carry
             // one, which is the engine's to say.
             None => true,
@@ -183,7 +204,9 @@ pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
 
 /// Whether the variable `name` makes a command the engine's ([`env`]).
 pub fn refuses(name: &str) -> bool {
-    (name.starts_with("BLAZE_") && name != HOME)
+    // SCRIPT_READ and SCRIPT_CACHES are part of the invocation environment. Their checks and
+    // the sandbox grants stay in the daemon; the launcher neither parses them nor grants a path.
+    (name.starts_with("BLAZE_") && name != HOME && name != "BLAZE_SCRIPT_READ" && name != "BLAZE_SCRIPT_CACHES")
         || name == "IX_PROF"
         || name == "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"
 }
@@ -226,12 +249,15 @@ mod tests {
             other => panic!("{typed:?} is not the engine's: {other:?}"),
         };
         assert_eq!(engine(&[]), Why::NoCommand);
-        for first in ["test", "check", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
+        assert_eq!(asked(&["check"]).command, Command::Check);
+        for first in ["test", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
             assert_eq!(engine(&[first, "build"]), Why::Command(first.to_owned()), "{first}");
         }
         // `--version` with anything after it is blaze's cargo's own, which says the binary.
         assert_eq!(engine(&["--version", "-v"]), Why::Command("--version".to_owned()));
-        for word in ["-v", "--verbose", "-p", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
+        assert_eq!(engine(&["build", "-p"]), Why::Word("-p".into()));
+        assert_eq!(asked(&["check", "-p", "opencode-desktop"]).packages, ["opencode-desktop"]);
+        for word in ["-v", "--verbose", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
             "--manifest-path", "-Zscript", "--features", "--target", "--profile", "-j8", "--goal", "--refused", "--help", "-h"]
         {
             assert_eq!(engine(&["build", word]), Why::Word(word.to_owned()), "{word}");
@@ -256,7 +282,7 @@ mod tests {
     #[test]
     fn blazes_own_variables_are_the_engines_to_read() {
         let names = |names: &[&str]| env(os(names).into_iter());
-        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "CARGO_TERM_COLOR", "BLAZEX"]), None);
+        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "BLAZE_SCRIPT_READ", "CARGO_TERM_COLOR", "BLAZEX"]), None);
         for name in ["BLAZE_CORES", "BLAZE_PINNED_BY", "BLAZE_IGNORE_PIN_FOR", "BLAZE_RUN_AS_DEFAULT", "BLAZE_PROFILE",
             "BLAZE_STATS", "BLAZE_UI", "BLAZE_LAUNCHED", "IX_PROF", "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"]
         {

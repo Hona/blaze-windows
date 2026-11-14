@@ -89,7 +89,7 @@ fn workspace_of(from: &Path) -> Option<PathBuf> {
 /// The machine's name, as the `hostname` program prints it: std has no safe call for it, and
 /// this crate allows no `unsafe`.
 fn host() -> Result<String, String> {
-    let out = std::process::Command::new("hostname")
+    let out = blaze_core::platform::command::command("hostname", &std::env::temp_dir())
         .output()
         .map_err(|error| format!("running `hostname` to name this machine: {error}"))?;
     if !out.status.success() {

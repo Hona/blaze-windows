@@ -170,11 +170,13 @@ impl Image {
             .output
             .live
             .map(|_| blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode());
+        // A volume that shares no blocks has no clone to patch back: the file is written whole.
+        let full = undo.full || self.sharing == blaze_core::Sharing::Unshared;
         Ok(Writes {
-            full: undo.full,
+            full,
             len: undo.len,
             old_len: self.state.file_len,
-            writes: file::restore(&undo.state, undo.full, &undo.writes),
+            writes: file::restore(&undo.state, full, &undo.writes),
             message,
         })
     }

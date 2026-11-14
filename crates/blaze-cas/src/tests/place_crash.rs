@@ -23,6 +23,36 @@ use blaze_core::sim::SECTOR;
 
 use super::*;
 
+/// The invariant: an eligible edit writes its delta only. A file edited by another
+/// writer (same length) or absent after an interrupted lease is replaced whole; the
+/// same tag answers exactly once with the independent reference bytes in every case.
+#[hegel::test(test_cases = 64)]
+fn exclusive_edits_never_accept_a_wrong_base(tc: TestCase) {
+    let mut sim = Sim::new(tc.draw(gs::integers()), quiet());
+    let mut store = open_with(&mut sim, sharing_config(Sharing::Unshared));
+    let to = name("out/app");
+    let mode = tc.draw(gs::integers::<u8>().max_value(2));
+    if mode != 2 {
+        sim.change(&to, if mode == 0 { b"abcde" } else { b"abcdf" });
+    }
+    let x = tc.draw(gs::integers::<u8>());
+    let want = vec![b'a', x, b'c', b'd', b'e'];
+    let mut effects = Vec::new();
+    let tag = store.place_edit(to.clone(), Sparse { len: 5, runs: vec![(1, vec![x])] },
+        Sparse { len: 5, runs: vec![(0, want.clone())] }, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed.len(), 1);
+    assert_eq!(placed[0].tag, tag);
+    assert_eq!(placed[0].result, Ok(()));
+    assert_eq!(placed[0].bytes.copied, if mode == 0 { 1 } else { 5 });
+    assert_eq!(sim.contents(&to), want);
+    if mode == 0 {
+        sim.crash();
+        assert_eq!(sim.contents(&to), want, "a published lease is durable");
+    }
+}
+
 /// How long a derived value's file is, against its base's.
 #[derive(Clone, Copy, Debug)]
 enum Len {
@@ -58,6 +88,9 @@ enum Op {
 struct Case {
     seed: u64,
     latency_us: u64,
+    /// Whether the simulated volume shares blocks: where it does not, the simulation refuses
+    /// every clone ([`Faults::no_clone`]) and the store is told so ([`Config::sharing`]).
+    sharing: Sharing,
     ops: Vec<Op>,
 }
 
@@ -84,6 +117,7 @@ struct World {
     /// The store; none only while it is closed to be opened again.
     store: Option<Store>,
     plant: PlacePlant,
+    sharing: Sharing,
     effects: Vec<Effect>,
     values: Vec<Value>,
     /// What each path holds: none, or exactly these bytes. Changed only by a place that
@@ -103,13 +137,18 @@ fn path(n: usize) -> FileName {
 impl World {
     fn new(case: &Case, plant: PlacePlant) -> World {
         let latency = Duration::from_micros(case.latency_us);
-        let mut sim = Sim::new(case.seed, Faults { max_latency: latency, ..Faults::default() });
-        let mut store = open(&mut sim, "store");
+        let no_clone = case.sharing == Sharing::Unshared;
+        let mut sim = Sim::new(case.seed, Faults { max_latency: latency, no_clone, ..Faults::default() });
+        // Every write under `placed/` is recorded: on a volume that shares no blocks there is
+        // to be none.
+        sim.record(vec![name("store/placed")]);
+        let mut store = open_with(&mut sim, sharing_config(case.sharing));
         store.plant = plant;
         World {
             sim,
             store: Some(store),
             plant,
+            sharing: case.sharing,
             effects: Vec::new(),
             values: Vec::new(),
             holds: [None, None, None],
@@ -176,9 +215,17 @@ impl World {
                             placed.bytes
                         ));
                     }
+                    if self.sharing == Sharing::Unshared && placed.bytes.cloned != 0 {
+                        return Err(format!("{} was placed by a clone on a volume that shares no blocks: {:?}", PATHS[n], placed.bytes));
+                    }
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
                     self.last[n] = Some(value);
+                }
+                // A place on a volume that shares no blocks is one write of its bytes, which
+                // nothing here fails.
+                Err(why) if self.sharing == Sharing::Unshared => {
+                    return Err(format!("{} failed on a volume that shares no blocks: {why}", PATHS[n]));
                 }
                 // A place may fail (a full `placed/`): then its path is as it was.
                 Err(_) => {}
@@ -279,8 +326,13 @@ impl World {
     /// The store dropped, as its process ends, and opened again.
     fn open(&mut self) {
         self.store = None;
-        let mut store = open(&mut self.sim, "store");
+        // The planted open must run with its bug enabled during the placement sweep,
+        // not after the sweep has already removed the derived file under test.
+        let mut effects = Vec::new();
+        let mut store = Store::open(sharing_config(self.sharing), &mut effects);
         store.plant = self.plant;
+        drive(&mut self.sim, &mut store, &mut effects);
+        assert!(store.ready(), "{:?}", store.broken());
         self.store = Some(store);
     }
 
@@ -387,6 +439,12 @@ fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
         world.step(op).map_err(|why| format!("at op {n} ({op:?}): {why}"))?;
     }
     world.pump(None).map_err(|why| format!("at the end: {why}"))?;
+    if case.sharing == Sharing::Unshared && !world.sim.recorded().is_empty() {
+        return Err(format!(
+            "on a volume that shares no blocks the store wrote under placed/: {:?}",
+            world.sim.recorded()
+        ));
+    }
     Ok(world.sim.bytes_forced())
 }
 
@@ -430,6 +488,10 @@ fn case(tc: &TestCase) -> Case {
     Case {
         seed: tc.draw(gs::integers()),
         latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
+        sharing: match tc.draw(gs::booleans()) {
+            true => Sharing::Blocks,
+            false => Sharing::Unshared,
+        },
         ops: tc.draw(gs::vecs(op()).min_size(1).max_size(24)),
     }
 }
@@ -444,7 +506,10 @@ fn case(tc: &TestCase) -> Case {
 /// the power left of a place of one (nothing of a place is synced: any of the sectors of a
 /// value written where it goes, or a derived value's base with any of its ranges written),
 /// never bytes of anything else; (4) no clone the store asks for is of a file with data not written back,
-/// so no place waits for a write-back a clone forced; and the store opens.
+/// so no place waits for a write-back a clone forced; (5) on a volume that shares no blocks
+/// every place is one write of its value's file (a derived value's as its chain gives it):
+/// none fails, none is a clone (the simulation refuses every clone there) and nothing is
+/// written under `placed/`; and the store opens.
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn a_place_gives_its_values_bytes_whole_through_any_crash() {
@@ -475,7 +540,7 @@ fn place(value: u8, path: u8) -> Op {
 fn caught(ops: &[Op], seeds: std::ops::Range<u64>, plant: PlacePlant) -> Option<(u64, String)> {
     seeds.into_iter().find_map(|seed| {
         // clone: a test's ops, once a seed.
-        let case = Case { seed, latency_us: 300, ops: ops.to_vec() };
+        let case = Case { seed, latency_us: 300, sharing: Sharing::Blocks, ops: ops.to_vec() };
         assert_eq!(run(&case, PlacePlant::None), Ok(()), "seed {seed}: the store as it is must pass");
         run(&case, plant).err().map(|why| (seed, why))
     })
@@ -542,7 +607,7 @@ fn the_oracle_catches_a_clone_of_a_dirty_file_on_the_edit_path() {
     let ops = [whole(5), place(0, 0), derived, Op::Reopen, place(1, 0)];
     // The planted store's clone races its own write-back, so on some seed it comes first.
     let caught = (0..96).find_map(|seed| {
-        let case = Case { seed, latency_us: 300, ops: ops.to_vec() }; // clone: a test's ops.
+        let case = Case { seed, latency_us: 300, sharing: Sharing::Blocks, ops: ops.to_vec() }; // clone: a test's ops.
         assert_eq!(
             forced(&case, PlacePlant::None),
             Ok(0),
@@ -557,7 +622,7 @@ fn the_oracle_catches_a_clone_of_a_dirty_file_on_the_edit_path() {
     assert!(planted <= 9 * SECTOR as u64, "seed {seed}: {planted} bytes, more than its ranges");
     // The first place too: a whole file written and cloned from at once forces all of it.
     let ops = [whole(6), place(0, 0), place(0, 1)];
-    let case = Case { seed: 2, latency_us: 300, ops: ops.to_vec() }; // clone: a test's ops.
+    let case = Case { seed: 2, latency_us: 300, sharing: Sharing::Blocks, ops: ops.to_vec() }; // clone: a test's ops.
     assert_eq!(forced(&case, PlacePlant::None), Ok(0));
 }
 
@@ -900,6 +965,7 @@ fn a_derived_value_places_the_same_bytes_after_a_restart_as_a_whole_put_of_them(
                 tags: 3 << 40,
                 load_tags: (3 << 40) + (1 << 32),
                 loader: crate::Loader::Pumped,
+                sharing: blaze_core::Sharing::Blocks,
             },
         );
         other.put(key(3), Kind::Output, &gives).unwrap();

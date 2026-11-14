@@ -80,7 +80,7 @@ impl DebugProgram {
         let rows = (0..count)
             .map(|row| {
                 let at = (row * 3).min(size as u32 - 1);
-                (at, (seed + row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
+                (at, seed.wrapping_add(row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
             })
             .collect();
         let name = (seed % 7 != 6).then(|| format!("_RNvCs{n}_1f{}", "x".repeat(seed as usize % 3)));
@@ -401,6 +401,7 @@ fn input_of<'a>(
         functions,
         lines,
         given,
+        publics: None,
     }
 }
 
@@ -793,6 +794,7 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
@@ -829,6 +831,7 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());
@@ -858,6 +861,7 @@ fn an_executable_with_no_build_id_is_refused_by_name() {
         functions: &functions,
         lines: &lines,
         given: Given::All,
+        publics: None,
     };
     let read = |at: u64, out: &mut [u8]| {
         let from = (at as usize).min(exe.len());

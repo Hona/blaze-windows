@@ -246,6 +246,29 @@ impl B { fn get(&self) -> u8 { self.x as u8 } }
     assert_ne!(layout_hash(&db, adt(&db, "A")).unwrap(), a, "a field's field is in a layout");
 }
 
+/// A field declared through a projection with no parameter in it (bitflags'
+/// `struct Flags(<Flags as PublicFlags>::Internal)`) is in the interface and the layout as
+/// what it normalizes to: the impl's `type Internal = ..` and that type's fields. Two crates'
+/// `Flags` over a `u32` and a `u8` had one interface and one layout, and so one code for
+/// `#[derive(Clone)]`'s `*self` (rule 21). Control: the impl's other items stay out.
+#[test]
+fn a_projected_field_is_its_normalized_type() {
+    const SRC: &str = r#"
+trait PublicFlags { type Internal; }
+struct Flags(<Flags as PublicFlags>::Internal);
+struct Internal(u32);
+impl PublicFlags for Flags { type Internal = Internal; }
+impl Flags { fn get(&self) -> u8 { 1 } }
+"#;
+    let (mut db, file) = single(SRC);
+    let (flags, layout) = (of(&db, "Flags"), layout_hash(&db, adt(&db, "Flags")).unwrap());
+    edit(&mut db, file, &SRC.replace("{ 1 }", "{ 2 }"));
+    assert_eq!(of(&db, "Flags").interface, flags.interface, "a method is not the field's");
+    edit(&mut db, file, &SRC.replace("Internal(u32)", "Internal(u8)"));
+    assert_ne!(of(&db, "Flags").interface, flags.interface, "the normalized field's field");
+    assert_ne!(layout_hash(&db, adt(&db, "Flags")).unwrap(), layout, "and in the layout");
+}
+
 #[test]
 fn a_cycle_hashes_by_content() {
     let (mut db, file) = single(

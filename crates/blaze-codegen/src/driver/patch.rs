@@ -96,6 +96,8 @@ enum Item<I, S> {
 /// What a kept walk holds beside its nodes: what finds the changed set and what a change
 /// touches.
 pub(super) struct Keep<I, S> {
+    /// A whole walk with a consumer cannot be patched from its closed describes.
+    takes_world: bool,
     /// Every item the walk described, by its place in `graph`; `None` for a place given up.
     items: Vec<Option<Item<I, S>>>,
     /// Each function, by who asks for it, and each static, by its handle: what finds the
@@ -133,7 +135,8 @@ pub(super) struct Keep<I, S> {
 }
 
 /// The walk kept of one program: its inputs, its result, and its [`Keep`].
-pub(super) struct Walked<I, S> {
+pub(super) struct Walked<I, S, W> {
+    world: Option<W>,
     roots_in: Vec<(I, Origin)>,
     static_roots_in: Vec<S>,
     check_in: Vec<CheckRoot<I, S>>,
@@ -162,6 +165,7 @@ pub(super) struct Walked<I, S> {
 /// What a whole walk hands the build beside its result, for the walk to be kept
 /// ([`Build::keep_of`]): made only by a walk with no error.
 pub(super) struct Side<I, S> {
+    pub(super) closed: bool,
     pub(super) asked: HashMap<(I, Origin), InstanceKey>,
     pub(super) counted: Vec<((I, Origin), Counted)>,
     /// Every describe the walk's last round was given, by who asked.
@@ -438,7 +442,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         {
             return Err("the kept walk is of other roots or another policy");
         }
-        if walked.view != view {
+        // A front end with a changed set covers all writes, including durable ones.
+        // Re-loading the macro unit, for example, publishes a HIGH input even if not
+        // one library describe changes. The durable epoch alone proves no such change.
+        if walked.view != view && walked.seen.is_none() {
             return Err("a durable input was written since the kept walk");
         }
         if self.frontend.stopped() {
@@ -457,6 +464,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         // build is refused with the front end's reason (`refused`; rule no-fallback), and
         // the kept walk goes back as it was, so the refusal stands until its cause is gone.
         let seen = walked.seen;
+        if walked.keep.takes_world {
+            self.frontend.resume_world(
+                walked.world.as_ref().ok_or("the front end kept no world checkpoint")?,
+                seen.ok_or("the world checkpoint has no database view")?,
+            )?;
+        }
+        let describe_round = usize::from(walked.keep.takes_world);
         let named = match seen {
             Some(seen) => match self.frontend.changed_since(seen) {
                 Changed::Unknown(why) => {
@@ -542,7 +556,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Ok(Some(now)) => {
                         // alloc: once per describe, shared by the walk's node and the walk kept
                         let now = Arc::new(now);
-                        kept.keep(0, &it.asked, now.clone()); // clone: a reference count
+                        kept.keep(describe_round, &it.asked, now.clone()); // clone: a reference count
                         Some(now)
                     }
                     Err(_) => return Err("a describe failed"),
@@ -625,6 +639,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             work.described += 1;
             redescribed += 1;
+            if now.takes_world && !keep.takes_world {
+                return Err("a changed function takes the program's dyn facts");
+            }
             if !same_frame(&was, &now) {
                 return Err("a changed function is another's or is defined another way");
             }
@@ -707,7 +724,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // The functions an edit brought in: a few, run here where that is cheaper.
             static NEW: par::Small = par::Small::new("codegen walk: describe new functions");
             let described = par::map_small(&NEW, &functions, |(_, asked)| {
-                let described = self.described(asked, 0, &counts)?;
+                let described = self.described(asked, describe_round, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));
                 let each_build = self.frontend.each_build(&asked.0, &asked.1);
@@ -721,6 +738,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return Err("the front end gave no count of a new function");
                 };
                 let key = node.unit.instance.key();
+                if node.described.takes_world {
+                    return Err("a new function takes the program's dyn facts");
+                }
                 if keep.askers.contains_key(&key) {
                     return Err("a new function has a key the walk holds");
                 }
@@ -765,6 +785,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             structural = true;
         }
         self.frontend.reached(&told, &[]);
+
+        if keep.takes_world && (structural || recount) {
+            return Err("the closed walk's reachability changed");
+        }
 
         // What the roots reach now.
         let visited = keep.graph.visited;
@@ -1202,6 +1226,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
     ) -> Option<Keep<FrontInstance<B>, FrontStatic<B>>> {
         let mut keep = Keep {
+            takes_world: side.closed || side.described.iter().any(|(_, it)| it.takes_world),
             // alloc: per whole walk, one per item it described
             items: Vec::with_capacity(side.described.len() + side.statics.len()),
             functions: HashMap::with_capacity(side.described.len()),
@@ -1358,6 +1383,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     ) {
         let Some(kept) = self.kept else { return };
         let walked = Walked {
+            world: self.frontend.kept_world(),
             // clone: per build that keeps its walk, its roots
             roots_in: roots.to_vec(),
             static_roots_in: static_roots.to_vec(), // clone: as above

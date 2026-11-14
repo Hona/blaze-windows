@@ -4,13 +4,14 @@
 mod db;
 
 use blaze_codegen::{
-    Arch, BuiltId, Changes, CompiledFunction, Delta, Line, NativeLib, NativeLibKind, driver::Built,
+    Arch, BuiltId, Changes, CompiledFunction, Delta, Line, NativeLib, NativeLibKind, RawImport,
+    driver::Built,
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
-use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
 use hegel::generators as gs;
+use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
@@ -30,7 +31,142 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 }
 
 fn lib(name: &str, kind: NativeLibKind) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind, verbatim: false }
+    NativeLib { name: name.to_owned(), kind, verbatim: false, imports: Vec::new() }
+}
+
+fn import(symbol: &str, ordinal: Option<u16>, data: bool) -> RawImport {
+    RawImport { symbol: symbol.to_owned(), ordinal, data }
+}
+
+/// Native libraries belong to the crate, not to the scope or reachability of their wrapper.
+#[test]
+fn bodies_contribute_their_native_libraries() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+macro_rules! import { () => {
+    #[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" { fn PropVariantClear(p: *mut u8) -> i32; }
+} }
+fn clear(p: *mut u8) -> i32 { import!(); unsafe { PropVariantClear(p) } }
+const _: () = { fn nested() { #[link(name = "other")] extern "C" {} } };
+"#,
+    );
+    let krate = fixture::test_crate(db);
+    let mut libs = frontend.linked(krate, krate).unwrap();
+    libs.sort_by(|a, b| a.name.cmp(&b.name));
+    assert_eq!(
+        libs,
+        [
+            NativeLib {
+                name: "ole32.dll".into(),
+                kind: NativeLibKind::RawDylib,
+                verbatim: true,
+                imports: vec![import("PropVariantClear", None, false)],
+            },
+            lib("other", NativeLibKind::Dylib)
+        ]
+    );
+}
+
+/// A `raw-dylib` block's library lists its items as the code names them (a `link_name` over
+/// the item's name), by ordinal where `#[link_ordinal]` says, statics as data; another kind's
+/// lists none.
+#[test]
+fn a_raw_dylib_lists_the_items_of_its_block() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+#[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "system" {
+    fn GetLastError() -> u32;
+    #[link_name = "SetLastError"]
+    fn set_last_error(code: u32);
+}
+#[link(name = "bcryptprimitives", kind = "raw-dylib")]
+extern "system" {
+    #[link_ordinal(7)]
+    fn by_ordinal();
+    static Exported: u32;
+}
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW();
+}
+"#,
+    );
+    let mut libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
+    for lib in &mut libs {
+        lib.imports.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    }
+    let raw = |name: &str, verbatim, imports| NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::RawDylib,
+        verbatim,
+        imports,
+    };
+    assert_eq!(
+        libs,
+        [
+            raw(
+                "kernel32.dll",
+                true,
+                vec![import("GetLastError", None, false), import("SetLastError", None, false)]
+            ),
+            raw(
+                "bcryptprimitives",
+                false,
+                vec![import("Exported", None, true), import("by_ordinal", Some(7), false)]
+            ),
+            lib("user32", NativeLibKind::Dylib),
+        ]
+    );
+}
+
+/// A static of a DLL (a block whose first `#[link]` is a `dylib`, of no kind, or a
+/// `raw-dylib`) is reached through its import address table cell `__imp_X` on Windows, as
+/// rustc's `is_dllimport` has it; one of a `static` library or of a block that names none is
+/// the image's own, and so is every one on another target.
+#[test]
+fn a_dlls_static_is_reached_through_its_import_cell() {
+    let text = r#"
+#[link(name = "kernel32")]
+extern "C" { static IN_DYLIB: u32; }
+#[link(name = "ntdll.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+extern "C" { #[link_name = "RAW_NAME"] static IN_RAW: u32; }
+#[link(name = "own", kind = "static")]
+extern "C" { static IN_STATIC: u32; }
+extern "C" { static IN_NONE: u32; }
+"#;
+    let named = |db: &TestDB, name: &str| {
+        let id = hir_def::test_items::static_item(db, fixture::test_crate(db), name);
+        (crate::dll_imported(db, id), crate::v2::places::static_ref(db, id).unwrap())
+    };
+    let (db, _) = frontend(&format!("//- target: x86_64-pc-windows-msvc\n{text}"));
+    let symbol = |name: &str| blaze_codegen::backend::FrontRef::Extern(name.to_owned());
+    assert_eq!(named(db, "IN_DYLIB"), (true, symbol("__imp_IN_DYLIB")));
+    assert_eq!(named(db, "IN_RAW"), (true, symbol("__imp_RAW_NAME")));
+    assert_eq!(named(db, "IN_STATIC"), (false, symbol("IN_STATIC")));
+    assert_eq!(named(db, "IN_NONE"), (false, symbol("IN_NONE")));
+    let (db, _) = frontend(text);
+    assert_eq!(named(db, "IN_DYLIB"), (false, symbol("IN_DYLIB")));
+}
+
+/// An ordinal that is no 16-bit integer is an error naming it, as rustc's.
+#[test]
+fn an_ordinal_past_16_bits_is_an_error() {
+    let (db, frontend) = frontend(
+        r#"
+//- target: x86_64-pc-windows-msvc
+#[link(name = "k", kind = "raw-dylib")]
+extern "C" {
+    #[link_ordinal(65536)]
+    fn far();
+}
+"#,
+    );
+    let error = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
+    assert!(error.what.contains("`#[link_ordinal(65536)]` on `far`"), "{}", error.what);
 }
 
 /// A block's `wasm_import_module` names its imports' module, no library.
@@ -50,22 +186,53 @@ extern "C" {}
 extern "C" {}
 "#,
     );
-    let libs = frontend.linked(fixture::test_crate(&db)).unwrap();
+    let libs = frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap();
     assert_eq!(
         libs,
         [
             lib("z", NativeLibKind::Dylib),
             lib("ssl", NativeLibKind::Static { whole: true, bundle: false }),
             lib("Foundation", NativeLibKind::Framework),
-            NativeLib { name: "exact.so".to_owned(), kind: NativeLibKind::Dylib, verbatim: true },
+            NativeLib {
+                name: "exact.so".to_owned(),
+                kind: NativeLibKind::Dylib,
+                verbatim: true,
+                imports: Vec::new(),
+            },
         ]
     );
+}
+
+/// A `#[link(.., cfg(..))]` is decided by the cfg of the crate that links the program, not of
+/// the crate that names it, as rustc's `relevant_lib` decides it in the linking session: core,
+/// built without `+crt-static`, names `/defaultlib:libcmt` under `cfg(target_feature =
+/// "crt-static")` and `/defaultlib:msvcrt` under its negation, and a program built with
+/// `+crt-static` links the first (it linked the second, and the link refused it as LNK2038).
+#[test]
+fn a_links_cfg_is_the_linking_crates() {
+    let (db, frontend) = frontend(
+        r#"
+//- /dep.rs crate:dep
+#[link(name = "static_crt", cfg(target_feature = "crt-static"))]
+#[link(name = "dynamic_crt", cfg(not(target_feature = "crt-static")))]
+extern "C" {}
+//- /main.rs crate:main deps:dep cfg:target_feature=crt-static
+"#,
+    );
+    let main = fixture::test_crate(&db);
+    let dep = main.data(&*db).dependencies[0].crate_id;
+    assert_eq!(frontend.linked(dep, main).unwrap(), [lib("static_crt", NativeLibKind::Dylib)]);
+    // Control: linked by a crate without the feature, the block's other library.
+    assert_eq!(frontend.linked(dep, dep).unwrap(), [lib("dynamic_crt", NativeLibKind::Dylib)]);
 }
 
 #[test]
 fn a_link_blaze_cannot_make_is_an_error_naming_it() {
     for (text, named) in [
-        ("#[link(name = \"kernel32\", kind = \"raw-dylib\")]\nextern \"C\" {}", "raw-dylib"),
+        (
+            "#[link(name = \"kernel32\", kind = \"raw-dylib\")]\nextern \"C\" {}",
+            "`raw-dylib` links only on Windows",
+        ),
         ("#[link(name = \"m\", modifiers = \"+whole-archive\")]\nextern \"C\" {}", "whole-archive"),
         ("#[link(name = \"-Wl,-z\", kind = \"link-arg\")]\nextern \"C\" {}", "kind = \"link-arg\""),
         ("#[link(name = \"m\", modifiers = \"+as-needed\")]\nextern \"C\" {}", "+as-needed"),
@@ -84,7 +251,8 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ),
     ] {
         let (db, frontend) = frontend(text);
-        let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
+        let error =
+            frontend.linked(fixture::test_crate(&db), fixture::test_crate(&db)).unwrap_err();
         assert!(error.what.contains(named), "{text}: {}", error.what);
     }
 }
@@ -195,6 +363,40 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
         "names an item it could not look in: {}",
         error.what
     );
+}
+
+/// The vtable shim of a method that tracks its caller where the trait's declaration does not
+/// names the place of that declaration, which no item of the build is: rune's `hello` failed
+/// to link on it (INTEGRATION I56).
+#[test]
+fn a_vtable_shim_names_its_trait_methods_declaration() {
+    let (db, frontend) = frontend(
+        "pub trait T { fn by_value(self) -> u32; }\n\
+         pub struct S(u32);\n\
+         impl T for S {\n    #[track_caller]\n    fn by_value(self) -> u32 { self.0 }\n}\n",
+    );
+    let imp = hir_def::test_items::impls(db, fixture::test_crate(db))[0];
+    let method = imp
+        .impl_items(db)
+        .items
+        .iter()
+        .find_map(|&(_, item)| match item {
+            hir_def::AssocItemId::FunctionId(it) => Some(it),
+            _ => None,
+        })
+        .unwrap();
+    let declared = crate::declared_method(db, method);
+    assert_ne!(declared, method);
+    let hashes = &frontend.hashes;
+    let place = hashes.declaration(db, declared).unwrap();
+    let built = Built {
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: place }]))],
+        items: vec![item_key(db, ItemId::Function(method))],
+        debug_names: vec![(InstanceKey(ContentId([1; 32])), "{vtable}".to_owned())],
+        ..Built::default()
+    };
+    let inputs = frontend.link_inputs(&built).unwrap();
+    assert!(inputs.tables.iter().any(|it| it.anchor == place.anchor), "the declaration's table");
 }
 
 #[test]
@@ -336,12 +538,18 @@ impl Program {
             let owner = DefWithBodyId::FunctionId(func);
             let store = BodyStore::of(db, owner);
             let mut lines = vec![
-                Line { at: 0, span: hashes.span(db, owner, MirSpan::ExprId(store.root_expr())).unwrap() },
+                Line {
+                    at: 0,
+                    span: hashes.span(db, owner, MirSpan::ExprId(store.root_expr())).unwrap(),
+                },
                 Line { at: 1, span: hashes.declaration(db, func).unwrap() },
             ];
             if self.bodies[at].2 {
                 let pat = store.pat_ids().next().expect("the parameter's pattern");
-                lines.push(Line { at: 2, span: hashes.span(db, owner, MirSpan::PatId(pat)).unwrap() });
+                lines.push(Line {
+                    at: 2,
+                    span: hashes.span(db, owner, MirSpan::PatId(pat)).unwrap(),
+                });
             }
             let mut compiled = compiled(0, lines);
             compiled.key = self.key(at);
@@ -406,7 +614,9 @@ fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork
         if given.serial != serial {
             if given.base != Some(serial) {
                 if given.base.is_some() {
-                    return Err(format!("step {step} ({edit:?}): a change of a snapshot never given"));
+                    return Err(format!(
+                        "step {step} ({edit:?}): a change of a snapshot never given"
+                    ));
                 }
                 held.clear();
             }

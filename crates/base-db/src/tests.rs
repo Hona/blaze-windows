@@ -1056,6 +1056,26 @@ fn an_unreadable_included_file_keeps_its_error() {
     assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
 }
 
+/// A file outside the VFS is named as the daemon names it (`/C:/a/b.rs` on Windows) and read
+/// at the system's path of that name: on Windows `std::fs::read("/C:/..")` is os error 123,
+/// and every `include_str!(concat!(env!("X"), ".."))` of rune-desktop's font packs and plugin
+/// spec failed so. Control: read at the name as written, it fails on Windows.
+#[test]
+fn an_included_file_is_read_at_the_system_path_of_its_name() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-named-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("included.txt");
+    std::fs::write(&file, b"included").unwrap();
+    let named = blaze_core::platform::path::daemon(&file.canonicalize().unwrap()).unwrap();
+    let read = crate::IncludedFile::read_now(std::path::Path::new(&named));
+    assert_eq!(read.as_deref().ok(), Some(&b"included"[..]), "{named}: {read:?}");
+    if cfg!(windows) {
+        assert!(named.starts_with('/'), "the premise: a daemon name, {named}");
+        assert!(std::fs::read(&named).is_err(), "the name itself is no system path");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
 /// contents, some of which are not UTF-8.
 fn seeded_view(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
@@ -1410,6 +1430,53 @@ fn disk_module(db: &Db, krate: Crate) -> Option<(u32, u32)> {
 
 fn disk_module_runs() -> usize {
     DISK_MODULE_RUNS.with(Cell::get)
+}
+
+#[test]
+fn rechecking_outside_inputs_applies_only_changed_reads_in_path_order() {
+    let dir = std::env::temp_dir().join(format!("blaze-includes-batch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut db = Db::new(); // probe through the same pool as a daemon request
+    let mut moved = Vec::new();
+    for (name, new) in [("b", None), ("c", Some(&b"old"[..])), ("a", Some(&b"new"[..]))] {
+        let host = dir.join(name);
+        let name = blaze_core::platform::path::daemon(&host).unwrap();
+        let path = AbsPathBuf::try_from(name.as_str()).unwrap();
+        db.set_included_file(&path, std::sync::Arc::from(&b"old"[..]));
+        if let Some(bytes) = new {
+            std::fs::write(&host, bytes).unwrap();
+        }
+        if new != Some(&b"old"[..]) {
+            moved.push(path);
+        }
+    }
+    moved.sort();
+    assert_eq!(db.reload_included_files(Trigger::named("test changes")), moved);
+    assert!(db.reload_included_files(Trigger::named("test no-op")).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_outside_include_and_its_record_lookup_read_the_same_host_file() {
+    let host = std::env::temp_dir().join(format!("blaze-included-record-{}.rs", std::process::id()));
+    let named = blaze_core::platform::path::daemon(&host).unwrap();
+    let path = AbsPathBuf::try_from(named.as_str()).unwrap();
+    std::fs::write(&host, b"pub struct Private;").unwrap();
+    let mut db = Db::for_tests();
+    let lib = FileId::from_raw(0);
+    db.set_file_text_with_durability(lib, "", Durability::LOW);
+    db.set_file_source_root_with_durability(lib, SourceRootId(0), Durability::MEDIUM);
+    let mut set = FileSet::default();
+    set.insert(lib, VfsPath::from(AbsPathBuf::try_from("/src/lib.rs").unwrap()));
+    db.set_source_root_with_durability(SourceRootId(0), Arc::new(SourceRoot::new_local(set)), Durability::MEDIUM);
+    let mut graph = CrateGraphBuilder::default();
+    let id = add(&mut graph, lib, CfgOptions::default(), Env::default());
+    let krate = graph.set_in_db(&mut db)[&id];
+    let read = db.files().included_file(&db, krate, &path, Durability::LOW);
+    let key = read.content(&db);
+    assert_eq!(key, crate::IncludedFile::content_now(&host));
+    assert_eq!(read.bytes(&db).map(|it| &it[..]), Some(&b"pub struct Private;"[..]));
+    std::fs::remove_file(host).unwrap();
 }
 
 /// A module file outside every source root (crates/blaze-inproc-rt's `#[path]` into
@@ -2025,4 +2092,19 @@ fn the_oracle_catches_a_read_variable_that_changed() {
     let (changed, value) =
         changed_after_env(&[("FOO", "1"), ("UNRELATED", "a")], &[("FOO", "2"), ("UNRELATED", "a")]);
     assert_eq!((changed, value), (1, Some("2".to_owned())));
+}
+
+/// A file outside the VFS is read by the daemon's name of it (`/C:/a` on Windows, which the
+/// system reads as `\C:\a`, no path) where the system has it: `include_bytes!` of an absolute
+/// path a build script printed, or of one `..` above its crate.
+#[test]
+fn an_included_file_is_read_by_the_daemons_name_of_it() {
+    let dir = std::env::temp_dir().join(format!("blaze-base-db-read-now-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("font.ttf.zst");
+    std::fs::write(&file, b"\x28\xb5\x2f\xfd").unwrap();
+    let named = blaze_core::platform::path::daemon(&file).unwrap();
+    let read = crate::IncludedFile::read_now(std::path::Path::new(&named));
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(read.as_deref().ok(), Some(&b"\x28\xb5\x2f\xfd"[..]), "{named}");
 }

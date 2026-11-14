@@ -8,6 +8,26 @@ mod mapped;
 pub(crate) use mapped::map;
 pub use mapped::{Advice, MapOptions, Mapped};
 
+mod patch;
+pub(crate) use patch::matches_patch;
+#[cfg(windows)]
+pub(crate) use patch::{PATCH_PUBLICATION, PublishStep};
+
+pub(crate) fn sparse_file(path: &Path, len: u64) -> io::Result<()> {
+    let file = making_parent(path, || OpenOptions::new().write(true).create_new(true).open(path))?;
+    #[cfg(windows)]
+    crate::iocp::files::sparse_output(&file)?;
+    file.set_len(len)
+}
+#[cfg(windows)]
+pub(crate) use crate::iocp::files::try_patch;
+
+#[cfg(not(windows))]
+pub(crate) fn try_patch(_: &Path, _: u64, _: &[(u64, Vec<u8>)], _: &[(u64, Vec<u8>)]) -> io::Result<bool> {
+    // Unix advisory locks cannot exclude other writers or existing file mappings.
+    Ok(false)
+}
+
 mod private;
 
 pub(crate) use private::private;
@@ -309,39 +329,86 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 
 /// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
 /// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.sync_data()
 }
 
+/// [`crate::Effect::WriteBack`] on Windows: the file's dirty pages written out through a view
+/// of it mapped to read, which needs no handle to write (a file the store sealed read-only
+/// refuses one, os error 5) and flushes no drive cache: as Linux's `sync_file_range`, nothing
+/// is made durable. `FlushFileBuffers` (a handle to write, and the drive's cache flushed) cost
+/// 3 to 7 times as much and left a ReFS clone of the file no faster (measured on ReFS, 16 KiB
+/// to 64 MiB: a flush of a 16 KiB file 3.3 to 3.9 ms, through a view 0.3 ms; a clone of a
+/// file just written 0.6 ms, after either 0.44 to 0.59 ms). A file of no bytes has nothing to
+/// write and can't be mapped.
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "a read-only view of a file mapped, flushed and unmapped")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Memory::{
+            CreateFileMappingW, FILE_MAP_READ, FlushViewOfFile, MapViewOfFile, PAGE_READONLY,
+            UnmapViewOfFile,
+        },
+    };
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    // SAFETY: `file` is an open handle, borrowed for the call; the rest are no attributes, the
+    // whole file and no name.
+    let mapping = unsafe {
+        CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+    };
+    if mapping.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `mapping` is the mapping just made, of the whole file, to read.
+    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) };
+    let flushed = if view.Value.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `view` is the whole file's view, mapped above and not yet unmapped; a length
+        // of 0 flushes all of it. It is unmapped once, here, and read by nothing.
+        let flushed = match unsafe { FlushViewOfFile(view.Value, 0) } {
+            0 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        };
+        // SAFETY: as above.
+        unsafe { UnmapViewOfFile(view) };
+        flushed
+    };
+    // SAFETY: `mapping` is open and owned here, closed once.
+    unsafe { CloseHandle(mapping) };
+    flushed
+}
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
 #[cfg(target_os = "linux")]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     linux::sync_dir(path)
 }
 
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable (`sync_all`
 /// is `F_FULLFSYNC` on Apple's systems).
 #[cfg(all(any(unix, target_os = "wasi"), not(target_os = "linux")))]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+pub fn sync_dir(path: &Path) -> io::Result<()> {
     // durable: the effect is the sync its caller asked for.
     File::open(path)?.sync_all()
 }
 
-/// [`crate::Effect::SyncDir`] on Windows: not built. A directory's names are flushed there
-/// through a handle opened with backup semantics, which this driver does not open yet, and
-/// nothing stands in for it (rule no-fallback).
+/// [`crate::Effect::SyncDir`] on Windows: `FlushFileBuffers` of the directory, opened for
+/// writing with backup semantics (a directory opens with no other flag), which commits its
+/// entries' changes (NTFS and ReFS journal them) and flushes the device's cache.
 #[cfg(windows)]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        // alloc: an error path.
-        format!(
-            "Effect::SyncDir of {}: this driver has no directory sync on Windows yet \
-             (FlushFileBuffers of a directory handle), and nothing stands in for it",
-            path.display()
-        ),
-    ))
+pub fn sync_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, as `windows_sys` names it.
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let dir = OpenOptions::new().write(true).custom_flags(BACKUP_SEMANTICS).open(path)?;
+    // durable: the effect is the sync its caller asked for.
+    dir.sync_all()
 }
 
 /// `bytes` written at `at` of the file at `path`, which exists.
@@ -926,6 +993,28 @@ fn created_mode() -> io::Result<u32> {
     Ok(*MODE.get_or_init(|| mode))
 }
 
+/// The [`Stamp`] of the file at `path`, a link stamped and not followed, as a sweep stamps it
+/// ([`crate::Effect::Stamp`]): for what keeps what it made of a file under the file's stamp
+/// outside a sweep (the linker's reading of a C library's directives).
+pub fn stamp(path: &Path) -> io::Result<crate::Stamp> {
+    #[cfg(windows)]
+    return crate::iocp::stamp_path(path);
+    #[cfg(unix)]
+    return std::fs::symlink_metadata(path).map(|it| {
+        use std::os::unix::fs::MetadataExt as _;
+        let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+        crate::Stamp {
+            ino: it.ino(),
+            size: it.size(),
+            mtime_ns: ns(it.mtime(), it.mtime_nsec()),
+            ctime_ns: ns(it.ctime(), it.ctime_nsec()),
+            mode: it.mode(),
+        }
+    });
+    #[cfg(target_os = "wasi")]
+    return std::fs::symlink_metadata(path).map(|it| wasi::stamp_of(&it));
+}
+
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
 #[cfg(unix)]
 pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
@@ -1208,6 +1297,45 @@ mod tests {
                 0 => assert_eq!(stamp.size, (at % 7) as u64, "name {at}"),
                 _ => assert_eq!(*stamp, Stamp::GONE, "name {at}"),
             }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The invariant: a write-back of a file the store sealed read-only, its bytes still in
+    /// the cache, succeeds and leaves it sealed and as it was; of a file of no bytes too; of
+    /// none, the typed error. The control, the cause put back: a handle to write, which
+    /// `FlushFileBuffers` needs, is refused on the sealed file.
+    #[test]
+    fn a_sealed_file_is_written_back_and_stays_sealed() {
+        let root = std::env::temp_dir().join(format!("blaze-fs-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (path, empty) = (root.join("sealed"), root.join("empty"));
+        let bytes: Vec<u8> = (0..300_000u32).map(|it| it as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        for it in [&path, &empty] {
+            let mut sealed = std::fs::metadata(it).unwrap().permissions();
+            sealed.set_readonly(true);
+            std::fs::set_permissions(it, sealed).unwrap();
+        }
+        write_back(&path).unwrap();
+        write_back(&empty).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(write_back(&root.join("none")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let refused = OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(5), "{refused}");
+        for it in [&path, &empty] {
+            let mut open = std::fs::metadata(it).unwrap().permissions();
+            #[expect(clippy::permissions_set_readonly_false, reason = "the test's own files, removed")]
+            open.set_readonly(false);
+            std::fs::set_permissions(it, open).unwrap();
         }
         std::fs::remove_dir_all(root).unwrap();
     }

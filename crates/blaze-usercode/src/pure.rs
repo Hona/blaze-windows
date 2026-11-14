@@ -48,7 +48,13 @@ pub struct Proof {
 
 /// What a pure run is given beside its identity: nothing but that it is one, so a pure key is
 /// never a sandboxed run's.
-const GIVEN: &[u8] = b"blaze v2 pure build script 1";
+// Old Windows shapes could record None for a present, differently cased variable; even
+// when it really is absent now their kept answer cannot be trusted. Leave them unreachable.
+const GIVEN: &[u8] = if cfg!(windows) {
+    b"blaze v2 pure build script 2 Windows environment block"
+} else {
+    b"blaze v2 pure build script 1"
+};
 
 /// The run key a pure script's result is kept under: its identity, the roles of its roots
 /// ([`crate::roots`]), and nothing else given. Its working directory is its package, whose

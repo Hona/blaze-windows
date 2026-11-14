@@ -2777,7 +2777,20 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     }
 
     fn lower_literal_to_operand(&mut self, ty: Ty<'db>, l: &Literal) -> Result<'db, Operand> {
+        let word = self.word()?;
         let size = || {
+            // The representation of a machine numeric literal follows from its primitive
+            // type and target word, both already inputs to lowering. Asking for a general
+            // layout instead adds an environment-dependent read to otherwise reusable MIR.
+            let bits = match ty.kind() {
+                TyKind::Int(int) if !matches!(int, rustc_type_ir::IntTy::Bits(_)) => Some(int.bit_width()),
+                TyKind::Uint(uint) if !matches!(uint, rustc_type_ir::UintTy::Bits(_)) => Some(uint.bit_width()),
+                TyKind::Float(float) => Some(Some(float.bit_width())),
+                _ => None,
+            };
+            if let Some(bits) = bits {
+                return Ok(bits.map_or(word, |width| (width / 8) as usize));
+            }
             self.db
                 .layout_of_ty(
                     ty.store(),
@@ -2787,7 +2800,6 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         // A reference to `len` bytes, whose address the memory map gives: two words of the
         // target.
-        let word = self.word()?;
         let fat = |len: usize| -> Box<[u8]> {
             [word_bytes(0, word), word_bytes(len, word)].concat().into()
         };
@@ -3403,14 +3415,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             // reference in a generic function; not promoted, the vtable was a slot of the frame
             // the function returned a reference to, and the borrow checker refused it (E0515).
             [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }] => {
-                matches!(
-                    self.store.expr(expr),
-                    Expr::Closure { closure_kind: ClosureKind::Closure, .. }
-                ) && self
-                    .infer
-                    .closures_data
-                    .get(&expr)
-                    .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+                self.infer.constant_closure_pointer(expr)
             }
             // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
             // rustc's `promote_consts::Validator::validate_rvalue`.

@@ -1172,8 +1172,12 @@ fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
     let used = file_rounds(&mut threads, ROUNDS);
     assert_eq!(used, 0, "threads: {ROUNDS} warm Sync, Stat and Read cycles, on the polling thread");
     let (off, payload) = threads.off_thread();
+    // std on Windows copies each path it opens into a heap `Vec<u16>` (`to_u16s`), where Unix's
+    // takes a stack buffer: four a cycle there (the Sync's open, the Stat's two calls, the
+    // Read's open), each a malloc beside a system call that costs a thousand times more.
+    let copies = if cfg!(windows) { 4 } else { 0 };
     assert!(
-        off - payload <= ROUNDS,
+        off - payload <= ROUNDS * (1 + copies),
         "threads: the file thread made {} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only",
         off - payload
     );

@@ -478,7 +478,21 @@ pub(crate) fn library_narrowed(db: &Db, krate: Crate) -> bool {
 /// [`library_key`]: asked only where the store has none.
 #[blaze_query::tracked(returns(copy))]
 pub(crate) fn library_narrow(db: &Db, krate: Crate) -> OwnNarrow {
-    let edition = krate.data(db).edition;
+    let data = krate.data(db);
+    let edition = data.edition;
+    // Each file's parse is independent. The reduction below reads the resulting memos
+    // in path order, including when the database leaves the work to those readers.
+    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+    let set = root.source_root_ref(db);
+    let rust: Vec<_> = set.iter().filter(|file| set.path_for_file(file)
+        .and_then(|p| p.as_path()).is_some_and(|p| p.as_str().ends_with(".rs"))).collect(); // alloc: once per cold library
+    if rust.len() >= 16 {
+        db.run_all(blaze_mem::Tag::Parse, rust.len().div_ceil(8), |db, batch| {
+            for &file in &rust[batch * 8..rust.len().min((batch + 1) * 8)] {
+                whole_code_text(db, EditionedFileId::new(db, file, edition));
+            }
+        });
+    }
     narrow_from(
         db,
         krate,

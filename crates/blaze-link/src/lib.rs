@@ -80,8 +80,8 @@ pub use lazy::{LazyPlacer, Slots};
 pub use patch::Patch;
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
-    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
-    Undefined,
+    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, NoDefaultLibs, Output, OutputKind,
+    PeArgs, PeFlag, Platform, Undefined,
 };
 pub use position::{
     COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
@@ -380,6 +380,8 @@ pub struct Image {
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
+    /// Whether the image's volume can clone it ([`Image::set_sharing`]).
+    sharing: blaze_core::Sharing,
 }
 
 impl Image {
@@ -437,7 +439,7 @@ impl Image {
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
         }
-        if output.debug == Debug::Beside && !matches!(output.format, Format::Elf | Format::MachO)
+        if output.debug == Debug::Beside && output.format == Format::Wasm
         {
             // alloc: error path
             return Err(fail(format!(
@@ -497,7 +499,51 @@ impl Image {
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
             beside: beside::Kept::new(),
+            sharing: blaze_core::Sharing::Blocks,
         })
+    }
+
+    /// The import library of a Windows DLL as its last commit left it: what rustc writes beside a
+    /// `cdylib` as `<name>.dll.lib` (link.exe's `/IMPLIB`), for programs that link against the
+    /// DLL. One short import member per export, by name, a data export (`DATA`) reached only
+    /// through `__imp_`. `None` for any other image; an error before the first commit.
+    pub fn import_library(&self) -> Result<Option<Vec<u8>>, LinkError> {
+        let OutputKind::Shared { name, .. } = &self.output.kind else { return Ok(None) };
+        if self.output.format != Format::Pe {
+            return Ok(None);
+        }
+        if !self.state.laid_out {
+            return Err(LinkError {
+                function: None,
+                // alloc: error path
+                what: format!("{}: an import library before the DLL's first commit", self.to),
+                refusal: None,
+            });
+        }
+        let mut exports: Vec<&model::Export> = self.state.exports.iter().collect();
+        exports.sort_by(|a, b| a.name.cmp(&b.name));
+        // alloc: once per import library, an import per export
+        let imports: Vec<blaze_codegen::RawImport> = exports
+            .iter()
+            .map(|it| blaze_codegen::RawImport {
+                // clone: the import library's own names
+                symbol: it.name.clone(),
+                ordinal: None,
+                data: !matches!(it.kind, model::SymbolKind::Function),
+            })
+            .collect();
+        pe::raw_dylib::import_library(name, &imports)
+            .map(Some)
+            .map_err(|what| LinkError { function: None, what, refusal: None })
+    }
+
+    /// Whether the volume the image is written on can clone it ([`blaze_core::platform::volume`]
+    /// of its directory): with [`blaze_core::Sharing::Blocks`] (the default) a commit of a stage
+    /// that placed into the room the image kept clones the image and writes what changed; with
+    /// [`blaze_core::Sharing::Unshared`] (NTFS) no clone exists, and every commit and rollback
+    /// writes the whole file. A commit never asks for a clone the volume refuses.
+    pub fn set_sharing(&mut self, sharing: blaze_core::Sharing) {
+        self.sharing = sharing;
     }
 
     /// Places and relocates what `change` says, in parallel, into address space not yet
@@ -774,6 +820,12 @@ impl Image {
     ) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
+        // On a volume whose files share no blocks there is no clone of the image to patch: the
+        // file is written whole, and the history undoes it whole ([`Image::set_sharing`]).
+        if !staged.writes.full && self.sharing == blaze_core::Sharing::Unshared {
+            staged.writes.writes = file::whole(&staged.state);
+            staged.writes.full = true;
+        }
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
         let revert = self.take(staged.state, full, staged.undo);
@@ -1153,6 +1205,10 @@ impl Image {
                 }
             }
             views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+            // A PDB's publics: given again only when the native code may have changed.
+            let version = state.resolved.natives_version;
+            let publics = (format == Format::Pe && self.beside.pdb_natives() != Some(version))
+                .then(|| (version, state.resolved.native_functions(state)));
             let input = beside::Input {
                 format,
                 name: &self.name,
@@ -1161,6 +1217,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
+                publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1173,6 +1230,9 @@ impl Image {
             views.push(piece)?;
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        // A PDB names native code by its objects' names; DWARF's side file does not.
+        let version = state.resolved.natives_version;
+        let publics = (format == Format::Pe).then(|| (version, state.resolved.native_functions(state)));
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1181,6 +1241,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
+            publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);

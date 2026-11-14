@@ -107,6 +107,7 @@ pub fn untraceable_name(it: Untraceable) -> &'static str {
         Untraceable::Random => "random",
         Untraceable::Network => "network",
         Untraceable::Descriptor => "descriptor",
+        Untraceable::CargoDeclared => "cargo-declared",
     }
 }
 
@@ -116,6 +117,7 @@ pub fn untraceable_of(name: &str) -> Option<Untraceable> {
         "random" => Untraceable::Random,
         "network" => Untraceable::Network,
         "descriptor" => Untraceable::Descriptor,
+        "cargo-declared" => Untraceable::CargoDeclared,
         _ => return None,
     })
 }
@@ -674,14 +676,25 @@ impl Keyer {
         untraceable: impl IntoIterator<Item = &'t Untraceable>,
     ) {
         for (path, hash) in files {
-            self.file(&os_bytes(path.as_os_str()), hash.as_ref());
+            self.put(b"f");
+            os_part(path.as_os_str(), |bytes| self.put(bytes));
+            match hash {
+                Some(hash) => { self.put(&[1]); self.put(hash); }
+                None => self.put(&[0]),
+            }
         }
         for (path, hash) in dirs {
-            self.dir(&os_bytes(path.as_os_str()), hash);
+            self.put(b"d");
+            os_part(path.as_os_str(), |bytes| self.put(bytes));
+            self.put(hash);
         }
         for (name, value) in env {
-            let value = value.as_deref().map(os_bytes);
-            self.env(&os_bytes(name), value.as_deref());
+            self.put(b"e");
+            os_part(name, |bytes| self.put(bytes));
+            match value {
+                Some(value) => { self.put(&[1]); os_part(value, |bytes| self.put(bytes)); }
+                None => self.put(&[0]),
+            }
         }
         for it in untraceable {
             self.untraceable(untraceable_name(*it).as_bytes());
@@ -745,6 +758,35 @@ pub fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
     {
         Cow::Borrowed(name.as_encoded_bytes())
     }
+}
+
+/// A length-prefixed `os_bytes` without allocating the UTF-16 representation on every hit.
+/// The two passes count code units (not Rust string bytes), then stream them little-endian.
+fn os_part(name: &OsStr, mut put: impl FnMut(&[u8])) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let bytes = (name.encode_wide().count() as u64) * 2;
+        put(&bytes.to_le_bytes());
+        let mut buf = [0u8; 256];
+        let mut len = 0;
+        for unit in name.encode_wide() {
+            buf[len..len+2].copy_from_slice(&unit.to_le_bytes());
+            len += 2;
+            if len == buf.len() { put(&buf); len = 0; }
+        }
+        if len != 0 { put(&buf[..len]); }
+    }
+    #[cfg(not(windows))]
+    {
+        let bytes = os_bytes(name);
+        put(&(bytes.len() as u64).to_le_bytes());
+        put(&bytes);
+    }
+}
+
+pub(crate) fn hash_os(hasher: &mut Hasher, name: &OsStr) {
+    os_part(name, |bytes| { hasher.update(bytes); });
 }
 
 /// The name [`os_bytes`] gave `bytes` of, or why they are not one. The bytes come from the
@@ -1376,5 +1418,21 @@ mod tests {
         }
         #[cfg(unix)]
         assert!(matches!(os_bytes(OsStr::new("a")), Cow::Borrowed(b"a")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn streamed_os_parts_are_the_persisted_utf16_even_at_buffer_boundaries() {
+        use std::os::windows::ffi::OsStringExt as _;
+        for len in [0, 1, 127, 128, 129, 1024] {
+            let mut units = vec![0x1234; len];
+            units.extend_from_slice(&[0xd800, 0x1234, 0xdc00]); // unpaired surrogates are legal OS strings
+            let name = OsString::from_wide(&units);
+            let mut old = Hasher::new("test OS argument");
+            old.part(&os_bytes(&name));
+            let mut streamed = Hasher::new("test OS argument");
+            hash_os(&mut streamed, &name);
+            assert_eq!(old.finish(), streamed.finish());
+        }
     }
 }

@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
 use blaze_api::units::Installed;
 use blaze_core::wait::{self, Deadline, Monotonic, Waited};
 
@@ -46,10 +47,12 @@ pub struct Homes {
 
 impl Homes {
     /// Of `home` when one is named (`BLAZE_HOME`'s meaning: the socket and the state are both
-    /// in it), else of the environment `var` reads: the socket as the CLI finds it, the state
-    /// under blaze's root (`$BLAZE_HOME`, else `$XDG_CACHE_HOME/blaze`, else `~/.cache/blaze`,
-    /// as `blaze_manifest::home::root`). An empty variable is unset.
-    pub fn of(home: Option<&Path>, var: impl Fn(&str) -> Option<OsString>) -> Result<Homes, String> {
+    /// in it), else of the environment `var` reads: the socket and the state under blaze's root
+    /// as `blaze_core::platform::home` finds them. An empty variable is unset.
+    pub fn of(
+        home: Option<&Path>,
+        var: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Homes, String> {
         let set = |name: &str| var(name).filter(|it| !it.is_empty()).map(PathBuf::from);
         let absolute = |dir: PathBuf| {
             std::path::absolute(&dir).map_err(|error| {
@@ -65,17 +68,12 @@ impl Homes {
                 home: Some(home),
             });
         }
-        let user = set("HOME").or_else(|| set("USERPROFILE"));
-        let Some(user) = user else {
-            return Err(
-                "no BLAZE_HOME or HOME says where blaze's daemon listens and keeps its state".to_owned()
-            );
-        };
-        let runtime = set("XDG_RUNTIME_DIR").map(|it| it.join("blaze"));
-        let cache = set("XDG_CACHE_HOME").map(|it| it.join("blaze"));
-        let socket = runtime.unwrap_or_else(|| user.join(".cache/blaze")).join("v2.sock");
-        let state = cache.unwrap_or_else(|| user.join(".cache/blaze")).join("v2");
-        Ok(Homes { socket: absolute(socket)?, state: absolute(state)?, home: None })
+        let found = blaze_core::platform::home::homes(var)?;
+        Ok(Homes {
+            socket: absolute(found.socket)?,
+            state: absolute(found.root.join("v2"))?,
+            home: None,
+        })
     }
 }
 
@@ -94,7 +92,13 @@ pub enum StartError {
     /// The daemon said something on its ready pipe that is no part of a start.
     Said { what: String },
     /// It was started and did not say it listens by the deadline.
-    NotListening { socket: PathBuf, log: PathBuf, pid: u32, doing: &'static str, inside: Option<String> },
+    NotListening {
+        socket: PathBuf,
+        log: PathBuf,
+        pid: u32,
+        doing: &'static str,
+        inside: Option<String>,
+    },
     /// It was started and closed its ready pipe before it listened: `ended` is how its process
     /// ended, when it had.
     Ended { socket: PathBuf, log: PathBuf, pid: u32, doing: &'static str, ended: Option<String> },
@@ -301,8 +305,9 @@ pub fn program(
             _ => Err(StartError::NoBlaze { looked: vec![named.to_owned()] }),
         };
     }
-    let beside = this.and_then(Path::parent).map(|it| it.join("blaze"));
-    let on_path = path.into_iter().flat_map(std::env::split_paths).map(|it| it.join("blaze"));
+    let name = if cfg!(windows) { "blaze.exe" } else { "blaze" };
+    let beside = this.and_then(Path::parent).map(|it| it.join(name));
+    let on_path = path.into_iter().flat_map(std::env::split_paths).map(|it| it.join(name));
     // alloc: once a start, the places looked at, for its error.
     let mut looked = Vec::new();
     for candidate in beside.into_iter().chain(on_path) {
@@ -318,10 +323,12 @@ pub fn program(
 /// daemon that is gone left.
 pub fn nothing_listens(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+        || (cfg!(windows) && error.raw_os_error() == Some(10050)) // AF_UNIX missing socket: WSAENETDOWN
 }
 
 /// Starts the daemon of `homes` with the program `blaze` and waits, at most until `deadline`
 /// on `clock`, for it to say it listens.
+#[cfg(unix)]
 pub fn daemon(
     homes: &Homes,
     blaze: &Path,
@@ -333,7 +340,9 @@ pub fn daemon(
         os::{
             fd::AsRawFd as _,
             unix::{
-                fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+                fs::{
+                    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+                },
                 process::CommandExt as _,
             },
         },
@@ -359,7 +368,11 @@ pub fn daemon(
     let state = &homes.state;
     // alloc: error path texts below, each made once a start.
     let named = format!("the daemon's directory {}", state.display());
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(state).map_err(failed(named.clone()))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state)
+        .map_err(failed(named.clone()))?;
     let is = std::fs::symlink_metadata(state).map_err(failed(named.clone()))?;
     if !is.is_dir() || is.uid() != blaze_api::activation::uid() {
         let why = if is.is_dir() { "belongs to another user" } else { "is not a directory" };
@@ -379,8 +392,8 @@ pub fn daemon(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&log)
         .map_err(failed(logged.clone()))?;
-    let (mut ready, said) =
-        std::io::pipe().map_err(failed("making the pipe the daemon says it listens on".to_owned()))?;
+    let (mut ready, said) = std::io::pipe()
+        .map_err(failed("making the pipe the daemon says it listens on".to_owned()))?;
     let fd = said.as_raw_fd();
     // `Command::new`, as the CLI's own start of the daemon: the program is `blaze`, not a
     // tool of the toolchain, and its working directory is this process's, as the CLI's.
@@ -411,7 +424,8 @@ pub fn daemon(
     let mut bytes = [0u8; 1024];
     // Bounded: each turn reads at least one byte, or ends; every wait is to `deadline`.
     loop {
-        let mut watched = [libc::pollfd { fd: ready.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let mut watched =
+            [libc::pollfd { fd: ready.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
         let waited = wait::readable(
             "the daemon it started to say it listens",
             &mut watched,
@@ -458,21 +472,72 @@ pub fn daemon(
     }
 }
 
+/// Use the engine's one Windows detached launcher: it restricts the inherited handles,
+/// enforces the home ACL and job boundary, and hears the ready pipe before it returns.
+#[cfg(windows)]
+pub fn daemon(
+    homes: &Homes,
+    blaze: &Path,
+    deadline: Deadline,
+    clock: &Monotonic,
+) -> Result<(), StartError> {
+    use std::os::windows::io::AsRawHandle as _;
+    let failed = |error| StartError::Io {
+        what: format!("starting {} for {}", blaze.display(), homes.socket.display()),
+        error,
+    };
+    let mut cmd = blaze_core::platform::command::command(
+        blaze,
+        std::env::current_dir().map_err(failed)?.as_path(),
+    );
+    cmd.args(["status", "--start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    if let Some(home) = &homes.home {
+        cmd.env("BLAZE_HOME", home);
+    }
+    let mut child = cmd.spawn().map_err(failed)?;
+    match wait::signaled(
+        "the daemon starter to hear the ready pipe",
+        child.as_raw_handle(),
+        deadline.finite(),
+        clock,
+    )
+    .map_err(|e| failed(io::Error::other(e)))?
+    {
+        Waited::Ready(()) => {
+            let status = child.wait().map_err(failed)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(failed(io::Error::other(format!("status --start: {status}"))))
+            }
+        }
+        Waited::Deadline => {
+            child.kill().map_err(failed)?;
+            child.wait().map_err(failed)?;
+            Err(failed(io::Error::new(io::ErrorKind::TimedOut, "waiting for daemon startup")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_named_home_holds_the_socket_and_the_state() {
-        let homes = Homes::of(Some(Path::new("/h")), |_| None).unwrap();
-        assert_eq!(homes.socket, Path::new("/h/v2.sock"));
-        assert_eq!(homes.state, Path::new("/h/v2"));
-        assert_eq!(homes.home.as_deref(), Some(Path::new("/h")));
+        let h = std::env::temp_dir().join("h");
+        let homes = Homes::of(Some(&h), |_| None).unwrap();
+        assert_eq!(homes.socket, h.join("v2.sock"));
+        assert_eq!(homes.state, h.join("v2"));
+        assert_eq!(homes.home.as_ref(), Some(&h));
     }
 
     /// The socket is where the CLI finds it and the state where the daemon keeps it: the
     /// runtime directory holds the one, the cache directory the other.
     #[test]
+    #[cfg(unix)]
     fn the_environment_places_the_socket_and_the_state_as_the_cli_does() {
         let var = |pairs: &'static [(&str, &str)]| {
             move |name: &str| {

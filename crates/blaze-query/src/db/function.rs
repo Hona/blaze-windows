@@ -211,13 +211,7 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
     let storage = db.storage();
     let id = key.as_id();
     let clock = storage.clock();
-    let dir = storage.dir(F::ingredient().index());
-    if !dir.is_null() {
-        // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
-        // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long
-        // as the storage.
-        let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
-        if let Some(page) = NonNull::new(page) {
+    if let Some(page) = NonNull::new(storage.row_page(F::ingredient().index(), id)) {
             // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
             let row = unsafe { RowOf::<F>::at(page, id.slot()) };
             if u64::from(row.header.verified.load(Ordering::Acquire)) == clock {
@@ -226,7 +220,6 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
                 // published in this view and no writer may start in it (`row`'s rule 2).
                 return unsafe { row.value() };
             }
-        }
     }
     fetch_cold::<F>(db, key)
 }
@@ -240,14 +233,7 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
 pub fn durable<F: Function>(db: &F::Db, key: F::Key) -> bool {
     let storage = db.storage();
     let id = key.as_id();
-    let dir = storage.dir(F::ingredient().index());
-    if dir.is_null() {
-        return false;
-    }
-    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
-    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long
-    // as the storage. As [`fetch`].
-    let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
+    let page = storage.row_page(F::ingredient().index(), id);
     let Some(page) = NonNull::new(page) else { return false };
     // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
     let row = unsafe { RowOf::<F>::at(page, id.slot()) };
@@ -990,14 +976,7 @@ fn member_header(storage: &Storage, member: Member) -> Option<&Header> {
 pub(crate) fn header_of(storage: &Storage, ingredient: u32, id: Id) -> Option<&Header> {
     let member = Member { ingredient, id: id.as_u32() };
     let size = ingredient::vtable(member.ingredient)?.row_size;
-    let dir = storage.dir(member.ingredient);
-    if dir.is_null() {
-        return None;
-    }
-    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
-    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long as
-    // the storage.
-    let page = NonNull::new(unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire))?;
+    let page = NonNull::new(storage.row_page(member.ingredient, id))?;
     // SAFETY: the page is the member function's, made with rows of `size` bytes.
     Some(unsafe { row::header_at(page, id.slot(), size) })
 }

@@ -37,6 +37,14 @@ impl Programs for Fake {
 /// A package `foo` with a lib, a bin and a test `x`, each tested, and its doc tests; out of
 /// cargo's order.
 pub(crate) fn built() -> Vec<Artifact> {
+    built_in("/w")
+}
+
+/// [`built`] of a workspace at `w`, as the daemon names it.
+pub(crate) fn built_in(w: &str) -> Vec<Artifact> {
+    let artifact = |package, kind, name, test, exe| {
+        crate::cli::run::tests::artifact_in(w, package, kind, name, test, exe)
+    };
     vec![
         artifact("foo", "test", "x", true, Some("deps/x-4567")),
         artifact("foo", "lib", "foo", false, None),
@@ -48,6 +56,13 @@ pub(crate) fn built() -> Vec<Artifact> {
         artifact("foo", "lib", "foo", true, Some("deps/foo-0123abcd")),
         artifact("foo", "bin", "foo", false, Some("foo")),
     ]
+}
+
+/// `said` with each `target/debug/deps/` as this system shows a path from the workspace:
+/// cargo shows `target\debug\deps\...` on Windows.
+fn deps(said: &str) -> String {
+    let shown = ["target", "debug", "deps", ""].iter().collect::<std::path::PathBuf>();
+    said.replace("target/debug/deps/", &shown.display().to_string())
 }
 
 fn asked(command: Command, words: &[&str]) -> Invocation {
@@ -104,11 +119,12 @@ fn executables_in_cargos_order() {
             "unittests src/main.rs (target/debug/deps/foo-89ab)",
             "tests/x.rs (target/debug/deps/x-4567)",
         ]
+        .map(deps)
     );
     assert_eq!(docs.len(), 1);
     assert_eq!(
         running(tests[0], Path::new("/w"), Kind::Bench),
-        "benches src/lib.rs (target/debug/deps/foo-0123abcd)"
+        deps("benches src/lib.rs (target/debug/deps/foo-0123abcd)")
     );
 }
 
@@ -120,9 +136,11 @@ fn every_one_passes() {
     assert_eq!(code, 0);
     assert_eq!(
         err,
-        "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n     Running unittests \
-         src/main.rs (target/debug/deps/foo-89ab)\n     Running tests/x.rs (target/debug/deps/x-4567)\n   \
-         Doc-tests foo\n"
+        deps(
+            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n     Running unittests \
+             src/main.rs (target/debug/deps/foo-89ab)\n     Running tests/x.rs (target/debug/deps/x-4567)\n   \
+             Doc-tests foo\n"
+        )
     );
     let first = &fake.ran[0];
     assert_eq!(first.program, Path::new("/w/target/debug/deps/foo-0123abcd"));
@@ -141,7 +159,7 @@ fn fail_fast_stops_at_the_first_failed_test_executable() {
     assert_eq!(fake.ran.len(), 1);
     assert_eq!(
         err,
-        "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\nerror: test failed, to rerun pass `--lib`\n"
+        deps("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)\nerror: test failed, to rerun pass `--lib`\n")
     );
 }
 
@@ -264,9 +282,11 @@ fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
     let verbose = Speaking { verbose: 1, ..speaking() };
     run(&asked(Command::Test, &[]), &[doc], &[], 1, verbose, &mut err, &mut Fake::default())
         .unwrap();
+    // The program as the system names it, as cargo says it.
+    let program = blaze_core::platform::path::host("/w/target/debug/deps/my_lib-doctests");
     assert_eq!(
         String::from_utf8(err).unwrap(),
-        "   Doc-tests my-lib\n     Running `/w/target/debug/deps/my_lib-doctests`\n"
+        format!("   Doc-tests my-lib\n     Running `{}`\n", program.display())
     );
 }
 
@@ -350,8 +370,10 @@ fn no_run_lists_the_executables() {
     assert!(fake.ran.is_empty());
     assert_eq!(
         err,
-        "  Executable unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n  Executable unittests \
-         src/main.rs (target/debug/deps/foo-89ab)\n  Executable tests/x.rs (target/debug/deps/x-4567)\n"
+        deps(
+            "  Executable unittests src/lib.rs (target/debug/deps/foo-0123abcd)\n  Executable unittests \
+             src/main.rs (target/debug/deps/foo-89ab)\n  Executable tests/x.rs (target/debug/deps/x-4567)\n"
+        )
     );
 }
 

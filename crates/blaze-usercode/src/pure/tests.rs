@@ -60,6 +60,13 @@ fn a_pure_key_is_its_identity_and_never_a_sandboxed_runs() {
     other.identity = ContentId::of("blaze v2 test 1", b"another script");
     assert_ne!(one, run_key(&other, &roots().view()));
     assert_eq!(one.code, proof().identity);
+    #[cfg(windows)]
+    {
+        let mut old = Given::new(RunKind::BuildScript);
+        old.part("pure", b"blaze v2 pure build script 1");
+        old.roots(&roots().view());
+        assert_ne!(one.given, old.finish(), "never look up legacy case-sensitive shapes");
+    }
     assert_ne!(
         one.given,
         Given::new(RunKind::BuildScript).finish(),
@@ -423,7 +430,7 @@ impl Inputs for Fixed {
 
 fn opened(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);

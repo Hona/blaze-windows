@@ -1458,7 +1458,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     let args = self.invoke_arguments(ty, sig, dfg.inst_args(inst))?;
                     let call =
                         self.builder.build_direct_invoke(callee, &args, returned, pad, "")?;
-                    return self.finish_guarded(call, sig, dfg.inst_results(inst), returned, pad);
+                    return self.finish_guarded(call, sig, inst, returned, pad);
                 }
                 let args = self.arguments(ty, sig, dfg.inst_args(inst))?;
                 let call = self.builder.build_direct_call(callee, &args, "")?;
@@ -1476,7 +1476,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     let args = self.invoke_arguments(ty, sig, args)?;
                     let call =
                         self.builder.build_indirect_invoke(ty, callee, &args, returned, pad, "")?;
-                    return self.finish_guarded(call, sig, dfg.inst_results(inst), returned, pad);
+                    return self.finish_guarded(call, sig, inst, returned, pad);
                 }
                 let args = self.arguments(ty, sig, args)?;
                 let call = self.builder.build_indirect_call(ty, callee, &args, "")?;
@@ -2780,12 +2780,15 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
     /// Has a guarded call go on in one block whichever way it came back, as Cranelift's
     /// does: with what it returned, or with the exception in the slot, which is what the
-    /// code after the call looks at.
+    /// code after the call looks at. A call whose pad stops the unwind (`catch_unwind`'s,
+    /// `unwind::seh::is_catching`) has a pad that catches anything (`catch ptr null`),
+    /// which LLVM's table says by an action (`Code::pads_coff` reads it); any other's only
+    /// cleans up.
     fn finish_guarded(
         &mut self,
         call: CallSiteValue<'ctx>,
         sig: &Signature,
-        results: &[Value],
+        inst: ir::Inst,
         returned: BasicBlock<'ctx>,
         pad: BasicBlock<'ctx>,
     ) -> Lowered<()> {
@@ -2800,14 +2803,21 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         self.builder.position_at_end(pad);
         let pointer = context.ptr_type(AddressSpace::default());
         let exception = context.struct_type(&[pointer.into(), context.i32_type().into()], false);
-        // The personality enters the pad for whatever is thrown, with no say of the pad's.
-        let landed = self.builder.build_landing_pad(exception, personality, &[], true, "")?;
+        let catches = unwind::seh::is_catching(self.func.srcloc(inst));
+        let landed = match catches {
+            true => {
+                let anything = pointer.const_null().into();
+                self.builder.build_landing_pad(exception, personality, &[anything], false, "")?
+            }
+            false => self.builder.build_landing_pad(exception, personality, &[], true, "")?,
+        };
         let payload = self.builder.build_extract_value(landed.into_struct_value(), 0, "")?;
         self.builder.build_store(arrival, payload)?;
         self.builder.build_unconditional_branch(after)?;
 
         self.builder.position_at_end(after);
-        for (&result, value) in std::iter::zip(results, values) {
+        let func = self.func;
+        for (&result, value) in std::iter::zip(func.dfg.inst_results(inst), values) {
             let ty = value.get_type();
             let phi = self.builder.build_phi(ty, "")?;
             phi.add_incoming(&[(&value, returned), (&ty.const_zero(), pad)]);

@@ -454,3 +454,22 @@ fn agrees_on_any_number(tc: TestCase) {
     let src = tc.draw(gs::from_regex("0[box]?[0-9a-f_.]{0,6}(e[+-]?[0-9]{0,2})?[a-z_0-9]{0,3}"));
     agrees(&src);
 }
+
+/// rustc reads a source file with each `\r\n` as `\n`: a string across a CRLF line end, a `\`
+/// that continues one and a byte string are no error, and an error after a CRLF is at its byte
+/// in the file. A `\r` of no `\r\n` is still a bare CR.
+#[test]
+fn a_literal_across_a_crlf_line_end_is_read_with_lf() {
+    assert_eq!(as_read("a\r\nb"), "a\nb");
+    assert_eq!(raw_offset("a\r\nb\\q", 3), 4, "`\\` after the CRLF");
+    assert_eq!(raw_offset("ab", 1), 1);
+    for src in ["\"a\r\nb\"", "\"e\\\r\n    f\"", "b\"g\r\nh\"", "c\"i\r\nj\""] {
+        let (cooked, errors) = cook(src).unwrap();
+        assert!(errors.is_empty(), "{src:?}: {errors:?}");
+        assert!(cooked.unwrap().0 != LitKind::Err, "{src:?}");
+    }
+    let (_, errors) = cook("\"a\r\n\\qb\"").unwrap();
+    assert_eq!(errors, [CookError::new(4..6, "unknown character escape: `q`")]);
+    let (_, errors) = cook("\"a\rb\"").unwrap();
+    assert_eq!(errors.len(), 1, "a bare CR: {errors:?}");
+}

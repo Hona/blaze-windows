@@ -83,9 +83,7 @@ pub fn find(cwd: &Path, manifest_path: Option<&str>) -> Result<Place, String> {
 
 /// A path as the API carries it.
 pub fn utf8(path: &Path) -> Result<String, String> {
-    path.to_str().map(str::to_owned).ok_or_else(|| {
-        format!("the path {} is not UTF-8, which a request to the daemon can't carry", path.display())
-    })
+    blaze_core::platform::path::daemon(path).map_err(|why| why.to_string())
 }
 
 /// Reads `path` onto `files` unless it is not there; a file already among them is not read
@@ -142,39 +140,20 @@ pub fn clippy_files(place: &Place) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(files)
 }
 
-/// An environment, sorted by name. A variable that is not UTF-8 is refused by its name alone:
-/// its value is never shown.
+/// An environment as a request carries it ([`blaze_core::platform::env::captured`]).
 pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(String, String)>, String> {
-    // alloc: the request's environment, once a command.
-    let mut env = Vec::with_capacity(vars.size_hint().0);
-    let refused = |named: &str| {
-        format!("the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry")
-    };
-    for (name, value) in vars {
-        match (name.into_string(), value.into_string()) {
-            (Ok(name), Ok(value)) => env.push((name, value)),
-            (Ok(name), Err(_)) => return Err(refused(&name)),
-            (Err(name), _) => return Err(refused(&name.to_string_lossy())),
-        }
-    }
-    env.sort_unstable();
-    Ok(env)
+    blaze_core::platform::env::captured(vars)
 }
 
-/// The environment a command is sent with: `given` when the caller named one, sorted, else
-/// this process's, read here.
+/// The environment a command is sent with: `given` when the caller named one, else this
+/// process's, read here; either carried alike ([`blaze_core::platform::env`]).
 pub fn env_of(given: Option<&[(String, String)]>) -> Result<Vec<(String, String)>, String> {
     match given {
-        Some(given) => {
-            // clone: the request owns its environment.
-            let mut env = given.to_vec();
-            env.sort_unstable();
-            Ok(env)
-        }
+        // clone: the request owns its environment.
+        Some(given) => Ok(blaze_core::platform::env::carried(given.to_vec())),
         None => env(std::env::vars_os()),
     }
 }
-
 /// cargo's home in `env`: `CARGO_HOME` (against `cwd` when relative), else `.cargo` in `HOME`.
 pub fn cargo_home(env: &[(String, String)], cwd: &Path) -> Option<PathBuf> {
     let set = |name: &str| {
@@ -187,7 +166,7 @@ pub fn cargo_home(env: &[(String, String)], cwd: &Path) -> Option<PathBuf> {
 }
 
 /// The columns of the terminal stderr is; `None` when it is none.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn stderr_columns() -> Option<u16> {
     crate::sys::stderr_columns()
 }

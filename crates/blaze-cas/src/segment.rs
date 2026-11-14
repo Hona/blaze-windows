@@ -201,7 +201,7 @@ impl Drop for Chunk {
 }
 
 /// A chunk of a segment, by address.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ChunkRef(NonNull<Chunk>);
 
 // SAFETY: a chunk is `Sync`; a reference is dereferenced only while its chunk is alive (see

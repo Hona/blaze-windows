@@ -27,6 +27,26 @@ use crate::{
 
 const BASE: ContentId = ContentId([5; 32]);
 
+#[test]
+fn an_impl_from_a_macro_in_a_const_block_loads_its_methods_dependencies() {
+    super::check_number(r#"
+//- minicore: sized
+//- /emit.rs crate:emit
+#[macro_export]
+macro_rules! make { ($name:ty) => { impl $name { pub const fn data() -> u32 { other::make() } } }; }
+//- /other.rs crate:other
+pub trait Marker { type Data; }
+pub struct Key;
+impl Marker for Key { type Data = u32; }
+const VALUE: <Key as Marker>::Data = 37;
+pub const fn make() -> u32 { VALUE }
+//- /caller.rs crate:caller deps:emit,other
+pub struct Table;
+const _: () = { emit::make!(Table); };
+const GOAL: u32 = Table::data();
+"#, 37);
+}
+
 const FIXTURE: &str = r#"
 //- minicore: coerce_unsized, slice
 //- /main.rs crate:main deps:lib new_source_root:local

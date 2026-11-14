@@ -21,6 +21,7 @@
 mod clock;
 mod env;
 mod files;
+pub(crate) mod host;
 mod random;
 pub(crate) mod target;
 

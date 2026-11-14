@@ -5,6 +5,8 @@
 //!
 //! - `[update]`: blaze's own updates (crates/blaze-engine/src/update.rs).
 //! - `[terminal]`: what stderr's terminal does (crates/blaze-cargo/src/cli/terminal.rs).
+//! - `[sandbox]`: the machine's library directories every build script may name
+//!   (`build-script-link-dirs`, crates/blaze-cargo/src/directives.rs).
 //!
 //! Not `home::root`: that is where the daemon keeps its state and the build directories
 //! (`$BLAZE_HOME`, else a cache directory), which a user may delete; this is where what blaze
@@ -13,19 +15,18 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home (`HOME`, `USERPROFILE` on
-/// Windows). None when no variable names one; the caller says what needed it.
+/// blaze's home: `$BLAZE_HOME`, else `%LOCALAPPDATA%\blaze` on Windows, else `.blaze` in
+/// `$HOME` (`blaze_core::platform::home`). None when no variable names one; the caller says
+/// what needed it.
 pub fn home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    Some(user_home()?.join(".blaze"))
+    blaze_core::platform::home::homes(|name| std::env::var_os(name)).ok().map(|it| it.home)
 }
 
-/// The user's home directory (`HOME`, `USERPROFILE` on Windows), none when unset or empty.
-pub fn user_home() -> Option<PathBuf> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home))
+/// The home blaze has without `BLAZE_HOME`: what every home of the machine shares (its
+/// toolchains). None when no variable names one.
+pub fn machine_home() -> Option<PathBuf> {
+    let var = |name: &str| (name != "BLAZE_HOME").then(|| std::env::var_os(name)).flatten();
+    blaze_core::platform::home::homes(var).ok().map(|it| it.home)
 }
 
 /// `config.toml` under `home`.

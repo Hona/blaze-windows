@@ -948,11 +948,19 @@ fn uplifted_on_windows() {
             format!("{dest}/foo.dll.lib"),
             format!("{out}/foo.dll.exp"),
             format!("{dest}/foo.dll.exp"),
-            format!("{out}/foo.pdb"),
-            format!("{dest}/foo.pdb"),
+            format!("{out}/foo.dll.pdb"),
+            format!("{dest}/foo.dll.pdb"),
             format!("{out}/foo.d"),
         ]
     );
+    // A cdylib and a bin of one package share a crate name: the DLL's PDB is named for the
+    // DLL, so the two PDBs are two paths (INTEGRATION I45: cargo's `foo.pdb` for both).
+    let cdylib = TargetKind::Lib(vec![CrateType::Cdylib, CrateType::Rlib]);
+    let lib = files(msvc, hash::CompileMode::Build, &cdylib, "luau-panel", None, true);
+    let bin = files(msvc, hash::CompileMode::Build, &TargetKind::Bin, "luau-panel", None, true);
+    assert!(lib.contains(&format!("{dest}/luau_panel.dll.pdb")), "{lib:?}");
+    assert!(bin.contains(&format!("{dest}/luau_panel.pdb")), "{bin:?}");
+    assert!(lib.iter().all(|it| !bin.contains(it) || it.ends_with(".d")), "{lib:?} {bin:?}");
     let gnu = "x86_64-pc-windows-gnu";
     let gnu_out = format!("/w/build/{gnu}/debug/build/app/{H}/out");
     assert_eq!(
@@ -964,6 +972,34 @@ fn uplifted_on_windows() {
             format!("/w/target/{gnu}/debug/libfoo.dll.a"),
         ]
     );
+}
+
+/// A library that lists a `cdylib` or `staticlib` beside its rlib (rav1d's `["staticlib",
+/// "rlib"]`, betteroffice's `["cdylib", "rlib"]`) has the files of its rlib alone where the build
+/// only depends on it, and every crate type's where it is asked for.
+#[test]
+fn a_dependency_with_an_rlib_plans_only_the_rlib() {
+    let msvc = "x86_64-pc-windows-msvc";
+    let out = format!("/w/build/{msvc}/debug/build/app/{H}/out");
+    for other in [CrateType::Cdylib, CrateType::Staticlib, CrateType::Dylib] {
+        let kind = TargetKind::Lib(vec![other.clone(), CrateType::Rlib]);
+        assert_eq!(
+            files(msvc, hash::CompileMode::Build, &kind, "foo", Some(H), false),
+            [
+                format!("{out}/libfoo-{H}.rlib"),
+                format!("{out}/libfoo-{H}.rmeta"),
+                format!("{out}/foo-{H}.d"),
+            ],
+            "{other}"
+        );
+        // Control: asked for, it has the other crate type's file too.
+        let asked = files(msvc, hash::CompileMode::Build, &kind, "foo", Some(H), true);
+        let suffix = match other {
+            CrateType::Staticlib => format!("foo-{H}.lib"),
+            _ => format!("foo-{H}.dll"),
+        };
+        assert!(asked.contains(&format!("{out}/{suffix}")), "{other}: {asked:?}");
+    }
 }
 
 /// A directory of the test's own under the system's temporary one, removed after.

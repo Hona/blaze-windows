@@ -604,18 +604,24 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     let make = |sandboxed: bool| Binary {
         id: artifact.content,
         name: program.clone(),
-        program: PathBuf::from(program),
+        program: blaze_core::platform::path::host(program),
         env: env.clone(),
         dir: manifest_dir.clone(),
         read: vec![
-            PathBuf::from(&config.invocation.root),
-            PathBuf::from(&units.target_dir),
+            blaze_core::platform::path::host(&config.invocation.root),
+            blaze_core::platform::path::host(&units.target_dir),
             manifest_dir.clone(),
         ],
         write: Vec::new(),
         network: false,
         memory: None,
-        mode: TestMode::Process,
+        // Windows has no fork, so no fork server: a binary's tests run whole, as libtest's
+        // threads in one process, each result the binary's.
+        mode: if cfg!(windows) {
+            TestMode::Threads { args: Vec::new(), timeout: TIMEOUT }
+        } else {
+            TestMode::Process
+        },
         jobs: Vec::new(),
         loaded: loaded.clone(),
         sandboxed,
@@ -915,11 +921,29 @@ impl Runs<Real> for TestRun {
                     }
                 }
             }
-            binaries.push(binary);
-            self.suite_of.push(at);
-            if let Some(outside) = outside {
-                binaries.push(outside);
-                self.suite_of.push(at);
+            for binary in std::iter::once(binary).chain(outside) {
+                // A binary run whole is started with its tests' names: where a command line
+                // has a length it can't pass, it is as many runs as its names need.
+                let runs = match blaze_core::platform::command::LONGEST_LINE {
+                    Some(longest) => binary.whole_runs(longest),
+                    None => Ok(vec![binary]),
+                };
+                match runs {
+                    Ok(runs) => {
+                        for run in runs {
+                            binaries.push(run);
+                            self.suite_of.push(at);
+                        }
+                    }
+                    Err(what) => {
+                        self.ok = false;
+                        out.push(Response::Diagnostic(super::say::refused(
+                            what,
+                            None,
+                            super::compile::drawing(&job).color,
+                        )));
+                    }
+                }
             }
         }
         // The run's sockets and records go under the daemon's state. The queue names them to the

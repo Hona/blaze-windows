@@ -137,7 +137,7 @@ pub fn planned(artifact: &Artifact, program_args: &[OsString], cwd: &Path) -> Re
             artifact.target.name
         ));
     };
-    let shown = shown_exe(&super::place::host_path(executable), cwd);
+    let shown = shown_exe(&blaze_core::platform::path::host(executable), cwd);
     Ok(Exec::of(artifact, shown, program_args.iter().cloned(), cwd.to_owned()))
 }
 
@@ -257,7 +257,8 @@ pub struct Told {
 
 /// cargo's `exec_replace`: on Unix this process becomes the program, which ends the command as
 /// it ends (with its code, or by its signal); elsewhere it waits for it and exits with its code,
-/// saying nothing of it under `-q` (`to_run_error`).
+/// saying nothing of it under `-q` (`to_run_error`): on Windows held in a job of its own that
+/// ends with this process, the console's Ctrl-C the program's ([`crate::raw::process::run_held`]).
 // dyn: the CLI's output writer, written once per program run.
 pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
     let mut command = exec.command();
@@ -268,7 +269,11 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
     }
     #[cfg(not(unix))]
     {
-        match command.status() {
+        #[cfg(windows)]
+        let ran = crate::raw::process::run_held(&mut command);
+        #[cfg(not(windows))]
+        let ran = command.status();
+        match ran {
             Err(error) => never_executed(exec, &error, err, told),
             Ok(status) => match say::Ended::of(status) {
                 say::Ended::Code(0) => 0,

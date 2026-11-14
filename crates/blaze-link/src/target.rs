@@ -53,6 +53,7 @@
 
 #[cfg(test)]
 mod tests;
+mod coff_requests;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -65,6 +66,7 @@ use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
+use blaze_core::Stamp;
 use blaze_core::lock::Lock;
 use smallvec::SmallVec;
 use std::alloc::Global;
@@ -82,6 +84,9 @@ pub struct Located {
     /// names it is matched against.
     pub name: String,
     pub kind: NativeKind,
+    /// A file the link made rather than found (a `raw-dylib`'s import library): its content's
+    /// id and its bytes, which no path on the machine holds. `path` is then only its name.
+    pub made: Option<(ContentId, Arc<[u8]>)>,
 }
 
 /// The main thread's stack where the format says it: link.exe's default, which rustc keeps,
@@ -103,6 +108,12 @@ const MACOS_MINIMUM: u32 = 0x000b_0000;
 /// The domain a linker script's bytes are named in for the engine's reader.
 const SCRIPT: &str = "blaze v2 link target script";
 
+/// The domain the object of a link's resources is named in ([`crate::pe::rsrc`]).
+const RESOURCES: &str = "blaze v2 link target resources";
+
+/// The domain the object of the delay-load tail merge is named in ([`crate::pe::delay`]).
+const TAIL_MERGE: &str = "blaze v2 link target delay tail merge";
+
 /// The domain a PE archive's bytes are named in for what its members ask for.
 const ASKED: &str = "blaze v2 link target default libraries";
 
@@ -121,7 +132,14 @@ const LINKED: &str = "x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch
                       wasm64-blaze-wasip1";
 
 /// The process's answers of the machine's toolchains.
-static CACHE: Cache = Cache::new();
+static CACHE: Cache<'static> = Cache::new();
+
+/// Bind COFF request records to the daemon's verified store and the code identity covering
+/// its linker. Standalone links need no store. No records are opened until a link asks.
+pub fn keep_coff_requests(store: &'static blaze_cas::Handle, producer: ContentId) -> Result<(), String> {
+    CACHE.records.set(coff_requests::Records { store, producer })
+        .map_err(|_| "the linker's COFF request store was already installed".into())
+}
 
 /// How `triple` links: an executable, or the shared library `shared` names (its file name and
 /// exports) for a `cdylib` or proc macro. `incremental` keeps room to grow in the image, where
@@ -149,6 +167,8 @@ pub fn output(
 /// (the link arguments').
 #[derive(Clone, Copy, Debug)]
 pub struct CrateLibs<'a> {
+    /// The crate whose compile supplied these libraries (the final crate for link arguments).
+    pub name: &'a str,
     pub libs: &'a [NativeLib],
     pub search: &'a [PathBuf],
 }
@@ -432,6 +452,11 @@ fn locate_with<A: Ask>(
         found: &found,
         out: Vec::with_capacity(libs.iter().map(|it| it.libs.len()).sum::<usize>() + 8),
         listings: RefCell::default(),
+        // alloc: none until a `.res` is on the line
+        resources: Vec::new(),
+        resources_at: 0,
+        // alloc: none until an archive asks for a default library
+        defaulted: Vec::new(),
     };
     for name in target.start(&output.kind)? {
         line.object(name)?;
@@ -439,9 +464,31 @@ fn locate_with<A: Ask>(
     for (path, kind) in runtimes {
         line.push(path, kind)?;
     }
-    for CrateLibs { libs, search: own } in libs {
+    if target == Target::Msvc {
+        vc_runtime(output.link.pe.crt_static, libs)?;
+    }
+    // Each DLL `raw-dylib`s name, and where its import library goes on the line: the place of
+    // the first to name it.
+    let mut dlls: Vec<(usize, crate::pe::raw_dylib::Dll)> = Vec::new();
+    for CrateLibs { libs, search: own, .. } in libs {
         for lib in *libs {
+            if lib.kind == NativeLibKind::RawDylib {
+                raw_dylib(&mut line, &mut dlls, lib)?;
+                continue;
+            }
             if !lib.verbatim && target.provided_by_rust(&lib.name) {
+                continue;
+            }
+            if target == Target::Msvc
+                && lib.verbatim
+                && let Some(library) = crate::pe::verbatim_option(&lib.name)
+            {
+                let library = library.map_err(fail)?;
+                line.default(&library).map_err(|it| LinkError {
+                    // alloc: error path
+                    what: format!("the native library `{}`: {}", lib.name, it.what),
+                    ..it
+                })?;
                 continue;
             }
             let own: &[PathBuf] = match lib.kind {
@@ -451,13 +498,111 @@ fn locate_with<A: Ask>(
             line.library(&lib.name, lib.kind, lib.verbatim, own)?;
         }
     }
+    for input in &output.link.inputs {
+        line.input(input)?;
+    }
+    line.make_resources()?;
+    // `/DELAYLOAD`'s tail merge, which every delay-loaded function's first call goes through
+    // ([`crate::pe::delay`]); `delayimp.lib`, which the arguments give as link.exe needs them
+    // to, defines the helper it calls.
+    if target == Target::Msvc && !output.link.pe.delay_load.is_empty() {
+        let bytes: Arc<[u8]> = crate::pe::delay::tailmerge_object().into();
+        line.out.push(Located {
+            path: PathBuf::from(crate::pe::delay::TAILMERGE),
+            // alloc: once per link with delay-loads, what errors call the made object
+            name: "the link's delay-load tail merge".to_owned(),
+            kind: NativeKind::Object,
+            made: Some((ContentId::of(TAIL_MERGE, &bytes), bytes)),
+        });
+    }
     for &(name, kind) in target.late() {
         line.library(name, kind, false, &[])?;
     }
+    line.flush_defaults()?;
     for name in target.end() {
         line.object(name)?;
     }
+    for (at, dll) in dlls {
+        let made = dll.library().map_err(fail)?;
+        line.out[at].made = Some(made);
+    }
     Ok(line.out)
+}
+
+/// A `raw-dylib` library on the line: its imports join its DLL's, whose import library the
+/// link makes ([`crate::pe::raw_dylib`]) and puts where the DLL is first named. Only PE has
+/// DLLs; the front end refuses a `raw-dylib` for another target, and so does this.
+fn raw_dylib(
+    line: &mut Line<'_, '_>,
+    dlls: &mut Vec<(usize, crate::pe::raw_dylib::Dll)>,
+    lib: &NativeLib,
+) -> Result<(), LinkError> {
+    if line.output.format != Format::Pe {
+        // alloc: error path
+        return Err(fail(format!(
+            "the `raw-dylib` `{}`: a `raw-dylib` is a Windows DLL, and this links {:?}",
+            lib.name, line.output.format
+        )));
+    }
+    let name = crate::pe::raw_dylib::dll_name(lib);
+    let at = match dlls.iter().position(|(_, it)| it.name.eq_ignore_ascii_case(&name)) {
+        Some(at) => at,
+        None => {
+            line.out.push(Located {
+                path: PathBuf::from(&name),
+                // alloc: once per DLL `raw-dylib`s name, what errors call its import library
+                name: format!("raw-dylib {name}"),
+                kind: NativeKind::Archive { whole: false },
+                made: None,
+            });
+            dlls.push((line.out.len() - 1, crate::pe::raw_dylib::Dll::new(name)));
+            dlls.len() - 1
+        }
+    };
+    dlls[at].1.add(lib).map_err(fail)
+}
+
+/// MSVC's VC runtime libraries, the dynamic ones (the DLLs' import libraries and their static
+/// start-up code) and the static ones, release and debug, as `.lib` stems.
+const VC_DYNAMIC: &[&str] = &["msvcrt", "msvcrtd", "vcruntime", "vcruntimed", "msvcprt", "msvcprtd"];
+const VC_STATIC: &[&str] = &["libcmt", "libcmtd", "libvcruntime", "libvcruntimed", "libcpmt", "libcpmtd"];
+
+/// That no crate asks for the VC runtime the image does not link: `+crt-static` (`crt_static`)
+/// is the static one, and its absence the dynamic one. The crates ask for it by the cfg the
+/// front end evaluated (`libc`'s `#[link(name = "libcmt", cfg(target_feature = "crt-static"))]`),
+/// so a crate asking for the other one was compiled for another CRT than the link is for:
+/// link.exe's `LNK2038`, which the C objects' `/FAILIFMISMATCH:RuntimeLibrary` would catch only
+/// for C.
+fn vc_runtime(crt_static: bool, libs: &[CrateLibs<'_>]) -> Result<(), LinkError> {
+    let (wrong, flag) = match crt_static {
+        true => (VC_DYNAMIC, "the static one (`-C target-feature=+crt-static`)"),
+        false => (VC_STATIC, "the dynamic one (no `-C target-feature=+crt-static`)"),
+    };
+    for (krate, lib) in libs.iter().flat_map(|it| it.libs.iter().map(|lib| (it.name, lib))) {
+        let asked = match lib.verbatim {
+            true => crate::pe::verbatim_option(&lib.name).and_then(Result::ok),
+            false => None,
+        };
+        let name = asked.as_deref().unwrap_or(&lib.name);
+        let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let stem = match name.len().checked_sub(4) {
+            Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".lib") => {
+                &name[..at]
+            }
+            _ => name,
+        };
+        if wrong.iter().any(|it| it.eq_ignore_ascii_case(stem)) {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "crate `{krate}` links the VC runtime library `{}`, and the image's VC runtime is {flag}: \
+                     the crate was compiled for the other C runtime (link.exe: LNK2038)",
+                    lib.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The targets blaze links: those `hir_ty_codegen::v2::toolchain` compiles for whose link
@@ -844,17 +989,25 @@ type Asked = Arc<Vec<(String, String)>>;
 
 /// The toolchains found, by what each was found from, and what the PE archives read for their
 /// default libraries ask for, by their bytes: a few of each per process, searched in order.
-pub(crate) struct Cache {
+pub(crate) struct Cache<'a> {
+    records: std::sync::OnceLock<coff_requests::Records<'a>>,
     found: Lock<Vec<(Key, Arc<Found>)>>,
     asked: Lock<Vec<(ContentId, u32, Asked)>>,
+    /// What each file was read as, by its path, domain, platform and the stamp it had then: a
+    /// file whose stamp is unchanged is not read again (as a sweep takes it,
+    /// [`blaze_core::Stamp`]). A link of rustc's line names 1.8 GB of archives; reading and
+    /// hashing them on every link was 1.8 s of 9.
+    stamped: Lock<Vec<(PathBuf, &'static str, u32, Stamp, Asked)>>,
 }
 
-impl Cache {
-    pub(crate) const fn new() -> Cache {
+impl Cache<'_> {
+    pub(crate) const fn new() -> Self {
         // alloc: none, an empty `Vec` holds no buffer
         Cache {
+            records: std::sync::OnceLock::new(),
             found: Lock::new("link.toolchain.found", Vec::new()),
             asked: Lock::new("link.toolchain.asked", Vec::new()),
+            stamped: Lock::new("link.toolchain.stamped", Vec::new()),
         }
     }
 
@@ -872,9 +1025,15 @@ impl Cache {
             (Format::MachO, _) => AUTOLINKED_AARCH64,
             _ => ASKED,
         };
-        self.read(path, name, (domain, 0), |bytes| match format {
+        self.read(path, name, (domain, 0), |id, bytes| match format {
             Format::MachO => crate::macho::asked_libraries(name, bytes, arch),
-            _ => crate::pe::asked_libraries(name, bytes),
+            _ => {
+                let parse = || crate::pe::asked_libraries(name, bytes);
+                match self.records.get() {
+                    Some(records) => records.requests(name, id, parse),
+                    None => parse(),
+                }
+            }
         })
     }
 
@@ -892,7 +1051,7 @@ impl Cache {
             Arch::X86_64 => REEXPORTED_X86_64,
             _ => REEXPORTED_AARCH64,
         };
-        self.read(path, name, (domain, platform), |bytes| {
+        self.read(path, name, (domain, platform), |_, bytes| {
             let installs = crate::macho::reexported(name, bytes, arch, platform)?;
             // alloc: once per process and library content, its re-exports
             Ok(installs.into_iter().map(|it| (String::new(), it)).collect())
@@ -906,19 +1065,41 @@ impl Cache {
         path: &Path,
         name: &str,
         (domain, platform): (&'static str, u32),
-        read: impl FnOnce(&[u8]) -> Result<Vec<(String, String)>, String>,
+        read: impl FnOnce(ContentId, &[u8]) -> Result<Vec<(String, String)>, String>,
     ) -> Result<Asked, LinkError> {
+        // alloc: error path
+        let stamp = blaze_core::fs::stamp(path).map_err(|error| fail(format!("{name}: {error}")))?;
+        let same = |it: &&(PathBuf, &'static str, u32, Stamp, Asked)| {
+            it.0 == path && it.1 == domain && it.2 == platform && it.3 == stamp
+        };
+        if let Some((.., asked)) = self.stamped.lock().iter().find(same) {
+            return Ok(Arc::clone(asked));
+        }
         // alloc: error path
         let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
         let id = ContentId::of(domain, &bytes);
-        if let Some((.., asked)) =
-            self.asked.lock().iter().find(|it| it.0 == id && it.1 == platform)
-        {
-            return Ok(Arc::clone(asked));
+        let known = self
+            .asked
+            .lock()
+            .iter()
+            .find(|it| it.0 == id && it.1 == platform)
+            .map(|it| Arc::clone(&it.2));
+        let asked = match known {
+            Some(it) => it,
+            None => {
+                // alloc: once per process and file content, what it asks for
+                let asked = Arc::new(read(id, &bytes).map_err(fail)?);
+                self.asked.lock().push((id, platform, Arc::clone(&asked)));
+                asked
+            }
+        };
+        // A file written while it was read has another stamp after: kept under neither.
+        if blaze_core::fs::stamp(path).is_ok_and(|after| after == stamp) && !stamp.is_unknown() {
+            let mut stamped = self.stamped.lock();
+            stamped.retain(|it| !(it.0 == path && it.1 == domain && it.2 == platform));
+            // alloc: once per file and stamp, its path
+            stamped.push((path.to_owned(), domain, platform, stamp, Arc::clone(&asked)));
         }
-        // alloc: once per process and file content, what it asks for
-        let asked = Arc::new(read(&bytes).map_err(fail)?);
-        self.asked.lock().push((id, platform, Arc::clone(&asked)));
         Ok(asked)
     }
 
@@ -1058,8 +1239,8 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         .ok_or_else(|| fail(format!("{} printed no `libraries:` line", shown(0))))?;
     // alloc: once per toolchain asked, its directories
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for dir in listed.trim().trim_start_matches('=').split(':').filter(|it| !it.is_empty()) {
-        let dir = PathBuf::from(dir);
+    // GCC's path separator belongs to the machine running it, not the target triple.
+    for dir in std::env::split_paths(listed.trim().trim_start_matches('=')) {
         if dir.is_dir() && !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -1493,14 +1674,21 @@ fn wasi(key: &Key) -> Result<Found, LinkError> {
 }
 
 /// A link line as it is found.
-struct Line<'a> {
-    cache: &'a Cache,
+struct Line<'a, 'store> {
+    cache: &'a Cache<'store>,
     output: &'a Output,
     search: &'a [PathBuf],
     found: &'a Found,
     out: Vec<Located>,
     /// Each search directory's entry names, read once per link ([`listing`]).
     listings: RefCell<HashMap<PathBuf, Option<Listing>, Global>>,
+    /// The `.res` files the link arguments name, each once, and where on the line the object
+    /// of their resources goes ([`Line::resource`]).
+    resources: Vec<PathBuf>,
+    resources_at: usize,
+    /// The PE default libraries found so far, each once, in the order asked: on the line last
+    /// ([`Line::flush_defaults`]).
+    defaulted: Vec<PathBuf>,
 }
 
 /// A directory's entry names, ASCII lowercased.
@@ -1519,7 +1707,7 @@ fn listing(dir: &Path) -> Option<Listing> {
     Some(names)
 }
 
-impl Line<'_> {
+impl Line<'_, '_> {
     /// Where a library is searched for, and what named each directory: `own`, the directories
     /// of the compile of the crate that names it ([`CrateLibs::search`]), then the link's, then
     /// those the C driver passes its linker, then the toolchain's.
@@ -1562,6 +1750,98 @@ impl Line<'_> {
         // alloc: none for a name of up to 64 bytes
         key.extend(first.as_encoded_bytes().iter().map(u8::to_ascii_lowercase));
         names.contains(&key[..])
+    }
+
+    /// An input file the link arguments name ([`crate::LinkArgs::inputs`]), as link.exe finds
+    /// one: an absolute path as it is, a relative one in the line's directories (link.exe's
+    /// `LIB`), ASCII case ignored. Read by its extension: `.obj` and `.o` an object, `.lib` and
+    /// `.a` an archive, `.res` a compiled resource file (an object to the reader).
+    fn input(&mut self, input: &Path) -> Result<(), LinkError> {
+        let extension = input.extension().and_then(|it| it.to_str()).unwrap_or_default();
+        let is = |it: &str| extension.eq_ignore_ascii_case(it);
+        if is("res") && self.output.format == Format::Pe {
+            return self.resource(input);
+        }
+        let kind = if is("obj") || is("o") {
+            NativeKind::Object
+        } else if is("lib") || is("a") {
+            NativeKind::Archive { whole: false }
+        } else {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "the link argument's input file {}: blaze's linker takes .obj, .o, .lib, .a and \
+                     .res files",
+                    input.display()
+                ),
+            ));
+        };
+        let path = match input.to_str() {
+            Some(name) => self.default_library(name),
+            // alloc: error path
+            None => Err(fail(format!("the input file {} is not UTF-8", input.display()))),
+        }
+        .map_err(|it| LinkError {
+            // alloc: error path
+            what: format!("the link argument's input file {}: {}", input.display(), it.what),
+            ..it
+        })?;
+        self.push(path, kind)
+    }
+
+    /// A compiled resource file the link arguments name: its resources join the other `.res`
+    /// files', merged into one object the link makes ([`crate::pe::rsrc`], as link.exe runs
+    /// `cvtres` over them all), on the line where the first was.
+    fn resource(&mut self, input: &Path) -> Result<(), LinkError> {
+        let path = match input.to_str() {
+            Some(name) => self.default_library(name),
+            // alloc: error path
+            None => Err(fail(format!("the input file {} is not UTF-8", input.display()))),
+        }
+        .map_err(|it| LinkError {
+            // alloc: error path
+            what: format!("the link argument's resource file {}: {}", input.display(), it.what),
+            ..it
+        })?;
+        if self.resources.is_empty() {
+            self.out.push(Located {
+                // clone: once per link with resources, where the made object stands
+                path: path.clone(),
+                // alloc: once per link with resources, what errors call the made object
+                name: "the link's resources".to_owned(),
+                kind: NativeKind::Object,
+                made: None,
+            });
+            self.resources_at = self.out.len() - 1;
+        }
+        if !self.resources.contains(&path) {
+            self.resources.push(path);
+        }
+        Ok(())
+    }
+
+    /// The object of every `.res` file's resources ([`Line::resource`]), made in its place.
+    fn make_resources(&mut self) -> Result<(), LinkError> {
+        if self.resources.is_empty() {
+            return Ok(());
+        }
+        // alloc: once per link with resources, each file's resources
+        let mut files = Vec::with_capacity(self.resources.len());
+        for path in &self.resources {
+            let name = path.to_string_lossy().into_owned();
+            // alloc: error path
+            let bytes = std::fs::read(path).map_err(|error| fail(format!("{name}: {error}")))?;
+            let resources = crate::pe::rsrc::read(&name, &bytes).map_err(fail)?;
+            files.push((name, resources));
+        }
+        let names: Vec<String> = files.iter().map(|it| it.0.clone()).collect();
+        let merged = crate::pe::rsrc::merge(files).map_err(fail)?;
+        let bytes: Arc<[u8]> = crate::pe::rsrc::object(&merged).into();
+        let at = &mut self.out[self.resources_at];
+        // alloc: once per link with resources, what errors call the made object
+        at.name = format!("the resources of {}", names.join(", "));
+        at.made = Some((ContentId::of(RESOURCES, &bytes), bytes));
+        Ok(())
     }
 
     fn object(&mut self, name: &str) -> Result<(), LinkError> {
@@ -1629,14 +1909,14 @@ impl Line<'_> {
         let script = self.output.format == Format::Elf
             && matches!(kind, NativeKind::Shared { .. })
             && sniff(&path)? == Sniffed::Text;
-        let archive = pe && matches!(kind, NativeKind::Archive { .. });
+        let archive = pe && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let autolinks = self.output.format == Format::MachO
             && matches!(kind, NativeKind::Archive { .. } | NativeKind::Object);
         let reexports =
             self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
-        self.out.push(Located { path, name, kind });
+        self.out.push(Located { path, name, kind, made: None });
         let at = self.out.len() - 1;
         if script {
             self.follow(at)?;
@@ -1744,7 +2024,8 @@ impl Line<'_> {
         Err(not_found(install, &files, searched.iter().map(|(dir, by)| (dir.as_path(), *by)), &[]))
     }
 
-    /// The libraries the members of the PE archive at `at` ask for, each after it on the line
+    /// The libraries the members of the PE archive at `at` ask for (or the COFF object at `at`
+    /// itself), each after it on the line
     /// and followed in turn, as link.exe follows `/DEFAULTLIB` from the members it takes. A
     /// member's own `/NODEFAULTLIB` takes its own out ([`crate::pe::asked_libraries`]); one in
     /// another member does not, since that member may not be taken. Every member's are
@@ -1758,14 +2039,52 @@ impl Line<'_> {
             self.output.arch,
         )?;
         for (member, library) in asked.iter() {
-            let path = self.default_library(library).map_err(|it| LinkError {
+            self.default(library).map_err(|it| LinkError {
                 // alloc: error path
-                what: format!(
-                    "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
-                    self.out[at].name, it.what
-                ),
+                what: match member.is_empty() {
+                    true => format!(
+                        "{} asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                    false => format!(
+                        "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
+                        self.out[at].name, it.what
+                    ),
+                },
                 ..it
             })?;
+        }
+        Ok(())
+    }
+
+    /// `library`, a `/DEFAULTLIB` of a member or of a crate (a `+verbatim` native library
+    /// named `/defaultlib:NAME`), among the default libraries [`Line::flush_defaults`] puts
+    /// on the line, once, unless the link's `/NODEFAULTLIB` takes it out.
+    fn default(&mut self, library: &str) -> Result<(), LinkError> {
+        if self.output.link.pe.no_default_libs.excludes(library) {
+            return Ok(());
+        }
+        let path = self.default_library(library)?;
+        let pe = self.output.format == Format::Pe;
+        let known = self.defaulted.iter().any(|it| {
+            *it == path || (pe && it.as_os_str().eq_ignore_ascii_case(path.as_os_str()))
+        });
+        if !known {
+            self.defaulted.push(path);
+        }
+        Ok(())
+    }
+
+    /// The default libraries [`Line::defaults`] found, on the line after every other library,
+    /// as link.exe searches them after those of its command line: a library asked for by a member
+    /// is searched after one the link names (Ghostty's Zig-built `_fltused` before LIBCMT's).
+    /// Each one's own are followed in turn.
+    fn flush_defaults(&mut self) -> Result<(), LinkError> {
+        let mut next = 0;
+        while let Some(path) = self.defaulted.get(next) {
+            // clone: once per default library, its path for the line
+            let path = path.clone();
+            next += 1;
             self.push(path, NativeKind::Archive { whole: false })?;
         }
         Ok(())
@@ -1908,6 +2227,13 @@ fn files(
                 "the framework `{name}`: frameworks are Apple's, and this links {format:?}"
             )));
         }
+        NativeLibKind::RawDylib => {
+            // alloc: error path
+            return Err(fail(format!(
+                "the `raw-dylib` `{name}` searched for as a file: the link makes its import \
+                 library, and no file is looked for"
+            )));
+        }
         NativeLibKind::Framework => {
             // alloc: once per library searched, its file names
             files.push((format!("{name}.framework/{name}.tbd"), shared));
@@ -1962,7 +2288,9 @@ fn by_extension(format: Format, name: &str, kind: NativeLibKind) -> NativeKind {
     let is = |it: &str| extension.eq_ignore_ascii_case(it);
     if is("o") || is("obj") {
         NativeKind::Object
-    } else if is("a") || is("lib") {
+    } else if is("a") || is("lib") || is("rlib") {
+        // An `.rlib` is rustc's archive of a crate's objects: a link line of rustc's (a
+        // benchmark against link.exe on its inputs) names them.
         NativeKind::Archive { whole }
     } else {
         NativeKind::Shared { as_needed: format == Format::Elf }

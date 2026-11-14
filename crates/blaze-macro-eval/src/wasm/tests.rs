@@ -140,8 +140,9 @@ impl Workspace {
     }
 
     fn path(&self, rel: &str) -> String {
-        let top = self.0.to_str().unwrap();
-        if rel.is_empty() { top.to_owned() } else { format!("{top}/{rel}") }
+        // The walk's name of it, as the daemon names paths (`/C:/...` on Windows).
+        let top = crate::os::host::guest_path(self.0.to_str().unwrap());
+        if rel.is_empty() { top.into_owned() } else { format!("{top}/{rel}") }
     }
 
     /// The member's variables: its package and an `OUT_DIR` that is not there.
@@ -275,7 +276,7 @@ fn at(start: u32, end: u32) -> Span {
 /// A store in `sim`, open and ready.
 fn opened(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         let durable = store.complete(completion, effects);
@@ -294,7 +295,7 @@ fn modules() -> Modules {
 fn opened_in(sim: &mut Sim, dir: &str, layers: &[&str]) -> Store {
     let mut effects = Vec::new();
     let layers = layers.iter().map(|it| FileName::new(it).unwrap()).collect();
-    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
+    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
@@ -573,7 +574,7 @@ fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
         library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert!(!spent.evaluated && spent.steps > 0 && spent.over.is_none(), "{spent:?}");
     assert!(
-        first.seen.is_empty() && first.unkeyable.is_none() && !first.asked,
+        first.seen.is_empty() && first.unkeyable.is_none() && first.asked.is_none(),
         "an echo read nothing"
     );
     // A fresh instance each time: the second run is the first again.

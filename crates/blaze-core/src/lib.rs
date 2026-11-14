@@ -69,6 +69,7 @@ mod locks;
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "sockets: descriptors owned from raw and the calls std lacks")]
 mod net;
+pub mod platform;
 #[cfg(unix)]
 mod process;
 /// The children the drivers started and have not reaped, for a stall report to name
@@ -108,6 +109,7 @@ use std::{fmt, time::Duration};
 pub use crate::journal::{
     Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
 };
+pub use crate::platform::Sharing;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
 
@@ -371,8 +373,8 @@ pub enum Effect {
     /// that completed before this was asked for survives a crash once it completes. What a
     /// `_synced` remove, create or `sync_names` of bstd waits for; a file's bytes are
     /// [`Effect::Sync`]'s. Unix: `fsync` of the directory (Apple's: `F_FULLFSYNC`, through
-    /// `sync_all`). Windows has no such call yet and fails, naming that. A `dir` that is not
-    /// there fails. Completes with [`Done::Synced`].
+    /// `sync_all`); Windows: `FlushFileBuffers` of the directory opened with backup semantics.
+    /// A `dir` that is not there fails. Completes with [`Done::Synced`].
     SyncDir {
         dir: FileName,
         tag: Tag,
@@ -402,6 +404,21 @@ pub enum Effect {
         bytes: Vec<u8>,
         tag: Tag,
     },
+    /// Publish an edit by taking exclusive custody of its previous file. `whole` is a
+    /// byte-for-byte witness of the result, holes included: no path stamp authenticates
+    /// the base. `Patched(false)` means custody or the base was unavailable, before any
+    /// edit. Once editing begins a failure is an error, never a request to try again.
+    TryPatch {
+        file: FileName,
+        len: u64,
+        delta: Vec<(u64, Vec<u8>)>,
+        whole: std::sync::Arc<Vec<(u64, Vec<u8>)>>,
+        tag: Tag,
+    },
+    /// Create a fresh, exclusive staged output of `len` zero bytes. Holes cost no
+    /// blocks on sparse-capable volumes. Unlike Truncate this never resizes a file
+    /// that another publisher already owns. Completes with Truncated.
+    SparseFile { file: FileName, len: u64, tag: Tag },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
     /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
@@ -484,7 +501,9 @@ pub enum Effect {
     /// `fclonefileat`): a new file's mode (0o666 less the umask) and modified now, whatever
     /// `from`'s are (a store's copies are read-only). A symbolic link `from` is refused, never
     /// followed or cloned, with [`CLONE_THROUGH_A_LINK`]. Fails where the file system cannot
-    /// share blocks, naming both files' volumes: nothing copies instead.
+    /// share blocks, naming both files' volumes: nothing copies instead. Whoever places files
+    /// asks [`platform::volume`] first, and on a volume of [`Sharing::Unshared`] asks for no
+    /// clone at all.
     Clone {
         from: FileName,
         to: FileName,
@@ -799,6 +818,8 @@ impl Effect {
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
             | Effect::WriteUnsynced { tag, .. }
+            | Effect::TryPatch { tag, .. }
+            | Effect::SparseFile { tag, .. }
             | Effect::List { tag, .. }
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
@@ -975,6 +996,8 @@ pub enum Untraceable {
     Network,
     /// A file read through a descriptor the sandbox did not see opened.
     Descriptor,
+    /// A confined build-script run keyed by Cargo declarations, not by observed reads.
+    CargoDeclared,
 }
 
 /// How a spawned process ended.
@@ -1123,6 +1146,8 @@ pub enum Done {
     WrittenBack,
     Truncated,
     Written,
+    /// Of TryPatch: published, or not a base the driver can take into custody.
+    Patched(bool),
     Listed(Vec<(FileName, Meta)>),
     Renamed,
     Moded,

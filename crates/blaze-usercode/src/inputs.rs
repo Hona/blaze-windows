@@ -193,7 +193,19 @@ const MOST_LINKS: usize = 40;
 /// before the last is missing or unreadable. Cold: on a miss only.
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
+    let path = on_disk(path);
     let mut parts = path.components();
+    #[cfg(windows)]
+    let mut at = {
+        use std::path::Prefix;
+        let Some(Component::Prefix(prefix)) = parts.next() else { return None };
+        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) { return None; }
+        let mut volume = PathBuf::from(prefix.as_os_str());
+        volume.push(r"\");
+        volume
+    };
+    #[cfg(not(windows))]
+    let mut at = PathBuf::from("/"); // alloc: cold, once per first miss
     if parts.next() != Some(Component::RootDir) {
         return None;
     }
@@ -207,7 +219,6 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     }
     left.reverse();
     let mut names = Vec::new(); // alloc: cold, as above
-    let mut at = PathBuf::from("/"); // alloc: cold, as above
     // Bounded: each turn takes one part, and only a link, of which there are at most
     // `MOST_LINKS`, adds any.
     while let Some(part) = left.pop() {
@@ -218,6 +229,10 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
         }
         let name = at.join(&part);
         match std::fs::symlink_metadata(&name) {
+            // Junctions, volume mount points and other reparse tags may reach a different
+            // tree. Until all of those spellings are watched, check these by stamp instead.
+            #[cfg(windows)]
+            Ok(meta) if std::os::windows::fs::MetadataExt::file_attributes(&meta) & 0x400 != 0 => return None,
             Ok(meta) if meta.file_type().is_symlink() => {
                 if names.len() == MOST_LINKS {
                     return None;
@@ -242,6 +257,18 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     }
     names.push(at);
     Some(names)
+}
+
+/// Where the system opens `path`, a name a trace holds: a daemon name of a Windows path
+/// (`/C:/a`, which a proc macro's reads are noted by) at [`blaze_core::platform::path::host`]'s,
+/// any other as it is. The name stays the key.
+fn on_disk(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str() {
+        Some(name) if cfg!(windows) && name.starts_with('/') => {
+            std::borrow::Cow::Owned(blaze_core::platform::path::host(name))
+        }
+        _ => std::borrow::Cow::Borrowed(path),
+    }
 }
 
 impl Files {
@@ -347,7 +374,8 @@ impl Files {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        let meta = match std::fs::metadata(path) {
+        let disk = on_disk(path);
+        let meta = match std::fs::metadata(&disk) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok((None, true)),
             Err(error) => return Err(unreadable(error)),
@@ -366,10 +394,10 @@ impl Files {
         if let Some(found) = self.stamped.find(&key) {
             return Ok((Some(*self.stamped.get(found)), true));
         }
-        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let file = std::fs::File::open(&disk).map_err(unreadable)?;
         let hash = hash_reader(file).map_err(unreadable)?;
         // A file changed while it was read is hashed again at its next check.
-        let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
+        let after = std::fs::metadata(&disk).map(|it| Stamp::of(&it)).ok();
         let settled = after == Some(stamp);
         if settled {
             self.stamped.intern(key, || hash);
@@ -392,7 +420,8 @@ impl Files {
         }
         // Looked at on the disk every time: no watch vouches for an entry.
         blaze_vfs::outside::looked(path);
-        let meta = match std::fs::symlink_metadata(path) {
+        let disk = on_disk(path);
+        let meta = match std::fs::symlink_metadata(&disk) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
             Err(error) => return Err(unreadable(error)),
@@ -402,7 +431,7 @@ impl Files {
             return Ok(Entry::Dir);
         }
         if kind.is_symlink() {
-            let target = std::fs::read_link(path).map_err(unreadable)?;
+            let target = std::fs::read_link(&disk).map_err(unreadable)?;
             #[cfg(unix)]
             let id = ContentId::of(
                 blaze_vfs::FILE_DOMAIN,
@@ -435,12 +464,12 @@ impl Files {
         if let Some(found) = self.stamped.find(&key) {
             return Ok(Entry::File(ContentId(*self.stamped.get(found)), mode));
         }
-        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let file = std::fs::File::open(&disk).map_err(unreadable)?;
         let mut hasher = Hasher::new(blaze_vfs::FILE_DOMAIN);
         read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
         let id = hasher.finish();
         // A file changed while it was read is hashed again at its next check.
-        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp) {
+        if std::fs::symlink_metadata(&disk).is_ok_and(|it| Stamp::of(&it) == stamp) {
             self.stamped.intern(key, || id.0);
         }
         Ok(Entry::File(id, mode))
@@ -486,11 +515,20 @@ pub struct Now<'a> {
 pub struct Disk {
     files: &'static Files,
     env: Env,
+    #[cfg(windows)]
+    declared: Option<Vec<PathBuf>>,
 }
 
 impl Disk {
     pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
-        Disk { files: Files::shared(), env: Env::new(env) }
+        Disk { files: Files::shared(), env: Env::new(env), #[cfg(windows)] declared: None }
+    }
+
+    /// Check declared paths against this run's grants, both when publishing and on lookup.
+    #[cfg(windows)]
+    pub fn declared_inputs(mut self, grants: Vec<PathBuf>) -> Self {
+        self.declared = Some(grants);
+        self
     }
 
     /// The same files with another environment.
@@ -506,6 +544,70 @@ impl Disk {
 fn missing(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
         || error.raw_os_error() == Some(NOT_A_DIRECTORY)
+}
+
+/// Cargo-style filesystem stamps. Hash names as well as file stamps: editing a header
+/// doesn't touch its parent directory and renaming a file need not change its own time.
+/// Never open the contents (in particular not devices) on behalf of a script. Refuse
+/// reparses instead of following a junction with the daemon's wider access.
+#[cfg(windows)]
+fn declared_stamp(path: &Path, tree: bool, package: bool) -> Result<Option<[u8; 32]>, Unreadable> {
+    use std::os::windows::fs::MetadataExt;
+    let err = |at: &Path, e: io::Error| Unreadable { path: at.into(), error: e.to_string() };
+    blaze_vfs::outside::looked(path);
+    let mut hash = Hasher::new("blaze Windows Cargo path stamps 1");
+    let mut pending = vec![path.to_owned()]; // alloc: directory walk, only when a tree is requested
+    while let Some(at) = pending.pop() {
+        let m = match std::fs::symlink_metadata(&at) {
+            Ok(it) => it,
+            Err(e) if missing(&e) && at == path => return Ok(None),
+            Err(e) => return Err(err(&at, e)),
+        };
+        if m.file_attributes() & 0x400 != 0 {
+            return Err(Unreadable { path: at, error: "a reparse point cannot be stamped as a confined Cargo input".into() });
+        }
+        if tree && at == path && !m.is_dir() { return Ok(None); }
+        hash.part(at.strip_prefix(path).expect("a descendant").as_os_str().as_encoded_bytes());
+        if m.is_dir() {
+            hash.update(b"d");
+            if tree {
+                let mut kids = Vec::new(); // alloc: one directory, sorted by name
+                for entry in std::fs::read_dir(&at).map_err(|e| err(&at, e))? {
+                    let entry = entry.map_err(|e| err(&at, e))?;
+                    let n = entry.file_name();
+                    if package && ((at == path && n == "target") || n == ".git") { continue; }
+                    kids.push(entry.path());
+                }
+                kids.sort_unstable();
+                pending.extend(kids);
+            }
+        } else {
+            hash.update(b"f").update(&Stamp::of(&m).bytes());
+        }
+    }
+    Ok(Some(hash.finish().0))
+}
+
+/// Resolve the name before walking it with the daemon's (not the child's) access. A
+/// negative lookup has no canonical name: check its nearest existing ancestor instead.
+#[cfg(windows)]
+pub fn granted(path: &Path, roots: &[PathBuf]) -> Result<bool, Unreadable> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(real) => return Ok(roots.iter().any(|root| real.starts_with(root))),
+            Err(e) if missing(&e) && ancestor.parent().is_some() => {
+                ancestor = ancestor.parent().expect("checked parent");
+            }
+            Err(e) => return Err(Unreadable { path: path.into(), error: e.to_string() }),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn require_grant(path: &Path, roots: &[PathBuf]) -> Result<(), Unreadable> {
+    if granted(path, roots)? { return Ok(()); }
+    Err(Unreadable { path: path.into(), error: "outside the script's read grants".into() })
 }
 
 #[cfg(unix)]
@@ -591,7 +693,21 @@ impl Inputs for Disk {
     type Error = Unreadable;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared {
+            require_grant(path, roots)?;
+            return declared_stamp(path, false, false);
+        }
         self.now().file(path)
+    }
+
+    fn tree(&mut self, path: &Path, package: bool) -> Result<Option<[u8; 32]>, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared {
+            require_grant(path, roots)?;
+            return declared_stamp(path, true, package);
+        }
+        crate::trace::walk(self, path, package)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
@@ -599,6 +715,8 @@ impl Inputs for Disk {
     }
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
+        #[cfg(windows)]
+        if let Some(roots) = &self.declared { require_grant(path, roots)?; }
         self.now().names(path, out)
     }
 
@@ -857,7 +975,9 @@ mod tests {
         assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(now.file(&dir.join("gone")).unwrap(), None);
         assert_eq!(dirs.len(), 1);
-        let roundabout = dir.join("sub").join("..").join("a");
+        // Windows normalizes `..` when joining onto the verbatim path `canonicalize`
+        // returns. Use the original directory to actually exercise a noncanonical name.
+        let roundabout = made.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
         assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());

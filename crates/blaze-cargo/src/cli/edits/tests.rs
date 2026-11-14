@@ -60,9 +60,10 @@ fn a_function_is_found_past_a_comment_and_a_declaration_of_its_name() {
     );
     let twice = format!("{SOURCE}\nmod m {{\n    fn main() {{}}\n}}\n");
     let error = locate(&twice, "main", None).unwrap_err();
-    assert_eq!(error, EditError::Ambiguous { name: "main".to_owned(), lines: vec![9, 16] });
-    assert!(error.to_string().contains("at lines 9, 16: name one as `--fn main:LINE`"), "{error}");
-    assert_eq!(locate(&twice, "main", Some(16)).unwrap().line, 16);
+    // SOURCE is 12 lines; then a blank one, `mod m {` and its `fn main` on line 15.
+    assert_eq!(error, EditError::Ambiguous { name: "main".to_owned(), lines: vec![9, 15] });
+    assert!(error.to_string().contains("at lines 9, 15: name one as `--fn main:LINE`"), "{error}");
+    assert_eq!(locate(&twice, "main", Some(15)).unwrap().line, 15);
 }
 
 #[test]

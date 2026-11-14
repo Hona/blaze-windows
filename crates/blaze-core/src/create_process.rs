@@ -71,28 +71,39 @@ fn push_arg(line: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
             String::from_utf16_lossy(arg)
         )));
     }
-    let quoted =
-        arg.is_empty() || arg.iter().any(|&it| it == u16::from(b' ') || it == u16::from(b'\t'));
+    quote(arg.iter().copied(), |unit| line.push(unit));
+    Ok(())
+}
+
+/// UTF-16 units consumed by an argument, not including the separating space. Measure with
+/// exactly the encoder used for CreateProcessW: a quoted trailing backslash counts twice.
+pub fn argument_units(arg: impl Iterator<Item = u16> + Clone) -> usize {
+    let mut units = 0;
+    quote(arg, |_| units += 1);
+    units
+}
+
+fn quote(arg: impl Iterator<Item = u16> + Clone, mut emit: impl FnMut(u16)) {
+    let quoted = arg.clone().next().is_none() || arg.clone().any(|it| it == u16::from(b' ') || it == u16::from(b'\t'));
     if quoted {
-        line.push(QUOTE);
+        emit(QUOTE);
     }
     let mut slashes = 0;
-    for &unit in arg {
+    for unit in arg {
         if unit == SLASH {
             slashes += 1;
         } else {
             if unit == QUOTE {
-                line.extend(std::iter::repeat_n(SLASH, slashes + 1));
+                for _ in 0..=slashes { emit(SLASH); }
             }
             slashes = 0;
         }
-        line.push(unit);
+        emit(unit);
     }
     if quoted {
-        line.extend(std::iter::repeat_n(SLASH, slashes));
-        line.push(QUOTE);
+        for _ in 0..slashes { emit(SLASH); }
+        emit(QUOTE);
     }
-    Ok(())
 }
 
 /// [`environment`] of names and values in code units.
@@ -116,7 +127,9 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
                 String::from_utf16_lossy(&name)
             )));
         }
-        by_name.push((upper(&name), given, name, value));
+        // alloc: once per variable, its comparison key for sorting the environment block
+        let key: Vec<_> = name.iter().copied().map(crate::platform::env::upper_unit).collect();
+        by_name.push((key, given, name, value));
     }
     by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     by_name.dedup_by(|later, kept| later.0 == kept.0);
@@ -133,22 +146,6 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
     }
     block.push(0);
     Ok(block)
-}
-
-/// Each code unit in upper case where that is one code unit, as Windows compares names.
-fn upper(units: &[u16]) -> Vec<u16> {
-    units
-        .iter()
-        .map(|&unit| {
-            let Some(c) = char::from_u32(u32::from(unit)) else { return unit };
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(one), None) => u16::try_from(u32::from(one)).unwrap_or(unit),
-                _ => unit,
-            }
-        })
-        // alloc: once per variable of a process spawned, its name's sort key
-        .collect()
 }
 
 fn invalid(message: String) -> io::Error {

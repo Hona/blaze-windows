@@ -33,7 +33,8 @@
 //!   build's `panic_unwind` and `panic_abort` are.
 //!
 //! The fixture's own metadata, at its top in this order: `//- toolchain: nightly|stable`,
-//! `//- target_data_layout: <layout>`, `//- target_arch: <arch>`,
+//! `//- target_data_layout: <layout>`, `//- target_arch: <arch>`, `//- target: <tuple>` (the
+//! crates' tuple, when not the one the arch implies: x86-64's is Linux's),
 //! `//- proc_macros: <name>,<name>` (the test proc macros below, as crate `proc_macros`, a
 //! dependency of every crate) and `//- minicore: <flag>, <flag>` (a `core` of the parts of
 //! `test-utils`' minicore named, a dependency of every crate).
@@ -385,13 +386,16 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         toolchain,
         target_data_layout,
         target_arch,
+        target,
     } = FixtureWithProjectMeta::parse(fixture);
     let arch = parse_target_arch(&target_arch);
-    // The tuple is the arch's: a crate's keys and its code generator's target read the tuple.
-    let tuple = match arch {
-        Arch::Wasm32 => "wasm32-wasip1",
-        Arch::Wasm64 => "wasm64-unknown-unknown",
-        _ => "x86_64-unknown-linux-gnu",
+    // The tuple is the arch's unless `//- target:` names one: a crate's keys and its code
+    // generator's target read the tuple.
+    let tuple = match (target.as_deref(), arch) {
+        (Some(tuple), _) => tuple,
+        (None, Arch::Wasm32) => "wasm32-wasip1",
+        (None, Arch::Wasm64) => "wasm64-unknown-unknown",
+        (None, _) => "x86_64-unknown-linux-gnu",
     };
     let target = Ok(TargetData {
         tuple: Symbol::intern(tuple),

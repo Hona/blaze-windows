@@ -55,6 +55,7 @@ fn a_start_that_never_listens_names_the_socket() {
 
 #[test]
 fn the_status_as_json_has_every_field_with_or_without_a_daemon() {
+    crate::release::for_tests();
     let place = StatusPlace {
         home: PathBuf::from("/h"),
         state: PathBuf::from("/h/v2"),

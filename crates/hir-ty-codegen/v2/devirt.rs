@@ -17,7 +17,14 @@
 //! subtrait's vtable (`Upcast::Same`), so the supertrait's list takes the subtrait's, and its
 //! openness.
 
-use std::alloc::Global;
+use std::{
+    alloc::Global,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use base_db::{Crate, Db};
 use blaze_codegen::{
@@ -25,7 +32,7 @@ use blaze_codegen::{
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey};
-use hir_def::{CallableDefId, ItemContainerId, TraitId, signatures::TraitSignature};
+use hir_def::{CallableDefId, HasModule, ItemContainerId, TraitId, signatures::TraitSignature};
 use hir_ty::{
     next_solver::{
         GenericArgs, ParamEnv, StoredGenericArgs, StoredTy, Ty, TyKind, infer::InferCtxt,
@@ -50,7 +57,7 @@ const LOADERS: &[&str] =
     &["dlopen", "dlmopen", "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"];
 
 /// What one walked body does with trait objects, each once, in the order found.
-#[derive(PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Facts {
     /// The vtables its IR makes: the type and the object type.
     pub(crate) vtables: Vec<(StoredTy, ObjectKey)>,
@@ -215,6 +222,115 @@ pub(crate) struct State {
     /// The world the program's bodies are built against, held from the end of its first walk
     /// ([`State::closed`]): unset before, and for a program that has none.
     held: Slot<Held>,
+    plain: Slot<Arc<Members>>,
+    closed_members: Slot<Arc<Members>>,
+    resumed: Slot<Checkpoint>,
+    using_resumed: AtomicBool,
+}
+
+/// The exact inputs of the two successful closures, scoped to the kept walk's database.
+#[derive(Clone)]
+pub struct Checkpoint {
+    makes: (RootKind, Crate),
+    program: Box<str>,
+    held: Held,
+    plain: Arc<Members>,
+    closed: Arc<Members>,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct Members {
+    functions: HashMap<(HirInstance, Origin), Arc<Contribution>>,
+    statics: HashMap<HirStatic, Arc<StaticContribution>>,
+}
+
+impl State {
+    pub(super) fn checkpoint(&self) -> Option<Checkpoint> {
+        if self.using_resumed.load(Ordering::Acquire) {
+            return self.resumed.get().cloned();
+        }
+        let held = self.held.get()?;
+        Some(Checkpoint {
+            makes: *self.makes.get()?,
+            program: held.world().program.clone(), // clone: the program's name, once a build
+            held: held.clone(),                    // clone: one reference, kept with its walk
+            plain: self.plain.get()?.clone(),
+            closed: self.closed_members.get()?.clone(),
+        })
+    }
+
+    pub(super) fn abandon(&self) {
+        self.using_resumed.store(false, Ordering::Release);
+    }
+
+    pub(super) fn resume(
+        &self,
+        front: &HirFrontend<'_>,
+        kept: &Checkpoint,
+        view: u64,
+    ) -> Result<(), &'static str> {
+        use blaze_query::db::{Changed, View};
+        front.with(|db| {
+            if self.makes.get() != Some(&kept.makes)
+                || program_name(db, kept.makes.0, kept.makes.1) != kept.program
+            {
+                return Err("another program made the world checkpoint");
+            }
+            let since = View::from_u64(view);
+            let Changed::Keys(changed) = contribution::changed_since(db, since) else {
+                return Err("the changed set of world contributions is unknown");
+            };
+            for id in changed {
+                let Some((i, o, facing)) = contribution::arguments(db, id) else {
+                    return Err("a changed world contribution has no arguments");
+                };
+                if facing == front.facing(None) {
+                    let asked = (i, o);
+                    if let Some(was) = kept
+                        .plain
+                        .functions
+                        .get(&asked)
+                        .or_else(|| kept.closed.functions.get(&asked))
+                    {
+                        let now = contribution(db, asked.0, o, facing)
+                            .as_ref()
+                            .map_err(|_| "a function's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            return Err(
+                                "a reached function changed its world contribution or plain edges",
+                            );
+                        }
+                    }
+                }
+            }
+            let Changed::Keys(changed) = static_contribution::changed_since(db, since) else {
+                return Err("the changed set of static world contributions is unknown");
+            };
+            for id in changed {
+                let Some((s, facing)) = static_contribution::arguments(db, id) else {
+                    return Err("a changed static world contribution has no arguments");
+                };
+                if facing == front.facing(None) {
+                    if let Some(was) =
+                        kept.plain.statics.get(&s).or_else(|| kept.closed.statics.get(&s))
+                    {
+                        let now = static_contribution(db, s, facing)
+                            .as_ref()
+                            .map_err(|_| "a static's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            return Err(
+                                "a reached static changed its world contribution or plain edges",
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        self.resumed.set(kept.clone()).map_err(|_| "the front end already resumed a world")?;
+        self.using_resumed.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 impl State {
@@ -243,6 +359,9 @@ impl State {
     /// The world the walk's bodies are built against: `None` before the first walk ends, and
     /// for a program that has none. One acquire load.
     pub(crate) fn world(&self) -> Option<DevirtWorld> {
+        if self.using_resumed.load(Ordering::Acquire) {
+            return self.resumed.get().map(|it| it.held.world().id);
+        }
         self.held.get().map(|it| it.world().id)
     }
 
@@ -270,6 +389,52 @@ impl State {
                 .map_err(|what| refused_of(db, krate, kind, what))
         })?;
         let held = self.held.get().map(|it| it.world().id);
+        if made.is_some() && made.as_ref().is_some_and(|it| held.is_none_or(|id| it.id == id)) {
+            let slot = if held.is_none() { &self.plain } else { &self.closed_members };
+            if slot.get().is_none() {
+                // alloc: one membership index for this round; changes are probed by item.
+                let members = frontend.with(|db| {
+                    let facing = frontend.facing(None);
+                    let fail = |s: &String| refused_of(db, krate, kind, s);
+                    Ok::<_, CodegenError>(Arc::new(Members {
+                        functions: functions
+                            .iter()
+                            .map(|(i, o)| {
+                                Ok((
+                                    (i.clone(), *o),
+                                    contribution(db, i.clone(), *o, facing)
+                                        .as_ref()
+                                        .map_err(fail)?
+                                        .clone(),
+                                ))
+                            })
+                            .collect::<Result<_, CodegenError>>()?,
+                        statics: statics
+                            .iter()
+                            .map(|s| {
+                                Ok((
+                                    *s,
+                                    static_contribution(db, *s, facing)
+                                        .as_ref()
+                                        .map_err(fail)?
+                                        .clone(),
+                                ))
+                            })
+                            .collect::<Result<_, CodegenError>>()?,
+                    }))
+                })?;
+                if slot.put(members).is_err() {
+                    return Err(frontend.with(|db| {
+                        refused_of(
+                            db,
+                            krate,
+                            kind,
+                            "two walks gave different members for the same closure",
+                        )
+                    }));
+                }
+            }
+        }
         let others = |id: DevirtWorld, found: String| {
             frontend.with(|db| {
                 refused_of(
@@ -337,6 +502,131 @@ struct Found {
     open: Option<String>,
 }
 
+// The projection must backdate when a literal changes but no edge or world input does.
+// The graph is ordered: the first loader or foreign signature supplies the open reason.
+#[derive(PartialEq, Eq, Debug)]
+struct Contribution {
+    origin: Origin,
+    edges: Vec<super::places::Ref>,
+    count: blaze_codegen::backend::Counted,
+    sites: bool,
+    facts: Facts,
+    loader: Option<String>,
+    foreign: Option<String>,
+    objects: Vec<ContentId>,
+}
+
+/// DB handles alone don't prove that an object's content identity has not changed. Read
+/// the same type, principal and argument digests the world writer uses for each key.
+fn object_inputs(
+    front: &HirFrontend<'_>,
+    db: &Db,
+    facts: &Facts,
+) -> Result<Vec<ContentId>, String> {
+    let mut ids = Vec::new(); // alloc: only an item that contributes an object
+    for &(ref ty, key) in &facts.vtables {
+        let (tr, args) = key_id(front, db, key)?;
+        ids.extend([tr, args]);
+        ids.push(front.hashes.ty(db, ty.as_ref())?);
+    }
+    for &key in facts.foreign.iter().chain(facts.upcasts.iter().flat_map(|(a, b)| [a, b])) {
+        let (tr, args) = key_id(front, db, key)?;
+        ids.extend([tr, args]);
+    }
+    Ok(ids)
+}
+
+#[blaze_query::tracked(returns(ref))]
+fn contribution(
+    db: &Db,
+    i: HirInstance,
+    o: Origin,
+    facing: super::frontend::Facing,
+) -> Result<Arc<Contribution>, String> {
+    let front = facing.front(db)?;
+    let origin = front.compiled_for(db, &i, &o);
+    let inlined = front.inlines_for(db, &i, &o)?;
+    let owner = front.owner(db, &i.0);
+    let sites = takes_world(db, &i, inlined, || owner)?;
+    let walking = refs::Walking::plain(inlined);
+    let facts = refs::facts(db, &i, walking)?.cloned().unwrap_or_default();
+    let mut edges = refs::walk(db, &i, walking)?;
+    super::frontend::asked_by(owner, &mut edges);
+    let ours = super::frontend::crate_of(db, &i.0).is_some_and(|it| !it.data(db).origin.is_lang());
+    let loader = ours
+        .then(|| {
+            edges.iter().find_map(|r| match r {
+                FrontRef::Extern(name) if LOADERS.contains(&name.as_str()) => {
+                    Some(format!("{} loads code at run time (`{name}`)", super::Named(db, &i)))
+                }
+                _ => None,
+            })
+        })
+        .flatten();
+    edges.retain(|r| matches!(r, FrontRef::Function(_) | FrontRef::Static(_)));
+    let foreign = (!facts.foreign.is_empty())
+        .then(|| format!("{} carries it across the program's edge", super::Named(db, &i)));
+    let objects = object_inputs(&front, db, &facts)?;
+    Ok(Arc::new(Contribution {
+        origin,
+        edges,
+        count: super::frontend::counted_memo(db, i, ()),
+        sites,
+        facts,
+        foreign,
+        loader,
+        objects,
+    }))
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct StaticContribution {
+    facts: Facts,
+    origin: Origin,
+    edges: Vec<super::places::Ref>,
+    objects: Vec<ContentId>,
+}
+
+#[blaze_query::tracked(returns(ref))]
+fn static_contribution(
+    db: &Db,
+    value: HirStatic,
+    facing: super::frontend::Facing,
+) -> Result<Arc<StaticContribution>, String> {
+    let front = facing.front(db)?;
+    let mut facts = Facts::default();
+    let mut edges = super::places::Placer::open();
+    if let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)? {
+        for request in &compiled.requests.funcs {
+            let r = super::places::func_ref(db, &request.target)?;
+            if matches!(r, FrontRef::Function(_)) {
+                edges.place(r)?;
+            }
+        }
+        for request in &compiled.requests.datas {
+            if let crate::fragment::DataRequest::Vtable {
+                ty,
+                trait_ref: Some((trait_, args)),
+                ..
+            } = request
+            {
+                facts.vtable(ty, *trait_, args);
+            }
+            if let crate::fragment::DataRequest::Static(id) = request {
+                let r = super::places::static_ref(db, *id)?;
+                if matches!(r, FrontRef::Static(_)) {
+                    edges.place(r)?;
+                }
+            }
+        }
+    }
+    let objects = object_inputs(&front, db, &facts)?;
+    let origin = front.origin(db, value.0.krate(db));
+    let mut edges = edges.into_refs();
+    super::frontend::asked_by(front.static_owner(db, &value), &mut edges);
+    Ok(Arc::new(StaticContribution { facts, edges, origin, objects }))
+}
+
 /// The program's world from what its walk reached; `None` where no reached body calls through
 /// a `dyn`, so nothing is built against one.
 fn world_of(
@@ -352,16 +642,27 @@ fn world_of(
     let mut upcasts = Vec::new();
     let mut loads = None;
     let mut sites = false;
+    // No consumer: no world, and therefore no checkpoint or projections to maintain.
+    let mut any = false;
+    for (i, o) in functions {
+        if takes_world(db, i, frontend.inlines_for(db, i, o)?, || frontend.owner(db, &i.0))? {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return Ok(None);
+    }
     let mut seen = blaze_hash::HashSet::new_in(Global);
     for (instance, requester) in functions {
+        let c = contribution(db, instance.clone(), *requester, frontend.facing(None))
+            .as_ref()
+            .map_err(Clone::clone)?;
         if !seen.insert(instance) {
             continue;
         }
-        let inlined = frontend.inlines_for(db, instance, requester)?;
-        sites |= takes_world(db, instance, inlined, || frontend.owner(db, &instance.0))?;
-        let Some(facts) = refs::facts(db, instance, refs::Walking::plain(inlined))? else {
-            continue;
-        };
+        sites |= c.sites;
+        let facts = &c.facts;
         for (ty, key) in &facts.vtables {
             // clone: a reference count, once per vtable the program makes
             objects.entry(*key).or_default().tys.push(ty.clone());
@@ -371,26 +672,11 @@ fn world_of(
             let found = objects.entry(*key).or_default();
             if found.open.is_none() {
                 // alloc: the reason, once an object
-                found.open = Some(format!(
-                    "{} carries it across the program's edge",
-                    super::Named(db, instance)
-                ));
+                found.open = c.foreign.clone();
             }
         }
-        let ours = super::frontend::crate_of(db, &instance.0)
-            .is_some_and(|it| !it.data(db).origin.is_lang());
-        if ours && loads.is_none() {
-            for it in refs::listed(db, instance, refs::Walking::plain(inlined))?.iter() {
-                if let FrontRef::Extern(name) = it
-                    && LOADERS.contains(&name.as_str())
-                {
-                    // alloc: the reason, once a program
-                    loads = Some(format!(
-                        "{} loads code at run time (`{name}`)",
-                        super::Named(db, instance)
-                    ));
-                }
-            }
+        if loads.is_none() {
+            loads.clone_from(&c.loader);
         }
     }
     if !sites {
@@ -398,23 +684,11 @@ fn world_of(
     }
     for value in statics {
         // An `extern_weak` static holds a foreign symbol's address: no vtable of its value.
-        let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)?
-        else {
-            continue;
-        };
-        let mut facts = Facts::default();
-        for request in &compiled.requests.datas {
-            if let crate::fragment::DataRequest::Vtable {
-                ty,
-                trait_ref: Some((trait_, args)),
-                ..
-            } = request
-            {
-                facts.vtable(ty, *trait_, args);
-            }
-        }
-        for (ty, key) in facts.vtables {
-            objects.entry(key).or_default().tys.push(ty);
+        let c = static_contribution(db, *value, frontend.facing(None))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        for (ty, key) in &c.facts.vtables {
+            objects.entry(*key).or_default().tys.push(ty.clone());
         }
     }
     // An upcast object holds the types of the one it is upcast from: propagated to a fixpoint,
@@ -470,13 +744,11 @@ fn world_of(
 }
 
 /// The facts of one object type: its types by content, in order, each once.
-fn object(
+fn key_id(
     frontend: &HirFrontend<'_>,
     db: &Db,
     key: ObjectKey,
-    found: Found,
-    everything: Option<&str>,
-) -> Result<Object, String> {
+) -> Result<(ContentId, ContentId), String> {
     let hashes = &frontend.hashes;
     let trait_id = hashes.item(db, ItemId::Trait(key.trait_))?.0;
     let mut args = Hasher::new(ARGS_DOMAIN);
@@ -490,7 +762,19 @@ fn object(
             (None, None) => args.update(&[2]),
         };
     }
-    let args_id = args.finish();
+    Ok((trait_id, args.finish()))
+}
+
+fn object(
+    frontend: &HirFrontend<'_>,
+    db: &Db,
+    key: ObjectKey,
+    found: Found,
+    everything: Option<&str>,
+) -> Result<Object, String> {
+    let hashes = &frontend.hashes;
+    let after_self = key.args.as_ref();
+    let (trait_id, args_id) = key_id(frontend, db, key)?;
     // alloc: once an object, its types
     let mut targets = Vec::with_capacity(found.tys.len());
     for ty in found.tys {

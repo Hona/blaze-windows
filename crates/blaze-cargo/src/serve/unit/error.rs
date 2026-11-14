@@ -110,7 +110,8 @@ impl From<UnitError> for ApiError {
 
 /// The directory of `package`'s manifest at `path`.
 pub(crate) fn manifest_dir(package: &str, path: &str) -> Result<std::path::PathBuf, UnitError> {
-    std::path::Path::new(path)
+    // The system's path: a program runs there, and a sandbox opens it.
+    blaze_core::platform::path::host(path)
         .parent()
         .filter(|it| !it.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)

@@ -15,14 +15,26 @@ pub(crate) fn artifact(
     test: bool,
     exe: Option<&str>,
 ) -> Artifact {
+    artifact_in("/w", package, kind, name, test, exe)
+}
+
+/// [`artifact`] of a workspace at `w`, as the daemon names it.
+pub(crate) fn artifact_in(
+    w: &str,
+    package: &str,
+    kind: &str,
+    name: &str,
+    test: bool,
+    exe: Option<&str>,
+) -> Artifact {
     let src_path = match kind {
-        "lib" => format!("/w/{package}/src/lib.rs"),
-        "bin" if name == package => format!("/w/{package}/src/main.rs"),
-        "bin" => format!("/w/{package}/src/bin/{name}.rs"),
-        "test" => format!("/w/{package}/tests/{name}.rs"),
-        "bench" => format!("/w/{package}/benches/{name}.rs"),
-        "example" => format!("/w/{package}/examples/{name}.rs"),
-        _ => format!("/w/{package}/src/lib.rs"),
+        "lib" => format!("{w}/{package}/src/lib.rs"),
+        "bin" if name == package => format!("{w}/{package}/src/main.rs"),
+        "bin" => format!("{w}/{package}/src/bin/{name}.rs"),
+        "test" => format!("{w}/{package}/tests/{name}.rs"),
+        "bench" => format!("{w}/{package}/benches/{name}.rs"),
+        "example" => format!("{w}/{package}/examples/{name}.rs"),
+        _ => format!("{w}/{package}/src/lib.rs"),
     };
     let target = UnitTarget {
         kind: TargetKind::named(kind).unwrap(),
@@ -35,15 +47,15 @@ pub(crate) fn artifact(
         test: true,
     };
     let path = exe.map_or_else(
-        || format!("/w/target/debug/lib{name}.rlib"),
-        |it| format!("/w/target/debug/{it}"),
+        || format!("{w}/target/debug/lib{name}.rlib"),
+        |it| format!("{w}/target/debug/{it}"),
     );
     Artifact {
-        package: format!("path+file:///w/{package}#0.1.0"),
+        package: format!("path+file://{w}/{package}#0.1.0"),
         kind: if test { ArtifactKind::Test } else { ArtifactKind::named(kind).unwrap() },
         path: path.clone(),
         content: ContentId([0; 32]),
-        manifest_path: format!("/w/{package}/Cargo.toml"),
+        manifest_path: format!("{w}/{package}/Cargo.toml"),
         target,
         profile: UnitProfile {
             opt_level: "0".to_owned(),
@@ -154,14 +166,17 @@ fn the_program_as_cargo_shows_and_runs_it() {
     assert_eq!(exec.cwd, Path::new("/w/foo"));
     assert_eq!(exec.env, [("CARGO_PKG_NAME".to_owned(), "foo".to_owned())]);
     let exec = planned(&foo, &args, Path::new("/w")).unwrap();
-    assert_eq!(exec.shown(), "`target/debug/foo a 'b c'`");
+    // As cargo shows it on each: the system's separator, and its shell's quotes.
+    let (exe, quoted) =
+        if cfg!(windows) { (r"target\debug\foo", "\"b c\"") } else { ("target/debug/foo", "'b c'") };
+    assert_eq!(exec.shown(), format!("`{exe} a {quoted}`"));
 
     let runner = Artifact {
         runner: vec!["qemu-aarch64".to_owned(), "-L".to_owned(), "/sysroot".to_owned()],
         ..foo
     };
     let exec = planned(&runner, &args, Path::new("/w")).unwrap();
-    assert_eq!(exec.shown(), "`qemu-aarch64 -L /sysroot target/debug/foo a 'b c'`");
+    assert_eq!(exec.shown(), format!("`qemu-aarch64 -L /sysroot {exe} a {quoted}`"));
 }
 
 #[cfg(unix)]
@@ -191,4 +206,59 @@ fn an_error_with_its_cause() {
         ),
         "error: could not execute process `target/debug/foo` (never executed)\n\nCaused by:\n  No such file or directory (os error 2)\n"
     );
+}
+
+/// The invariant, on Windows: a program `blaze run` runs ends the command with its whole exit
+/// code (an NTSTATUS too, said by name), and nothing it started outlives it: what is left in
+/// its job when the run ends is ended (the job ends with the run). The control, the job taken
+/// out: the same program run by std's `status()` leaves its child running.
+#[cfg(windows)]
+#[test]
+fn a_program_ends_the_run_with_its_whole_code_and_takes_what_it_started_with_it() {
+    let dir = std::env::temp_dir().join(format!("blaze-run-held-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cmd = |args: &[&str]| Exec {
+        program: std::path::PathBuf::from("cmd.exe"),
+        args: args.iter().map(OsString::from).collect(),
+        env: Vec::new(),
+        cwd: dir.clone(),
+    };
+    let told = Told { color: false, quiet: false, verbose: 0 };
+    let mut said = Vec::new();
+    assert_eq!(exec(&cmd(&["/c", "exit 3"]), &mut said, told), 3);
+    assert_eq!(exec(&cmd(&["/c", "exit -1073741819"]), &mut said, told), 0xC000_0005_u32 as i32);
+    let said = String::from_utf8(said).unwrap();
+    assert!(said.contains("STATUS_ACCESS_VIOLATION"), "{said}");
+    // A program that starts a ping, writes down its process ID and ends.
+    let starter = |file: &str| {
+        let script = format!(
+            "$s = New-Object System.Diagnostics.ProcessStartInfo 'ping.exe', '-n 60 127.0.0.1'; \
+             $s.UseShellExecute = $false; $s.CreateNoWindow = $true; \
+             $p = [System.Diagnostics.Process]::Start($s); Set-Content -Path {file} -Value $p.Id"
+        );
+        Exec {
+            program: std::path::PathBuf::from("powershell.exe"),
+            args: ["-NoProfile", "-NonInteractive", "-Command", script.as_str()]
+                .iter()
+                .map(OsString::from)
+                .collect(),
+            env: Vec::new(),
+            cwd: dir.clone(),
+        }
+    };
+    let pid = |file: &str| -> u32 {
+        std::fs::read_to_string(dir.join(file)).unwrap().trim().parse().unwrap()
+    };
+    let second = std::time::Duration::from_secs(1);
+    assert_eq!(exec(&starter("held.txt"), &mut Vec::new(), told), 0);
+    assert!(
+        crate::raw::process::ended_within(pid("held.txt"), 5 * second).unwrap(),
+        "the program's child outlived the run"
+    );
+    assert!(starter("loose.txt").command().status().unwrap().success());
+    let loose = pid("loose.txt");
+    assert!(!crate::raw::process::ended_within(loose, second).unwrap(), "the control's child ran on");
+    let _ = std::process::Command::new("taskkill.exe").args(["/F", "/PID", &loose.to_string()]).output();
+    let _ = std::fs::remove_dir_all(&dir);
 }

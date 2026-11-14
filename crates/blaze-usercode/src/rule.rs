@@ -66,7 +66,7 @@ pub fn widen<I: Inputs>(
     }
     // Any file of the package, only where a file read went unseen (the module's docs).
     if let Some(package) = &rule.package
-        && traced.untraceable.contains(&Untraceable::Descriptor)
+        && traced.untraceable.iter().any(|it| matches!(it, Untraceable::Descriptor | Untraceable::CargoDeclared))
     {
         match trace::package(inputs, package)? {
             Some(hash) => traced.dirs.push((package.join(PACKAGE), hash)),

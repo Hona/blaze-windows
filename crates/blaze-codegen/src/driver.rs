@@ -326,6 +326,8 @@ pub enum CheckRoot<I, S> {
 
 type FrontInstance<B> = <<B as Prepare>::Frontend as Frontend>::Instance;
 type FrontStatic<B> = <<B as Prepare>::Frontend as Frontend>::Static;
+type FrontWorld<B> = <<B as Prepare>::Frontend as Frontend>::World;
+type KeptOf<B> = Kept<FrontInstance<B>, FrontStatic<B>, FrontWorld<B>>;
 type Node<B> = FnNode<FrontInstance<B>, FrontStatic<B>>;
 
 /// A function of a walk, over the front end's instance `I` and static `S`: what a lazy run
@@ -1620,7 +1622,7 @@ pub struct Build<'a, B: Prepare> {
     rebinds: bool,
     /// The describes of the walks before this one over the same front end, which this walk
     /// takes where the front end says they still hold and adds its own to ([`Build::keeping`]).
-    kept: Option<&'a Kept<FrontInstance<B>, FrontStatic<B>>>,
+    kept: Option<&'a KeptOf<B>>,
     /// Whether the front end is asked before a kept describe is taken
     /// ([`Frontend::redescribe`]): always, but in the control of the test that holds the
     /// walk over kept describes to the walk over none.
@@ -1925,7 +1927,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// `kept` is of this front end's database and configuration and of no other: its
     /// instances are that database's. The walk reaches the same functions either way; with
     /// it, an unchanged function costs the front end's answer in place of a describe.
-    pub fn keeping(mut self, kept: &'a Kept<FrontInstance<B>, FrontStatic<B>>) -> Self {
+    pub fn keeping(mut self, kept: &'a KeptOf<B>) -> Self {
         self.kept = Some(kept);
         self
     }
@@ -2831,6 +2833,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per build, sized by its roots
         let roots = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
         let side = (keeps && errors.is_empty()).then(|| patch::Side {
+            closed: round > 1,
             asked,
             counted,
             described: described_functions,
@@ -3146,6 +3149,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     (nodes, statics, roots, walk, Some(keep), Some((touched, work)))
                 }
                 Err(why) => {
+                    self.frontend.abandon_resumed_world();
                     let (nodes, statics, root_keys, mut walk, side) = self.walk(
                         roots,
                         static_roots,
@@ -3582,7 +3586,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     Err(now) => {
                         lists_unkept = Some(
-                            "a function is folded or built by a release backend, or the \
+                            "a function is folded or profiled, or the \
                              build's lists are not a row a function",
                         );
                         Some(now)

@@ -154,6 +154,113 @@ as the repository's cargo configuration names it. That was run by hand on one ma
 crate and `demo/life`, not in CI; `harness/blaze_cli.py` and the fuzzer are not run there.
 The GNU and ARM64 Windows targets have nothing implemented.
 
+### v2's linker on Windows (2026-11-13, branch `windows/link`)
+
+The paragraphs above are v1's. v2 links PE images with its own linker (`crates/blaze-link`),
+not `link.exe`. What is checked on Windows 11 26100 with MSVC 14.44 and SDK 10.0.26100:
+
+- `src/tests/pe_run.rs` links MSVC-built objects with the machine's CRT and SDK libraries and
+  runs each image: C with the dynamic and the static CRT, C++ exceptions and static
+  initialisers, TLS and TLS callbacks, a DLL and its importer (also through the DLL's own
+  import library, `Image::import_library`), `/guard:cf` and `/GS` code, a GUI program, `.res`
+  resources and their manifest, `/DELAYLOAD` (a missing DLL raises its exception), raw-dylib.
+- link.exe's arguments as rustc and build scripts give them are read (`args/msvc.rs`, listed in
+  [cargo.md](cargo.md)); one blaze does not implement is refused by name. `+crt-static` links
+  the static VC runtime, with the dynamic UCRT where the line asks for it.
+- rustc's own link line for rune-desktop (258 objects, 387 rlibs, its C libraries, 13
+  `/DELAYLOAD`s, its `.res`) links with blaze-link (`examples/pe_relink.rs`), and the program
+  renders frames byte for byte the same as link.exe's image does.
+- The image's PDB is written beside it (`app.pdb` for `app.exe`, `app.dll.pdb` for `app.dll`,
+  so the two can share a directory; [v2/plan/design/pdb.md](v2/plan/design/pdb.md)):
+  dbghelp (std's backtrace) names Rust functions and their lines and C functions by name, cdb
+  breaks on a Rust function by name. It has no types or locals, and is written whole by each
+  link.
+- Not done: CFG tables (`/guard:cf` is refused), a generated manifest (`/MANIFEST:EMBED`; a
+  `.res` manifest works).
+
+### v2 code generation on Windows (2026-11-13, branch `windows/codegen`)
+
+What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 with MSVC 14.52
+(local test programs, not in CI):
+
+- std, with `panic = "abort"` and `"unwind"`: thread-locals reach `_tls_index` (COFF TLS),
+  std's `raw-dylib` imports (`ProcessPrng`, `NtCreateFile`) are an import library the link makes
+  (`blaze-link/src/pe/raw_dylib.rs`), a DLL's static is read through its `__imp_` cell, `f16`
+  and `f128` go to compiler-builtins as Win64 passes them, and core's
+  `#[link(name = "/defaultlib:msvcrt", modifiers = "+verbatim")]` is a default library.
+- Panics are SEH with blaze's own personality (`library/std/src/sys/personality/blaze_seh.rs`):
+  `catch_unwind` four frames down with every frame's drop, XMM6-XMM15 restored into the
+  catching frame, a panic in a thread, nested catches, `resume_unwind`, `#[should_panic]`. A C++
+  exception thrown through a Rust `extern "C-unwind"` frame runs its drop and is caught in C++;
+  a Rust panic through a C++ frame runs its destructor and is caught by `catch_unwind`. Only a
+  pad that catches claims an exception in the search pass; cleanup pads run in the unwind pass.
+- Thread-local destructors, threads, `i128`, C varargs (`snprintf` from
+  `legacy_stdio_definitions`, as under rustc), a 64 KiB frame (stack probes), SSE intrinsics.
+- A Rust panic escaping an `extern "C"` boundary terminates with `panic in a function that
+  cannot unwind`, including when no handler exists above the boundary. A non-C++ structured
+  exception caught above a Rust `extern "C-unwind"` frame runs no Rust drop, as on the pinned
+  MSVC Rust toolchain. Cleanup through a C++ `throw;` rethrow remains unverified.
+
+### Restoring native linker inputs on Windows
+
+The daemon keeps the ordered `(member, library)` names requested by each COFF object or
+archive as a query in its store. The key covers the record schema, the code that produced
+it and the input bytes. On the first link after restart the linker hashes each input it
+encounters, then reads and validates just its record. A miss parses that input; a wrong
+layout or corrupt entry is an error. No records are loaded at daemon startup. Within a
+process the existing file-stamp cache still avoids a read of an unchanged input.
+
+Only requests are reusable, not the paths they resolved to: a new library in an earlier
+search directory must win. The unit header's native paths and hashes describe files a link
+read, not search misses, input kinds, or member directives. This record does not restore
+the image layout or its PDB.
+
+### v2 output placement on Windows
+
+On ReFS, blaze can clone the previous output's blocks and patch the clone. On NTFS,
+a new linker output starts as a sparse file: unused patch room consumes no clusters.
+For an edit, blaze verifies the prospective result against the linker's bytes while
+holding the previous file exclusively. It removes the public name and syncs its directory
+before changing bytes, then flushes the file and publishes the complete result. A crash
+during the patch can leave a missing output, not an accepted partial one. A running,
+mapped, multiply linked or externally changed file is not a patch base; blaze places
+a new file instead. Less data written need not mean a shorter edit: the profile names
+the wait to open an executable exclusively, separate from validation and flushes.
+
+### v2 build scripts on Windows
+
+A script runs inside an AppContainer with its own job. The token has one read capability
+for each input root; the filesystem keeps its read grant, but another run without that
+capability does not gain access. Granting a directory includes its contents. The script
+can write its `OUT_DIR` and temporary directory, not the inputs.
+
+Windows redirects `LOCALAPPDATA` to the AppContainer profile. Each run gets a new profile
+that is deleted when it ends, not a persistent folder shared by packages. To consume an
+existing machine cache, point the script's own override at the cached input and grant it
+read access. For example, `GHOSTTY_VT_LIB` can name the prebuilt Ghostty archive. Its
+parent must also be allowed as a `build-script-link-dirs` entry. This does not grant
+write access to the user's cache or let the script download a missing archive.
+
+Windows has two ways to reuse a script. Blaze can prove that it prints constants or
+depends only on known Cargo variables. Otherwise a successful AppContainer run is keyed
+by **Cargo's rerun rules**, not by a claim that Windows observed the process tree. A
+declared directory covers its descendants. With neither a file nor an environment
+directive, the package's files are inputs. With other directives, an undeclared read in
+the package (including a compiler's header) can go unseen, exactly as with Cargo.
+AppContainer still restricts the script and its children; Cargo does not. Explicit mutable
+read grants, native tools, dependency outputs and the script's logical environment are
+additional inputs. The launcher's private temporary/profile paths are run-local scratch,
+not external caches. See `docs/cargo.md`.
+
+For an external input, set `BLAZE_SCRIPT_READ` in the shell invoking blaze, to absolute
+paths separated by `;`. Use the individual executable for a portable tool on `PATH`, or
+its dedicated installation directory if it also needs DLLs. `PATH` is not permission
+to read everything under each entry. For a linked worktree, include the trusted main
+repository's `.git` directory (including its `worktrees` subdirectory). Blaze does not
+treat paths supplied by a checkout's `.git` file or Cargo `[env]` as permission. All
+build scripts of that invocation can read the inputs you list; do not list a profile,
+a credentials directory or a repository whose history you cannot share with them.
+
 ## macOS arm64
 
 Runs on `macos-latest` in CI under both backends, with `worktrees.py` in all three of its

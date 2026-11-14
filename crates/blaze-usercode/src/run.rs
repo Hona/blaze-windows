@@ -177,6 +177,12 @@ impl Value {
 pub enum Mode {
     Normal,
     Verify,
+    /// Cargo's declared inputs, not a complete observation. A separate given-key domain
+    /// includes the logical environment, tools, explicit grants and dependency results.
+    Declared { verify: bool, host: blaze_ids::ContentId },
+    /// The platform cannot account for its reads. Keep the sandbox, not the result. No
+    /// previous trace (including a record written by another launcher) authorizes reuse.
+    Unobserved,
 }
 
 /// What a run is.
@@ -382,10 +388,12 @@ impl Run {
         I::Error: From<NoRoot>,
     {
         let roots = spec.roots.view();
-        let found = index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs))
-            .map_err(RunError::Find)?;
+        let found = match spec.mode {
+            Mode::Unobserved => None,
+            Mode::Normal | Mode::Verify | Mode::Declared { .. } => Some(index::find_held(store, &spec.key, &mut Rooted::new(roots, inputs)).map_err(RunError::Find)?),
+        };
         let (kept, verified) = match found {
-            Found::Hit { value, verified, .. } => {
+            Some(Found::Hit { value, verified, .. }) => {
                 let value = Value::decode(value).map_err(RunError::BadValue)?;
                 // What it printed, with this run's roots.
                 (
@@ -397,10 +405,10 @@ impl Run {
                     verified,
                 )
             }
-            Found::Miss { .. } => (None, None),
+            Some(Found::Miss { .. }) | None => (None, None),
         };
         let kept = match (kept, spec.mode) {
-            (Some(value), Mode::Normal) => {
+            (Some(value), Mode::Normal | Mode::Declared { verify: false, .. }) => {
                 if let Some(out_dir) = &spec.out_dir {
                     restore(out_dir, &value.files).map_err(RunError::OutDir)?;
                 }
@@ -508,6 +516,9 @@ impl Run {
             .transpose()
             .map_err(|error| RunError::Output { key, error })?;
         let value = Value::of(exit, files);
+        if self.spec.mode == Mode::Unobserved {
+            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
+        }
         // One comparison for verify mode, stderr included: the one sharing makes
         // ([`ported_differs`]), so a rerun that differs only in stderr is a difference said
         // here, never a silent retraction in `verify::keep` or a mismatch of its own key.
@@ -582,6 +593,10 @@ impl Run {
             return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
         };
         rule::widen(&mut traced, &rule, inputs).map_err(RunError::Inputs)?;
+        if matches!(self.spec.mode, Mode::Declared { .. }) && traced.files.iter().any(|(_, v)| v.is_none()) {
+            // Cargo always reruns a declaration naming a missing file, even before it appears.
+            return Ok(Completed { value, traced, tickets: Vec::new(), retracted: None });
+        }
         let roots = self.spec.roots.view();
         // alloc: error path, why the scan could not be made
         let (marked, stored) = roots.kept(&traced, &value).map_err(|error| {
@@ -610,7 +625,7 @@ impl Run {
                 error => RunError::Keep { error, landed: it.tickets, retracted: it.retracted },
             })?;
         // Verify mode: a copy comparison that retracted is a difference too, said as one.
-        if self.spec.mode == Mode::Verify
+        if matches!(self.spec.mode, Mode::Verify | Mode::Declared { verify: true, .. })
             && let Some(ticket) = kept.retracted
         {
             let what = match kept.verdict {
@@ -1227,7 +1242,7 @@ mod tests {
     fn opened(sim: &mut Sim) -> Store {
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -1304,6 +1319,12 @@ mod tests {
         };
         spec.roots =
             crate::roots::RootMap::default().with(crate::roots::Role::Package, Path::new(dir));
+        // Windows has no roots: `script::prepare` keys a run by its absolute directory and read
+        // roots there, so each checkout's run is its own.
+        #[cfg(windows)]
+        {
+            spec.key.given = ContentId::of("blaze v2 test checkout", dir.as_bytes());
+        }
         spec
     }
 
@@ -1357,6 +1378,26 @@ mod tests {
         let completed =
             run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| Ok(()))?;
         Ok((completed.value, true))
+    }
+
+    #[test]
+    fn an_unobserved_run_neither_uses_nor_publishes_a_cached_value() {
+        let mut sim = Sim::new(3, Faults::default());
+        let mut store = opened(&mut sim);
+        let data = Rc::new(RefCell::new([1; 32]));
+        let printed = Rc::new(RefCell::new(b"first".to_vec()));
+        script(&mut sim, data, printed.clone(), Rc::new(RefCell::new(0)));
+        let mut inputs = Fixed {
+            files: [("/ws/data".into(), [1; 32])].into(),
+            env: vec![("CC".into(), "cc".into())],
+        };
+        assert!(go(&mut sim, &mut store, &mut inputs, Mode::Unobserved).unwrap().1);
+        // No record was published. A traced run must execute too.
+        assert!(go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap().1);
+        // Same declared inputs, different result. Must neither reuse nor collide.
+        *printed.borrow_mut() = b"second".to_vec();
+        let (value, ran) = go(&mut sim, &mut store, &mut inputs, Mode::Unobserved).unwrap();
+        assert!(ran && value.stdout == b"second");
     }
 
     #[test]
@@ -1447,6 +1488,22 @@ mod tests {
         // Two checkouts run it and agree: verified.
         assert!(go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap().1);
         assert!(go_in(&mut sim, &mut store, Mode::Normal, "/ckout/b").unwrap().1);
+        // On Windows a run has no roots and is keyed by its checkout: no checkout is given
+        // another's, so each runs and keeps its own, and a rerun that differs has nothing
+        // shared to retract.
+        if cfg!(windows) {
+            let (third, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/c").unwrap();
+            assert!(ran && third.stdout == b"cargo:rustc-cfg=one\n", "a third checkout runs its own");
+            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            match go_in(&mut sim, &mut store, Mode::Verify, "/ckout/c") {
+                Err(RunError::Differs { retracted: None, .. }) => {}
+                other => panic!("a checkout's own value that reruns otherwise is no shared one, not {other:?}"),
+            }
+            let (first, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap();
+            assert!(!ran && first.stdout == b"cargo:rustc-cfg=one\n", "another checkout keeps its own");
+            assert_eq!(*runs.borrow(), 4);
+            return;
+        }
         // A third is given it without a run.
         let (given, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/c").unwrap();
         assert!(!ran && given.stdout == b"cargo:rustc-cfg=one\n");
@@ -1526,6 +1583,29 @@ mod tests {
         }
         let hit = pure_hit(&store, &mut inputs, "/ckout/c")
             .expect("a third checkout is given the pure key's value");
+        // On Windows a run has no roots: what the pure key keeps names the files it read by
+        // their absolute paths, and a third checkout is given it because those files are as
+        // they were, not because two checkouts agreed. Nothing is verified across checkouts,
+        // so a check run that differs retracts nothing, and the sandboxed key is each
+        // checkout's own.
+        if cfg!(windows) {
+            assert!(hit.verified.is_none(), "nothing is verified across checkouts on Windows");
+            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            // The check run is of the third checkout's own key, which kept nothing: it runs
+            // and keeps what it ran.
+            let ran =
+                match go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Verify, "/ckout/c")) {
+                    Ok((ran, true)) => ran,
+                    other => panic!("a check run of a checkout's own key that kept nothing runs, not {other:?}"),
+                };
+            assert_eq!(ran.stdout, b"cargo:rustc-cfg=other\n");
+            let c = spec_in(Mode::Normal, "/ckout/c").roots;
+            assert!(crate::pure::retract(&mut store, &proof, c.view(), &hit, &ran).unwrap().is_none());
+            let (fourth, ran) =
+                go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Normal, "/ckout/d")).unwrap();
+            assert!(ran && fourth.stdout == b"cargo:rustc-cfg=other\n", "a fourth checkout runs its own");
+            return;
+        }
         assert!(hit.verified.is_some(), "verified across the two checkouts");
 
         // The third reruns it on request and gets otherwise: the sandboxed key is retracted,

@@ -433,6 +433,9 @@ fn compiled(
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
         }
+        if alone.is_some() {
+            coff_own_section(&module, target)?;
+        }
         if dump.as_deref() == Some("after") {
             eprintln!("{}", module.print_to_string().to_string_lossy());
         }
@@ -484,6 +487,23 @@ fn own_comdat<'ctx>(
     }
     function.as_global_value().set_comdat(module.get_or_insert_comdat(&name));
     Ok(())
+}
+
+/// Puts the function compiled alone ([`OWN`]) in a COMDAT of its own on COFF. COFF puts a
+/// function's jump tables in a section of their own only for a function in a COMDAT (LLVM's
+/// `getSectionForJumpTable`); else they share `.rdata` with the module's tables of addresses,
+/// a section `emitted` can take neither as the function's (its addresses) nor as a data
+/// object (the jump table's offsets into the code).
+pub(super) fn coff_own_section(
+    module: &Module<'_>,
+    target: &super::Target,
+) -> Result<(), Unhandled> {
+    match module.get_function(OWN) {
+        Some(own) if target.object_format == super::ObjectFormat::Coff => {
+            own_comdat(module, target, own)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Leaves `function`, whose body could not be lowered, a declaration of the same name and
@@ -2037,6 +2057,10 @@ pub enum Unhandled {
     /// Two functions or data objects under one name of the module's own ([`Symbol`]), which
     /// LLVM would tell apart by renaming one to a name no request has: what they are.
     Duplicate(String),
+    /// A constant whose relocation is none the code generator makes of a constant: an
+    /// address of a request (another constant or a function), as LLVM's relocation and target
+    /// say it.
+    Held(String),
 }
 
 impl fmt::Display for Unhandled {
@@ -2056,6 +2080,7 @@ impl fmt::Display for Unhandled {
             Unhandled::Duplicate(what) => {
                 write!(f, "two objects under one name of the module's own: {what}")
             }
+            Unhandled::Held(what) => write!(f, "a constant that holds {what}"),
         }
     }
 }
@@ -2425,6 +2450,142 @@ define i32 @"blaze.own"() {
         assert!(function.as_global_value().get_comdat().is_some());
     }
 
+    /// A `match` that picks one of several constants is a table of their addresses after
+    /// LLVM's optimizations (a switch made a lookup table), on each object format: on COFF an
+    /// absolute one with `IMAGE_REL_AMD64_ADDR64` relocations, which reads back as a constant
+    /// whose relocations name the constants.
+    #[test]
+    fn a_table_of_constants_reads_back_on_each_format() {
+        for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            table_of_constants(crate::Target::of(triple).unwrap());
+        }
+    }
+
+    fn table_of_constants(target: &'static crate::Target) {
+        use cranelift_codegen::ir::{AbiParam, types::I64};
+
+        use super::super::fragment::FuncTarget;
+
+        let isa = super::super::isa_for(target).unwrap();
+        let mut wants = Wants::new(target, &**isa);
+        let datas: Vec<_> = (0..6)
+            .map(|at| {
+                let bytes = format!("the text of case {at}").into_bytes();
+                let blob = crate::ConstBlob { bytes, align: 1, ..crate::ConstBlob::default() };
+                wants.define_const(blob).unwrap()
+            })
+            .collect();
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        // Two functions of one unit, each with its tables, so each is a section of its own.
+        let arms: Vec<_> =
+            (0..8).map(|at| wants.func(FuncTarget::Symbol(format!("arm{at}")), &sig)).collect();
+        let picks = [0, 1].map(|at| {
+            let request = wants.func(FuncTarget::Symbol(format!("pick{at}")), &sig);
+            (request, picking(&**isa, &wants, &sig, &datas, &arms, at))
+        });
+        let members = picks.each_ref().map(|(request, func)| Member {
+            func,
+            named: &[],
+            pointees: &[],
+            request: request.as_u32(),
+        });
+        let unit = emit_unit(&mut wants, &members, optimized_level(), &[]).unwrap();
+        for code in &unit.members {
+            if let Err(error) = code {
+                panic!("{}: {error}", target.triple());
+            }
+        }
+        // A function compiled alone: on COFF its jump table is in a section of its own only
+        // when the function is in a COMDAT, else beside the table of addresses in `.rdata`.
+        if let Err(error) = emit(&mut wants, &[], &picks[0].1, optimized_level(), None, &[]) {
+            panic!("{} alone: {error}", target.triple());
+        }
+    }
+
+    /// A function that returns the address of `datas[i]` for `i` up to their number and,
+    /// past them, what one of eight functions it calls returns (`salt` changes what it passes): a table of addresses
+    /// and a jump table into its code, after LLVM's optimizations.
+    // dyn: cranelift's API takes `&dyn TargetIsa`
+    fn picking(
+        isa: &dyn cranelift_codegen::isa::TargetIsa,
+        wants: &Wants,
+        sig: &ir::Signature,
+        datas: &[cranelift_module::DataId],
+        calls: &[cranelift_module::FuncId],
+        salt: i64,
+    ) -> ir::Function {
+        use cranelift_codegen::ir::{InstBuilder, UserFuncName, types::I64};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
+
+        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig.clone());
+        let globals: Vec<_> = datas
+            .iter()
+            .map(|&it| {
+                let name = func.declare_imported_user_function(ir::UserExternalName {
+                    namespace: 1,
+                    index: it.as_u32(),
+                });
+                func.create_global_value(ir::GlobalValueData::Symbol {
+                    name: ir::ExternalName::user(name),
+                    offset: ir::immediates::Imm64::new(0),
+                    colocated: true,
+                    tls: false,
+                })
+            })
+            .collect();
+        let callees: Vec<_> =
+            calls.iter().map(|&it| wants.declare_func_in_func(it, &mut func)).collect();
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let index = builder.block_params(entry)[0];
+        let cases: Vec<_> = globals.iter().map(|_| builder.create_block()).collect();
+        let other = builder.create_block();
+        let mut switch = Switch::new();
+        for (at, &case) in cases.iter().enumerate() {
+            switch.set_entry(at as u128, case);
+        }
+        switch.emit(&mut builder, index, other);
+        for (&case, &global) in cases.iter().zip(&globals) {
+            builder.switch_to_block(case);
+            let address = builder.ins().symbol_value(I64, global);
+            builder.ins().return_(&[address]);
+        }
+        builder.switch_to_block(other);
+        let none = builder.ins().iconst(I64, 0);
+        // Cases that compute rather than pick: a jump table into the code.
+        let (computed, done) = (builder.create_block(), builder.create_block());
+        builder.append_block_param(done, I64);
+        let picked = builder.ins().icmp_imm(ir::condcodes::IntCC::Equal, index, -1);
+        builder.ins().brif(picked, done, &[none.into()], computed, &[]);
+        builder.switch_to_block(computed);
+        let arms: Vec<_> = (0..8).map(|_| builder.create_block()).collect();
+        let mut table = Switch::new();
+        for (at, &arm) in arms.iter().enumerate() {
+            table.set_entry(at as u128 + 100, arm);
+        }
+        let last = builder.create_block();
+        table.emit(&mut builder, index, last);
+        for (at, &arm) in arms.iter().enumerate() {
+            builder.switch_to_block(arm);
+            let scaled = builder.ins().imul_imm(index, at as i64 * 7 + 3 + salt);
+            let call = builder.ins().call(callees[at], &[scaled]);
+            let value = builder.inst_results(call)[0];
+            builder.ins().jump(done, &[value.into()]);
+        }
+        builder.switch_to_block(last);
+        builder.ins().jump(done, &[none.into()]);
+        builder.switch_to_block(done);
+        let value = builder.block_params(done)[0];
+        builder.ins().return_(&[value]);
+        builder.seal_all_blocks();
+        builder.finalize(isa.frontend_config());
+        func
+    }
     fn reads_back_a_unit_of_two(target: &'static crate::Target) {
         use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

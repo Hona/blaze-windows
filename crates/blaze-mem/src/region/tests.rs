@@ -12,7 +12,7 @@ use crate::{Region, Tag, racy, tag};
 /// system blaze runs on.
 const PAGE: usize = 64 << 10;
 
-/// The pool's default reservation: 4 TiB, 4096 windows of 1 GiB.
+/// Unix's default and the largest supported Windows reservation.
 const POOL_RESERVATION: usize = 4 << 40;
 
 fn write_page(region: &Region, at: usize, byte: u8) {
@@ -43,21 +43,21 @@ fn resident(region: &Region, at: usize, len: usize) -> usize {
     pages.iter().filter(|&&it| it & 1 != 0).count()
 }
 
-/// The pool's reservation is granted, costs nothing until touched, and its pages anywhere in it
-/// (the first, one 2 TiB in, the last) are made the process's, hold what is written, and go back
-/// in one call. Run on macOS and Linux, where the pool reserves this much at the store's open.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// The default Unix reservation and the minimum Windows reservation support sparse use at
+/// both ends and the midpoint. Only the three reused pages should count as held.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-fn the_pools_four_tib_reservation_is_granted_and_gives_pages_back() {
-    let region = Region::reserve_sparse(POOL_RESERVATION, Tag::Other)
-        .unwrap_or_else(|error| panic!("the store pool's 4 TiB reservation: {error}"));
-    assert_eq!(region.reserved(), POOL_RESERVATION);
+fn the_pool_reservation_is_granted_and_gives_pages_back() {
+    let bytes = if cfg!(windows) { 32 << 30 } else { POOL_RESERVATION };
+    let region = Region::reserve_sparse_ranges(bytes, Tag::Other)
+        .unwrap_or_else(|error| panic!("the store pool's {bytes} byte reservation: {error}"));
+    assert_eq!(region.reserved(), bytes);
     assert_eq!((region.committed(), region.held()), (0, 0), "a reservation holds nothing");
-    let pages = [0, POOL_RESERVATION / 2, POOL_RESERVATION - PAGE];
+    let pages = [0, bytes / 2, bytes - PAGE];
     for (n, &at) in pages.iter().enumerate() {
-        // SAFETY: inside the live region, every byte of which reads zero until written.
-        assert_eq!(unsafe { region.at(at).as_ptr().read_volatile() }, 0, "untouched reads zero");
         region.reuse(at, PAGE).expect("reuse a page of the reservation");
+        // SAFETY: the first reuse committed this page; no byte was written yet.
+        assert_eq!(unsafe { region.at(at).as_ptr().read_volatile() }, 0, "new pages read zero");
         write_page(&region, at, n as u8 + 1);
     }
     assert_eq!(region.held(), 3 * PAGE);
@@ -78,6 +78,38 @@ fn the_pools_four_tib_reservation_is_granted_and_gives_pages_back() {
         assert_eq!(resident(&region, at, PAGE), 0, "MADV_DONTNEED dropped the page at {at}");
         assert_eq!(ends_of(&region, at), [0; 16], "a page given back reads zeros on Linux");
     }
+}
+
+/// Query the kernel, not the region's accounting: an empty store's state words used to
+/// charge the page file for all 4 TiB of potential windows (512 MiB of words per store).
+#[cfg(windows)]
+#[test]
+fn only_open_windows_cost_commit_for_the_pools_state_words() {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
+    fn kernel_charge(region: &Region) -> usize {
+        let (mut at, mut charged) = (0, 0);
+        while at < region.reserved() {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: this address is inside the reservation; the query writes one `info`.
+            let n = unsafe { VirtualQuery(region.at(at).as_ptr().cast(), &mut info, size_of_val(&info)) };
+            assert_eq!(n, size_of_val(&info));
+            assert!(info.RegionSize > 0);
+            if info.State == MEM_COMMIT { charged += info.RegionSize; }
+            at += info.RegionSize;
+        }
+        charged
+    }
+    let reservation = POOL_RESERVATION / PAGE * 8;
+    let old = Region::reserve_sparse(reservation, Tag::Other).unwrap();
+    assert_eq!(kernel_charge(&old), 512 << 20);
+    drop(old);
+    let words = Region::reserve_sparse_prefix(reservation, Tag::Other).unwrap();
+    assert_eq!(kernel_charge(&words), 0);
+    words.ensure(128 << 10).unwrap(); // one 1 GiB window
+    let charge = kernel_charge(&words);
+    eprintln!("store word commit: old empty {reservation}, new empty 0, new first window {charge}");
+    assert_eq!(charge, words.committed());
+    assert!(charge < 512 << 10);
 }
 
 /// The kernel takes the pool's give-back of its own pages: on Linux `process_madvise` of this
@@ -173,7 +205,8 @@ fn the_tag_follows_reuses_and_evictions(tc: TestCase) {
         assert_eq!(region.held(), holds, "the region's held bytes after {n} steps");
         assert_eq!(
             tag::snapshot().get(Tag::Pool).live,
-            before + holds as u64,
+            // Windows commits a readable sparse region whole as it is reserved, and counts it.
+            before + holds as u64 + if region.whole { region.reserved() as u64 } else { 0 },
             "Tag::Pool after {n} steps"
         );
         for (it, byte) in held.iter().enumerate() {

@@ -256,3 +256,139 @@ fn the_oracle_catches_a_model_that_says_first_is_always_some() {
     let Err(what) = caught else { panic!("the planted model was not caught: {caught:?}") };
     assert!(what.contains("is discharged, and the run panics"), "{what}");
 }
+
+
+/// A `match` of `arms` arms, each through `Option::and_then` and a
+/// `let .. else`, like rune's `dispatch_action`.
+fn dispatch_source(arms: usize) -> String {
+    let mut variants = String::new();
+    let mut fields = String::new();
+    let mut body = String::new();
+    for i in 0..arms {
+        variants += &format!("A{i}(P, bool), ");
+        fields += &format!("h{i}: Option<fn(u32) -> bool>, ");
+        body += &format!(
+            "Action::A{i}(p, b) => {{ let Some(f) = node(s, p.0).and_then(|n| n.h{i}) else {{ return false }}; let k = p.0; if b {{ s.held = {i}; s.keep = Some(p); }} f(k) }}\n"
+        );
+    }
+    format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub enum Action {{ {variants} }}\n\
+         pub struct Node {{ {fields} }}\n\
+         pub struct P(u32);\nimpl Drop for P {{ fn drop(&mut self) {{}} }}\npub struct S {{ nodes: Option<Node>, held: u32, keep: Option<P> }}\n\
+         fn node(s: &S, p: u32) -> Option<&Node> {{ if p == 0 {{ None }} else {{ match &s.nodes {{ Some(n) => Some(n), None => None }} }} }}\n\
+         pub fn probe(s: &mut S, a: Action) -> bool {{\n\
+         let repeat = match a {{ Action::A1(..) => true, _ => false }};\n\
+         let ran = match a {{\n{body}}};\n\
+         ran && !repeat\n}}\n"
+    )
+}
+
+#[test]
+fn a_wide_dispatch_proof_scales() {
+    for arms in [20usize, 40, 80, 160, 320] {
+        let source = dispatch_source(arms);
+        let db = fixture::db(&source).into_db();
+        let krate = crate_named(&db, "kernel");
+        blaze_query::db::attach(&db, || {
+            let probe = fn_named(&db, krate, "probe");
+            let def = DefWithBodyId::FunctionId(probe);
+            let body = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers");
+            let blocks = body.basic_blocks.len();
+            let start = std::time::Instant::now();
+            let reach = reach::of_body(&db, def);
+            let visits = reach::PROOF_VISITS.get();
+            eprintln!("{arms} arms, {blocks} blocks: {visits} visits, {:?}", start.elapsed());
+            assert_eq!(reach.refused, None);
+            assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
+            // A path carries one exclusion per preceding arm. None is a transitive or
+            // linear premise; each question should inspect only a bounded number of facts.
+            // Counts fact inspections and endpoint lookups, not allocations or wall time.
+            assert!(visits <= 80 * blocks as u64, "{blocks} blocks, {visits} visits");
+        });
+    }
+}
+
+/// The most implications any joined state of `probe` holds, where `probe` joins a `bool` of
+/// two comparisons `joins` times, each read once and then gone (a drop flag's shape).
+fn most_implications(joins: u32) -> usize {
+    let mut body = String::new();
+    for n in 0..joins {
+        body += &format!(
+            "{{ let b{n} = x < {} && y < {} && x != {}; if b{n} {{ r += 1; }} }}\n",
+            n + 10,
+            n + 5,
+            n + 20
+        );
+    }
+    // alloc: a test's fixture
+    let source = format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub fn probe(x: u32, y: u32) -> u32 {{\n    let mut r = 0u32;\n{body}    r\n}}\n"
+    );
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        reach::MOST_IMPLICATIONS.set(0);
+        let reach = reach::of_body(&db, def);
+        assert_eq!(reach.refused, None);
+        reach::MOST_IMPLICATIONS.get()
+    })
+}
+
+/// The invariant: what a join implies of a joined `bool` is forgotten once no later read can
+/// reach that value, so the implications a state holds do not grow with the joins before
+/// it. rune's `dispatch_action` carried 18,570 to its end and took hours (INTEGRATION I49).
+#[test]
+fn a_join_forgets_the_implications_of_values_gone() {
+    let (few, many) = (most_implications(2), most_implications(24));
+    assert!(few > 0, "the shape makes no implications to forget");
+    assert_eq!(few, many, "the implications grew with the joins: {few} for 2, {many} for 24");
+}
+
+/// A body with no loop has each block walked once, after all paths into it.
+#[test]
+fn a_body_with_no_loop_walks_each_block_once() {
+    let source = dispatch_source(24);
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers").basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
+    let source = dispatch_source(32).replace("ran && !repeat", "let mut i = s.held; while i > 0 { i -= 1; } ran && !repeat");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).unwrap().basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks < blocks + 100, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn iterating_recursive_effects_proves_the_instance_sites_only_once() {
+    let source = format!("{MINICORE}//- /lib.rs crate:kernel\nfn probe(n: u32) -> u32 {{ if n > 0 {{ next(n - 1) }} else {{ 0 }} }}\nfn next(n: u32) -> u32 {{ probe(n) }}");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let probe = fn_named(&db, krate, "probe");
+        reach::COUNT_BODY.set(Some(probe.into()));
+        reach::COUNT_PROOFS.set(0);
+        crate::fn_purity_generic(&db, probe);
+        reach::COUNT_BODY.set(None);
+        assert_eq!(reach::COUNT_PROOFS.get(), 1);
+    });
+}

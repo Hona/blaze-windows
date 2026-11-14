@@ -180,6 +180,9 @@ impl Default for Faults {
 
 #[derive(Debug)]
 struct SimFile {
+    /// The immutable generation leased to readers by Map. A rename moves the lease with
+    /// the file; replacing its name makes an independent generation. Never owns the view.
+    mapped: std::sync::Weak<crate::Held>,
     /// What survives a crash.
     durable: Vec<u8>,
     /// What changed it since the last sync that covered it, in order; read as part of the
@@ -211,6 +214,7 @@ impl Default for SimFile {
     fn default() -> SimFile {
         // alloc: none, two empty vectors.
         SimFile {
+            mapped: std::sync::Weak::new(),
             durable: Vec::new(),
             ops: Vec::new(),
             mode: 0o644,
@@ -1614,6 +1618,15 @@ impl Sim {
     fn complete(&mut self, pending: Pending) -> Completion {
         let Pending { effect, covers, spawn } = pending;
         let tag = effect.tag();
+        // The Windows immutable-map handle shares delete, not write. Check before fault
+        // injection: even a failed append must not land a torn sector in a leased file.
+        if let Effect::Append { file, .. } | Effect::WriteAt { file, .. }
+            | Effect::WriteFrom { file, .. } | Effect::Truncate { file, .. } = &effect
+            && self.files.get(file).is_some_and(|f| f.mapped.strong_count() != 0)
+        {
+            // alloc: an error naming the in-place writer and the affected generation.
+            return Completion { tag, done: Done::Failed(IoError(format!("{file}: in-place write to a mapped generation"))) };
+        }
         if !matches!(effect, Effect::Timer { .. })
             && self.rng.one_in(u64::from(self.faults.fail_one_in))
         {
@@ -1703,6 +1716,15 @@ impl Sim {
                 self.changed(&file);
                 Done::Truncated
             }
+            Effect::SparseFile { file, len, .. } => {
+                if self.files.contains_key(&file) {
+                    Done::Failed(IoError(format!("{file}: the staged file already exists")))
+                } else {
+                    file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
+                    self.changed(&file);
+                    Done::Truncated
+                }
+            }
             // Made beside it and renamed over it: a lock of the file it replaced is of that one.
             Effect::Write { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
@@ -1717,6 +1739,7 @@ impl Sim {
                 self.bytes_written += bytes.len() as u64;
                 let was = self.files.remove(&file);
                 let new = SimFile {
+                    mapped: std::sync::Weak::new(),
                     // alloc: none, an empty vector.
                     durable: Vec::new(),
                     // alloc: the file's one change not synced.
@@ -1875,10 +1898,44 @@ impl Sim {
             Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
-                let bytes = self.contents(&file);
-                self.bytes_read += bytes.len() as u64;
-                // alloc: the mapping, which the completion carries.
-                Done::Mapped(crate::Mapping::copy(&bytes))
+                match self.files.get_mut(&file) {
+                    Some(f) => {
+                        let view = match f.mapped.upgrade() {
+                            Some(held) => crate::Mapping(held),
+                            None => {
+                                let bytes = f.contents();
+                                self.bytes_read += bytes.len() as u64;
+                                let view = crate::Mapping::copy(&bytes);
+                                f.mapped = std::sync::Arc::downgrade(&view.0);
+                                view
+                            }
+                        };
+                        Done::Mapped(view)
+                    }
+                    // alloc: an error for the missing file, as on disk.
+                    None => Done::Failed(IoError(format!("{file}: no such file to map"))),
+                }
+            }
+            Effect::TryPatch { file, len, delta, whole, .. } => {
+                match self.files.get(&file) {
+                    Some(f) if !f.link && f.mapped.strong_count() == 0 => {
+                        let mut base = f.contents();
+                        match crate::fs::matches_patch(&base, len, &delta, &whole) {
+                            Ok(true) => {
+                                base.resize(len as usize, 0);
+                                for (at, bytes) in delta {
+                                    self.bytes_written += bytes.len() as u64;
+                                    base[at as usize..at as usize + bytes.len()].copy_from_slice(&bytes);
+                                }
+                                self.change(&file, &base);
+                                Done::Patched(true)
+                            }
+                            Ok(false) => Done::Patched(false),
+                            Err(e) => Done::Failed(IoError(e.to_string())),
+                        }
+                    }
+                    _ => Done::Patched(false),
+                }
             }
             Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
                 // alloc: the exit, which the completion carries.
@@ -2442,6 +2499,35 @@ mod tests {
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
+    }
+
+    /// The invariant: a writer can't mutate a mapped generation. Replacement changes
+    /// the name, not that generation, and the last reader releases its lease.
+    #[test]
+    fn a_view_leases_the_generation_and_not_its_name() {
+        for seed in 0..32 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let path = name("image");
+            sim.change(&path, b"old");
+            let mut run = |effect| {
+                let mut answer = None;
+                run_until_idle(&mut sim, &mut vec![effect], |it, _| answer = Some(it.done))
+                    .expect("one effect completes");
+                answer.unwrap()
+            };
+            let map = || Effect::Map { file: path.clone(), tag: Tag(1) };
+            let cut = || Effect::Truncate { file: path.clone(), len: 0, tag: Tag(2) };
+            let Done::Mapped(first) = run(map()) else { panic!("the old image maps") };
+            let Done::Mapped(second) = run(map()) else { panic!("the old image maps twice") };
+            drop(first);
+            assert!(matches!(run(cut()), Done::Failed(_)));
+            assert_eq!(run(Effect::Write { file: path.clone(), bytes: b"new".to_vec(), tag: Tag(3) }), Done::Written);
+            let Done::Mapped(new) = run(map()) else { panic!("the new image maps") };
+            assert_eq!(new.bytes(), b"new");
+            assert_eq!(second.bytes(), b"old");
+            drop(new);
+            assert_eq!(run(cut()), Done::Truncated);
+        }
     }
 
     #[test]

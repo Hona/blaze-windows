@@ -48,7 +48,7 @@ fn output(kind: OutputKind) -> Output {
     }
 }
 
-fn exe() -> Output {
+pub(super) fn exe() -> Output {
     output(OutputKind::Executable { entry: "mainCRTStartup".into() })
 }
 
@@ -56,7 +56,7 @@ fn dll() -> Output {
     output(OutputKind::Shared { name: "lib.dll".into(), exports: Vec::new() })
 }
 
-fn pe(output: Output) -> Pe {
+pub(super) fn pe(output: Output) -> Pe {
     let last = output.incremental.then(|| Lock::new("link.pe.last", Default::default()));
     Pe { output, descriptors: Lock::new("link.pe.descriptors", Default::default()), last }
 }
@@ -185,7 +185,10 @@ impl Fixture {
         let symbol = |name: &str| symbols.iter().find(|it| it.0 == name).map(|it| it.1);
         then(&Placed {
             output: &self.pe.output,
-            name: "app.exe",
+            name: match &self.pe.output.kind {
+                OutputKind::Shared { name, .. } => name,
+                _ => "app.exe",
+            },
             plan: &self.plan,
             regions: &self.regions,
             contents: &contents,
@@ -528,6 +531,7 @@ fn dll_exports_sorted_by_name() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
     assert_ne!(header.characteristics.get(LE).0 & pe::IMAGE_FILE_DLL.0, 0);
+    assert_eq!(file.pdb_info().unwrap().unwrap().path(), b"lib.dll.pdb");
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.image_base(), 0x1_8000_0000);
     assert_eq!(optional.address_of_entry_point(), 0);
@@ -567,7 +571,7 @@ fn dll_exports_sorted_by_name() {
     assert_eq!(by_name, ["alpha", "mid", "zeta"]);
     let directory = table.directory();
     let name = table.name_from_pointer(directory.name.get(LE)).unwrap();
-    assert_eq!(name, b"app.exe");
+    assert_eq!(name, b"lib.dll");
 }
 
 #[test]
@@ -807,12 +811,12 @@ fn classes_in_link_exe_order() {
         [
             Class::Text,
             Class::Plt,
+            Class::Got,
             Class::Rodata,
             Class::RelRo,
             Class::Synthetic(IDATA),
             Class::Named { name: ".CRT".into(), write: false, exec: false },
             Class::Data,
-            Class::Got,
             Class::Bss,
             pdata_class(),
             Class::Synthetic(PDATA),
@@ -822,7 +826,7 @@ fn classes_in_link_exe_order() {
     );
     assert_eq!(pe.prot(&Class::Text), crate::model::Prot::RX);
     assert_eq!(pe.prot(&Class::RelRo), crate::model::Prot::R);
-    assert_eq!(pe.prot(&Class::Got), crate::model::Prot::RW);
+    assert_eq!(pe.prot(&Class::Got), crate::model::Prot::R, "the IAT the loader makes read-only");
     assert_eq!(pe.prot(&Class::Tdata), crate::model::Prot::RW);
     assert_eq!(pe.prot(&pdata_class()), crate::model::Prot::R);
 }
@@ -854,7 +858,8 @@ fn encoders() {
     assert!(alignment(16384).is_err());
 
     assert_eq!(pdb_stem("app.exe"), "app");
-    assert_eq!(pdb_stem("lib.v2.dll"), "lib.v2");
+    assert_eq!(pdb_stem("lib.v2.dll"), "lib.v2.dll");
+    assert_eq!(pdb_stem("app.DLL"), "app.DLL");
     assert_eq!(pdb_stem("tool"), "tool");
     assert_eq!(pdb_stem(".hidden"), ".hidden");
 
@@ -904,7 +909,7 @@ fn encoders() {
 #[test]
 fn synthetic_sizes() {
     let classes = |counts: &Counts| -> Vec<Class> {
-        image::synthetic(counts, false).into_iter().map(|it| it.0).collect()
+        image::synthetic(counts, false, false).into_iter().map(|it| it.0).collect()
     };
     assert_eq!(
         classes(&Counts::default()),
@@ -922,7 +927,7 @@ fn synthetic_sizes() {
         library_names: 12,
         ..Counts::default()
     };
-    let sizes = image::synthetic(&counts, false);
+    let sizes = image::synthetic(&counts, false, false);
     let idata = sizes.iter().find(|it| it.0 == Class::Synthetic(IDATA)).unwrap().1;
     // Two descriptors, a lookup table of 2, a hint/name entry, the DLL name.
     assert_eq!(idata, 40 + 16 + 14 + 13);
@@ -1361,7 +1366,7 @@ fn object() -> Vec<u8> {
     data[0..8].copy_from_slice(&16u64.to_le_bytes());
     let data = coff.section(".data", DATA, data);
     let directives = " /DEFAULTLIB:msvcrt /DEFAULTLIB:\"oldnames\" /DEFAULTLIB:msvcrt.lib /INCLUDE:keep_me \
-                      /FAILIFMISMATCH:_MSC_VER=1900 /ALTERNATENAME:alias=target /MERGE:.a=.b";
+                      /FAILIFMISMATCH:_MSC_VER=1900 /ALTERNATENAME:alias=target /MERGE:.CRT=.rdata";
     let drectve = coff.section(".drectve", INFO, directives.as_bytes().to_vec());
     let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xc3; 4]);
     let mut entry = vec![0u8; 12];
@@ -1429,7 +1434,7 @@ fn coff_object_sections_and_groups() {
             (".drectve", &SectionKind::Dropped, false),
             (".text$mn", &SectionKind::Alloc(Class::Text, rank(Some("mn"))), false),
             (".pdata", &SectionKind::Unwind(pdata), false),
-            (".xdata", &SectionKind::Unwind(Class::Rodata), false),
+            (".xdata", &SectionKind::Alloc(Class::Rodata, 0), false),
             (".tls$", &SectionKind::Alloc(Class::Tdata, 1), true),
             (".bss", &SectionKind::Alloc(Class::Bss, 0), true),
         ]
@@ -2434,7 +2439,7 @@ fn without_a_dev_run_the_image_is_unchanged() {
     let plan = writer.plan();
     assert_eq!((plan.page, plan.headers), (0x1000, 0x1000));
     let tls = |dev_run| {
-        image::synthetic(&Counts::default(), dev_run)
+        image::synthetic(&Counts::default(), dev_run, false)
             .into_iter()
             .find(|it| it.0 == Class::Synthetic(TLS_DIR))
     };

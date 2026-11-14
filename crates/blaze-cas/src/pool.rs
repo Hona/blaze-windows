@@ -82,8 +82,37 @@ pub(crate) const PER_WINDOW: u64 = WINDOW / PAGE;
 /// its packs to, so a block never changes once committed.
 pub(crate) const BLOCK: u64 = crate::disk::BLOCK;
 
-/// The windows of a store's reservation: 4 TiB of address space at 1 GiB a window.
+/// Upper bound for a store's reservation: 4 TiB of address space at 1 GiB a window.
 pub(crate) const WINDOWS: u32 = 4096;
+
+#[cfg(any(windows, test))]
+fn windows_for_capacity(physical: u64, commit: u64, address: u64) -> u32 {
+    let bytes = physical.min(commit).saturating_mul(8).min(address / 16);
+    (bytes / WINDOW).clamp(32, u64::from(WINDOWS)) as u32
+}
+
+#[cfg(windows)]
+pub(crate) fn store_windows() -> Result<u32, String> {
+    let c = blaze_mem::address_capacity()
+        // alloc: name the failing API and the reservation it was to size
+        .map_err(|why| format!("sizing the store's pool (GlobalMemoryStatusEx): {why}"))?;
+    Ok(windows_for_capacity(c.physical, c.available_commit, c.available_address))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn store_windows() -> Result<u32, String> {
+    Ok(WINDOWS)
+}
+
+#[test]
+fn store_reservation_is_bounded_in_whole_windows() {
+    let windows = |ram: u64, commit: u64, va: u64| windows_for_capacity(ram * WINDOW, commit * WINDOW, va * WINDOW);
+    assert_eq!(windows(16, 24, 131072), 128);
+    assert_eq!(windows(96, 12, 131072), 96);
+    assert_eq!(windows(96, 128, 1024), 64);
+    assert_eq!(windows(8, 2, 131072), 32);
+    assert_eq!(windows(1024, 1024, 131072), WINDOWS);
+}
 
 /// Waits and spins one reading takes before it ends as [`PoolError::Starved`]: far more than a
 /// page is ever evicted and loaded again under one reader (rule `bounded-progress`).
@@ -420,9 +449,10 @@ impl<G: Give> Pool<G> {
             // alloc: an error path
             why: err.to_string(),
         };
-        let pages = Region::reserve_sparse((total * PAGE) as usize, blaze_mem::Tag::Pool)
+        // Every page is reused before a load or an append writes it, and read only once loaded.
+        let pages = Region::reserve_sparse_ranges((total * PAGE) as usize, blaze_mem::Tag::Pool)
             .map_err(|err| reserving("its pages", err))?;
-        let words = Region::reserve_sparse(total as usize * size_of::<u64>(), blaze_mem::Tag::Store)
+        let words = Region::reserve_sparse_prefix(total as usize * size_of::<u64>(), blaze_mem::Tag::Store)
             .map_err(|err| reserving("its pages' state words", err))?;
         // SAFETY: the pages are this pool's, every byte readable and writable for the region's
         // life (a sparse reservation), and the registration is dropped before the region (field
@@ -475,9 +505,10 @@ impl<G: Give> Pool<G> {
     /// The word of `page`.
     #[allow(unsafe_code, reason = "the state words are atomics laid over a reserved region")]
     pub(crate) fn word(&self, page: u64) -> &AtomicU64 {
-        assert!(page < self.total, "page {page} of a store pool of {} pages", self.total);
-        // SAFETY: the words region is a sparse reservation of `total` words, every byte readable
-        // and writable for its life (which `&self` bounds); the offset is inside it and 8-aligned
+        let count = self.words.committed() / size_of::<u64>();
+        assert!(page < count as u64, "page {page} beyond {count} committed store pool state words");
+        // SAFETY: Windows::open_room ensures these windows' words before publishing them. The
+        // prefix never shrinks; the offset is inside it (checked above) and 8-aligned
         // (the region is page-aligned); every access to a word is atomic.
         unsafe {
             AtomicU64::from_ptr(self.words.base().as_ptr().add(page as usize * size_of::<u64>()).cast())
@@ -733,7 +764,7 @@ impl<G: Give> Pool<G> {
     /// `out.len()` bytes at `at` copied out with relaxed atomic loads: defined while the kernel drops
     /// or a load writes the pages underneath, and good only if [`Pool::still`] says so after.
     #[allow(unsafe_code, reason = "a racy copy out of the pool's pages")]
-    pub(crate) fn copy(&self, at: u64, out: &mut [u8]) {
+    fn copy(&self, at: u64, out: &mut [u8]) {
         assert!(
             at + out.len() as u64 <= self.total * PAGE,
             "copying bytes {at}..{} of a store pool of {} pages",
@@ -1611,7 +1642,7 @@ impl fmt::Display for PoolError {
             PoolError::Full { id, windows, live, total } => write!(
                 f,
                 "the store's pool has no run of {windows} free windows for {id:?}: {live} files hold windows of its \
-                 {total} (pool::WINDOWS); the reservation is too small for this store"
+                 {total}; the reservation is too small for this store"
             ),
             PoolError::Busy { id, page, word } => {
                 let (window, at) = page_of(*page);

@@ -204,7 +204,9 @@ fn of<'a>(
 ) -> script::Of<'a> {
     script::Of {
         units,
-        host: HOST,
+        // A script runs on the machine that builds: its library path is that machine's
+        // (`PATH` on Windows, which joins with `;` and takes `C:`), whatever the target.
+        host: crate::toolchain::own::host().unwrap_or(HOST),
         tools,
         launcher: std::path::Path::new("/opt/blaze/bin/blaze"),
         program: PathBuf::from("/w/target/debug/build/x/build-script-build"),
@@ -251,6 +253,8 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
 
     // The dependent's script is told `DEP_Z_INCLUDE`.
     let applied = script::Applied {
+        #[cfg(windows)]
+        result: ContentId::default(),
         package_id: Z.to_owned(),
         links: Some("z".to_owned()),
         output,
@@ -321,9 +325,11 @@ fn a_failed_script_says_what_cargo_says() {
     let report = judged.failure.expect("the run failed");
     assert_eq!(report.rule.as_deref(), Some("build-script:failed"));
     assert_eq!(report.subject(), Some("z-sys"));
+    // As cargo says it on each system (std's `ExitStatus` display).
+    let ended = if cfg!(windows) { "exit code: 101" } else { "exit status: 101" };
     assert_eq!(
         report.flat(),
-        "the build script failed\n  it ended with exit status: 101\n  thread 'main' panicked"
+        format!("the build script failed\n  it ended with {ended}\n  thread 'main' panicked")
     );
 
     // An error it logged fails it too, said as the headline.
@@ -382,6 +388,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
         code: ContentId::of("blaze v2 test 1", b"script"),
         read: vec!["/w".into()],
         pinned: Vec::new(),
+        caches: Vec::new(),
         network: false,
         memory: None,
         mode: blaze_usercode::run::Mode::Normal,
@@ -534,6 +541,44 @@ fn a_program_with_no_hash_in_its_name_is_made_once() {
     assert_eq!(artifact::made(&lib).len(), 2);
 }
 
+/// The invariant (I19): an MSVC `cdylib` is one image made, its DLL; the import library cargo
+/// plans beside it is the DLL's, at both its paths, and listed after it as cargo lists it; the
+/// export file is no output blaze makes or lists. The control, the by-products not told
+/// apart: three images, two under a by-product's name.
+#[test]
+fn an_msvc_cdylib_is_one_image_and_its_import_library_is_beside_it() {
+    let deps = "/w/target/debug/deps";
+    let outputs = [
+        format!("{deps}/rune_www-89ab.dll"),
+        format!("{deps}/rune_www-89ab.dll.lib"),
+        format!("{deps}/rune_www-89ab.dll.exp"),
+        format!("{deps}/rune_www-89ab.dll.pdb"),
+        "/w/target/debug/rune_www.dll".to_owned(),
+        "/w/target/debug/rune_www.dll.lib".to_owned(),
+    ];
+    let it = plan("-89ab", &outputs.iter().map(String::as_str).collect::<Vec<_>>());
+    let dll = format!("{deps}/rune_www-89ab.dll");
+    assert_eq!(artifact::made(&it), [dll.as_str()]);
+    assert_eq!(artifact::import_library(&dll, &it), Some(format!("{dll}.lib").as_str()));
+    assert_eq!(
+        artifact::uplifted(&format!("{dll}.lib"), &it),
+        Some("/w/target/debug/rune_www.dll.lib")
+    );
+    assert_eq!(artifact::import_library("/w/target/debug/deps/p-89ab.exe", &it), None);
+    let lib = unit(P, target("rune_www", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    assert_eq!(
+        artifact::filenames(&lib, &it),
+        ["/w/target/debug/rune_www.dll", "/w/target/debug/rune_www.dll.lib"]
+    );
+    let control: Vec<&str> = it
+        .outputs
+        .iter()
+        .map(String::as_str)
+        .filter(|it| artifact::listed(it) && it.starts_with(deps) && !it.ends_with(".pdb"))
+        .collect();
+    assert_eq!(control.len(), 2, "the control: the DLL and its import library both images");
+}
+
 #[test]
 fn a_build_scripts_artifact_is_cargos() {
     let script =
@@ -568,16 +613,17 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
     let env = artifact::run_env(&plan, "/opt/blaze/bin/blaze", &script, &native, "linux");
     let get = |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str());
     assert_eq!(get("CARGO"), Some("/opt/blaze/bin/blaze"));
-    assert_eq!(get("CARGO_MANIFEST_DIR"), Some("/w/p"));
-    assert_eq!(get("OUT_DIR"), Some("/w/target/debug/build/p-0002/out"));
+    // The program opens them: the system's paths of the daemon's names.
+    let host = |name: &str| blaze_core::platform::path::host(name).to_string_lossy().into_owned();
+    assert_eq!(get("CARGO_MANIFEST_DIR"), Some(host("/w/p").as_str()));
+    assert_eq!(get("OUT_DIR"), Some(host("/w/target/debug/build/p-0002/out").as_str()));
     assert_eq!(get("GIT_HASH"), Some("abc"));
     // What cargo sets for rustc only is not set for the program.
     assert_eq!(get("CARGO_PRIMARY_PACKAGE"), None);
     assert_eq!(get("CARGO_CRATE_NAME"), None);
-    assert_eq!(
-        get("LD_LIBRARY_PATH"),
-        Some("/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug")
-    );
+    let dirs = ["/w/target/debug/build/z-sys-0001/out/lib", "/w/target/debug/deps", "/w/target/debug"];
+    let joined = dirs.map(host).join(":");
+    assert_eq!(get("LD_LIBRARY_PATH"), Some(joined.as_str()));
     assert_eq!(artifact::dylib_var("macos"), "DYLD_FALLBACK_LIBRARY_PATH");
 
     let package = package(P, "p", "/w/p");
@@ -605,12 +651,7 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
         |name: &str| process.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("p")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
-    assert_eq!(
-        get("LD_LIBRARY_PATH"),
-        Some(OsString::from(
-            "/w/target/debug/build/z-sys-0001/out/lib:/w/target/debug/deps:/w/target/debug:/opt/lib"
-        ))
-    );
+    assert_eq!(get("LD_LIBRARY_PATH"), Some(OsString::from(format!("{joined}:/opt/lib"))));
     // A library's artifact runs nothing, and says no environment.
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
     let lib_plan = self::plan("-0123", &["/w/target/debug/deps/libp-0123.rlib"]);
@@ -2863,6 +2904,24 @@ fn a_dependencys_staticlib_or_dylib_is_built_as_its_rlib_and_refused_where_asked
     }
 }
 
+/// A dependency that lists a `cdylib` beside its rlib (betteroffice's `crate-type = ["cdylib",
+/// "rlib"]`) is built as that rlib: the DLL is no file the build reads. Asked for itself, or
+/// with no rlib, it links the shared library, as a `cdylib` is linked.
+#[test]
+fn a_dependencys_cdylib_is_built_as_its_rlib_and_linked_where_asked_for() {
+    let mut lib = target("docx_parse", "lib", "src/lib.rs");
+    lib.kind = vec!["cdylib".to_owned(), "rlib".to_owned()];
+    lib.crate_types = lib.kind.clone(); // clone: the test's target
+    let dep = unit("git+betteroffice-docx-parse", lib, Mode::Build, &[]);
+    assert_eq!(codegen::makes(&dep, false), Ok(codegen::Makes::Library));
+    assert_eq!(codegen::makes(&dep, true), Ok(codegen::Makes::Shared { proc_macro: false }));
+    // Control: a `cdylib` alone is what its dependents get, and is linked.
+    let mut only = dep.clone(); // clone: the test's unit
+    only.target.kind = vec!["cdylib".to_owned()];
+    only.target.crate_types = vec!["cdylib".to_owned()];
+    assert_eq!(codegen::makes(&only, false), Ok(codegen::Makes::Shared { proc_macro: false }));
+}
+
 /// A file's text by name, for [`compile::placed_from`] and [`compile::replaced_from`].
 fn one_file(text: &'static str) -> impl Fn(&str) -> Option<String> {
     move |name| (name == "src/lib.rs").then(|| text.to_owned())
@@ -3178,11 +3237,11 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().expect("an item store is installed unless it is turned off");
     assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
-    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
     let (puts, mut flushes) = super::deps::store(&first, None, &mut session, &[], "/w")
         .unwrap_or_else(|error| panic!("what the build left was not kept: {}", error.what));
     assert_eq!(flushes.take_refusal(), None, "every record the build offered is kept");
     let items = flushes.items.as_ref().expect("the item store was flushed");
+    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{items:?}");
     assert_eq!((items.failed, items.slots_full), (0, 0), "{items:?}");
     assert!(items.written >= 6, "three identities' inference and MIR at least: {items:?}");
     assert!(!puts.is_empty());
@@ -3198,4 +3257,36 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     let read = session.item_steps().unwrap();
     assert_eq!((read[infer].hits, read[infer].ran), (4, 1), "inference: {read:?}");
     assert_eq!((read[mir].hits, read[mir].ran), (4, 1), "MIR: {read:?}");
+}
+
+/// The invariant: the stand-ins are blaze's executable, made once and kept while it is that
+/// file, and made again once it is another, whatever volume the stand-ins are on against the
+/// launcher's (`BLAZE_TEST_VOLUMES` names more directories to try, as blaze-core's tests do):
+/// on Windows a hard link on its volume and a copy on another, never a symbolic link.
+#[test]
+fn the_stand_ins_are_the_launcher_kept_and_made_again_when_it_changes() {
+    let base = tempfile::tempdir().unwrap();
+    let launcher = base.path().join(format!("blaze{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&launcher, b"blaze one").unwrap();
+    let mut dirs = vec![base.path().join("tools")];
+    if let Some(more) = std::env::var_os("BLAZE_TEST_VOLUMES") {
+        let id = std::process::id();
+        dirs.extend(std::env::split_paths(&more).map(|it| it.join(format!(".blaze-stand-ins.{id}"))));
+    }
+    for dir in &dirs {
+        let rustc = dir.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::read(&rustc).unwrap(), b"blaze one", "{}", dir.display());
+        assert!(!std::fs::symlink_metadata(&rustc).unwrap().is_symlink() || cfg!(unix));
+        let made = std::fs::metadata(&rustc).unwrap().modified().unwrap();
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::metadata(&rustc).unwrap().modified().unwrap(), made, "kept");
+        // Another launcher (a new build of blaze written in its place).
+        std::fs::remove_file(&launcher).unwrap();
+        std::fs::write(&launcher, b"blaze two, longer").unwrap();
+        super::stand_ins(dir, &launcher).unwrap();
+        assert_eq!(std::fs::read(&rustc).unwrap(), b"blaze two, longer", "{}", dir.display());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(&launcher, b"blaze one").unwrap();
+    }
 }

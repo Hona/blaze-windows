@@ -13,6 +13,8 @@ use super::{
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform, Searched};
 
+mod coff_restore;
+
 /// A machine that answers what it is told to: variables, and commands by their whole text.
 struct Answers {
     vars: Vec<(&'static str, String)>,
@@ -167,10 +169,9 @@ fn glibc(target: Target) -> Glibc {
     let mut answers = Answers::new().answer(
         "cc -print-search-dirs",
         Ok(format!(
-            "install: {gcc}/\nprograms: =/usr/bin/\nlibraries: ={gcc}/:{libc}/:{missing}\n",
+            "install: {gcc}/\nprograms: =/usr/bin/\nlibraries: ={listed}\n",
             gcc = gcc.display(),
-            libc = libc.display(),
-            missing = root.join("missing").display()
+            listed = std::env::join_paths([&gcc, &libc, &root.join("missing")]).unwrap().display()
         )),
     );
     let files = [
@@ -193,7 +194,12 @@ fn glibc(target: Target) -> Glibc {
 }
 
 fn dylib(name: &str) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind: NativeLibKind::Dylib, verbatim: false }
+    NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::Dylib,
+        verbatim: false,
+        imports: Vec::new(),
+    }
 }
 
 fn static_lib(name: &str, whole: bool) -> NativeLib {
@@ -201,11 +207,17 @@ fn static_lib(name: &str, whole: bool) -> NativeLib {
         name: name.to_owned(),
         kind: NativeLibKind::Static { whole, bundle: true },
         verbatim: false,
+        imports: Vec::new(),
     }
 }
 
 fn verbatim(name: &str) -> NativeLib {
-    NativeLib { name: name.to_owned(), kind: NativeLibKind::Dylib, verbatim: true }
+    NativeLib {
+        name: name.to_owned(),
+        kind: NativeLibKind::Dylib,
+        verbatim: true,
+        imports: Vec::new(),
+    }
 }
 
 fn executable(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, LinkError> {
@@ -226,7 +238,7 @@ fn shared(cache: &Cache, answers: &Answers, triple: &str) -> Result<Output, Link
 /// `libs` as one crate's whose compile searches no directory of its own: each searched in the
 /// link's directories alone.
 fn program(libs: &[NativeLib]) -> [CrateLibs<'_>; 1] {
-    [CrateLibs { libs, search: &[] }]
+    [CrateLibs { name: "ffi", libs, search: &[] }]
 }
 
 /// [`locate_with`] for a target that links nothing from blaze's toolchain.
@@ -445,6 +457,7 @@ fn another_triple_is_an_error_naming_it() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_linux_line_is_the_c_runtime_around_the_libraries_with_libcs_script_followed() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -487,6 +500,7 @@ const DEBIAN_GCC_S: &[u8] =
     b"/* GNU ld script\n   Use the shared library, but some functions are only in\n   the static library.  */\nGROUP ( libgcc_s.so.1 -lgcc )\n";
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn debians_libgcc_s_script_is_followed_by_libgcc_s_so_1_and_libgcc() {
     let glibc = glibc(Target::LinuxX86_64);
     let (gcc, libc) = (&glibc.gcc, &glibc.libc);
@@ -544,8 +558,8 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
     let first = [static_lib("asm", false)];
     let second = [static_lib("asm", false), static_lib("shared", false), dylib("dyn")];
     let libs = [
-        CrateLibs { libs: &first, search: &one_dirs },
-        CrateLibs { libs: &second, search: &two_dirs },
+        CrateLibs { name: "first", libs: &first, search: &one_dirs },
+        CrateLibs { name: "second", libs: &second, search: &two_dirs },
     ];
     // The link's directories have `one`'s first, which a name resolved once for the whole
     // program would take for both.
@@ -575,6 +589,7 @@ fn each_crates_library_is_found_first_in_the_directories_of_its_own_compile() {
 
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_one() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -626,8 +641,12 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     for dir in [&a, &b, &glibc.gcc, &glibc.libc] {
         assert!(error.what.contains(dir.to_str().unwrap()), "{}", error.what);
     }
-    let framework =
-        NativeLib { name: "Cocoa".to_owned(), kind: NativeLibKind::Framework, verbatim: false };
+    let framework = NativeLib {
+        name: "Cocoa".to_owned(),
+        kind: NativeLibKind::Framework,
+        verbatim: false,
+        imports: Vec::new(),
+    };
     let error = locate_plain(&cache, &glibc.answers, &output, &[framework], &search).unwrap_err();
     assert!(error.what.contains("Cocoa") && error.what.contains("Apple"), "{}", error.what);
 }
@@ -711,6 +730,7 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
         name: "CoreFoundation".to_owned(),
         kind: NativeLibKind::Framework,
         verbatim: false,
+        imports: Vec::new(),
     };
     let located =
         locate_plain(&cache, &answers, &output, &[dylib("iconv"), framework], &[]).unwrap();
@@ -731,6 +751,7 @@ fn a_macos_line_takes_tbds_before_dylibs_and_frameworks_from_the_sdk() {
 /// nix's dev shell on macOS: libiconv is not in the SDK, and cc-wrapper passes its directory
 /// to the linker from `NIX_LDFLAGS`, as rustc's link through `cc` gets it.
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_library_only_on_a_path_the_c_driver_passes_its_linker_is_found() {
     let sdk = temp("sdk-driver");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
@@ -831,6 +852,7 @@ fn a_library_only_on_a_nix_ldflags_path_the_c_driver_left_out_is_not_found_and_s
 /// nix's libiconv re-exports libcharset by its absolute install name, which no `-L` names:
 /// ld64 loads it with libiconv, so the line has it after libiconv, needed when imported from.
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_macos_library_is_followed_by_the_libraries_it_reexports() {
     let sdk = temp("sdk-reexport");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
@@ -927,6 +949,80 @@ fn a_windows_line_is_searched_in_lib_and_its_libraries_are_read_as_archives() {
     );
 }
 
+fn raw_dylib(name: &str, verbatim: bool, symbols: &[&str]) -> NativeLib {
+    let imports = symbols
+        .iter()
+        .map(|it| blaze_codegen::RawImport { symbol: (*it).to_owned(), ordinal: None, data: false })
+        .collect();
+    NativeLib { name: name.to_owned(), kind: NativeLibKind::RawDylib, verbatim, imports }
+}
+
+/// A `raw-dylib` is searched for nowhere: the link makes its DLL's import library, one for
+/// every `raw-dylib` of the DLL (its file name matched as the loader matches it), at the place
+/// of the first, and only on Windows.
+#[test]
+fn a_raw_dylib_is_an_import_library_the_link_makes() {
+    let a = temp("raw-dylib-lib");
+    touch(&a.join("user32.lib"), ARCHIVE);
+    let answers = Answers::new().var("LIB", format!("{};", a.display()));
+    let cache = Cache::new();
+    let output = executable(&cache, &answers, "x86_64-pc-windows-msvc").unwrap();
+    let libs = [
+        raw_dylib("kernel32.dll", true, &["Sleep"]),
+        dylib("user32"),
+        raw_dylib("bcryptprimitives", false, &["ProcessPrng"]),
+        raw_dylib("KERNEL32", false, &["ExitProcess", "Sleep"]),
+    ];
+    let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
+    let names: Vec<&str> = located.iter().map(|it| it.name.as_str()).collect();
+    let user32 = a.join("user32.lib").to_string_lossy().into_owned();
+    assert_eq!(names, ["raw-dylib kernel32.dll", &user32, "raw-dylib bcryptprimitives.dll"]);
+    assert!(located.iter().all(|it| it.kind == ARCHIVED));
+    let made: Vec<bool> = located.iter().map(|it| it.made.is_some()).collect();
+    assert_eq!(made, [true, false, true]);
+    let kernel32 = &located[0].made.as_ref().unwrap().1;
+    let wanted = crate::pe::raw_dylib::import_library(
+        "kernel32.dll",
+        &raw_dylib("", false, &["Sleep", "ExitProcess"]).imports,
+    )
+    .unwrap();
+    assert_eq!(&kernel32[..], &wanted[..], "both libraries' imports, each once");
+
+    let glibc = glibc(Target::LinuxX86_64);
+    let linux = executable(&cache, &glibc.answers, "x86_64-unknown-linux-gnu").unwrap();
+    let error = locate_plain(&cache, &glibc.answers, &linux, &[raw_dylib("k", false, &[])], &[])
+        .unwrap_err();
+    assert!(error.what.contains("a `raw-dylib` is a Windows DLL"), "{}", error.what);
+}
+
+/// core's `#[link(name = "/defaultlib:msvcrt", modifiers = "+verbatim")]` is the option
+/// link.exe reads it as: a default library, on the line after every library a crate names,
+/// left out by `/NODEFAULTLIB`, and checked against the image's VC runtime. Any other option
+/// is an error naming it.
+#[test]
+fn a_verbatim_defaultlib_is_a_default_library() {
+    let a = temp("verbatim-defaultlib");
+    touch(&a.join("msvcrt.lib"), ARCHIVE);
+    touch(&a.join("foo.lib"), ARCHIVE);
+    let answers = Answers::new().var("LIB", format!("{};", a.display()));
+    let cache = Cache::new();
+    let mut output = executable(&cache, &answers, "x86_64-pc-windows-msvc").unwrap();
+    let verbatim = |name: &str| NativeLib { verbatim: true, ..dylib(name) };
+    let libs = [verbatim("/defaultlib:msvcrt"), dylib("foo")];
+    let located = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap();
+    assert_eq!(line(&located), [(a.join("foo.lib"), ARCHIVED), (a.join("msvcrt.lib"), ARCHIVED)]);
+
+    output.link.pe.crt_static = true;
+    let error = locate_plain(&cache, &answers, &output, &libs, &[]).unwrap_err();
+    assert!(error.what.contains("LNK2038"), "{}", error.what);
+    assert!(error.what.contains("crate `ffi` links the VC runtime library `/defaultlib:msvcrt`"), "{error}");
+    output.link.pe.crt_static = false;
+
+    let error =
+        locate_plain(&cache, &answers, &output, &[verbatim("/merge:.a=.b")], &[]).unwrap_err();
+    assert!(error.what.contains("`/merge:.a=.b` is a linker option"), "{}", error.what);
+}
+
 /// A COFF object whose `.drectve` is `directives`.
 fn coff(directives: &str) -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
@@ -981,8 +1077,8 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let libs = [dylib("msvcrt"), dylib("kernel32")];
     let expected = [
         (vc.join("msvcrt.lib"), ARCHIVED),
-        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("kernel32.lib"), ARCHIVED),
+        (vc.join("vcruntime.lib"), ARCHIVED),
         (kits.join("ucrt.lib"), ARCHIVED),
         (vc.join("oldnames.lib"), ARCHIVED),
     ];
@@ -990,7 +1086,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     assert_eq!(
         line(&located),
         expected,
-        "each after the library that asked, each once, libcmt taken out by its asker"
+        "after every library the link names, in the order asked, each once, libcmt taken out by its asker"
     );
     let read = cache.asked.lock().len();
     assert_eq!(read, 3, "msvcrt.lib, vcruntime.lib and the empty archives' one content");
@@ -1006,7 +1102,7 @@ fn a_windows_archive_is_followed_by_the_libraries_its_members_ask_for() {
     let located =
         locate_plain(&cache, &answers, &output, &libs, std::slice::from_ref(&mine)).unwrap();
     assert_eq!(
-        line(&located)[1],
+        line(&located)[2],
         (mine.join("vcruntime.lib"), ARCHIVED),
         "the link's directories before LIB's"
     );
@@ -1291,6 +1387,7 @@ const SANITIZERS: [(Sanitizers, &str, &str); 3] = [
 ];
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
     let glibc = glibc(Target::LinuxX86_64);
     let cache = Cache::new();
@@ -1346,6 +1443,7 @@ fn a_linux_sanitizers_runtime_is_its_whole_archive_after_the_start_objects() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "a Linux or macOS line is found from a Unix C driver and SDK: their fakes here print Unix paths (`:`-separated search lists, `/` joins), which a Windows host's are not")]
 fn a_macos_sanitizers_runtime_is_its_dylib_found_by_an_absolute_rpath() {
     let sdk = temp("sanitize-sdk");
     touch(&sdk.join("SDKSettings.json"), br#"{"Version":"15.0"}"#);
@@ -1430,4 +1528,35 @@ fn a_sanitizer_on_windows_or_wasm_is_an_error() {
         let error = locate_with(&cache, &answers, &wasm, &[], &[], &sysroot).unwrap_err();
         assert!(error.what.contains(what) && error.what.contains("wasm"), "{}", error.what);
     }
+}
+
+
+/// A file is stamped as a sweep stamps it, the same while it is unchanged and another after a
+/// write; what it was read as is kept under that stamp, so a link that finds it unchanged does
+/// not read it again.
+#[test]
+fn an_unchanged_archive_is_not_read_again() {
+    let dir = std::env::temp_dir().join(format!("blaze-link-stamp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("a.lib");
+    std::fs::write(&path, b"one").unwrap();
+    let first = blaze_core::fs::stamp(&path).unwrap();
+    assert!(!first.is_unknown(), "{first:?}");
+    assert_eq!(blaze_core::fs::stamp(&path).unwrap(), first);
+    let cache = Cache::new();
+    let reads = std::cell::Cell::new(0);
+    let read = |_, _: &[u8]| {
+        reads.set(reads.get() + 1);
+        Ok(vec![("m".to_owned(), "kernel32".to_owned())])
+    };
+    let asked = cache.read(&path, "a.lib", ("test", 0), read).unwrap();
+    assert_eq!(asked[0].1, "kernel32");
+    assert_eq!(cache.stamped.lock().len(), 1, "kept under its stamp");
+    cache.read(&path, "a.lib", ("test", 0), |_, _| unreachable!("an unchanged file is not read")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(&path, b"two").unwrap();
+    assert_ne!(blaze_core::fs::stamp(&path).unwrap(), first);
+    cache.read(&path, "a.lib", ("test", 0), read).unwrap();
+    assert_eq!((reads.get(), cache.stamped.lock().len()), (2, 1));
+    let _ = std::fs::remove_dir_all(&dir);
 }

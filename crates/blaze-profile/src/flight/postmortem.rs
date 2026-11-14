@@ -16,8 +16,8 @@
 //! - the kept names ([`super::KEPT`]: threads' names, `&'static str`s): one log, appended as a
 //!   name is first given and read back newest first. Every other name a row holds is defined
 //!   in the rows of its ring ([`super::names`]), so the rings are all a postmortem needs of them;
-//! - the rings' [`Store`]s: room for [`MAPPED_RINGS`] of them, back to back, mapped as one
-//!   when the recorder is persisted and handed to rings as they are made. The file ends after
+//! - the rings' [`Store`]s: room for [`MAPPED_RINGS`] of them, back to back. Unix maps their
+//!   address range once; Windows maps each newly reserved range without moving old views. The file ends after
 //!   the last store handed out: each store's disk is reserved as it is handed out, never
 //!   before (until 2026-11-11 all 256 were reserved up front, 516 MiB a daemon, of which a
 //!   daemon on 18 cores used 26).
@@ -30,7 +30,7 @@
 //! written before the disk under it is reserved, so a full disk is a typed error naming the
 //! file and why, never a SIGBUS: [`persist`] reserves the fixed part and a store for each ring
 //! made so far, or fails whole; a ring made later has its store reserved as it is handed out
-//! ([`Mapping::store`], one system call a ring, under the lock its maker already holds, never
+//! ([`Mapping::store`], under the lock its maker already holds, never
 //! on a recording path). No ring is ever left on the heap once the recorder is persisted: a
 //! thread whose store the disk has no room for, or past [`MAPPED_RINGS`] recording at once,
 //! gets no ring and its spans count as ringless, as past [`super::RINGS_MAX`] in any process,
@@ -71,7 +71,7 @@
 //! its own callsite and name tables), so a blaze rebuilt after the crash, the common case, reads
 //! it; the hash names the blaze the crashed builds ran (`builds.blaze`).
 
-#![cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+#![cfg_attr(not(any(unix, windows)), allow(dead_code, unused_imports, unused_variables, unused_mut))]
 
 #[cfg(test)]
 use std::{fs::File, io::Read as _};
@@ -489,6 +489,7 @@ pub(crate) struct Mapping {
     builds: Lock<[u64; BUILD_SLOTS]>,
     /// The stores' part, `RINGS_AT..FILE_MOST`, mapped shared and never unmapped. The file
     /// ends at [`file_bytes`] of the stores reserved: no byte past it is ever touched.
+    #[cfg(not(windows))]
     stores: std::ptr::NonNull<u8>,
     /// Stores handed to rings, and stores reserved on disk (never fewer).
     given: Lock<Given>,
@@ -506,6 +507,10 @@ pub(crate) struct Mapping {
 struct Given {
     given: usize,
     reserved: usize,
+    /// Windows views cannot extend beyond their section. A new reservation maps only its
+    /// new stores and leaves all addresses already handed to recorders unchanged.
+    #[cfg(windows)]
+    views: [Option<std::ptr::NonNull<u8>>; MAPPED_RINGS],
 }
 
 // SAFETY: `fixed` and `stores` point into shared mappings that are never unmapped; a store is
@@ -529,15 +534,15 @@ impl Mapping {
         counting_copies: bool,
     ) -> Result<Mapping, PostmortemError> {
         let path = dir.join(file_name(pid));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             _ = (blaze, process, counting_copies);
             return Err(PostmortemError::Unsupported {
                 path,
-                why: "a mapping of the flight recorder needs `mmap`, which this blaze uses on unix only",
+                why: "the flight recorder needs writable file views, not implemented on this platform",
             });
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let page = sys::page_size();
             if page == 0 || PAGE % page != 0 {
@@ -571,6 +576,7 @@ impl Mapping {
             }
             let fixed = sys::map(&file, 0, RINGS_AT)
                 .map_err(io_error(&path, "mapping the fixed part of"))?;
+            #[cfg(not(windows))]
             let stores = sys::map(&file, RINGS_AT as u64, STORES_BYTES)
                 .map_err(io_error(&path, "mapping the rings' stores of"))?;
             let mapping = Mapping {
@@ -580,8 +586,14 @@ impl Mapping {
                 log: Lock::unrecorded("profile.postmortem.kept_log", 0),
                 sites: Lock::unrecorded("profile.postmortem.sites", ()),
                 builds: Lock::unrecorded("profile.postmortem.builds", [0; BUILD_SLOTS]),
+                #[cfg(not(windows))]
                 stores,
-                given: Lock::unrecorded("profile.postmortem.given", Given { given: 0, reserved: 0 }),
+                given: Lock::unrecorded("profile.postmortem.given", Given {
+                    given: 0,
+                    reserved: 0,
+                    #[cfg(windows)]
+                    views: [None; MAPPED_RINGS],
+                }),
                 nonce: nonce(pid),
                 marking: Lock::unrecorded("profile.postmortem.marking", ()),
                 #[cfg(test)]
@@ -675,6 +687,15 @@ impl Mapping {
             &self.path,
             "reserving the disk of a ring's store (2 MiB; its thread is not recorded) in",
         ))?;
+        #[cfg(windows)]
+        {
+            let view = sys::map(&self.file, file_bytes(given.reserved), (stores - given.reserved) * STORE_BYTES)
+                .map_err(io_error(&self.path, "mapping the reserved rings of"))?;
+            for (i, ptr) in given.views[given.reserved..stores].iter_mut().enumerate() {
+                // SAFETY: each stride lies wholly inside the new view, which lives as long as the process.
+                *ptr = Some(unsafe { view.add(i * STORE_BYTES) });
+            }
+        }
         given.reserved = stores;
         Ok(())
     }
@@ -693,8 +714,12 @@ impl Mapping {
         // out, so its pages are the file's, never past its end); the mapping is never
         // unmapped, all-zero is a valid `Store` (atomics and integers), and `claim` hands each
         // one to one ring alone.
-        let store: &'static Store =
-            unsafe { &*self.stores.as_ptr().add(at * STORE_BYTES).cast::<Store>() };
+        #[cfg(not(windows))]
+        let ptr = unsafe { self.stores.add(at * STORE_BYTES) };
+        #[cfg(windows)]
+        let ptr = state.views[at].expect("claim reserved this store's view");
+        // SAFETY: the store was claimed uniquely from reserved, mapped disk as above.
+        let store: &'static Store = unsafe { &*ptr.cast::<Store>().as_ptr() };
         store.number.store(u64::from(number), Ordering::Relaxed);
         self.word(H_RINGS).store(state.given as u64, Ordering::Release);
         Ok(store)
@@ -973,6 +998,57 @@ mod sys {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "reserving a file's disk is written for Linux and macOS only",
+        ))
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::{fs::File, io, os::windows::{fs::MetadataExt as _, io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle}}, ptr::NonNull};
+    use windows_sys::Win32::{Storage::FileSystem::{FILE_ATTRIBUTE_COMPRESSED, FILE_ATTRIBUTE_SPARSE_FILE}, System::{Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE}, SystemInformation::{GetSystemInfo, SYSTEM_INFO}}};
+
+    pub(super) fn page_size() -> usize {
+        let mut info = SYSTEM_INFO::default();
+        // SAFETY: GetSystemInfo initializes the supplied structure.
+        unsafe { GetSystemInfo(&mut info) };
+        info.dwAllocationGranularity as usize
+    }
+
+    pub(super) fn reserve(file: &File, _from: u64, to: u64) -> io::Result<()> {
+        // Sparse and compressed files can run out of disk during a subsequent page fault.
+        if file.metadata()?.file_attributes() & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE) != 0 {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "recording needs an uncompressed, non-sparse file for reserved disk space"));
+        }
+        file.set_len(to)
+    }
+
+    pub(super) fn map(file: &File, at: u64, len: usize) -> io::Result<NonNull<u8>> {
+        // The on-disk stride need not be a multiple of the Windows allocation granularity.
+        // Map the leading fragment too; no Rust reference is ever made to those bytes.
+        let offset = at / super::PAGE as u64 * super::PAGE as u64;
+        let skip = (at - offset) as usize;
+        // SAFETY: an open, read/write file already extended through at+len. Size 0 uses its EOF.
+        let section = unsafe { CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null()) };
+        if section.is_null() { return Err(io::Error::last_os_error()); }
+        // SAFETY: CreateFileMappingW returned a fresh, owned handle.
+        let section = unsafe { OwnedHandle::from_raw_handle(section) };
+        // SAFETY: the offset is granularity-aligned and the view ends no later than EOF.
+        let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, skip + len) };
+        let ptr = NonNull::new(view.Value.cast::<u8>()).ok_or_else(io::Error::last_os_error)?;
+        // SAFETY: the returned view covers skip+len bytes and remains live after the section closes.
+        Ok(unsafe { ptr.add(skip) })
+    }
+}
+
+/// No mapping is made on other platforms, so nothing is reserved either.
+#[cfg(not(any(unix, windows)))]
+mod sys {
+    use std::{fs::File, io};
+
+    pub(super) fn reserve(_file: &File, _from: u64, _to: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "flight recorder disk reservation is not implemented on this platform",
         ))
     }
 }
@@ -1790,7 +1866,7 @@ impl super::Namer for DeadNamer<'_> {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use crate::flight::{
@@ -1975,10 +2051,11 @@ mod tests {
         drop(mapping);
         let path = dir.join(file_name(DEAD));
         {
-            use std::{io::Write as _, os::unix::fs::FileExt as _};
-            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-            file.write_all_at(&(LAYOUT + 1).to_ne_bytes(), (H_LAYOUT * 8) as u64).unwrap();
-            (&file).flush().unwrap();
+            use std::io::{Seek as _, SeekFrom, Write as _};
+            let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start((H_LAYOUT * 8) as u64)).unwrap();
+            file.write_all(&(LAYOUT + 1).to_ne_bytes()).unwrap();
+            file.flush().unwrap();
         }
         let found = dead(&dir).unwrap();
         let refused = found[0].read(None).err().expect("refused");
@@ -2035,7 +2112,6 @@ mod tests {
     /// as its fixed part and every store handed out, and the disk holds that many bytes of
     /// it, so no page a ring writes is past the file's end or a hole.
     fn disk_is_under_every_store(mapping: &Mapping) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt as _;
         let given = mapping.given.lock().given;
         let meta = fs::metadata(&mapping.path).map_err(|error| error.to_string())?;
         let needed = file_bytes(given);
@@ -2045,10 +2121,23 @@ mod tests {
                 meta.len()
             ));
         }
-        if meta.blocks() * 512 < needed {
+        #[cfg(unix)]
+        let allocated = std::os::unix::fs::MetadataExt::blocks(&meta) * 512;
+        #[cfg(windows)]
+        let allocated = {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx};
+            let mut info = FILE_STANDARD_INFO::default();
+            // SAFETY: the handle is live, and the sized output is of the requested class.
+            if unsafe { GetFileInformationByHandleEx(mapping.file.as_raw_handle(), FileStandardInfo, (&raw mut info).cast(), size_of_val(&info) as u32) } == 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            info.AllocationSize as u64
+        };
+        if allocated < needed {
             return Err(format!(
                 "{given} stores are handed out, {needed} bytes, and the disk holds {} of the file",
-                meta.blocks() * 512
+                allocated
             ));
         }
         Ok(())
