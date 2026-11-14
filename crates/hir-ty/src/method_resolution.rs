@@ -2538,6 +2538,7 @@ impl<'db> TraitImpls<'db> {
     ) {
         let impls = module_impls(db, module);
         for &impl_id in impls.trait_impls.iter() {
+            if module.krate(db).named(db).to_string() == "withdeps" { eprintln!("COLLECT {impl_id:?} at {module:?} self={:?} trait={:?}", db.impl_self_ty(impl_id), db.impl_trait(impl_id)); }
             let trait_ref = match db.impl_trait(impl_id) {
                 Some(tr) => tr.instantiate_identity().skip_norm_wip(),
                 None => continue,

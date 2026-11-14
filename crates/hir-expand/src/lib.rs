@@ -680,6 +680,9 @@ impl MacroCallId {
 
             let (parse, mut rev_token_map, semicolon) =
                 token_tree_to_syntax_node(db, frame, tt.view(), expand_to);
+            if matches!(loc.kind, MacroCallKind::Derive { .. }) && loc.krate.named(db).to_string() == "withdeps" {
+                eprintln!("DERIVE {}", tt.view());
+            }
             rev_token_map.matched_arm = matched_arm;
             rev_token_map.dropped_semicolon = semicolon;
             // alloc: only for an expansion whose `${concat(..)}`s made identifiers
