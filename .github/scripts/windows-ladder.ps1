@@ -98,6 +98,10 @@ if ($env:DRIVER_REF -like 'windows/ladder/fixture-*') {
         'fixture-import' { $text = "use serde::Serialize;`n" + $text.Replace('derive(serde::Serialize)', 'derive(Serialize)') }
         'fixture-old' { $text = Get-Content -Raw (Join-Path $PSScriptRoot 'withdeps-reference.rs') }
         'fixture-order' { $text = $text.Substring($text.IndexOf('#[derive')) + "`n" + $main }
+        'fixture-scope' { $text = "use serde::Serialize;`n" + $text }
+        'fixture-under' { $text = "use serde::Serialize as _;`n" + $text }
+        'fixture-binding' { $text = $text.Replace('#[derive(serde::Serialize)]', "#[derive(serde::Serialize)]`n#[serde(crate = `"serde`")]" ) }
+        'fixture-manual' { $text = $text.Replace('#[derive(serde::Serialize)]', '').Replace('#[allow(dead_code)]', 'const _: () = { extern crate serde as _serde; impl _serde::Serialize for Point { fn serialize<S: _serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> { ser.serialize_i32(self.x) } } };' + "`n#[allow(dead_code)]") }
     }
     Set-Content $file $text
 }
