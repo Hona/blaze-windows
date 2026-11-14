@@ -39,11 +39,11 @@ impl Guard {
             use super::pulse::CeilingLook;
             match bytes.map(|n| watch.look(n, ceiling)) {
                 Some(CeilingLook::Purge) => { crate::raw::memory::purger().ask(); }
-                Some(CeilingLook::Near | CeilingLook::Eased) => eprintln!("blaze serve: private commit {bytes:?}, limit {ceiling} bytes"),
+                Some(CeilingLook::Near | CeilingLook::Eased) => super::said::logged!(WARN, "blaze serve: private commit {bytes:?}, limit {ceiling} bytes"),
                 Some(CeilingLook::Under) => {}
                 None | Some(CeilingLook::Passed) => {
-                eprintln!("blaze serve: pid {} stopped at its memory ceiling: private commit {bytes:?}, limit {ceiling} bytes", std::process::id());
-                std::process::exit(Exit::MemoryCeiling.code());
+                    super::said::logged!(ERROR, "blaze serve: pid {} stopped at its memory ceiling: private commit {bytes:?}, limit {ceiling} bytes", std::process::id());
+                    std::process::exit(Exit::MemoryCeiling.code());
                 }
             }
             if stop.recv_timeout(Duration::from_millis(100)) != Err(mpsc::RecvTimeoutError::Timeout) { break; }

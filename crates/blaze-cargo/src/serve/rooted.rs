@@ -14,7 +14,7 @@ use blaze_core::FileName;
 /// Whether `byte` can be part of a name: a name in a message starts where the byte before
 /// it cannot.
 fn of_a_name(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b'~')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b'~') || (cfg!(windows) && byte == b'\\')
 }
 
 /// `why`, a core's message, with every name under one of `dirs` written as a path under
@@ -74,7 +74,10 @@ mod tests {
         );
         // A name that only starts as the directory does is another name.
         assert_eq!(rooted("dev/shm/home/v2/stores/x", Path::new("/"), &[&store]), "dev/shm/home/v2/stores/x");
-        assert_eq!(rooted("`dev/shm/home/v2/store`", Path::new("/r"), &[&store]), "`/r/dev/shm/home/v2/store`");
+        let root = Path::new("/r");
+        let expected = format!("`{}`", root.join(store.as_str()).display());
+        assert_eq!(rooted("`dev/shm/home/v2/store`", root, &[&store]), expected);
+        assert_eq!(rooted(&expected, root, &[&store]), expected);
         assert_eq!(dir_of(&name("a/b/c")), Some(name("a/b")));
         assert_eq!(dir_of(&name("a")), None);
     }

@@ -156,7 +156,8 @@ fn a_mapping_keeps_its_length_when_the_file_grows() {
 #[cfg(windows)]
 #[test]
 fn a_mapped_generation_excludes_writers_in_both_open_orders() {
-    let path = dir("sealed").join("image");
+    let dir = dir("sealed");
+    let path = dir.join("image");
     std::fs::write(&path, b"generation").unwrap();
     let writer = || std::fs::File::options().write(true).open(&path);
     let write = writer().unwrap();

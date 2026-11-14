@@ -173,7 +173,7 @@ fn a_head_of_format_7_reads_with_no_homes_and_one_of_format_8_round_trips_them()
     assert_eq!(Head::decode(&old).unwrap(), head, "a head of format 7 lists no home");
     head.externals.push(ExternalRef { content: c, len: 40 << 10, placed: true });
     head.externals.push(ExternalRef { content: content_of(b"d"), len: disk::EXTERNAL_REMOVED, placed: true });
-    assert_eq!(FORMAT, 8);
+    assert_eq!(Head::decode(&head.encode_as(8)).unwrap(), head, "a head of format 8 lists homes");
     assert_eq!(Head::decode(&head.encode()).unwrap(), head);
     let mut collides = head.clone();
     collides.externals.truncate(1);

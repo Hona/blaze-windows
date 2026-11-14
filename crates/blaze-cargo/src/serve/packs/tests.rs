@@ -218,8 +218,9 @@ fn a_signed_pack_is_taken_under_its_trusted_key_only() {
 
 #[test]
 fn the_settings_refuse_what_they_do_not_know() {
-    let config = Config::parse(r#"{ "sources": ["/mnt/packs", "https://packs.example.invalid/x/"], "trusted": [] }"#).unwrap();
-    assert_eq!(config.sources, [Base::Dir("/mnt/packs".into()), Base::Url("https://packs.example.invalid/x".to_owned())]);
+    let packs = std::env::temp_dir().join("packs");
+    let config = Config::parse(&serde_json::json!({ "sources": [packs, "https://packs.example.invalid/x/"], "trusted": [] }).to_string()).unwrap();
+    assert_eq!(config.sources, [Base::Dir(packs), Base::Url("https://packs.example.invalid/x".to_owned())]);
     assert_eq!(config.pins, ["toolchain", "bstd"]);
     assert!(config.serve.is_none() && config.peers.is_empty() && config.install.is_none());
     assert!(config.prebuilt, "records built elsewhere are taken unless the settings say not");
@@ -470,11 +471,7 @@ fn with_no_prebuilt_a_source_that_has_the_key_is_never_asked() {
     let out = dir.path().join("out");
     let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, Some(&seed), false, false, &|_| false).unwrap();
     assert!(done.signed);
-    let config = Config::parse(&format!(
-        r#"{{ "sources": ["{}"], "trusted": ["{}"] }}"#,
-        out.display(),
-        blaze_pack::peer::hex(&public)
-    ))
+    let config = Config::parse(&serde_json::json!({"sources": [out], "trusted": [blaze_pack::peer::hex(&public)]}).to_string())
     .unwrap();
     let home = dir.path().join("home");
     let mut store = empty(&home);

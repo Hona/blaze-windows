@@ -198,7 +198,8 @@ pub(super) fn in_checkout(cwd: &Path, file: &Path, head: &Path) -> Option<String
         }
     }
     let rest = whole.strip_prefix(head).ok()?;
-    Some(rest.to_str()?.to_owned()) // alloc: CLI edge, a name, once
+    // A diagnostic filter names a VFS path, whose separator is '/', not the host's.
+    Some(rest.to_str()?.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
 /// `found` as one line and its children's under it: `file:line:col: level[code]: message`.

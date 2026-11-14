@@ -870,7 +870,7 @@ mod tests {
             Effect::Stamp { .. } => Step::Stamp,
             Effect::Mode { .. } => Step::Mode,
             Effect::Link { .. } => Step::Link,
-            Effect::Truncate { .. } => Step::Cut,
+            Effect::Truncate { .. } | Effect::SparseFile { .. } => Step::Cut,
             Effect::WriteAt { .. } => Step::Write,
             Effect::Prewarm { .. } => Step::Warm,
             Effect::RenameUnsynced { .. } => Step::Rename,

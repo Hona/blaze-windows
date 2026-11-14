@@ -397,14 +397,13 @@ fn make_texts(tree: &Path, digest: &str) -> Result<(), String> {
             texts::Step::Write { file, bytes } => {
                 std::fs::write(&file, &bytes).map_err(|error| named(&file, error))?
             }
-            texts::Step::Sync { file } => std::fs::File::open(&file)
+            texts::Step::Sync { file } => std::fs::File::options().write(true).open(&file)
                 .and_then(|it| it.sync_all())
                 .map_err(|error| named(&file, error))?,
             texts::Step::Rename { from, to } => {
                 std::fs::rename(&from, &to).map_err(|error| named(&to, error))?
             }
-            texts::Step::SyncDir { dir } => std::fs::File::open(&dir)
-                .and_then(|it| it.sync_all())
+            texts::Step::SyncDir { dir } => blaze_core::fs::sync_dir(&dir)
                 .map_err(|error| named(&dir, error))?,
             texts::Step::Done => {
                 tracing::info!(target: "blaze", at = %at.display(), files = lines.len(), "a shipped tree's texts are made");

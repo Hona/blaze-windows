@@ -265,9 +265,6 @@ impl Vfs {
         if !self.journal.can_stage() {
             return Err(ImageError::Busy);
         }
-        if let Some(error) = self.corrupt() {
-            return Err(ImageError::Corrupt(error));
-        }
         store_texts(self.tree.table(), texts)?;
         if !texts.durable() {
             return Err(ImageError::Storing);
@@ -423,6 +420,10 @@ fn id_of(words: &[u64]) -> ContentId {
 /// A file of an image's base is the store's already: an image is written only once every text
 /// it names is durable there.
 fn store_texts(table: &Table, texts: &dyn Texts) -> Result<(), ImageError> {
+    // A repair replaces a refused stored text with heap bytes. The mapped generation
+    // remembers its first refusal even after repair; validate the stored references
+    // still in this table, not the historical refusal. Healthy images stay lazy.
+    let damaged_base = table.mapped().is_some_and(|it| it.corrupt().is_some());
     for node in 0..table.len() {
         if table.shape(node).is_dir() {
             continue;
@@ -435,6 +436,8 @@ fn store_texts(table: &Table, texts: &dyn Texts) -> Result<(), ImageError> {
             if !texts.has(id) {
                 texts.put(id, bytes).map_err(ImageError::Unstored)?;
             }
+        } else if damaged_base {
+            table.blob(node).map_err(ImageError::Corrupt)?;
         }
     }
     Ok(())

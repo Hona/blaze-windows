@@ -725,7 +725,7 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         "{err}"
     );
     assert!(lines[2].starts_with("blaze: ok built=0 cached=0 "), "{err}");
-    assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
+    assert_eq!(lines[3], format!("   Generated {}", dir.join("foo").join("index.html").display()), "{err}");
     assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
     assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
     let listed = std::fs::read_to_string(dir.join("crates.js")).unwrap();
