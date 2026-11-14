@@ -29,7 +29,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '1'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -67,16 +67,19 @@ jobs:
           if (-not ($headers -match '^\s*800000 size of stack reserve\s*$')) {
             throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
           }
-      - name: Host, store and linker units
+      - name: Compile unit executables without starting them
         if: matrix.suite == 'units'
         run: |
           Get-PSDrive C,D | Format-Table Name,Used,Free
-          $p = Start-Process cargo -ArgumentList 'test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru
+          $p = Start-Process cargo -ArgumentList 'test --locked --no-run --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru
           while (-not $p.WaitForExit(30000)) {
             $os = Get-CimInstance Win32_OperatingSystem
             Write-Host "free MiB: RAM $([int]($os.FreePhysicalMemory/1024)), commit $([int]($os.FreeVirtualMemory/1024)), disk C $([int]((Get-PSDrive C).Free/1MB)), disk D $([int]((Get-PSDrive D).Free/1MB))"
           }
           exit $p.ExitCode
+      - name: Run host, store and linker units
+        if: matrix.suite == 'units'
+        run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link
       - name: Portable tool call sites and planted regressions
         if: '!cancelled() && matrix.suite == ''engine'''
         run: cargo test --locked -p astlog-core --test rules
