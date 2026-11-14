@@ -261,18 +261,35 @@ impl<'a, V> Row<'a, V> {
 /// any, found through a directory readable at every ID page (one load, no bounds load), of
 /// which only the entries written are committed.
 pub(crate) struct Pages {
-    dir: Whole<AtomicPtr<u8>, MAX_PAGES>,
+    dir: Directory,
     #[expect(clippy::disallowed_types, reason = "held only while a row page is made")]
     grow: blaze_core::lock::Lock<()>,
     /// Pages made: what the memory report counts without reading the directory.
     count: AtomicUsize,
 }
 
+// On overcommitting kernels a flat addressable directory costs only its touched pages.
+// Windows would charge all 8 MiB per ingredient just to let reads of absent rows see null.
+// There, publish the growable column itself: an acquire length check answers absence
+// without touching (or paying commit for) an address past its initialized prefix.
+#[cfg(windows)]
+type Directory = super::dense::Dense<AtomicPtr<u8>>;
+#[cfg(not(windows))]
+type Directory = Whole<AtomicPtr<u8>, MAX_PAGES>;
+
+#[cfg(windows)]
+pub(crate) type DirEntry = Directory;
+#[cfg(not(windows))]
+pub(crate) type DirEntry = AtomicPtr<u8>;
+
 impl Pages {
     #[expect(clippy::disallowed_types, reason = "makes the locks its fields allow")]
     pub(crate) fn new(tag: Tag) -> Pages {
         Pages {
-            dir: Whole::sparse(tag, "an ingredient's row page directory"),
+            #[cfg(not(windows))]
+            dir: Directory::sparse(tag, "an ingredient's row page directory"),
+            #[cfg(windows)]
+            dir: Directory::growing(MAX_PAGES, tag, "an ingredient's row page directory"),
             grow: blaze_core::lock::Lock::new("query.rows.grow", ()),
             count: AtomicUsize::new(0),
         }
@@ -283,22 +300,32 @@ impl Pages {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// The directory's first entry, for a hit path that indexes from it: the directory is a
-    /// [`Whole`] column of `MAX_PAGES` entries, a sparse reservation readable and writable whole
-    /// from [`Pages::new`] until the `Pages` is dropped (`Dense::sparse`'s invariant), so
-    /// `dir.add(i)` is a valid entry for every `i < MAX_PAGES`, such as any `Id`'s `page()`
-    /// (masked below `MAX_PAGES`): null until [`Pages::page_or_make`] commits and stores it.
-    /// The unchecked reads in `function::fetch`, `function::member_header` and
-    /// `verify::function_header` rest on this.
+    /// Read handle for this directory. Its table is boxed before publication and never moved.
     #[inline(always)]
-    pub(crate) fn dir(&self) -> NonNull<AtomicPtr<u8>> {
-        self.dir.base()
+    pub(crate) fn dir(&self) -> NonNull<DirEntry> {
+        #[cfg(windows)]
+        { NonNull::from(&self.dir) }
+        #[cfg(not(windows))]
+        { self.dir.base() }
+    }
+
+    /// # Safety
+    /// `dir` must come from a live table's `Pages::dir`.
+    #[inline(always)]
+    pub(crate) unsafe fn lookup(dir: *const DirEntry, id: Id) -> *mut u8 {
+        #[cfg(windows)]
+        // SAFETY: the published table lives at least as long as its storage's shared borrow.
+        let slot = unsafe { &*dir }.get_checked(id.page());
+        #[cfg(not(windows))]
+        // SAFETY: a Whole directory covers every id.page() (always < MAX_PAGES).
+        let slot = Some(unsafe { &*dir.add(id.page()) });
+        slot.map_or(std::ptr::null_mut(), |entry| entry.load(Ordering::Acquire))
     }
 
     /// The row page of ID page `page`, null when it has none.
     #[inline]
     pub(crate) fn page(&self, page: usize) -> *mut u8 {
-        self.dir.get(page).load(Ordering::Acquire)
+        self.dir.get_checked(page).map_or(std::ptr::null_mut(), |entry| entry.load(Ordering::Acquire))
     }
 
     /// The row page of ID page `page`, made of zeroes from `heap` when it has none.
@@ -321,7 +348,8 @@ impl Pages {
         let at = heap.alloc(PAGE_LEN * size, align.max(8));
         // Release: a reader that loads the page sees its zeroes, and whatever the maker
         // writes into its rows before publishing them on its own.
-        self.dir.get_to_write(page).store(at.as_ptr(), Ordering::Release);
+        self.dir.ensure(page + 1);
+        self.dir.get(page).store(at.as_ptr(), Ordering::Release);
         self.count.fetch_add(1, Ordering::Relaxed);
         at
     }
@@ -379,6 +407,22 @@ mod tests {
     use super::*;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn an_absent_row_page_does_not_commit_an_ingredients_directory() {
+        let pages = Pages::new(Tag::Query);
+        let heap = Heap::new(1 << 20, Tag::Query);
+        let read = |i| {
+            // SAFETY: pages is live and does not move until the closure is dropped.
+            unsafe { Pages::lookup(pages.dir().as_ptr(), Id::at(i, 0)) }
+        };
+        assert!(read(MAX_PAGES - 1).is_null());
+        assert_eq!(pages.dir.committed_bytes(), 0);
+        let at = pages.page_or_make(1, &heap, 8, 8);
+        assert_eq!(read(1), at.as_ptr());
+        assert!(read(MAX_PAGES - 1).is_null());
+        assert!(pages.dir.committed_bytes() < MAX_PAGES * size_of::<AtomicPtr<u8>>());
+    }
 
     /// A value that counts its drops, `N` words long.
     struct Counted<const N: usize>([u64; N]);

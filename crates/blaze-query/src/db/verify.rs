@@ -153,13 +153,7 @@ pub(crate) fn function_header<'s>(storage: &'s Storage, node: &NodeRow) -> Optio
     if vtable.kind != Kind::Function {
         return None;
     }
-    let dir = storage.dir(index);
-    if dir.is_null() {
-        return None;
-    }
-    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
-    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`).
-    let page = NonNull::new(unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire))?;
+    let page = NonNull::new(storage.row_page(index, id))?;
     // SAFETY: the page is the function's, made with rows of its vtable's `row_size`; the
     // header lives as long as `storage`.
     Some(unsafe { header_at(page, id.slot(), vtable.row_size) })
