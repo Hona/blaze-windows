@@ -5,7 +5,8 @@
 # first step that fails, naming it (docs/contributing.md, "Scripts that run commands").
 param(
     [Parameter(Mandatory)] [string] $Blaze,
-    [Parameter(Mandatory)] [string] $Out
+    [Parameter(Mandatory)] [string] $Out,
+    [Parameter(Mandatory)] [ValidateSet('hello','withdeps')] [string] $Fixture
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -102,6 +103,7 @@ try {
     if (!$ready) { throw 'blaze serve did not announce its listener in four minutes' }
     foreach ($p in @(@('hello', $hello, 'hello from blaze'), @('withdeps', $withdeps, 'hello from blaze with deps'))) {
         $name, $dir, $said = $p
+        if ($name -ne $Fixture) { continue }
         Step $name 'lock' $dir @('lock') ''
         Step $name 'check' $dir @('check') ''
         Step $name 'build' $dir @('build') ''

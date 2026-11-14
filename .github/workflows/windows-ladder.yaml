@@ -102,6 +102,10 @@ jobs:
         run: ./.github/scripts/windows-suite.ps1 '${{ matrix.crate }}'
   ladder:
     needs: compile
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [hello, withdeps]
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
@@ -125,13 +129,13 @@ jobs:
             fsutil usn createjournal m=33554432 a=4194304 $volume
             if ($LASTEXITCODE) { throw "could not provision USN journal on $volume" }
           }
-      - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/release/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
+      - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/release/blaze.exe" -Out "$env:RUNNER_TEMP/ladder" -Fixture '${{ matrix.fixture }}'
         env:
           RUST_BACKTRACE: '1'
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-ladder
+          name: windows-ladder-${{ matrix.fixture }}
           path: |
             ${{ runner.temp }}/ladder/*.log
             ${{ runner.temp }}/ladder/*.csv
