@@ -20,25 +20,6 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const WORD: usize = size_of::<u64>();
 
-/// The heavy half of an asymmetric fence: every store any thread of the process made before
-/// this call is seen by the calling thread's loads after it, so a reader's side needs only a
-/// compiler fence between its store and its load (the store's pool's optimistic readers before
-/// a decommit, `blaze-cas`'s `pool::readers`). Windows: `FlushProcessWriteBuffers`, which
-/// interrupts every processor running a thread of the process.
-#[cfg(windows)]
-#[allow(unsafe_code, reason = "FlushProcessWriteBuffers, a system call with no arguments")]
-pub fn process_fence() {
-    // SAFETY: no arguments and nothing of the caller's is touched.
-    unsafe { windows_sys::Win32::System::Threading::FlushProcessWriteBuffers() };
-}
-
-/// Off Windows nothing takes the pool's pages out of the address space, so no reader's side
-/// waits on this; a full fence orders it on one thread, as the tests run every reader.
-#[cfg(not(windows))]
-pub fn process_fence() {
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-}
-
 /// Bytes from `at` to the next 8-byte boundary, at most `len`.
 #[inline]
 fn head(at: *const u8, len: usize) -> usize {

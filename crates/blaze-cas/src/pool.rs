@@ -19,9 +19,7 @@
 //! Records are immutable, so no page is ever dirty: a page is loaded by an explicit read into its
 //! slot ([`blaze_core::Effect::ReadInto`]) that its asker yields on, checked block by block
 //! (CRC32C per 4 KiB) before it is `Loaded`, and given back by the sweep with `MADV_DONTNEED`
-//! or `MADV_FREE_REUSABLE` ([`blaze_mem::Region::evict`]), never written back. On Windows a page
-//! given back is decommitted ([`blaze_mem::Region::evict_out`]) once the optimistic reads that
-//! may copy it have left ([`readers`]), so its commit charge goes with it.
+//! or `MADV_FREE_REUSABLE` ([`blaze_mem::Region::evict`]), never written back.
 //!
 //! What the kernel does to the pages (making them the process's again, giving them back) goes
 //! through [`Give`], a type parameter: [`Kernel`] in a build, the DST's poisoning stand-in in
@@ -63,7 +61,6 @@ pub(crate) mod drive;
 pub(crate) mod evict;
 pub(crate) mod loads;
 pub(crate) mod prefetch;
-pub(crate) mod readers;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
 
@@ -305,9 +302,6 @@ pub(crate) enum Plant {
     /// 12: a prefetch is issued without its pages being charged to the prefetch budget, so
     /// a plan reads ahead past what the pool may hold unread.
     PrefetchUncharged,
-    /// 13: a give-back takes its pages out of the address space without waiting for the
-    /// optimistic reads in flight ([`readers::drain`]), so on Windows one faults.
-    NoDrain,
 }
 
 // --- Counting prefetched pages -------------------------------------------------------------------
@@ -378,19 +372,6 @@ pub(crate) trait Give: Sized {
     /// Every page of the ranges is `Evicting` with no pin, so nothing holds a reference into it, and
     /// each was made the process's by [`Give::reuse`] and not given back since.
     unsafe fn evict(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError>;
-
-    /// [`Give::evict`], the pages taken out of the address space where a page given back stays
-    /// charged otherwise ([`Region::evict_out`]).
-    ///
-    /// # Safety
-    ///
-    /// As [`Give::evict`], and no optimistic read that may copy the pages is in flight
-    /// ([`readers::drain`]).
-    unsafe fn evict_out(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError>;
-
-    /// Whether every optimistic read that began before now has left, so pages whose words
-    /// moved off `Loaded` before this call may leave the address space ([`readers::drain`]).
-    fn drained(&self) -> bool;
 }
 
 /// The kernel's: [`Region::reuse`] and [`Region::evict`] of the pool's pages (Linux
@@ -406,15 +387,6 @@ impl Give for Kernel {
         // SAFETY: the caller's contract is `Region::evict`'s: nothing references the pages, and
         // each was reused and not given back since.
         unsafe { pool.pages.evict(ranges) }
-    }
-
-    unsafe fn evict_out(&self, pool: &Pool<Self>, ranges: &[Range<usize>]) -> Result<usize, MemError> {
-        // SAFETY: the caller's contract is `Region::evict_out`'s: no read of the pages at all.
-        unsafe { pool.pages.evict_out(ranges) }
-    }
-
-    fn drained(&self) -> bool {
-        readers::drain()
     }
 }
 
@@ -697,16 +669,6 @@ impl<G: Give> Pool<G> {
     ///
     /// As [`Give::evict`].
     pub(crate) unsafe fn give_back(&self, ranges: &[Range<usize>]) -> Result<usize, MemError> {
-        // Every page's word moved off `Loaded` before this (the caller's contract): once the
-        // reads that may have seen one `Loaded` left, none can copy the pages, and they may
-        // leave the address space (on Windows their commit with them). A read still inside at
-        // the drain's bound (preempted mid-copy) has the batch given back in place, its commit
-        // kept until the pages are loaded and given back again, and counted.
-        if self.planted(Plant::NoDrain) || self.give.drained() {
-            // SAFETY: the caller's, and every read in flight that may copy the pages left.
-            return unsafe { self.give.evict_out(self, ranges) };
-        }
-        counts::undrained(ranges.iter().map(|it| it.len() as u64).sum());
         // SAFETY: the caller's.
         unsafe { self.give.evict(self, ranges) }
     }
@@ -759,9 +721,7 @@ impl<G: Give> Pool<G> {
     pub(crate) fn begin(&self, at: u64, len: usize) -> Result<Seen, Word> {
         assert!(len >= 1 && len as u64 <= PAGE, "an optimistic read of {len} bytes: 1 to a page");
         let run = Run::of(at, len as u64);
-        // In flight from before its first word is read until the `Seen` is dropped.
-        let inside = readers::enter();
-        let mut seen = Seen { first: run.first, words: [0; 2], pages: run.pages as u8, inside };
+        let mut seen = Seen { first: run.first, words: [0; 2], pages: run.pages as u8 };
         for (i, page) in run.pages().enumerate() {
             let word = self.word_now(page);
             if word.state() != State::Loaded {
@@ -838,15 +798,12 @@ impl<G: Give> Pool<G> {
     }
 }
 
-/// What [`Pool::begin`] saw of an optimistic read's pages. The read is in flight until this is
-/// dropped, on the thread that began it ([`readers`]).
-#[derive(Debug)]
+/// What [`Pool::begin`] saw of an optimistic read's pages.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Seen {
     first: u64,
     words: [u64; 2],
     pages: u8,
-    #[allow(dead_code, reason = "held for its drop: the read leaves as it goes")]
-    inside: readers::Inside,
 }
 
 /// How an optimistic read went.
