@@ -14,10 +14,15 @@ concurrency:
 
 jobs:
   bootstrap:
+    # Compare the exact source trees, with the same compiler budget, before integrating host.
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: ${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/windows/int' && '["df70baaf8d1b9754173fb0ab51e277f5c0d8f38d","c553ddba520c9d84244732ee3ddda34482cb06f4"]' || format('["{0}"]', github.sha)) }}
     runs-on: windows-2025
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: '8'
+      CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -26,6 +31,7 @@ jobs:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
+          ref: ${{ matrix.revision }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
