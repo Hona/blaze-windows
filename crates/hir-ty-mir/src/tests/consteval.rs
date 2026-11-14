@@ -527,6 +527,26 @@ const GOAL: usize = transmute(&X);
     );
 }
 
+/// The invariant: a reference to part of an allocation keeps the whole allocation in the
+/// constant's memory, as rustc's does: the bytes after the part are read through it (a
+/// `PCSTR` of `c"LOC".to_bytes()` reads its NUL; INTEGRATION I57). The control: the bytes
+/// kept were the two pointed to, and what came after them in the image was another piece's.
+#[test]
+fn a_reference_to_part_of_an_allocation_keeps_all_of_it() {
+    check_answer(
+        r#"
+//- minicore: slice, unsize, coerce_unsized
+const GOAL: &[u8] = match b"ABCD" { [x @ .., _, _] => x };
+        "#,
+        |b, mm| {
+            let addr = usize::from_le_bytes(b[..8].try_into().unwrap());
+            assert_eq!(usize::from_le_bytes(b[8..16].try_into().unwrap()), 2, "the slice's length");
+            let (start, memory) = mm.memory_at(addr).expect("the slice's memory is kept");
+            assert_eq!(&memory[addr - start..], b"ABCD", "the whole allocation from the slice on");
+        },
+    );
+}
+
 #[test]
 fn locals() {
     check_number(
