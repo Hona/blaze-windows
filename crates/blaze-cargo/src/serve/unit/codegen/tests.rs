@@ -266,8 +266,9 @@ fn a_profile_that_is_not_there_is_an_error_naming_its_path() {
     assert!(missing.contains("`-C profile-use=pgo/merged.profdata`"), "{missing}");
     let at = dir.path().join("pgo/merged.profdata");
     assert!(missing.contains(&format!("`{}` can't be read", at.display())), "{missing}");
-    let absolute = read_profile(root, "/nonexistent/blaze/merged.profdata").err().unwrap();
-    assert!(absolute.contains("`/nonexistent/blaze/merged.profdata` can't be read"), "{absolute}");
+    let path = dir.path().join("never-created.profdata");
+    let absolute = read_profile(root, path.to_str().unwrap()).err().unwrap();
+    assert!(absolute.contains(&format!("`{}` can't be read", path.display())), "{absolute}");
 }
 
 #[cfg(feature = "native")]

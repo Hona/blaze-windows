@@ -759,6 +759,19 @@ pub fn spawn_detached(
     log: &std::fs::File,
     keep: std::os::windows::io::BorrowedHandle<'_>,
 ) -> std::io::Result<Detached> {
+    spawn_with_handles(program, args, dir, log, keep, breakaway()?)
+}
+
+/// The detached console and handle list are independent of the enclosing job's lifetime.
+#[cfg(windows)]
+fn spawn_with_handles(
+    program: &std::path::Path,
+    args: impl FnOnce(usize) -> Vec<std::ffi::OsString>,
+    dir: &std::path::Path,
+    log: &std::fs::File,
+    keep: std::os::windows::io::BorrowedHandle<'_>,
+    away: bool,
+) -> std::io::Result<Detached> {
     use std::os::windows::{
         ffi::OsStrExt as _,
         io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle},
@@ -770,7 +783,6 @@ pub fn spawn_detached(
         InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
         STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
     };
-    let away = breakaway()?;
     // Inheritable copies of what it is given, closed here once it started: the originals stay
     // this process's alone.
     let inheritable =
@@ -987,9 +999,18 @@ mod tests {
                 .map(Into::into)
                 .to_vec()
         };
-        let child =
-            spawn_detached(&std::env::current_exe().unwrap(), args, &dir, &log, said.as_handle())
-                .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let child = match breakaway() {
+            Ok(_) => spawn_detached(&exe, args, &dir, &log, said.as_handle()).unwrap(),
+            Err(policy) => {
+                assert_eq!(policy.kind(), std::io::ErrorKind::PermissionDenied);
+                let refusal = spawn_detached(&exe, |_| panic!("spawned despite job policy"), &dir, &log, said.as_handle()).err().unwrap();
+                assert!(refusal.to_string().contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"));
+                // Still exercise the real child, log, working directory and handle list;
+                // unlike a persistent daemon this child exits before the enclosing job.
+                spawn_with_handles(&exe, args, &dir, &log, said.as_handle(), false).unwrap()
+            }
+        };
         drop(said);
         let mut heard = Vec::new();
         ready.read_to_end(&mut heard).unwrap();

@@ -1239,8 +1239,8 @@ fn linux<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
         .ok_or_else(|| fail(format!("{} printed no `libraries:` line", shown(0))))?;
     // alloc: once per toolchain asked, its directories
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for dir in listed.trim().trim_start_matches('=').split(':').filter(|it| !it.is_empty()) {
-        let dir = PathBuf::from(dir);
+    // GCC's path separator belongs to the machine running it, not the target triple.
+    for dir in std::env::split_paths(listed.trim().trim_start_matches('=')) {
         if dir.is_dir() && !dirs.contains(&dir) {
             dirs.push(dir);
         }

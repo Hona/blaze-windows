@@ -169,10 +169,9 @@ fn glibc(target: Target) -> Glibc {
     let mut answers = Answers::new().answer(
         "cc -print-search-dirs",
         Ok(format!(
-            "install: {gcc}/\nprograms: =/usr/bin/\nlibraries: ={gcc}/:{libc}/:{missing}\n",
+            "install: {gcc}/\nprograms: =/usr/bin/\nlibraries: ={listed}\n",
             gcc = gcc.display(),
-            libc = libc.display(),
-            missing = root.join("missing").display()
+            listed = std::env::join_paths([&gcc, &libc, &root.join("missing")]).unwrap().display()
         )),
     );
     let files = [

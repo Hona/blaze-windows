@@ -714,10 +714,8 @@ mod tests {
         assert_eq!(runtimes(Sanitizers::NONE, "aarch64-apple-darwin", &sysroot), Ok(()));
         let thread = runtimes(Sanitizers::THREAD, linux, &sysroot).unwrap_err();
         assert!(thread.starts_with("`-Zsanitizer=thread` needs its runtime `"), "{thread}");
-        assert!(
-            thread.contains(&lib.join("librustc-nightly_rt.tsan.a").display().to_string()),
-            "{thread}"
-        );
+        let named = thread.split('`').nth(3).expect("a quoted runtime path");
+        assert_eq!(std::path::Path::new(named), lib.join("librustc-nightly_rt.tsan.a"));
         let apple = runtimes(Sanitizers::ADDRESS, "aarch64-apple-darwin", &sysroot).unwrap_err();
         assert!(apple.contains("librustc-nightly_rt.asan.dylib"), "{apple}");
         assert!(

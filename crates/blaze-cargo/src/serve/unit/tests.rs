@@ -3237,11 +3237,11 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().expect("an item store is installed unless it is turned off");
     assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
-    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
     let (puts, mut flushes) = super::deps::store(&first, None, &mut session, &[], "/w")
         .unwrap_or_else(|error| panic!("what the build left was not kept: {}", error.what));
     assert_eq!(flushes.take_refusal(), None, "every record the build offered is kept");
     let items = flushes.items.as_ref().expect("the item store was flushed");
+    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{items:?}");
     assert_eq!((items.failed, items.slots_full), (0, 0), "{items:?}");
     assert!(items.written >= 6, "three identities' inference and MIR at least: {items:?}");
     assert!(!puts.is_empty());
