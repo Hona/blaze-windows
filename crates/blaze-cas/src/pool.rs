@@ -82,8 +82,37 @@ pub(crate) const PER_WINDOW: u64 = WINDOW / PAGE;
 /// its packs to, so a block never changes once committed.
 pub(crate) const BLOCK: u64 = crate::disk::BLOCK;
 
-/// The windows of a store's reservation: 4 TiB of address space at 1 GiB a window.
+/// Upper bound for a store's reservation: 4 TiB of address space at 1 GiB a window.
 pub(crate) const WINDOWS: u32 = 4096;
+
+#[cfg(any(windows, test))]
+fn windows_for_capacity(physical: u64, commit: u64, address: u64) -> u32 {
+    let bytes = physical.min(commit).saturating_mul(8).min(address / 16);
+    (bytes / WINDOW).clamp(32, u64::from(WINDOWS)) as u32
+}
+
+#[cfg(windows)]
+pub(crate) fn store_windows() -> Result<u32, String> {
+    let c = blaze_mem::address_capacity()
+        // alloc: name the failing API and the reservation it was to size
+        .map_err(|why| format!("sizing the store's pool (GlobalMemoryStatusEx): {why}"))?;
+    Ok(windows_for_capacity(c.physical, c.available_commit, c.available_address))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn store_windows() -> Result<u32, String> {
+    Ok(WINDOWS)
+}
+
+#[test]
+fn store_reservation_is_bounded_in_whole_windows() {
+    let windows = |ram: u64, commit: u64, va: u64| windows_for_capacity(ram * WINDOW, commit * WINDOW, va * WINDOW);
+    assert_eq!(windows(16, 24, 131072), 128);
+    assert_eq!(windows(96, 12, 131072), 96);
+    assert_eq!(windows(96, 128, 1024), 64);
+    assert_eq!(windows(8, 2, 131072), 32);
+    assert_eq!(windows(1024, 1024, 131072), WINDOWS);
+}
 
 /// Waits and spins one reading takes before it ends as [`PoolError::Starved`]: far more than a
 /// page is ever evicted and loaded again under one reader (rule `bounded-progress`).
@@ -1613,7 +1642,7 @@ impl fmt::Display for PoolError {
             PoolError::Full { id, windows, live, total } => write!(
                 f,
                 "the store's pool has no run of {windows} free windows for {id:?}: {live} files hold windows of its \
-                 {total} (pool::WINDOWS); the reservation is too small for this store"
+                 {total}; the reservation is too small for this store"
             ),
             PoolError::Busy { id, page, word } => {
                 let (window, at) = page_of(*page);

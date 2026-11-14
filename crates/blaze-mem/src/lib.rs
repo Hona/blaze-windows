@@ -79,6 +79,8 @@ pub use column::{Block, Column};
 pub use error::MemError;
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};
+#[cfg(windows)]
+pub use os::{AddressCapacity, address_capacity};
 pub use pool::{Cache, Pool, Pooled, Shared};
 #[cfg(target_pointer_width = "64")]
 pub use program::{ProgramArena, ProgramError, ProgramLifetime, Ref32};

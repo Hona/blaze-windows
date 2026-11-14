@@ -42,6 +42,30 @@ pub(crate) const RESERVE_ALIGN: usize = 64 << 10;
 
 static PAGE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
+/// Memory visible to this Windows process when sizing a new reservation. Free address bytes
+/// need not be contiguous; only the reservation itself can check that.
+#[cfg(windows)]
+pub struct AddressCapacity {
+    pub physical: u64,
+    pub available_commit: u64,
+    pub available_address: u64,
+}
+
+#[cfg(windows)]
+pub fn address_capacity() -> io::Result<AddressCapacity> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: status is writable for dwLength bytes, the size this API requires.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(AddressCapacity {
+        physical: status.ullTotalPhys,
+        available_commit: status.ullAvailPageFile,
+        available_address: status.ullAvailVirtual,
+    })
+}
+
 pub(crate) fn page_size() -> usize {
     let page = PAGE.load(atomic::Ordering::Relaxed);
     if page != 0 {

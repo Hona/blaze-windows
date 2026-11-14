@@ -12,7 +12,7 @@ use crate::{Region, Tag, racy, tag};
 /// system blaze runs on.
 const PAGE: usize = 64 << 10;
 
-/// The pool's default reservation: 4 TiB, 4096 windows of 1 GiB.
+/// Unix's default and the largest supported Windows reservation.
 const POOL_RESERVATION: usize = 4 << 40;
 
 fn write_page(region: &Region, at: usize, byte: u8) {
@@ -43,17 +43,17 @@ fn resident(region: &Region, at: usize, len: usize) -> usize {
     pages.iter().filter(|&&it| it & 1 != 0).count()
 }
 
-/// The pool's reservation is granted, costs nothing until touched, and its pages anywhere in it
-/// (the first, one 2 TiB in, the last) are made the process's, hold what is written, and go back
-/// in one call. Run on macOS and Linux, where the pool reserves this much at the store's open.
+/// The default Unix reservation and the minimum Windows reservation support sparse use at
+/// both ends and the midpoint. Only the three reused pages should count as held.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
-fn the_pools_four_tib_reservation_is_granted_and_gives_pages_back() {
-    let region = Region::reserve_sparse_ranges(POOL_RESERVATION, Tag::Other)
-        .unwrap_or_else(|error| panic!("the store pool's 4 TiB reservation: {error}"));
-    assert_eq!(region.reserved(), POOL_RESERVATION);
+fn the_pool_reservation_is_granted_and_gives_pages_back() {
+    let bytes = if cfg!(windows) { 32 << 30 } else { POOL_RESERVATION };
+    let region = Region::reserve_sparse_ranges(bytes, Tag::Other)
+        .unwrap_or_else(|error| panic!("the store pool's {bytes} byte reservation: {error}"));
+    assert_eq!(region.reserved(), bytes);
     assert_eq!((region.committed(), region.held()), (0, 0), "a reservation holds nothing");
-    let pages = [0, POOL_RESERVATION / 2, POOL_RESERVATION - PAGE];
+    let pages = [0, bytes / 2, bytes - PAGE];
     for (n, &at) in pages.iter().enumerate() {
         region.reuse(at, PAGE).expect("reuse a page of the reservation");
         // SAFETY: the first reuse committed this page; no byte was written yet.
