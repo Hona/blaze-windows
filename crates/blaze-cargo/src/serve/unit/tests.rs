@@ -549,7 +549,7 @@ fn an_msvc_cdylib_is_one_image_and_its_import_library_is_beside_it() {
         format!("{deps}/rune_www-89ab.dll"),
         format!("{deps}/rune_www-89ab.dll.lib"),
         format!("{deps}/rune_www-89ab.dll.exp"),
-        format!("{deps}/rune_www-89ab.pdb"),
+        format!("{deps}/rune_www-89ab.dll.pdb"),
         "/w/target/debug/rune_www.dll".to_owned(),
         "/w/target/debug/rune_www.dll.lib".to_owned(),
     ];

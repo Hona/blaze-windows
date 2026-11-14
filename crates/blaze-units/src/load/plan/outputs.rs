@@ -252,7 +252,11 @@ fn file_types(
             let suffix = if crate_type == CrateType::Bin { ".dSYM" } else { ".dylib.dSYM" };
             out.push(file(suffix, &prefix, Flavor::DebugInfo, false));
         } else if triple.ends_with("-msvc") || triple.ends_with("-uefi") {
-            out.push(file(".pdb", &prefix, Flavor::DebugInfo, true));
+            // A DLL's PDB is named for the DLL (`foo.dll.pdb`), as blaze's linker writes it
+            // and names it in the image's CodeView record: a package's `cdylib` and its bin
+            // share a crate name, and cargo's `foo.pdb` for both is one path (INTEGRATION I45).
+            let pdb = if suffix == ".dll" { ".dll.pdb" } else { ".pdb" };
+            out.push(file(pdb, &prefix, Flavor::DebugInfo, true));
         } else {
             out.push(file(
                 &format!("{suffix}.dwp"),

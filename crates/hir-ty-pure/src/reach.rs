@@ -641,7 +641,8 @@ struct Solver<'a, 'db> {
     addressed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
-    /// Forward priority, including the acyclic arms of a body that also contains a loop.
+    /// Worklist priority in reverse postorder, even for bodies with loops: the acyclic arms
+    /// of a branch are walked before their join. Back edges can still revisit a block.
     rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
