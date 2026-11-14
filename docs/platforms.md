@@ -201,6 +201,20 @@ What `blaze build` and `blaze test` were run on, by hand, on Windows 11 26100 wi
   exception caught above a Rust `extern "C-unwind"` frame runs no Rust drop, as on the pinned
   MSVC Rust toolchain. Cleanup through a C++ `throw;` rethrow remains unverified.
 
+### Restoring native linker inputs on Windows
+
+The daemon keeps the ordered `(member, library)` names requested by each COFF object or
+archive as a query in its store. The key covers the record schema, the code that produced
+it and the input bytes. On the first link after restart the linker hashes each input it
+encounters, then reads and validates just its record. A miss parses that input; a wrong
+layout or corrupt entry is an error. No records are loaded at daemon startup. Within a
+process the existing file-stamp cache still avoids a read of an unchanged input.
+
+Only requests are reusable, not the paths they resolved to: a new library in an earlier
+search directory must win. The unit header's native paths and hashes describe files a link
+read, not search misses, input kinds, or member directives. This record does not restore
+the image layout or its PDB.
+
 ### v2 output placement on Windows
 
 On ReFS, blaze can clone the previous output's blocks and patch the clone. On NTFS,

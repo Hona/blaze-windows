@@ -86,9 +86,9 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
-        Library, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
-        applying_fallible,
+        Broke, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut, Library,
+        Phase, PhaseDone, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
+        applying, applying_fallible,
     },
 };
 
@@ -1911,7 +1911,7 @@ impl Front<Real> for JobFront {
         unit: usize,
         phase: Phase,
         images: &mut Vec<Image<Real>>,
-    ) -> Result<Option<Compiled>, Failed> {
+    ) -> Result<PhaseDone, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }

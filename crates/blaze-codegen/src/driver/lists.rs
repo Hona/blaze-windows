@@ -114,6 +114,12 @@ struct StaticRow {
 
 /// A program's last `Built`, by row ([`self`]).
 pub(super) struct Lists {
+    /// The summary graph (`Build::release`) and its boundary. A patched walk leaves
+    /// the import decisions unchanged if no release node changes and all incoming
+    /// edges from other backends and statics remain the same.
+    release: blaze_hash::HashSet<InstanceKey, Global>,
+    incoming: BTreeMap<InstanceKey, Vec<InstanceKey>>,
+    static_incoming: BTreeMap<StaticId, Vec<InstanceKey>>,
     functions: Sorted<InstanceKey, FunctionRow>,
     statics: Sorted<StaticId, StaticRow>,
     /// What dedupe merged ([`Deduped`]), and the same as the map a rename takes.
@@ -167,11 +173,16 @@ pub(super) enum Patch {
 }
 
 impl Lists {
+    fn release_refs(&self, refs: &[crate::Target]) -> Vec<InstanceKey> {
+        // alloc: only for a row referring to release code
+        refs.iter().filter_map(super::callee).filter(|key| self.release.contains(key)).collect()
+    }
     /// The lists of `built`, a `Built` whose passes ran whole over `nodes` and `statics`:
     /// `originals` what its dedupe changed, as given it, `last` its entries and `codes` the
     /// code ID of each function it kept. `Err` gives `last` back for a build that is not
-    /// kept by row: one with a function folded or built by a release backend, whose compiles
-    /// are of the whole build.
+    /// kept by row: one with folded code, PGO counts, or no single row for each node.
+    /// Unfolded release functions also have one row each; keep those with the boundary
+    /// of their summary graph.
     pub(super) fn of_whole<I, S>(
         nodes: &Sorted<InstanceKey, FnNode<I, S>>,
         statics: &Sorted<StaticId, StaticNode<I, S>>,
@@ -180,7 +191,7 @@ impl Lists {
         last: Last,
         codes: &[(InstanceKey, ContentId)],
     ) -> Result<Lists, Last> {
-        let plain = nodes.values().all(|it| !it.spec.backend.is_release() && !it.spec.fold)
+        let plain = nodes.values().all(|it| !it.spec.fold && it.spec.pgo == crate::settings::Pgo::None)
             && built.walked.is_empty()
             && built.inputs.len() == nodes.len()
             && last.functions.len() == nodes.len()
@@ -190,6 +201,10 @@ impl Lists {
             return Err(last);
         }
         let mut lists = Lists {
+            release: nodes.iter().filter(|(_, it)| it.spec.backend.is_release())
+                .map(|(key, _)| *key).collect(), // alloc: the summary graph's keys, once per whole walk
+            incoming: BTreeMap::new(),
+            static_incoming: BTreeMap::new(),
             functions: Sorted::default(),
             statics: Sorted::default(),
             merged: BTreeMap::new(),
@@ -219,6 +234,12 @@ impl Lists {
         // alloc: per build kept by row, a row a function
         let mut rows = Vec::with_capacity(nodes.len());
         for (at, (key, node)) in nodes.iter().enumerate() {
+            if !lists.release.is_empty() && !node.spec.backend.is_release() {
+                let refs = lists.release_refs(&node.refs);
+                if !refs.is_empty() {
+                    lists.incoming.insert(*key, refs);
+                }
+            }
             let (kept, before) = (post(key), original(key));
             // A function dedupe changed is kept as it was made too; any other is the
             // `Built`'s own, shared.
@@ -265,6 +286,12 @@ impl Lists {
         // alloc: per build kept by row, a row a static
         let mut rows = Vec::with_capacity(statics.len());
         for (at, (id, node)) in statics.iter().enumerate() {
+            if !lists.release.is_empty() {
+                let refs = lists.release_refs(&node.refs);
+                if !refs.is_empty() {
+                    lists.static_incoming.insert(*id, refs);
+                }
+            }
             let find = |list: &[Static]| {
                 let at = list.binary_search_by_key(id, |it| (it.item, it.instance)).ok()?;
                 // clone: per build kept by row, each static as it is and as it was made
@@ -535,6 +562,24 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         if touched.statics.iter().any(|id| !statics.contains(id)) {
             return Patch::Whole("the walk touched a static it does not hold", lists);
+        }
+        // Release code reads the complete summary graph and which nodes are
+        // externally callable. Do not reuse it across *any* change to those inputs.
+        // Compare the boundary by source (conservative even if another source still
+        // calls the same function), so this costs only the edited rows.
+        if !lists.release.is_empty() {
+            let changed = touched.removed.iter().any(|key| lists.release.contains(key) || lists.incoming.contains_key(key))
+                || touched.removed_statics.iter().any(|id| lists.static_incoming.contains_key(id))
+                || touched.functions.iter().any(|key| {
+                    lists.release.contains(key) || lists.release_refs(&nodes[key].refs).as_slice()
+                        != lists.incoming.get(key).map_or(&[][..], Vec::as_slice)
+                }) || touched.statics.iter().any(|id| {
+                    lists.release_refs(&statics[id].refs).as_slice()
+                        != lists.static_incoming.get(id).map_or(&[][..], Vec::as_slice)
+                });
+            if changed {
+                return Patch::Whole("the release import graph or its incoming references changed", lists);
+            }
         }
         let refused = |key: InstanceKey, item: ItemKey, what: String| {
             Patch::Refused(vec![error(key, item, what)])

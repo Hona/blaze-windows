@@ -1383,7 +1383,13 @@ fn begin(
     if !started.whole() || matches!(before, Before::Ended(_)) {
         eprintln!("{who}: {STARTED}{started}; {before}");
     }
-    daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
+    let store = daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
+    // Use the actual linker's producer even in a dev process assuming other toolchain IDs.
+    let producer = match dev_toolchain::dev() {
+        Some(dev) => dev.built.record,
+        None => record_code().map_err(anyhow::Error::msg)?.0,
+    };
+    blaze_link::target::keep_coff_requests(store, producer).map_err(anyhow::Error::msg)?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
     let root = builds()?

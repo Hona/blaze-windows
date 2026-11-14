@@ -144,7 +144,8 @@ use super::{
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
-        Linking, LocalRead, Made, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
+        Linking, LocalRead, Made, Phase, PhaseDone, Readers, RunPuts, Runs, Selection, Source, Steps,
+        Writer,
     },
 };
 use crate::cli::print::Format;
@@ -183,6 +184,8 @@ pub enum Value<S: Steps> {
     /// A phase of a unit's compile before its last, done, and the images it relinked: its
     /// link's, which the loop keeps at once.
     Phase(usize, Vec<Image<S>>),
+    /// Names replayed the record on the worker (not just a positive freshness probe).
+    ReplayedNames(usize),
     Answer(Result<Response, ApiError>),
     /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
     Answers(Result<Vec<Response>, ApiError>),
@@ -597,7 +600,7 @@ impl<S: Steps> plane::Work for Step<S> {
                         images.clear();
                         let refused =
                             front.refused(unit, format!("blaze {panic}, making this unit")); // alloc: a panic, once
-                        Ok(Some(Compiled {
+                        Ok(PhaseDone::Compiled(Compiled {
                             diagnostics: vec![refused], // alloc: a panic, once
                             ok: false,
                             open: false,
@@ -621,13 +624,19 @@ impl<S: Steps> plane::Work for Step<S> {
                     return None;
                 }
                 let compiled = match compiled {
-                    Ok(None) => {
+                    Ok(PhaseDone::ReplayedNames) => {
+                        return Some(Did {
+                            outcome: Outcome::Built,
+                            value: Value::ReplayedNames(unit),
+                        });
+                    }
+                    Ok(PhaseDone::Continue) => {
                         return Some(Did {
                             outcome: Outcome::Built,
                             value: Value::Phase(unit, images),
                         });
                     }
-                    Ok(Some(compiled)) => Ok(compiled),
+                    Ok(PhaseDone::Compiled(compiled)) => Ok(compiled),
                     // An error of one unit's compile (a codegen error that is no refusal, a
                     // record that does not read, a toolchain it can't be made for) fails that
                     // unit, as a panic does, never the job: its siblings build under
@@ -1896,6 +1905,9 @@ struct Build<S: Steps> {
     refused: Option<Refused>,
     /// Each unit's freshness by its place in the plan, once asked ([`Build::is_fresh`]).
     fresh: Vec<Option<bool>>,
+    /// Names finished installing the record. Distinct from `fresh`: a native input or a
+    /// proc-macro read can have moved since the loop probed the record.
+    replayed_names: BitSet<u32>,
     /// What became of each unit by its place in the plan, as its nodes settle: what the
     /// build's report of what it left unchecked is made of ([`Build::unchecked`]).
     verdicts: Vec<Verdict>,
@@ -4524,6 +4536,16 @@ impl<S: Steps> Jobs<S> {
                     build.held.push((task, again));
                     return;
                 };
+                // The worker that replayed names installed neither a check nor code to build.
+                // Settle these empty nodes on this turn, after the usual refusal/write gates.
+                // Link and store still consume the record and publish the unit normally.
+                if matches!(task.kind, kinds::UNIT_BODIES | kinds::COMPILE | kinds::PROGRAM)
+                    && build.replayed_names.contains(Phase::of(task.arg).0 as u32)
+                    && !build.input.cancelled.load(Ordering::Acquire)
+                {
+                    w.plane.ended(w.now, task.id, Outcome::Built);
+                    return;
+                }
                 let images = match task.kind == kinds::UNIT_LINK || task.kind == kinds::PROGRAM_LINK
                 {
                     true => self.paths.take_images(build.outputs.of(Phase::of(task.arg).0)),
@@ -4879,6 +4901,13 @@ impl<S: Steps> Jobs<S> {
                 self.compiled(w, node, unit, result);
             }
             Value::Phase(unit, images) => self.keep_images(node, unit, images),
+            Value::ReplayedNames(unit) => {
+                if let Some(Job { stage: Stage::Units(build), .. }) =
+                    self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
+                {
+                    build.replayed_names.insert(unit as u32);
+                }
+            }
             Value::Evaluated(result) => {
                 let Some(id) = self.batches.job_of(node) else { return };
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -6029,6 +6058,7 @@ impl<S: Steps> Jobs<S> {
         // not built. A unit's first node waits for the last of each unit it depends on.
         let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
         let fresh_units = vec![None; all.len()]; // alloc: once per build
+        let replayed_names = BitSet::new(all.len()); // alloc: one bit per unit, once per build
         let verdicts = vec![Verdict::Unsettled; all.len()]; // alloc: once per build
         let mut units_of = Vec::new(); // alloc: once per build, a unit a node
         // Each package's `name version` by its id, what a node is named by.
@@ -6238,9 +6268,12 @@ impl<S: Steps> Jobs<S> {
             evaluation,
             refused: None,
             fresh: fresh_units,
+            replayed_names,
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
             made_wait: (count > 0).then(|| {
+                // Opened on the loop, not inside a worker's build context.
+                let _build = job.request.map(|id| blaze_profile::flight::building(id.0));
                 tracing::info_span!(
                     target: "blaze",
                     "the build's first made unit waits behind the units found kept"

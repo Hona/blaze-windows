@@ -888,7 +888,7 @@ pub(crate) struct Parts {
     pub(crate) build_time: BuildTime,
     /// What the walks over the front end keep, which made `built`: where `built` goes back
     /// once the link is done with it ([`Drop`]).
-    kept: Arc<blaze_codegen::driver::Kept<HirInstance, hir_ty_codegen::v2::HirStatic>>,
+    kept: Arc<hir_ty_codegen::v2::KeptProgram>,
 }
 
 /// The `Built` goes back to the driver that made it, whatever became of its link

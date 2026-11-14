@@ -367,12 +367,21 @@ pub(crate) fn rule_of(
     None
 }
 
-/// Whether `file` is `at` or ends in `/` then `at`.
+/// Match the rule's source components against `file!()`, independently of the build host's
+/// separators. Never accept a same-named ingredient from a different file.
 fn ends_with_path(file: &str, at: &str) -> bool {
-    match file.strip_suffix(at) {
-        Some(rest) => rest.is_empty() || rest.ends_with('/') || rest.ends_with('\\'),
-        None => false,
-    }
+    let mut actual = file.rsplit(['/', '\\']);
+    at.rsplit('/').all(|part| actual.next() == Some(part))
+}
+
+#[test]
+fn ingredient_files_match_whole_components_with_either_separator() {
+    let at = "hir-def/src/expr_store/body.rs";
+    assert!(ends_with_path(at, at));
+    assert!(ends_with_path(r"C:\work\crates\hir-def\src\expr_store\body.rs", at));
+    assert!(ends_with_path(r"crates/hir-def\src/expr_store\body.rs", at));
+    assert!(!ends_with_path(r"crates\not-hir-def\src\expr_store\body.rs", at));
+    assert!(!ends_with_path(r"hir-def\src\other\body.rs", at));
 }
 
 fn apply(
