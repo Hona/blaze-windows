@@ -4298,8 +4298,9 @@ fn a_build_answers_while_its_front_end_is_stored_and_the_next_waits_only_for_the
 }
 
 /// After a restart the front end the last build kept is gone from memory: the first build
-/// lowers anew, and reads from the store all the last build left for it, rather than working
-/// it out again (the fakes' lowering counts the reads).
+/// that is a job (a source was edited: the same request with nothing changed is its
+/// certificate's, and lowers nothing) lowers anew, and reads from the store all the last build
+/// left for it, rather than working it out again (the fakes' lowering counts the reads).
 #[test]
 fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
     for (seed, crash) in [(171, false), (172, true), (173, true)] {
@@ -4333,6 +4334,7 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
         };
         let mut client = dial(&mut daemon);
         let anew = ANEW.get();
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
         let id = client.send(
             &mut daemon,
             Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
@@ -5892,9 +5894,11 @@ fn the_loop_runs_no_front_end_step_of_the_carry() {
 }
 
 /// The session survives a restart (rule 26): seeded, carried over an edit, the daemon stopped
-/// (its journal marks the session), started again, the edit undone and built. The restarted
-/// daemon opens the marked session and carries it from that root, with the counts an edit of
-/// that shape carries, rather than seeding; and none of it runs on the loop.
+/// (its journal marks the session), started again, the file edited again and built. The
+/// restarted daemon opens the marked session and carries it from that root, with the counts
+/// an edit of that shape carries, rather than seeding; and none of it runs on the loop. The
+/// edit after the start is to a text no check answered yet: the edit undone is the first
+/// check's view, which that check's certificate answers with no job and so no pass.
 #[test]
 fn a_restarted_daemon_carries_from_its_mark() {
     CARRY_CRATES.set(carry_crates());
@@ -5913,7 +5917,7 @@ fn a_restarted_daemon_carries_from_its_mark() {
     let mut daemon = restart(daemon, &steps, 35);
     assert_eq!(daemon.started().carries, None, "the marked sessions were used");
     let mut client = dial(&mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
     check_settled(&mut client, &mut daemon);
     let after = crate::serve::front_carry::sim::take_built();
     assert_eq!(after.len(), 1, "one pass: {after:?}");
@@ -5926,8 +5930,9 @@ fn a_restarted_daemon_carries_from_its_mark() {
 
 /// Whether the first pass of `/w`'s carry after a crash opened a session: seeded and carried
 /// over an edit, a snapshot (the journal and the store durable, the journal rewritten onto
-/// the image with its marks), a crash, a start and the edit undone. `drops_marks` plants the
-/// bug the control catches: the start keeps no mark.
+/// the image with its marks), a crash, a start and the file edited again (to a text no check
+/// answered yet: the edit undone is the first check's view, its certificate's to answer with
+/// no pass). `drops_marks` plants the bug the control catches: the start keeps no mark.
 fn carries_after_a_crash(seed: u64, drops_marks: bool) -> (bool, Option<String>) {
     CARRY_CRATES.set(carry_crates());
     let mut sim = Sim::new(seed, Faults::default());
@@ -5951,7 +5956,7 @@ fn carries_after_a_crash(seed: u64, drops_marks: bool) -> (bool, Option<String>)
     super::daemon::DROPS_MARKS.set(false);
     let said = daemon.started().carries.clone();
     let mut client = dial(&mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
     check_settled(&mut client, &mut daemon);
     let after = crate::serve::front_carry::sim::take_built();
     assert_eq!(after.len(), 1, "one pass: {after:?}");
