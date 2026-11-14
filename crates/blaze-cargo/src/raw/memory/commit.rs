@@ -62,29 +62,6 @@ fn charged_shared(protect: u32) -> bool {
         != 0
 }
 
-/// Whether any 64 KiB slice of `[at, at + len)` is a page of mimalloc's.
-#[cfg(feature = "native")]
-fn in_heap(at: usize, len: usize) -> bool {
-    const SLICE: usize = 64 << 10;
-    let mut slice = at & !(SLICE - 1);
-    while slice < at + len {
-        // SAFETY: mimalloc's page map lookup reads only its own map; any address is allowed.
-        if unsafe {
-            libmimalloc_sys::mi_is_in_heap_region(slice.max(at) as *const std::ffi::c_void)
-        } {
-            return true;
-        }
-        slice += SLICE;
-    }
-    false
-}
-
-/// Without mimalloc, no range is the global heap's by this walk.
-#[cfg(not(feature = "native"))]
-fn in_heap(_at: usize, _len: usize) -> bool {
-    false
-}
-
 /// One walk of this process's address space. Allocates nothing: the pools' and heaps' ranges
 /// are read into arrays on the stack. Takes a few milliseconds a daemon (a `VirtualQuery` per
 /// range of like pages).
@@ -116,7 +93,6 @@ pub fn commit_map() -> CommitMap {
     // The allocation the walk is in, and what it was found to be.
     let mut allocation = usize::MAX;
     let mut stack = false;
-    let mut heap = false;
     loop {
         // SAFETY: all zeros is a valid record of integers and pointers.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -132,7 +108,6 @@ pub fn commit_map() -> CommitMap {
         if info.AllocationBase as usize != allocation {
             allocation = info.AllocationBase as usize;
             stack = guarded(allocation);
-            heap = false;
         }
         if info.State == MEM_COMMIT {
             let bytes = len as u64;
@@ -147,9 +122,6 @@ pub fn commit_map() -> CommitMap {
                     map.system_heaps += bytes;
                 } else if stack {
                     map.stacks += bytes;
-                } else if heap || in_heap(base, len) {
-                    heap = true;
-                    map.heap += bytes;
                 } else {
                     map.other += bytes;
                 }

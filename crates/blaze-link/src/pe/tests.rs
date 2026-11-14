@@ -1037,6 +1037,7 @@ fn delta<'a>(functions: &'a [Splice], rebase: &'a [Splice], from: u64) -> Delta<
         binds: &[],
         same_names: true,
         same_regions: true,
+        same_places: true,
         written: &[],
         from,
     }

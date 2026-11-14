@@ -26,10 +26,38 @@
 //!
 //! The invariant: a site [`Reach::discharged`] says is discharged is not reached, or its
 //! condition holds, in every run of the body's MIR.
+//!
+//! The cost, by design. The floor is one pass over the body: each statement read once, each
+//! site asked once. A proof has one deterministic work budget ([`work_bound`]: [`WORK_BASE`]
+//! plus [`WORK_PER_STEP`] per statement and terminator), and every loop that visits facts,
+//! implications, terms or forms charges one unit per element it visits ([`Solver::charge`]).
+//! A proof that runs out ends refused ([`Reach::refusal`] names the bound, the body's size and
+//! the block it reached), and nothing is discharged; the bound is a function of the body
+//! alone, never of time, so the answer is the same on every machine and every run. Within it
+//! the common case is cheap: a state indexes its facts by each term they are about
+//! ([`State::about`]) and its implications by premise and conclusion. A fact's linear
+//! bound is made once per proof ([`Solver::put`]); a saturation pass asks a shared
+//! premise just once, after discarding unreachable implications at joins. One
+//! question of a state works out each term's bounds, each sub-question and each linear
+//! residual once ([`Ask`]), so it costs the distinct terms and facts it reaches, not the paths
+//! to them. The walk goes in passes of reverse postorder, so a block with many paths into it
+//! is joined once, and a loop's head again only after its body; a join works out relations
+//! only for the locals still read after it ([`Solver::live_at`]). A state is persistent
+//! ([`Slots`], [`Sorted`]): copying it along an edge is O(1), a write copies the nodes on its
+//! path, and a join or a comparison looks only at what two states do not share, and at the
+//! slots and facts whose marks say they may mention what the join makes again. So a statement
+//! costs `O(log f + k)` per question, `f` the state's facts and `k` the facts about the terms
+//! it asks of, with each linear proof at most [`LINEAR_FUEL`] steps: linear in the body for
+//! bounded `k`, and at most [`work_bound`] whatever `k` is. What is not quite linear: the
+//! first write after a copy moves an index's list of chunks, `f / CHUNK` pointers; liveness is
+//! `l / 64` words a block; and a join of `p` paths asks `p` questions of each joined local.
 
 pub mod models;
+mod obligations;
 
-use std::alloc::Global;
+pub(crate) use obligations::Obligation;
+
+use std::{alloc::Global, cell::Cell, rc::Rc};
 
 use base_db::Db;
 use blaze_hash::HashMap;
@@ -127,11 +155,22 @@ type Form = (Vec<(TermId, i128)>, i128);
 
 /// `a + scale * b`; none when a coefficient or the constant leaves `i128`.
 fn form_add(a: &Form, b: &Form, scale: i128) -> Option<Form> {
-    let mut parts = Vec::with_capacity(a.0.len() + b.0.len()); // alloc: a form's terms, a few
+    form_merge(&a.0, a.1, &b.0, b.1, scale)
+}
+
+/// [`form_add`] of forms given as their parts and constant.
+fn form_merge(
+    a: &[(TermId, i128)],
+    a_constant: i128,
+    b: &[(TermId, i128)],
+    b_constant: i128,
+    scale: i128,
+) -> Option<Form> {
+    let mut parts = Vec::with_capacity(a.len() + b.len()); // alloc: a form's terms, a few
     let (mut i, mut j) = (0, 0);
-    while i < a.0.len() || j < b.0.len() {
-        let left = a.0.get(i).copied();
-        let right = b.0.get(j).copied();
+    while i < a.len() || j < b.len() {
+        let left = a.get(i).copied();
+        let right = b.get(j).copied();
         let (term, coefficient) = match (left, right) {
             (Some((t, c)), Some((u, d))) if t == u => {
                 (i, j) = (i + 1, j + 1);
@@ -155,13 +194,130 @@ fn form_add(a: &Form, b: &Form, scale: i128) -> Option<Form> {
             parts.push((term, coefficient));
         }
     }
-    Some((parts, a.1.checked_add(b.1.checked_mul(scale)?)?))
+    Some((parts, a_constant.checked_add(b_constant.checked_mul(scale)?)?))
 }
 
 /// How many facts one linear proof may add up, and how many it may try: the budget of
 /// [`Solver::lin_le`]. A proof that needs more is not found, and the site stays reported.
 const LINEAR_DEPTH: u8 = 4;
 const LINEAR_FUEL: u32 = 256;
+
+/// The work any proof may do, whatever its size: room for the entry state, the first joins
+/// and the few dozen entailments a body of a handful of statements asks, each up to a few
+/// hundred units with its linear proof.
+pub(crate) const WORK_BASE: u64 = 1 << 14;
+/// The work per statement and terminator: a statement asks a few entailments of a state with
+/// a few dozen facts (each an indexed lookup and a linear proof of at most [`LINEAR_FUEL`]
+/// steps), and a loop walks its blocks a few times. At a few nanoseconds a unit, a body of
+/// 1,000 statements ends within about a millisecond.
+pub(crate) const WORK_PER_STEP: u64 = 256;
+
+/// The work bound of a body of `steps` statements and terminators.
+pub(crate) fn work_bound(steps: u64) -> u64 {
+    WORK_BASE.saturating_add(WORK_PER_STEP.saturating_mul(steps))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COUNT_BODY: Cell<Option<DefWithBodyId>> = const { Cell::new(None) };
+    pub(crate) static COUNT_PROOFS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static PROOF_VISITS: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static MOST_IMPLICATIONS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static WALKS: Cell<usize> = const { Cell::new(0) };
+    /// A bug planted for the control of the work oracle (`tests/reach_work.rs`): the budget
+    /// check is skipped, so a proof runs past its bound.
+    pub(crate) static PLANT_UNBOUNDED_WORK: Cell<bool> = const { Cell::new(false) };
+    /// The work bound a test sets in place of [`work_bound`]'s, to reach it with a small body.
+    pub(crate) static WORK_BOUND_FOR_TEST: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// One proof's work: what it used, its bound, and the block it was walking when the bound
+/// ran out.
+struct Work {
+    used: Cell<u64>,
+    bound: u64,
+    stopped: Cell<Option<u32>>,
+}
+
+/// What one question of a state has worked out: the state does not change while it is asked,
+/// so each term's bounds, each sub-question's answer and each linear residual not shown are
+/// worked out once, and a question costs the distinct things it asks, not the paths to them
+/// ([`Solver::entails`], [`Solver::bounds`]). Only looked up, never walked: no answer depends
+/// on its order.
+struct Ask {
+    bounds: Memo<TermId, (i128, i128)>,
+    by_constants: Memo<TermId, (i128, i128)>,
+    /// `holds` of an atom to a depth.
+    held: Memo<(Atom, u8), bool>,
+    /// Each residual `parts <= limit` a linear proof searched to the end without finding it,
+    /// and the depth it searched: it is not found at that depth or less.
+    failed: Memo<(Vec<(TermId, i128)>, i128), u8>,
+    /// What is left of the running linear proof's [`LINEAR_FUEL`].
+    fuel: u32,
+}
+
+impl Ask {
+    fn new() -> Ask {
+        Ask {
+            bounds: Memo::new(),
+            by_constants: Memo::new(),
+            held: Memo::new(),
+            failed: Memo::new(),
+            fuel: LINEAR_FUEL,
+        }
+    }
+}
+
+/// How many entries a [`Memo`] keeps in place.
+const MEMO_INLINE: usize = 8;
+
+/// A map of one question's answers: the first [`MEMO_INLINE`] in place, looked through in
+/// order, the rest in a hash map. Most questions ask a few things, and so allocate nothing.
+struct Memo<K, V> {
+    few: smallvec::SmallVec<[(K, V); MEMO_INLINE]>,
+    many: HashMap<K, V, Global>,
+}
+
+impl<K: Eq + std::hash::Hash, V: Copy> Memo<K, V> {
+    fn new() -> Memo<K, V> {
+        Memo { few: smallvec::SmallVec::new(), many: HashMap::new_in(Global) }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        match self.few.iter().find(|it| it.0 == *key) {
+            Some(it) => Some(it.1),
+            None => self.many.get(key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(it) = self.few.iter_mut().find(|it| it.0 == key) {
+            it.1 = value;
+        } else if self.few.len() < MEMO_INLINE {
+            self.few.push((key, value));
+        } else {
+            self.many.insert(key, value);
+        }
+    }
+}
+
+
+/// `end` when it is not an open end of a range.
+fn closed(end: i128) -> Option<i128> {
+    (end != i128::MAX && end != i128::MIN).then_some(end)
+}
+
+/// `a / b` rounded down.
+fn floor_div(a: i128, b: i128) -> Option<i128> {
+    let quotient = a.checked_div(b)?;
+    Some(if a % b != 0 && ((a < 0) != (b < 0)) { quotient - 1 } else { quotient })
+}
+
+/// `a / b` rounded up.
+fn ceil_div(a: i128, b: i128) -> Option<i128> {
+    let quotient = a.checked_div(b)?;
+    Some(if a % b != 0 && ((a < 0) == (b < 0)) { quotient + 1 } else { quotient })
+}
 
 /// `a rel b`, or for [`Fact::If`] an implication.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -191,196 +347,552 @@ impl Atom {
     }
 }
 
-/// An implication: `then` holds where `premise` does. Ordered by its conclusion first, so a
-/// state's implications that conclude one atom are one run of them ([`State::concluding`]).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-struct Imp {
-    then: Atom,
-    premise: Atom,
+/// An implication: the premise, then the conclusion.
+type Imp = (Atom, Atom);
+
+/// The two operations that depend on the proof domain. The reference test supplies a
+/// smaller entailment, and observes the order of every question as well as the facts.
+trait Saturation {
+    fn spend(&self, units: u64) -> bool;
+    fn ask(&mut self, state: &State, atom: Atom) -> bool;
+    fn add(&mut self, state: &mut State, atom: Atom);
 }
 
-/// Scratch for the questions of one saturation, on one state's facts and implications.
-/// The solver is only borrowed during saturation (term ranges cannot change). Implications
-/// stay fixed. Adding a fact invalidates both successes and failures: even the bounded
-/// linear search may choose a different set of paths on the next question.
-#[derive(Default)]
-struct Questions {
-    facts: usize,
-    answers: HashMap<(Atom, u8), bool, Global>,
-    bounds: HashMap<TermId, (i128, i128), Global>,
-    known: Option<Vec<Form>>,
+impl Saturation for Solver<'_, '_> {
+    fn spend(&self, units: u64) -> bool { self.charge(units) }
+    fn ask(&mut self, state: &State, atom: Atom) -> bool { self.entails(state, atom) }
+    fn add(&mut self, state: &mut State, atom: Atom) { self.put(state, atom) }
 }
 
-/// What is known at a point: each slot's value (the locals, then the epoch), the atoms that
-/// hold and the implications between atoms. Sorted, so equal states are equal values.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct State {
-    vals: Slots,
-    facts: Vec<Atom>,
-    imps: Vec<Imp>,
-}
-
-/// Local values differ from the entry state at just the places a path wrote. Entry
-/// unknowns are interned in slot order before any other term; a missing slot is its own ID.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-struct Slots(Vec<(u32, TermId)>);
-
-impl Slots {
-    fn get(&self, slot: usize) -> TermId {
-        let slot = slot as u32;
-        self.0.binary_search_by_key(&slot, |it| it.0).map_or(slot, |i| self.0[i].1)
-    }
-
-    fn set(&mut self, slot: usize, value: TermId) {
-        let slot = slot as u32;
-        match self.0.binary_search_by_key(&slot, |it| it.0) {
-            Ok(i) if slot == value => { self.0.remove(i); }
-            Ok(i) => self.0[i].1 = value,
-            Err(i) if slot != value => self.0.insert(i, (slot, value)),
-            Err(_) => {}
-        }
-    }
-}
-
-impl State {
-    /// A disequality can exclude a range endpoint, but cannot give a linear inequality,
-    /// an equality rewrite, or a step through a middle term. Rel::Ne sorts last.
-    fn comparisons(&self) -> &[Atom] {
-        &self.facts[..self.facts.partition_point(|fact| fact.rel != Rel::Ne)]
-    }
-
-    fn has(&self, atom: Atom) -> bool {
-        self.facts.binary_search(&atom).is_ok()
-    }
-
-    fn put(&mut self, atom: Atom) {
-        if let Err(at) = self.facts.binary_search(&atom) {
-            self.facts.insert(at, atom);
-        }
-    }
-
-    fn put_imp(&mut self, (premise, then): (Atom, Atom)) {
-        let imp = Imp { then, premise };
-        if let Err(at) = self.imps.binary_search(&imp) {
-            self.imps.insert(at, imp);
-        }
-    }
-
-    /// The implications that conclude `atom`: one binary search, not a walk of them all (a
-    /// body of 2057 blocks held 2871 at one point, and each entailment question asked this).
-    fn concluding(&self, atom: Atom) -> &[Imp] {
-        let start = self.imps.partition_point(|it| it.then < atom);
-        let end = start + self.imps[start..].partition_point(|it| it.then == atom);
-        &self.imps[start..end]
-    }
-}
-
-/// Fire implications to a fixed point. Each pass takes the premises in order, and proves a
-/// premise just once for all its missing conclusions, not once per conclusion. A later
-/// group can establish an earlier one's premise: take another pass iff a fact was added.
-/// There can be at most one addition per implication. The state keeps its implications by
-/// conclusion ([`Imp`]); a pass orders the ones whose conclusion is missing by premise.
-fn saturate(state: &mut State, mut entails: impl FnMut(&State, Atom) -> bool) -> bool {
+fn saturate(cx: &mut impl Saturation, state: &mut State) -> bool {
+    if state.imps.len() == 0 { return true; }
+    // clone: the premise-ordered index is shared; adding facts cannot change it.
+    let imps = state.imps.clone();
     loop {
+        if !cx.spend(imps.len() as u64) { return true; }
         let before = state.facts.len();
-        // Those not missing at the start are not later: facts are only added.
-        let mut missing: Vec<(Atom, Atom)> = state.imps.iter() // alloc: one pass's missing, by premise
-            .filter(|it| !state.has(it.then))
-            .map(|it| (it.premise, it.then))
-            .collect();
-        missing.sort_unstable();
-        let mut i = 0;
-        while i < missing.len() {
-            let premise = missing[i].0;
-            let end = i + missing[i..].partition_point(|it| it.0 == premise);
-            if missing[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise) {
-                for &(_, then) in &missing[i..end] {
-                    if !state.has(then) {
-                        if entails(state, then.not()) { return false; }
-                        state.put(then);
-                    }
-                }
+        let mut premise = None;
+        let mut holds = false;
+        for &(when, then) in imps.iter() {
+            if state.has(then) { continue; }
+            if premise != Some(when) {
+                holds = cx.ask(state, when);
+                premise = Some(when);
             }
-            i = end;
+            if holds {
+                if cx.ask(state, then.not()) { return false; }
+                cx.add(state, then);
+            }
         }
         if state.facts.len() == before { return true; }
     }
 }
 
-#[test]
-fn a_join_proves_a_shared_premise_once_and_propagates_backwards() {
-    let key = |n| Atom::new(Rel::Le, n, n + 1);
-    let mut state = State { vals: Slots::default(), facts: vec![key(2)], imps: vec![] };
-    for i in 3..103 { state.put_imp((key(1), key(i))); }
-    state.put_imp((key(2), key(1)));
-    let mut tries = 0;
-    assert!(saturate(&mut state, |s, atom| {
-        tries += usize::from(atom == key(1));
-        s.has(atom)
-    }));
-    assert_eq!(tries, 2);
-    assert!((1..103).all(|i| state.has(key(i))));
+#[cfg(test)]
+mod saturation_tests;
+
+/// What is known at a point: each slot's value (the locals, then the epoch), the atoms that
+/// hold and the implications between atoms. Sorted, so equal states are equal values; what
+/// a state is is `vals`, `facts` and `imps`, and the rest is indexes of them.
+///
+/// Persistent: every part is shared between copies ([`Slots`], [`Sorted`]), so a copy (an
+/// edge's state, a block's entry) is O(1), a write copies only the nodes it changes, and a
+/// comparison or a join looks only at what is not shared, which charged writes made.
+#[derive(Clone, Debug)]
+struct State {
+    vals: Slots,
+    facts: Sorted<Atom>,
+    imps: Sorted<Imp>,
+    /// Each fact under each term it is about (its sides, and the parts of a side that is a
+    /// linear form: [`Solver::fact_keys`]), sorted: what bounds, the one-step walk and the
+    /// linear proofs read in place of every fact.
+    about: Sorted<(TermId, Atom)>,
+    /// Each implication by its conclusion, sorted.
+    concluding: Sorted<(Atom, Atom)>,
+    /// The union of the marks ([`Solver::marks`]) of every term a fact or an implication put
+    /// has: a fact can mention a join's or a statement's unknown only when its bit is here.
+    /// Never narrowed, so it is a superset.
+    marks: u64,
+
 }
 
-/// The refinement: [`saturate`] over implications kept by conclusion asks the same questions
-/// in the same order, and so adds the same facts and finds the same contradictions, as the
-/// table kept by premise it replaced (here, the reference), for an entailment that reads
-/// through `<` to `<=` and a contradiction that is a negated fact.
-#[cfg(test)]
-#[hegel::test(test_cases = 300)]
-fn saturating_by_conclusion_is_saturating_by_premise(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    fn by_premise(state: &mut State, imps: &[(Atom, Atom)], asked: &mut Vec<Atom>) -> bool {
-        loop {
-            let before = state.facts.len();
-            let mut i = 0;
-            while i < imps.len() {
-                let premise = imps[i].0;
-                let end = i + imps[i..].partition_point(|it| it.0 == premise);
-                if imps[i..end].iter().any(|&(_, then)| !state.has(then)) && entails(state, premise, asked) {
-                    for &(_, then) in &imps[i..end] {
-                        if !state.has(then) {
-                            if entails(state, then.not(), asked) { return false; }
-                            state.put(then);
-                        }
-                    }
-                }
-                i = end;
-            }
-            if state.facts.len() == before { return true; }
+impl PartialEq for State {
+    fn eq(&self, other: &State) -> bool {
+        self.vals == other.vals && self.facts == other.facts && self.imps == other.imps
+    }
+}
+
+impl Eq for State {}
+
+/// The bits of a term's mark ([`Solver::marks`]): one per block modulo 32 for the unknowns
+/// of its join, and one for those its statements make.
+fn join_mark(block: u32) -> u64 {
+    1 << (block % 32)
+}
+
+fn at_mark(block: u32) -> u64 {
+    1 << (32 + block % 32)
+}
+
+/// The bits of a slot's number each level of [`Slots`] reads, and how many entries a node has.
+const FAN_BITS: u32 = 4;
+const FAN: usize = 1 << FAN_BITS;
+const FAN_MASK: usize = FAN - 1;
+
+/// A node of [`Slots`]: [`FAN`] slots, or [`FAN`] nodes a level down, with the union of the
+/// marks of the terms under it.
+#[derive(Clone)]
+enum SlotNode {
+    Leaf { mark: u64, slots: [TermId; FAN] },
+    Branch { mark: u64, kids: [Rc<SlotNode>; FAN] },
+}
+
+impl SlotNode {
+    fn mark(&self) -> u64 {
+        match self {
+            SlotNode::Leaf { mark, .. } | SlotNode::Branch { mark, .. } => *mark,
         }
     }
-    fn entails(state: &State, atom: Atom, asked: &mut Vec<Atom>) -> bool {
-        asked.push(atom);
-        state.has(atom) || (atom.rel == Rel::Le && state.has(Atom { rel: Rel::Lt, ..atom }))
+}
+
+/// A state's slots: a fixed number of term ids in a tree of shared nodes, [`FAN`] wide. A
+/// copy is O(1); a write copies the nodes on its path, O(FAN log l), the first time after a
+/// copy, and none after; two copies differ only under nodes they do not share, which is what
+/// [`Slots::diff`] visits. Each node carries the union of its terms' marks, so the slots that
+/// may mention a join's or a statement's unknown are found without looking at the others
+/// ([`Slots::marked`]).
+#[derive(Clone)]
+struct Slots {
+    len: usize,
+    /// Levels above the leaves.
+    depth: u32,
+    root: Rc<SlotNode>,
+}
+
+impl Slots {
+    fn new(vals: &[TermId], marks: &[u64]) -> Slots {
+        let mut depth = 0;
+        while (FAN << (FAN_BITS * depth)) < vals.len() {
+            depth += 1;
+        }
+        let mut empty = None;
+        let root = Slots::build(vals, marks, depth, 0, &mut empty);
+        Slots { len: vals.len(), depth, root }
     }
-    let atom = |tc: &hegel::TestCase| {
-        let rel = [Rel::Lt, Rel::Le, Rel::Eq, Rel::Ne][tc.draw(gs::integers::<usize>().max_value(3))];
-        let a = tc.draw(gs::integers::<u32>().max_value(3));
-        let b = tc.draw(gs::integers::<u32>().max_value(3));
-        Atom::new(rel, a, b)
-    };
-    let mut state = State { vals: Slots::default(), facts: vec![], imps: vec![] };
-    for _ in 0..tc.draw(gs::integers::<usize>().max_value(4)) {
-        state.put(atom(&tc));
+
+    /// The node at `level` whose first slot is `start`; the leaves past the end are one
+    /// shared empty leaf, `empty`.
+    fn build(
+        vals: &[TermId],
+        marks: &[u64],
+        level: u32,
+        start: usize,
+        empty: &mut Option<Rc<SlotNode>>,
+    ) -> Rc<SlotNode> {
+        if level == 0 {
+            if start >= vals.len() && let Some(leaf) = empty {
+                return leaf.clone(); // clone: one shared empty leaf
+            }
+            let mut slots = [0; FAN];
+            let mut mark = 0;
+            for (at, slot) in slots.iter_mut().enumerate() {
+                if let Some(&value) = vals.get(start + at) {
+                    *slot = value;
+                    mark |= marks.get(value as usize).copied().unwrap_or(0);
+                }
+            }
+            let leaf = Rc::new_in(SlotNode::Leaf { mark, slots }, Global);
+            if start >= vals.len() {
+                *empty = Some(leaf.clone()); // clone: kept for the next past the end
+            }
+            return leaf;
+        }
+        let span = 1usize << (FAN_BITS * level);
+        let kids: [Rc<SlotNode>; FAN] =
+            std::array::from_fn(|at| Slots::build(vals, marks, level - 1, start + at * span, empty));
+        let mark = kids.iter().fold(0, |mark, it| mark | it.mark());
+        Rc::new_in(SlotNode::Branch { mark, kids }, Global)
     }
-    let mut imps = Vec::new(); // alloc: a test's table
-    for _ in 0..tc.draw(gs::integers::<usize>().max_value(12)) {
-        let imp = (atom(&tc), atom(&tc));
-        state.put_imp(imp);
-        imps.push(imp);
+
+    fn len(&self) -> usize {
+        self.len
     }
-    imps.sort();
-    imps.dedup();
-    let mut reference = state.clone(); // clone: the reference runs on its own copy
-    let (mut asked, mut asked_reference) = (Vec::new(), Vec::new());
-    let ran = saturate(&mut state, |s, atom| entails(s, atom, &mut asked));
-    let ran_reference = by_premise(&mut reference, &imps, &mut asked_reference);
-    assert_eq!((ran, &state.facts, &asked), (ran_reference, &reference.facts, &asked_reference));
-    for imp in &imps {
-        let concluding = state.concluding(imp.1);
-        assert!(concluding.iter().all(|it| it.then == imp.1));
-        assert_eq!(concluding.len(), imps.iter().filter(|it| it.1 == imp.1).count());
+
+    /// Puts `value` in slot `at`, copying the nodes on the way that another copy shares.
+    fn set(&mut self, at: usize, value: TermId, marks: &[u64]) {
+        assert!(at < self.len, "slot {at} of a state of {} slots", self.len);
+        if self[at] == value {
+            return;
+        }
+        Slots::set_in(&mut self.root, self.depth, at, value, marks);
+    }
+
+    fn set_in(node: &mut Rc<SlotNode>, level: u32, at: usize, value: TermId, marks: &[u64]) {
+        match Rc::make_mut(node) {
+            SlotNode::Leaf { mark, slots } => {
+                slots[at & FAN_MASK] = value;
+                *mark = slots
+                    .iter()
+                    .fold(0, |mark, &it| mark | marks.get(it as usize).copied().unwrap_or(0));
+            }
+            SlotNode::Branch { mark, kids } => {
+                let kid = (at >> (FAN_BITS * level)) & FAN_MASK;
+                Slots::set_in(&mut kids[kid], level - 1, at, value, marks);
+                *mark = kids.iter().fold(0, |mark, it| mark | it.mark());
+            }
+        }
+    }
+
+    /// Calls `found` with each slot whose value differs between `self` and `other` (two
+    /// states of one proof, of one length), looking only under the nodes they do not share.
+    fn diff(&self, other: &Slots, found: &mut impl FnMut(usize)) {
+        assert_eq!(self.len, other.len, "two states of one proof have one length");
+        Slots::diff_in(&self.root, &other.root, self.depth, 0, self.len, found);
+    }
+
+    fn diff_in(
+        a: &Rc<SlotNode>,
+        b: &Rc<SlotNode>,
+        level: u32,
+        start: usize,
+        len: usize,
+        found: &mut impl FnMut(usize),
+    ) {
+        if Rc::ptr_eq(a, b) || start >= len {
+            return;
+        }
+        match (&**a, &**b) {
+            (SlotNode::Leaf { slots: x, .. }, SlotNode::Leaf { slots: y, .. }) => {
+                for at in 0..FAN {
+                    if start + at < len && x[at] != y[at] {
+                        found(start + at);
+                    }
+                }
+            }
+            (SlotNode::Branch { kids: x, .. }, SlotNode::Branch { kids: y, .. }) => {
+                let span = 1usize << (FAN_BITS * level);
+                for at in 0..FAN {
+                    Slots::diff_in(&x[at], &y[at], level - 1, start + at * span, len, found);
+                }
+            }
+            _ => unreachable!("two slot trees of one length have one shape"),
+        }
+    }
+
+    /// Calls `found` with each slot whose term's mark has a bit of `mark`, looking only under
+    /// the nodes whose mark has one.
+    fn marked(&self, mark: u64, marks: &[u64], found: &mut impl FnMut(usize)) {
+        Slots::marked_in(&self.root, self.depth, 0, self.len, mark, marks, found);
+    }
+
+    fn marked_in(
+        node: &Rc<SlotNode>,
+        level: u32,
+        start: usize,
+        len: usize,
+        mark: u64,
+        marks: &[u64],
+        found: &mut impl FnMut(usize),
+    ) {
+        if node.mark() & mark == 0 || start >= len {
+            return;
+        }
+        match &**node {
+            SlotNode::Leaf { slots, .. } => {
+                for (at, &it) in slots.iter().enumerate() {
+                    let hit = marks.get(it as usize).is_some_and(|&it| it & mark != 0);
+                    if start + at < len && hit {
+                        found(start + at);
+                    }
+                }
+            }
+            SlotNode::Branch { kids, .. } => {
+                let span = 1usize << (FAN_BITS * level);
+                for (at, kid) in kids.iter().enumerate() {
+                    Slots::marked_in(kid, level - 1, start + at * span, len, mark, marks, found);
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Slots {
+    type Output = TermId;
+
+    fn index(&self, at: usize) -> &TermId {
+        assert!(at < self.len, "slot {at} of a state of {} slots", self.len);
+        let mut node = &*self.root;
+        let mut level = self.depth;
+        loop {
+            match node {
+                SlotNode::Leaf { slots, .. } => return &slots[at & FAN_MASK],
+                SlotNode::Branch { kids, .. } => {
+                    node = &*kids[(at >> (FAN_BITS * level)) & FAN_MASK];
+                    level -= 1;
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for Slots {
+    fn eq(&self, other: &Slots) -> bool {
+        fn same(a: &Rc<SlotNode>, b: &Rc<SlotNode>) -> bool {
+            Rc::ptr_eq(a, b)
+                || match (&**a, &**b) {
+                    (SlotNode::Leaf { slots: x, .. }, SlotNode::Leaf { slots: y, .. }) => x == y,
+                    (SlotNode::Branch { kids: x, .. }, SlotNode::Branch { kids: y, .. }) => {
+                        x.iter().zip(y.iter()).all(|(a, b)| same(a, b))
+                    }
+                    _ => false,
+                }
+        }
+        // Past the end every tree holds the empty leaf's zeros, so equal shapes compare whole.
+        self.len == other.len && same(&self.root, &other.root)
+    }
+}
+
+impl std::fmt::Debug for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries((0..self.len).map(|at| self[at])).finish()
+    }
+}
+
+/// How many entries a chunk of [`Sorted`] holds at most.
+const CHUNK: usize = 64;
+
+/// A sorted set shared between copies: sorted chunks of at most [`CHUNK`] entries, none
+/// empty, under a shared list of them in order. A copy is O(1); an insert copies the one chunk
+/// it changes and, the first time after a copy, the list ([`CHUNK`] times shorter than the
+/// set): what a state's facts and indexes are.
+#[derive(Clone)]
+struct Sorted<T> {
+    len: usize,
+    chunks: Rc<Vec<Rc<Vec<T>>>>,
+}
+
+impl<T: Ord + Copy> Sorted<T> {
+    fn new() -> Sorted<T> {
+        Sorted { len: 0, chunks: Rc::new_in(Vec::new_in(Global), Global) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// How many chunks: what the first write after a copy moves of the list.
+    fn chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The first chunk whose last entry is not below `entry`.
+    fn chunk_at(&self, entry: &T) -> usize {
+        self.chunks.partition_point(|it| it.last().is_some_and(|last| last < entry))
+    }
+
+    fn contains(&self, entry: &T) -> bool {
+        let at = self.chunk_at(entry);
+        self.chunks.get(at).is_some_and(|it| it.binary_search(entry).is_ok())
+    }
+
+    /// Puts `entry` in once: false when it was there.
+    fn insert(&mut self, entry: T) -> bool {
+        let at = self.chunk_at(&entry).min(self.chunks.len().saturating_sub(1));
+        let place = match self.chunks.get(at).map(|it| it.binary_search(&entry)) {
+            Some(Ok(_)) => return false,
+            Some(Err(place)) => place,
+            None => 0,
+        };
+        let chunks = Rc::make_mut(&mut self.chunks);
+        if chunks.is_empty() {
+            let mut chunk = Vec::with_capacity_in(CHUNK, Global);
+            chunk.push(entry);
+            chunks.push(Rc::new_in(chunk, Global));
+            self.len = 1;
+            return true;
+        }
+        let chunk = Rc::make_mut(&mut chunks[at]);
+        chunk.insert(place, entry);
+        if chunk.len() > CHUNK {
+            let mut upper = Vec::with_capacity_in(CHUNK, Global);
+            upper.extend_from_slice(&chunk[CHUNK / 2..]);
+            chunk.truncate(CHUNK / 2);
+            chunks.insert(at + 1, Rc::new_in(upper, Global));
+        }
+        self.len += 1;
+        true
+    }
+
+    /// Keeps the entries `keep` says yes to, each asked once: the chunks it keeps whole stay
+    /// shared. False when it kept all.
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) -> bool {
+        let mut out = Vec::with_capacity_in(self.chunks.len(), Global);
+        let mut changed = false;
+        let mut len = 0;
+        for chunk in self.chunks.iter() {
+            let Some(first) = chunk.iter().position(|it| !keep(it)) else {
+                len += chunk.len();
+                out.push(chunk.clone()); // clone: the chunk, shared
+                continue;
+            };
+            changed = true;
+            let mut kept = Vec::with_capacity_in(chunk.len(), Global);
+            kept.extend_from_slice(&chunk[..first]);
+            for it in &chunk[first + 1..] {
+                if keep(it) {
+                    kept.push(*it);
+                }
+            }
+            if !kept.is_empty() {
+                len += kept.len();
+                out.push(Rc::new_in(kept, Global));
+            }
+        }
+        if changed {
+            self.chunks = Rc::new_in(out, Global);
+            self.len = len;
+        }
+        changed
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        self.chunks.iter().flat_map(|it| it.iter())
+    }
+}
+
+impl<K: Ord + Copy, V: Ord + Copy> Sorted<(K, V)> {
+    /// The entries of a `(key, value)` index whose key is `key`, in order.
+    fn keyed(&self, key: K) -> impl Iterator<Item = &(K, V)> + Clone + '_ {
+        let at = self.chunks.partition_point(|it| it.last().is_some_and(|last| last.0 < key));
+        let start = self.chunks.get(at).map_or(0, |it| it.partition_point(|entry| entry.0 < key));
+        self.chunks[at.min(self.chunks.len())..]
+            .iter()
+            .enumerate()
+            .flat_map(move |(n, chunk)| chunk[if n == 0 { start } else { 0 }..].iter())
+            .take_while(move |entry| entry.0 == key)
+    }
+}
+
+impl<T: Ord + Copy> PartialEq for Sorted<T> {
+    fn eq(&self, other: &Sorted<T>) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        if Rc::ptr_eq(&self.chunks, &other.chunks) {
+            return true;
+        }
+        let aligned = self.chunks.len() == other.chunks.len()
+            && self.chunks.iter().zip(other.chunks.iter()).all(|(a, b)| Rc::ptr_eq(a, b) || a == b);
+        aligned || self.iter().eq(other.iter())
+    }
+}
+
+impl<T: Ord + Copy + std::fmt::Debug> std::fmt::Debug for Sorted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Puts `entry` into the sorted `index` once.
+fn insert_sorted<T: Ord>(index: &mut Vec<T>, entry: T) -> bool {
+    match index.binary_search(&entry) {
+        Ok(_) => false,
+        Err(at) => {
+            index.insert(at, entry);
+            true
+        }
+    }
+}
+
+impl State {
+    fn new(vals: Slots) -> State {
+        State {
+            vals,
+            facts: Sorted::new(),
+            imps: Sorted::new(),
+            about: Sorted::new(),
+            concluding: Sorted::new(),
+            marks: 0,
+        }
+    }
+
+    fn has(&self, atom: Atom) -> bool {
+        self.facts.contains(&atom)
+    }
+
+    fn has_imp(&self, imp: Imp) -> bool {
+        self.imps.contains(&imp)
+    }
+
+    /// What a copy (or a comparison) of the state costs: one unit. A copy shares every
+    /// node; a comparison looks only under the nodes two states do not share, each made by a
+    /// write that was charged when it was made.
+    fn size(&self) -> u64 {
+        1
+    }
+
+    /// The facts about `term` ([`State::about`]'s entries).
+    fn about(&self, term: TermId) -> impl Iterator<Item = &(TermId, Atom)> + Clone + '_ {
+        let entries = self.about.keyed(term);
+        #[cfg(test)]
+        let entries = entries.inspect(|_| PROOF_VISITS.set(PROOF_VISITS.get() + 1));
+        entries
+    }
+
+    /// `Ne` is last in `Atom` order. Exclusions do not give a linear bound, a rewrite,
+    /// or a transitive comparison. Look up excluded endpoints directly instead.
+    fn comparisons(&self, term: TermId) -> impl Iterator<Item = &(TermId, Atom)> + Clone + '_ {
+        self.about(term).take_while(|(_, atom)| atom.rel != Rel::Ne)
+    }
+
+    /// The implications whose conclusion is `atom`, as `(conclusion, premise)`.
+    fn concluding(&self, atom: Atom) -> impl Iterator<Item = &(Atom, Atom)> + Clone + '_ {
+        let entries = self.concluding.keyed(atom);
+        #[cfg(test)]
+        let entries = entries.inspect(|_| PROOF_VISITS.set(PROOF_VISITS.get() + 1));
+        entries
+    }
+
+    /// What the first write after a copy moves of the indexes' lists, in units of
+    /// [`CHUNK`] pointers ([`Sorted`]).
+    fn lists(&self) -> u64 {
+        (self.facts.chunks() + self.about.chunks()) as u64 / CHUNK as u64
+    }
+
+    /// Puts `atom` under the terms `keys`.
+    fn insert(&mut self, atom: Atom, keys: &[TermId]) {
+        if !self.facts.insert(atom) {
+            return;
+        }
+        for &key in keys {
+            self.about.insert((key, atom));
+        }
+    }
+
+    /// Indexes `imp` by premise and by conclusion.
+    fn insert_imp(&mut self, imp: Imp) {
+        if !self.imps.insert(imp) {
+            return;
+        }
+        self.concluding.insert((imp.1, imp.0));
+    }
+
+    /// Keeps the facts `keep` says yes to, and their entries in the indexes.
+    fn retain_facts(&mut self, mut keep: impl FnMut(Atom) -> bool) {
+        if !self.facts.retain(|&it| keep(it)) {
+            return;
+        }
+        let facts = &self.facts;
+        self.about.retain(|(_, it)| facts.contains(it));
+    }
+
+    /// Keeps the implications `keep` says yes to, and their entries in the indexes.
+    fn retain_imps(&mut self, mut keep: impl FnMut(Imp) -> bool) {
+        if !self.imps.retain(|&it| keep(it)) {
+            return;
+        }
+        let imps = &self.imps;
+        self.concluding.retain(|&(then, premise)| imps.contains(&(premise, then)));
     }
 }
 
@@ -397,11 +909,39 @@ pub struct Reach {
     pub explained: Box<[(u32, String)]>,
     /// Why nothing is proved, when the body was not analysed.
     pub refused: Option<&'static str>,
+    /// The work the proof did, and its bound ([`work_bound`]); `work <= bound` always.
+    pub work: u64,
+    pub bound: u64,
+    /// The body's statements and terminators, which the bound is of.
+    pub steps: u64,
+    /// The most facts any block's entry state held.
+    pub facts: u32,
+    /// The block the proof was walking when its work bound ran out.
+    pub stopped: Option<u32>,
 }
+
+/// Why a proof that ran out of work is refused ([`Reach::refusal`] adds the numbers).
+const OUT_OF_WORK: &str = "its proof stopped at its work bound";
 
 impl Reach {
     fn refused(why: &'static str) -> Reach {
         Reach { refused: Some(why), ..Reach::default() }
+    }
+
+    /// Why nothing is proved, with the bound, the body's size and how far the proof got when
+    /// it ran out of work; none when the body was analysed.
+    pub fn refusal(&self) -> Option<String> {
+        let why = self.refused?;
+        Some(match self.stopped {
+            // alloc: a message
+            Some(block) => format!(
+                "{why} ({} units: {WORK_BASE} and {WORK_PER_STEP} for each of its {} statements \
+                 and terminators), walking block {block}; split the function, or state what it \
+                 relies on as a narrower type or an invariant",
+                self.bound, self.steps,
+            ),
+            None => why.to_owned(), // alloc: a message
+        })
     }
 
     /// Whether no feasible path reaches `block`.
@@ -453,12 +993,296 @@ impl Reach {
     }
 }
 
+/// What kind of operation an [`Overflow`] site is: the lint asks of an expression the kind its
+/// syntax is, so a check lowering adds at the same expression (the cast of a signed shift
+/// amount) is not taken for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OpKind {
+    /// `+`, `-` or `*` of integers, compound or not.
+    Arith,
+    /// `<<` or `>>`: whether the amount is below the bits.
+    Shift,
+    /// `-` of a signed integer.
+    Neg,
+    /// An `as` between integers: whether the value survives, `usize` and `isize` taken as
+    /// narrow as 32 bits on the target side.
+    Cast,
+}
+
+/// What the prover could not show of one operation: the fact that is missing, for the
+/// message (docs/v2/plan/design/explicit-overflow.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Missing {
+    /// Nothing bounds the left operand, the right one, or both, on the side the result needs.
+    Unbounded { left: bool, right: bool },
+    /// `a - b` of an unsigned type: nothing shows `b <= a`.
+    Order,
+    /// The operands are bounded, but what bounds them lets the result reach this value,
+    /// outside its type.
+    Reaches(i128),
+    /// A shift: nothing shows the amount is below this many bits (or not negative).
+    Amount(u32),
+    /// `-a`: nothing shows `a` is not the type's least value.
+    NotMin,
+    /// A cast: nothing shows the value is at least this (`0 <= x` for a signed to unsigned).
+    Below(i128),
+    /// A cast: nothing shows the value is at most this.
+    Above(i128),
+    /// A `u128`: its values past `i128::MAX` are not held, so nothing of it is shown.
+    Wide,
+}
+
+/// What [`overflow_of_body`] found of a body and its closures: each integer operation the
+/// MIR has (`+`, `-`, `*`, a shift, a negation, an `as` between integers), at the expression
+/// it is written at, with what was not shown (none where it fits). An expression lowered
+/// more than once has one entry per lowering.
+///
+/// The semantics are the profile's with overflow checks, whichever the crate has: an
+/// operation not shown to fit is reported and taken to fit after it (as a run that got past
+/// it did), so a body with no site reported overflows in no profile, and the answer is the
+/// same in both.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Overflow {
+    pub sites: Box<[(ExprId, OpKind, Option<Missing>)]>,
+    /// Why a body was not analysed: none for the function's own, else the closure's
+    /// expression it is of; with the reason.
+    pub refused: Box<[(Option<ExprId>, &'static str)]>,
+}
+
+impl Overflow {
+    /// What was not shown of the operation of kind `kind` written at `expr`: `None` when every
+    /// lowering of it fits, or none was made (code no path reaches is not lowered).
+    pub fn missing(&self, expr: ExprId, kind: OpKind) -> Option<Missing> {
+        self.sites.iter().find_map(|&(at, of, missing)| (at == expr && of == kind).then_some(missing)?)
+    }
+
+    /// Whether an operation of kind `kind` at `expr` was lowered and analysed.
+    pub fn analysed(&self, expr: ExprId, kind: OpKind) -> bool {
+        self.sites.iter().any(|&(at, of, _)| at == expr && of == kind)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A bug planted for the control of the overflow oracle (`tests/reach_oracle.rs`): every
+    /// `+` is taken to fit.
+    pub(crate) static PLANT_ADD_ALWAYS_FITS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The integer operations of the body of `def` and of its closures that the prover can't
+/// show keep their value ([`Overflow`]), once per definition: what `blaze::implicit_overflow`
+/// reads.
+#[blaze_query::tracked(returns(ref))]
+pub fn overflow_of_body(db: &Db, def: DefWithBodyId) -> Overflow {
+    let Ok(root) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else {
+        return Overflow {
+            sites: Box::default(),
+            refused: Box::new([(None, "its body does not lower to MIR")]),
+        };
+    };
+    let krate = hir_def::HasModule::krate(&def, db);
+    let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let env = db.trait_environment(def.generic_def(db));
+    // alloc: the body's MIR and its closures', a few
+    let mut bodies: Vec<(Option<ExprId>, &MirBody<'_>)> = vec![(None, root)];
+    let mut refused = Vec::new(); // alloc: the bodies not analysed, few
+    let mut at = 0;
+    while at < bodies.len() {
+        for &closure in &bodies[at].1.closures {
+            let expr = closure.loc(db).expr;
+            match db.runtime_mir_body_for_closure(closure) {
+                Ok(body) => bodies.push((Some(expr), body)),
+                Err(_) => refused.push((Some(expr), "its body does not lower to MIR")),
+            }
+        }
+        at += 1;
+    }
+    let mut sites = Vec::new(); // alloc: the sites of the bodies, the result
+    for (of, body) in bodies {
+        match prove_overflow(db, &infcx, env, body) {
+            Ok(found) => sites.extend(found),
+            Err(why) => refused.push((of, why)),
+        }
+    }
+    sites.sort();
+    Overflow { sites: sites.into_boxed_slice(), refused: refused.into_boxed_slice() }
+}
+
+/// The integer operations of `body` with what was not shown of each, or why it was not
+/// analysed.
+fn prove_overflow<'db>(
+    db: &'db Db,
+    infcx: &InferCtxt<'db>,
+    env: ParamEnv<'db>,
+    body: &MirBody<'db>,
+) -> Result<Vec<(ExprId, OpKind, Option<Missing>)>, &'static str> {
+    if body.coroutine.is_some() {
+        return Err("it is a coroutine");
+    }
+    // alloc: the body's blocks by index, once per proof
+    let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
+    analysable(&blocks)?;
+    let Ok(layout) = db.target_data_layout(hir_def::HasModule::krate(&body.owner, db)) else {
+        return Err("its target's layout is not known");
+    };
+    let word = layout.pointer_size().bits() as u32;
+    let mut solver = Solver::new(db, infcx, env, body, &blocks, word);
+    solver.mode = Mode::Overflow;
+    let Some(entries) = solver.solve() else {
+        return Err(solver.unsettled());
+    };
+    // The verdicts, from the settled entry states: each block walked once more, recording.
+    solver.recording = true;
+    for (at, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry else { continue };
+        let mut state = entry.clone(); // clone: the block's entry state, walked to its end
+        let _ = solver.transfer(at as u32, &mut state);
+    }
+    if solver.spent() {
+        return Err(OUT_OF_WORK);
+    }
+    Ok(std::mem::take(&mut solver.verdicts))
+}
+
+/// Refuses a body with inline assembly, a `yield` or a `for const` loop.
+fn analysable(blocks: &[&BasicBlock]) -> Result<(), &'static str> {
+    for block in blocks {
+        let asm =
+            block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)));
+        let odd = matches!(
+            block.terminator.as_ref().map(|it| &it.kind),
+            Some(
+                TerminatorKind::Yield { .. }
+                    | TerminatorKind::ComptimeFor { .. }
+                    | TerminatorKind::ComptimeNext { .. }
+                    | TerminatorKind::CoroutineDrop
+            )
+        );
+        if asm || odd {
+            return Err("it has inline assembly, a `yield` or a `for const` loop");
+        }
+    }
+    Ok(())
+}
+
+/// What a proof is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Which panic sites are dead or cannot fail: the MIR's own semantics, its profile's.
+    Panics,
+    /// Which integer operations keep their value ([`overflow_of_body`]): an operation not
+    /// shown to fit is taken to fit after it, in either profile, and an overflow check's
+    /// `Assert` adds nothing, so both profiles give one answer.
+    Overflow,
+}
+
 fn index(block: BasicBlockId) -> usize {
     block.into_raw().into_u32() as usize
 }
 
 fn local_index(local: LocalId) -> usize {
     local.into_raw().into_u32() as usize
+}
+
+/// Sets the bit of the local in `slot`.
+fn set_bit(bits: &mut [u64], slot: usize) {
+    if let Some(word) = bits.get_mut(slot / 64) {
+        *word |= 1 << (slot % 64);
+    }
+}
+
+fn clear_bit(bits: &mut [u64], slot: usize) {
+    if let Some(word) = bits.get_mut(slot / 64) {
+        *word &= !(1 << (slot % 64));
+    }
+}
+
+/// The locals `place` reads: the indexes it goes through, and its local unless all of it is
+/// what is written (`whole_write`).
+fn place_reads(place: &StoredPlace, whole_write: bool, read: &mut impl FnMut(usize)) {
+    let projection = place.projection.as_slice();
+    for elem in projection {
+        if let ProjectionElem::Index(local) = elem {
+            read(local_index(*local));
+        }
+    }
+    if !(whole_write && projection.is_empty()) {
+        read(local_index(place.local));
+    }
+}
+
+fn operand_reads(operand: &Operand, read: &mut impl FnMut(usize)) {
+    if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+        place_reads(place, false, read);
+    }
+}
+
+/// The locals a statement reads, as `hir_ty_mir`'s passes' visitor sees its mentions.
+fn statement_reads(statement: &StatementKind, read: &mut impl FnMut(usize)) {
+    match statement {
+        StatementKind::Assign(to, rvalue) => {
+            match rvalue {
+                Rvalue::Ref(_, place)
+                | Rvalue::Len(place)
+                | Rvalue::Discriminant(place)
+                | Rvalue::CopyForDeref(place) => place_reads(place, false, read),
+                _ => rvalue.for_each_operand(&mut |it| operand_reads(it, read)),
+            }
+            place_reads(to, true, read);
+        }
+        StatementKind::FakeRead(place) | StatementKind::Deinit(place) => {
+            place_reads(place, false, read)
+        }
+        _ => statement.for_each_operand(&mut |it| operand_reads(it, read)),
+    }
+}
+
+/// The local a statement writes all of, which no read before it in the block sees.
+fn statement_def(statement: &StatementKind) -> Option<usize> {
+    match statement {
+        StatementKind::Assign(to, _) if to.projection.as_slice().is_empty() => {
+            Some(local_index(to.local))
+        }
+        _ => None,
+    }
+}
+
+/// The locals a statement writes, whole or in part.
+fn statement_writes(statement: &StatementKind, write: &mut impl FnMut(usize)) {
+    match statement {
+        StatementKind::Assign(to, _) | StatementKind::Deinit(to) => write(local_index(to.local)),
+        _ => {}
+    }
+}
+
+/// The locals a terminator reads.
+fn terminator_reads(terminator: &TerminatorKind, read: &mut impl FnMut(usize)) {
+    match terminator {
+        TerminatorKind::Drop { place, .. } => place_reads(place, false, read),
+        TerminatorKind::DropAndReplace { place, value, .. } => {
+            operand_reads(value, read);
+            place_reads(place, false, read);
+        }
+        TerminatorKind::Call { func, args, destination, .. } => {
+            operand_reads(func, read);
+            for arg in args.iter() {
+                operand_reads(arg, read);
+            }
+            place_reads(destination, true, read);
+        }
+        _ => terminator.for_each_operand(&mut |it| operand_reads(it, read)),
+    }
+}
+
+/// The locals a terminator writes, whole or in part (a call's destination is written on the
+/// way back only, so it is never a definition the block's liveness kills at).
+fn terminator_writes(terminator: &TerminatorKind, write: &mut impl FnMut(usize)) {
+    match terminator {
+        TerminatorKind::DropAndReplace { place, .. } => write(local_index(place.local)),
+        TerminatorKind::Call { destination, .. } => write(local_index(destination.local)),
+        _ => {}
+    }
 }
 
 /// Whether a proof of `body` could discharge anything: it has a branch or a check. A body
@@ -498,6 +1322,9 @@ pub fn explain(db: &Db, def: DefWithBodyId, explain: &[u32]) -> Reach {
 }
 
 /// What is proved of `body`'s sites. `explain` names the blocks to say why they are reached.
+///
+/// A body worth a proof ([`worth`]) has a span, `reach prove`, with its size, its work and
+/// bound, its facts and the outcome: one row per body proved, the unit the work bound is of.
 pub fn prove<'db>(
     db: &'db Db,
     infcx: &InferCtxt<'db>,
@@ -505,49 +1332,84 @@ pub fn prove<'db>(
     body: &MirBody<'db>,
     explain: &[u32],
 ) -> Reach {
+    if !worth(body) {
+        return prove_untraced(db, infcx, env, body, explain);
+    }
+    let blocks = body.basic_blocks.len();
+    let steps = body_steps(body);
+    let span = tracing::info_span!(
+        target: "blaze",
+        "reach prove",
+        body = %body_name(db, body.owner),
+        blocks,
+        steps,
+        facts = tracing::field::Empty,
+        work = tracing::field::Empty,
+        bound = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
+    .entered();
+    let reach = prove_untraced(db, infcx, env, body, explain);
+    span.record("facts", reach.facts);
+    span.record("work", reach.work);
+    span.record("bound", reach.bound);
+    let outcome = match reach.refusal() {
+        Some(why) => format!("refused: {why}"), // alloc: a span's field, once a row
+        None => {
+            let proved = (0..reach.safe.len()).filter(|&at| reach.discharged_at(at)).count();
+            format!("proved {proved}") // alloc: a span's field, once a row
+        }
+    };
+    span.record("outcome", outcome.as_str());
+    reach
+}
+
+/// The statements and terminators of `body`: what its work bound is of.
+fn body_steps(body: &MirBody<'_>) -> u64 {
+    body.basic_blocks
+        .iter()
+        .map(|(_, block)| block.statements.len() as u64 + u64::from(block.terminator.is_some()))
+        .sum()
+}
+
+/// The body a span names: its crate and function, else its owner.
+fn body_name(db: &Db, owner: InferBodyId) -> String {
+    match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+            let krate = hir_def::HasModule::krate(&func, db);
+            let name = hir_def::signatures::FunctionSignature::of(db, func).name.as_str().to_owned(); // alloc: a span's field
+            match &krate.extra_data(db).display_name {
+                // alloc: a span's field, once a row
+                Some(it) => format!("{}::{name}", it.crate_name().as_str()),
+                None => name,
+            }
+        }
+        other => format!("{other:?}"), // alloc: a span's field
+    }
+}
+
+fn prove_untraced<'db>(
+    db: &'db Db,
+    infcx: &InferCtxt<'db>,
+    env: ParamEnv<'db>,
+    body: &MirBody<'db>,
+    explain: &[u32],
+) -> Reach {
     #[cfg(test)]
-    if let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner && COUNT_BODY.get() == Some(def) {
-        COUNT_PROOFS.set(COUNT_PROOFS.get() + 1);
+    {
+        PROOF_VISITS.set(0);
+        if let InferBodyId::DefWithBodyId(def) = body.owner && COUNT_BODY.get() == Some(def) {
+            COUNT_PROOFS.set(COUNT_PROOFS.get() + 1);
+        }
     }
     if body.coroutine.is_some() {
         return Reach::refused("it is a coroutine");
     }
     let count = body.basic_blocks.len();
-    // One span a proof, named for its body: a proof is a fixpoint whose cost the budget bounds
-    // only in rounds, and it ran for minutes under a span that said only `mir SpendFacts`.
-    let span = tracing::info_span!(
-        target: "blaze",
-        "reach prove",
-        function = tracing::field::Empty,
-        blocks = count,
-        visits = tracing::field::Empty,
-    );
-    if !span.is_disabled()
-        && let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner
-    {
-        // alloc: a span's name of the body, once a proof
-        let mut path = String::new();
-        hir_def::span_names::write_body_path(db, def, &mut path);
-        span.record("function", path.as_str());
-    }
-    let _entered = span.enter();
     // alloc: the body's blocks by index, once per proof
     let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
-    for block in &blocks {
-        let asm =
-            block.statements.iter().any(|it| matches!(it.kind, StatementKind::InlineAsm(_)));
-        let odd = matches!(
-            block.terminator.as_ref().map(|it| &it.kind),
-            Some(
-                TerminatorKind::Yield { .. }
-                    | TerminatorKind::ComptimeFor { .. }
-                    | TerminatorKind::ComptimeNext { .. }
-                    | TerminatorKind::CoroutineDrop
-            )
-        );
-        if asm || odd {
-            return Reach::refused("it has inline assembly, a `yield` or a `for const` loop");
-        }
+    if let Err(why) = analysable(&blocks) {
+        return Reach::refused(why);
     }
     // A `usize`'s range is the target's: a wider guess would prove an overflow check that can
     // fail, a narrower one a bound that does not hold.
@@ -556,15 +1418,22 @@ pub fn prove<'db>(
     };
     let word = layout.pointer_size().bits() as u32;
     let mut solver = Solver::new(db, infcx, env, body, &blocks, word);
+    let measured = |solver: &Solver<'_, '_>, why: &'static str| Reach {
+        refused: Some(why),
+        work: solver.work.used.get(),
+        bound: solver.work.bound,
+        steps: solver.steps,
+        stopped: solver.work.stopped.get(),
+        ..Reach::default()
+    };
     let Some(entries) = solver.solve() else {
-        span.record("visits", solver.visits.get());
-        return Reach::refused("its proof did not settle within the budget");
+        return measured(&solver, solver.unsettled());
     };
     // The verdicts, from the settled entry states.
     let mut dead = vec![false; count]; // alloc: one flag per block, the proof's result
     let mut safe = vec![false; count]; // alloc: as above
     let mut sites = Vec::new(); // alloc: the body's sites, the proof's result
-    let mut explained = Vec::new(); // alloc: only what `explain` asked
+    let mut walked = Vec::new(); // alloc: the blocks whose site is not safe, few
     for (at, block) in blocks.iter().enumerate() {
         let Some(terminator) = &block.terminator else { continue };
         let site = matches!(
@@ -584,13 +1453,25 @@ pub fn prove<'db>(
         let mut state = entry.clone(); // clone: the block's entry state, walked to its end
         let out = solver.transfer(at as u32, &mut state);
         safe[at] = out.safe;
-        if explain.contains(&(at as u32)) && !out.safe {
-            explained.push((at as u32, solver.why_reached(at as u32, &entries)));
+        if !out.safe {
+            walked.push(at as u32);
         }
     }
-    span.record("visits", solver.visits.get());
-    #[cfg(test)]
-    PROOF_VISITS.set(solver.visits.get());
+    // A verdict walked past the bound is a refusal like any other: nothing is discharged.
+    if solver.spent() {
+        return measured(&solver, OUT_OF_WORK);
+    }
+    let (work, bound) = (solver.work.used.get(), solver.work.bound);
+    let facts = entries.iter().flatten().map(|it| it.facts.len() as u32).max().unwrap_or(0);
+    // Why each asked block is reached: after every verdict, on a budget of its own, so a
+    // proof is the same whether or not it is explained.
+    let mut explained = Vec::new(); // alloc: only what `explain` asked
+    if walked.iter().any(|it| explain.contains(it)) {
+        solver.work.used.set(0);
+        for at in walked.into_iter().filter(|it| explain.contains(it)) {
+            explained.push((at, solver.why_reached(at, &entries)));
+        }
+    }
     sites.sort();
     Reach {
         dead: dead.into_boxed_slice(),
@@ -598,7 +1479,54 @@ pub fn prove<'db>(
         sites: sites.into_boxed_slice(),
         explained: explained.into_boxed_slice(),
         refused: None,
+        work,
+        bound,
+        steps: solver.steps,
+        facts,
+        stopped: None,
     }
+}
+
+/// The clauses the body of `def` does not show where it must (`obligations`): a value of a
+/// struct with an invariant built, a field of one written, a callee's `requires`, the body's
+/// own `ensures` and `&mut` parameters at a return. Empty, after one scan of the MIR, for a
+/// body with none of these; refused when such a body can't be analysed. Its closures are not
+/// walked.
+pub(crate) fn obligations_of(db: &Db, def: DefWithBodyId) -> Result<Vec<Obligation>, &'static str> {
+    let Ok(body) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else {
+        return Err("its body does not lower to MIR");
+    };
+    let krate = hir_def::HasModule::krate(&def, db);
+    let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let env = db.trait_environment(def.generic_def(db));
+    // alloc: the body's blocks by index, once per check
+    let blocks: Vec<&BasicBlock> = body.basic_blocks.iter().map(|(_, block)| block).collect();
+    let Ok(layout) = db.target_data_layout(krate) else {
+        return Err("its target's layout is not known");
+    };
+    let word = layout.pointer_size().bits() as u32;
+    let mut solver = Solver::new(db, &infcx, env, body, &blocks, word);
+    if !solver.has_obligations() {
+        return Ok(Vec::new());
+    }
+    if body.coroutine.is_some() {
+        return Err("it is a coroutine");
+    }
+    analysable(&blocks)?;
+    let Some(entries) = solver.solve() else {
+        return Err(solver.unsettled());
+    };
+    // Every block a feasible path reaches, walked once more from its settled entry, recording.
+    solver.recording = true;
+    for (at, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry else { continue };
+        let mut state = entry.clone(); // clone: the block's entry state, walked to its end
+        let _ = solver.transfer(at as u32, &mut state);
+    }
+    if solver.spent() {
+        return Err(OUT_OF_WORK);
+    }
+    Ok(std::mem::take(&mut solver.obligations))
 }
 
 /// What walking a block to its end gives: the states along its feasible edges, and whether
@@ -608,13 +1536,6 @@ struct Out {
     safe: bool,
     /// What the block's site needs and the state did not entail.
     goal: Option<Atom>,
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static PROOF_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    pub(crate) static COUNT_BODY: std::cell::Cell<Option<DefWithBodyId>> = const { std::cell::Cell::new(None) };
-    pub(crate) static COUNT_PROOFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct Solver<'a, 'db> {
@@ -627,6 +1548,10 @@ struct Solver<'a, 'db> {
     ids: HashMap<Term, TermId, Global>,
     /// What each term's type allows, by its number.
     ranges: Vec<(i128, i128)>,
+    /// What each term mentions, by its number, as bits ([`join_mark`], [`at_mark`]): the
+    /// blocks (modulo 32) whose joins' or statements' unknowns are in it, so what a join or a
+    /// statement makes again is found among the slots and facts whose marks have its bit.
+    marks: Vec<u64>,
     /// The first named local each term was put in, for messages.
     names: HashMap<TermId, u32, Global>,
     /// The locals a binding of the source names.
@@ -637,34 +1562,52 @@ struct Solver<'a, 'db> {
     models: HashMap<hir_def::FunctionId, Option<Model>, Global>,
     /// The locals whose address a `&mut` or a raw pointer took.
     exposed: Vec<bool>,
-    /// The locals whose address any borrow took: read through it past their own last read.
-    addressed: Vec<bool>,
+    /// The same, as the slots' numbers in order: what [`Self::bump`] visits.
+    exposed_slots: Vec<u32>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
-    /// Worklist priority in reverse postorder, even for bodies with loops: the acyclic arms
-    /// of a branch are walked before their join. Back edges can still revisit a block.
-    rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
     joined: Vec<Vec<u32>>,
-    /// Dead join values have no consumer. Do not derive implications or relations for them.
-    read: hir_ty_mir::mir::ReadOnEntry,
     /// How many bits a `usize` has on the target.
     word: u32,
     /// The statement being walked, and how many unknowns it has made.
     at: (u32, u32),
     made: u32,
-    /// Estimated fact/implication visits for the profile, not an input to a proof.
-    visits: std::cell::Cell<u64>,
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The most implications a joined state of this thread's proofs held, for the test that a
-    /// join forgets those of values gone (`tests/reach_oracle.rs`).
-    pub(crate) static MOST_IMPLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How many times this thread's proofs walked a block.
-    pub(crate) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What the proof is for.
+    mode: Mode,
+    /// Where the statement being walked is written.
+    span: MirSpan,
+    /// Whether [`Self::note`] keeps what it is told: on for the last walk of a settled
+    /// [`Mode::Overflow`] proof.
+    recording: bool,
+    /// What [`Self::note`] kept.
+    verdicts: Vec<(ExprId, OpKind, Option<Missing>)>,
+    /// The clauses not shown, kept when recording ([`obligations_of`]).
+    obligations: Vec<Obligation>,
+    /// The proof's one work budget ([`work_bound`]), and the body's size it is of.
+    work: Work,
+    steps: u64,
+    /// Each fact's linear bounds (`form <= bound`, the form with no constant: one for `<`
+    /// and `<=`, two for `==`, none for `!=`), made once per proof when the fact is first
+    /// put: a range of [`Self::lin_bounds`].
+    lins: HashMap<Atom, (u32, u32), Global>,
+    lin_bounds: Vec<(Box<[(TermId, i128)]>, i128)>,
+    /// Each local's type, by its number.
+    local_tys: Vec<Ty<'db>>,
+    /// Each block's place in reverse postorder (`u32::MAX` for one the start does not reach):
+    /// the order [`Self::solve`] walks them in, so a block is joined after every block before
+    /// it on an acyclic path.
+    rpo: Vec<u32>,
+    /// Per block, `live_words` words of bits: the locals that may still be read from its
+    /// entry ([`Self::liveness`]). Only these are worth what a join works out of a slot.
+    live: Vec<u64>,
+    live_words: usize,
+    /// Per block, `live_words` words of bits: the locals it writes ([`Self::liveness`]).
+    written: Vec<u64>,
+    /// Each slot's value at the body's entry ([`Self::entry`]): what a slot no path reads
+    /// any more holds ([`Self::clear_dead`]).
+    entry_vals: Vec<TermId>,
 }
 
 /// The widest range a term's value is kept in.
@@ -692,6 +1635,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
         }
+        let steps = body_steps(body);
+        #[cfg(test)]
+        let bound = WORK_BOUND_FOR_TEST.get().unwrap_or_else(|| work_bound(steps));
+        #[cfg(not(test))]
+        let bound = work_bound(steps);
         let all = vec![true; count]; // alloc: once per proof
         let mut cyclic = vec![false; count]; // alloc: once per proof
         for component in graph.components(&all) {
@@ -699,10 +1647,6 @@ impl<'a, 'db> Solver<'a, 'db> {
                 cyclic[block as usize] = true;
             }
         }
-        let mut rank = vec![0; count]; // alloc: the worklist rank of each block, once per proof
-        let read = hir_ty_mir::mir::ReadOnEntry::in_order(body, |order| {
-            for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
-        });
         let mut solver = Solver {
             db,
             infcx,
@@ -712,24 +1656,39 @@ impl<'a, 'db> Solver<'a, 'db> {
             terms: Vec::new(), // alloc: the body's terms, once per proof
             ids: HashMap::new_in(Global),
             ranges: Vec::new(), // alloc: one range per term
+            marks: Vec::new_in(Global),
             names: HashMap::new_in(Global),
             named: Vec::new(),
             enums: HashMap::new_in(Global),
             variants: Vec::new(), // alloc: the variants the body names, few
             models: HashMap::new_in(Global),
             exposed: Vec::new(),
-            addressed: Vec::new(),
+            exposed_slots: Vec::new_in(Global),
             cyclic,
-            rank,
             predecessors,
             joined: vec![Vec::new(); count], // alloc: one list per block, once per proof
-            read,
             word,
             at: (0, 0),
             made: 0,
-            visits: std::cell::Cell::new(0),
+            mode: Mode::Panics,
+            span: MirSpan::Unknown,
+            recording: false,
+            verdicts: Vec::new(), // alloc: only an overflow proof's, its result
+            obligations: Vec::new(), // alloc: only a refinement check's, its result
+            work: Work { used: Cell::new(0), bound, stopped: Cell::new(None) },
+            steps,
+            lins: HashMap::new_in(Global),
+            lin_bounds: Vec::new(), // alloc: the facts' linear bounds, once per proof
+            local_tys: body.locals.iter().map(|(_, local)| local.ty.as_ref()).collect(),
+            rpo: Vec::new_in(Global),
+            live: Vec::new_in(Global),
+            live_words: body.locals.len().div_ceil(64),
+            written: Vec::new_in(Global),
+            entry_vals: Vec::new_in(Global),
         };
-        (solver.exposed, solver.addressed) = solver.exposed_locals();
+        solver.exposed = solver.exposed_locals();
+        solver.exposed_slots =
+            (0..solver.exposed.len() as u32).filter(|&it| solver.exposed[it as usize]).collect();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
         for (_, local) in body.binding_locals.iter() {
             named[local_index(*local)] = true;
@@ -738,8 +1697,117 @@ impl<'a, 'db> Solver<'a, 'db> {
         solver
     }
 
-    fn visit(&self, length: usize) {
-        self.visits.set(self.visits.get().saturating_add(length as u64 + 1));
+    // Work.
+
+    /// Charges `units` of work: false once the proof's bound is reached, and from then on
+    /// every question answers "not shown", which is sound, and [`Self::solve`] stops. What is
+    /// used never passes the bound.
+    fn charge(&self, units: u64) -> bool {
+        let used = self.work.used.get().saturating_add(units);
+        #[cfg(test)]
+        if PLANT_UNBOUNDED_WORK.get() {
+            self.work.used.set(used);
+            return true;
+        }
+        if used <= self.work.bound {
+            self.work.used.set(used);
+            return true;
+        }
+        self.work.used.set(self.work.bound);
+        if self.work.stopped.get().is_none() {
+            self.work.stopped.set(Some(self.at.0));
+        }
+        false
+    }
+
+    /// Whether the proof ran out of work.
+    fn spent(&self) -> bool {
+        self.work.stopped.get().is_some()
+    }
+
+    /// Why [`Self::solve`] gave no fixed point.
+    fn unsettled(&self) -> &'static str {
+        match self.spent() {
+            true => OUT_OF_WORK,
+            false => "its proof did not settle within the budget",
+        }
+    }
+
+    // Facts, indexed.
+
+    /// The terms a fact with side `term` is about: the term, and the parts of a linear form.
+    fn fact_keys(&self, term: TermId, keys: &mut impl Extend<TermId>) {
+        match &self.terms[term as usize] {
+            Term::Const(_) => {}
+            Term::Lin(parts, _) => {
+                keys.extend([term]);
+                keys.extend(parts.iter().map(|&(it, _)| it));
+            }
+            _ => keys.extend([term]),
+        }
+    }
+
+    /// Puts `atom` into `state`, under the terms it is about, with its linear bounds made the
+    /// first time the proof sees it.
+    fn put(&mut self, state: &mut State, atom: Atom) {
+        if state.has(atom) {
+            return;
+        }
+        if !self.lins.contains_key(&atom) {
+            let start = self.lin_bounds.len() as u32;
+            let (a, b) = (self.form(atom.a), self.form(atom.b));
+            let mut add = |left: &Form, right: &Form, slack: i128| {
+                if let Some((parts, constant)) = form_add(left, right, -1)
+                    && !parts.is_empty()
+                    && let Some(bound) = slack.checked_sub(constant)
+                {
+                    self.lin_bounds.push((parts.into_boxed_slice(), bound));
+                }
+            };
+            match atom.rel {
+                Rel::Lt => add(&a, &b, -1),
+                Rel::Le => add(&a, &b, 0),
+                Rel::Eq => {
+                    add(&a, &b, 0);
+                    add(&b, &a, 0);
+                }
+                Rel::Ne => {}
+            }
+            let end = self.lin_bounds.len() as u32;
+            self.lins.insert(atom, (start, end));
+        }
+        // The terms one fact is about, a few: in place, no allocation.
+        let mut keys = smallvec::SmallVec::<[TermId; 8]>::new();
+        self.fact_keys(atom.a, &mut keys);
+        self.fact_keys(atom.b, &mut keys);
+        keys.sort_unstable();
+        keys.dedup();
+        // Each key a binary search and an insert into one chunk of at most [`CHUNK`] entries
+        // ([`Sorted`]), and the lists' share of the first write after a copy.
+        let _ = self.charge(2 * keys.len() as u64 + 2 + state.lists());
+        state.marks |= self.marks[atom.a as usize] | self.marks[atom.b as usize];
+        state.insert(atom, &keys);
+    }
+
+    /// Puts `imp` into `state`, under the terms of its premise.
+    fn put_imp(&mut self, state: &mut State, imp: Imp) {
+        if state.has_imp(imp) {
+            return;
+        }
+        let _ = self.charge(2 + state.lists());
+        let (premise, then) = imp;
+        state.marks |= [premise.a, premise.b, then.a, then.b]
+            .iter()
+            .fold(0, |mark, &it| mark | self.marks[it as usize]);
+        state.insert_imp(imp);
+    }
+
+    /// The linear bounds of a fact the proof has put.
+    fn lin_bounds_of(&self, atom: Atom) -> &[(Box<[(TermId, i128)]>, i128)] {
+        match self.lins.get(&atom) {
+            Some(&(start, end)) => &self.lin_bounds[start as usize..end as usize],
+            None => &[],
+        }
     }
 
     // Terms.
@@ -753,10 +1821,34 @@ impl<'a, 'db> Solver<'a, 'db> {
             return id;
         }
         let id = self.terms.len() as TermId;
+        let mark = self.mark_of(&term);
         self.terms.push(term.clone()); // clone: the table's copy and the map's key
         self.ranges.push(range);
+        self.marks.push(mark);
         self.ids.insert(term, id);
         id
+    }
+
+    /// The mark of a new term ([`Self::marks`]): its own unknown's bit, or the union of its
+    /// parts' marks, the parts [`Self::mentions`] looks into.
+    fn mark_of(&self, term: &Term) -> u64 {
+        let of = |it: &TermId| self.marks[*it as usize];
+        match term {
+            Term::Const(_) | Term::Unknown(Key::Entry(_)) => 0,
+            Term::Unknown(Key::Join(block, _)) => join_mark(*block),
+            Term::Unknown(Key::At(block, ..)) => at_mark(*block),
+            Term::Len(a)
+            | Term::Discr(a)
+            | Term::Field(a, _)
+            | Term::Payload(a, _, _)
+            | Term::Not(a)
+            | Term::RefTo(a)
+            | Term::Deref(a)
+            | Term::Wrap(a, _) => of(a),
+            Term::Cmp(_, a, b) | Term::DerefAt(a, b) | Term::MutRef(_, a, b) => of(a) | of(b),
+            Term::Agg(_, fields) => fields.iter().fold(0, |mark, it| mark | of(it)),
+            Term::Lin(parts, _) => parts.iter().fold(0, |mark, (it, _)| mark | of(it)),
+        }
     }
 
     fn constant(&mut self, value: i128) -> TermId {
@@ -884,9 +1976,23 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// The greatest value `form` can have by the bounds of each of its terms alone; none
     /// when a term has no bound on that side.
     fn form_high(&self, state: &State, form: &Form) -> Option<i128> {
-        let mut high = form.1;
-        for &(term, coefficient) in &form.0 {
-            let (least, most) = self.bounds(state, term);
+        self.parts_high(state, &form.0, form.1, &mut Ask::new())
+    }
+
+    /// [`Self::form_high`] of the form of `parts` and `constant`.
+    fn parts_high(
+        &self,
+        state: &State,
+        parts: &[(TermId, i128)],
+        constant: i128,
+        ask: &mut Ask,
+    ) -> Option<i128> {
+        let mut high = constant;
+        for &(term, coefficient) in parts {
+            if !self.charge(1) {
+                return None;
+            }
+            let (least, most) = self.bounds_in(state, term, ask);
             let end = if coefficient > 0 { most } else { least };
             if end == i128::MAX || end == i128::MIN {
                 return None;
@@ -896,110 +2002,241 @@ impl<'a, 'db> Solver<'a, 'db> {
         Some(high)
     }
 
-    /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
-    /// `form <= bound`, the form with no constant.
-    fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
-        let comparisons = state.comparisons();
-        self.visit(comparisons.len());
-        let mut known = Vec::with_capacity(comparisons.len()); // alloc: one bound per comparison
-        let mut add = |left: &Form, right: &Form, slack: i128| {
-            if let Some((parts, constant)) = form_add(left, right, -1)
-                && !parts.is_empty()
-                && let Some(bound) = slack.checked_sub(constant)
-            {
-                known.push((parts, bound));
-            }
-        };
-        for fact in comparisons {
-            let (a, b) = (self.form(fact.a), self.form(fact.b));
-            match fact.rel {
-                Rel::Lt => add(&a, &b, -1),
-                Rel::Le => add(&a, &b, 0),
-                Rel::Eq => {
-                    add(&a, &b, 0);
-                    add(&b, &a, 0);
-                }
-                Rel::Ne => {}
-            }
-        }
-        known
-    }
-
     /// Whether the state entails `form <= limit`, by adding up facts: the bounds of the
     /// form's terms give it, or some fact `f <= b` that cancels a term of the form leaves
     /// `form - f <= limit - b` to show the same way. Shortest paths over difference
     /// constraints (`x - y <= c`) are the case of two-term facts; this adds any linear
-    /// facts, at most `depth` of them, trying at most `fuel`.
-    fn lin_le(
+    /// facts, at most `depth` of them, trying at most `fuel`. Only the facts about a term of
+    /// the form are looked at ([`State::about`]), each once, under the first term it cancels.
+    /// A residual the same question already searched to the end, as deep, without finding it
+    /// is not searched again ([`Ask::failed`]): the orders two facts can be taken in are one.
+    fn lin_le(&self, state: &State, form: &Form, limit: i128, depth: u8, ask: &mut Ask) -> bool {
+        let Some(limit) = limit.checked_sub(form.1) else { return false };
+        self.parts_le(state, &form.0, limit, depth, ask)
+    }
+
+    /// [`Self::lin_le`] of `bare <= limit`, a form with no constant.
+    fn parts_le(
         &self,
         state: &State,
-        form: &Form,
+        bare: &[(TermId, i128)],
         limit: i128,
-        known: &[(Vec<(TermId, i128)>, i128)],
         depth: u8,
-        fuel: &mut u32,
+        ask: &mut Ask,
     ) -> bool {
-        let Some(limit) = limit.checked_sub(form.1) else { return false };
-        if form.0.is_empty() {
+        if bare.is_empty() {
             return 0 <= limit;
         }
-        let bare = (form.0.clone(), 0); // clone: the form without its constant
-        if self.form_high(state, &bare).is_some_and(|high| high <= limit) {
+        if self.parts_high(state, bare, 0, ask).is_some_and(|high| high <= limit) {
             return true;
         }
         if depth == 0 {
             return false;
         }
-        self.visit(known.len());
-        for (parts, bound) in known {
-            let cancels = parts.iter().any(|&(term, coefficient)| {
-                bare.0.iter().any(|&(of, has)| of == term && (has > 0) == (coefficient > 0))
-            });
-            if !cancels {
-                continue;
-            }
-            if *fuel == 0 {
-                return false;
-            }
-            *fuel -= 1;
-            let fact = (parts.clone(), 0); // clone: subtracted from the form
-            let (Some(rest), Some(left)) = (form_add(&bare, &fact, -1), limit.checked_sub(*bound))
-            else {
-                continue;
-            };
-            if self.lin_le(state, &rest, left, known, depth - 1, fuel) {
-                return true;
+        for (first, &(term, _)) in bare.iter().enumerate() {
+            for &(_, fact) in state.comparisons(term) {
+                if !self.charge(1) {
+                    return false;
+                }
+                for (parts, bound) in self.lin_bounds_of(fact) {
+                    let cancels = bare.iter().position(|&(of, has)| {
+                        parts.iter().any(|&(it, coefficient)| it == of && (has > 0) == (coefficient > 0))
+                    });
+                    if cancels != Some(first) {
+                        continue;
+                    }
+                    if ask.fuel == 0 {
+                        return false;
+                    }
+                    ask.fuel -= 1;
+                    if !self.charge((bare.len() + parts.len()) as u64) {
+                        return false;
+                    }
+                    let (Some((rest, _)), Some(left)) =
+                        (form_merge(bare, 0, parts, 0, -1), limit.checked_sub(*bound))
+                    else {
+                        continue;
+                    };
+                    let residual = (rest, left);
+                    if ask.failed.get(&residual).is_some_and(|searched| searched >= depth - 1) {
+                        continue;
+                    }
+                    if self.parts_le(state, &residual.0, residual.1, depth - 1, ask) {
+                        return true;
+                    }
+                    // Searched to the end only when neither the fuel nor the work ran out.
+                    if ask.fuel > 0 && !self.spent() {
+                        ask.failed.insert(residual, depth - 1);
+                    }
+                }
             }
         }
         false
     }
 
-    /// Whether the state entails `atom` by linear reasoning ([`Self::lin_le`]).
-    fn linear(&self, state: &State, atom: Atom, known: &[Form]) -> bool {
+    /// Whether the state entails `atom` by linear reasoning ([`Self::lin_le`]), with
+    /// [`LINEAR_FUEL`] for the whole of it.
+    fn linear(&self, state: &State, atom: Atom, ask: &mut Ask) -> bool {
         let (a, b) = (self.form(atom.a), self.form(atom.b));
-        let mut fuel = LINEAR_FUEL;
-        let mut le = |left: &Form, right: &Form, limit: i128| {
-            form_add(left, right, -1).is_some_and(|form| {
-                self.lin_le(state, &form, limit, known, LINEAR_DEPTH, &mut fuel)
-            })
+        ask.fuel = LINEAR_FUEL;
+        let le = |ask: &mut Ask, left: &Form, right: &Form, limit: i128| {
+            form_add(left, right, -1)
+                .is_some_and(|form| self.lin_le(state, &form, limit, LINEAR_DEPTH, ask))
         };
         match atom.rel {
-            Rel::Lt => le(&a, &b, -1),
-            Rel::Le => le(&a, &b, 0),
-            Rel::Eq => le(&a, &b, 0) && le(&b, &a, 0),
-            Rel::Ne => le(&a, &b, -1) || le(&b, &a, -1),
+            Rel::Lt => le(ask, &a, &b, -1),
+            Rel::Le => le(ask, &a, &b, 0),
+            Rel::Eq => le(ask, &a, &b, 0) && le(ask, &b, &a, 0),
+            Rel::Ne => le(ask, &a, &b, -1) || le(ask, &b, &a, -1),
         }
     }
 
     /// Whether the state shows the exact value `form` is within `least..=most`.
     fn form_within(&self, state: &State, form: &Form, least: i128, most: i128) -> bool {
-        let known = self.known(state);
-        let mut fuel = LINEAR_FUEL;
+        let mut ask = Ask::new();
         let zero: Form = (Vec::new(), 0);
         let Some(negated) = form_add(&zero, form, -1) else { return false };
         let Some(floor) = least.checked_neg() else { return false };
-        self.lin_le(state, form, most, &known, LINEAR_DEPTH, &mut fuel)
-            && self.lin_le(state, &negated, floor, &known, LINEAR_DEPTH, &mut fuel)
+        self.lin_le(state, form, most, LINEAR_DEPTH, &mut ask)
+            && self.lin_le(state, &negated, floor, LINEAR_DEPTH, &mut ask)
+    }
+
+    /// Whether every product of the bounds of `a` and `b` is inside `range`.
+    fn product_within(&self, state: &State, a: TermId, b: TermId, range: Option<(i128, i128)>) -> bool {
+        let Some((least, most)) = range else { return false };
+        let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
+        let ends = [
+            low_a.checked_mul(low_b),
+            low_a.checked_mul(high_b),
+            high_a.checked_mul(low_b),
+            high_a.checked_mul(high_b),
+        ];
+        match ends {
+            [Some(a), Some(b), Some(c), Some(d)] => {
+                least <= a.min(b).min(c).min(d) && a.max(b).max(c).max(d) <= most
+            }
+            _ => false,
+        }
+    }
+
+    /// Keeps the verdict of the operation being walked, when recording.
+    fn note(&mut self, kind: OpKind, missing: Option<Missing>) {
+        if !self.recording {
+            return;
+        }
+        if let MirSpan::ExprId(expr) = self.span {
+            self.verdicts.push((expr, kind, missing));
+        }
+    }
+
+    /// The verdict of a shift of a `ty` by `amount`: it is below the bits and not negative.
+    /// Taken to hold after it, as every operation an overflow proof reports.
+    fn note_shift(&mut self, state: &mut State, ty: Ty<'db>, amount: TermId) {
+        let bits = type_bits(ty, self.word);
+        let (zero, limit) = (self.constant(0), self.constant(i128::from(bits)));
+        let (natural, below) = (Atom::new(Rel::Le, zero, amount), Atom::new(Rel::Lt, amount, limit));
+        let shown = self.entails(state, natural) && self.entails(state, below);
+        self.note(OpKind::Shift, (!shown).then_some(Missing::Amount(bits)));
+        let _ = self.assume(state, natural) && self.assume(state, below);
+    }
+
+    /// The verdict of a cast of `value`, a `from`, to `to`: every value it can have here is
+    /// one `to` holds, on every pointer width (`usize` and `isize` as narrow as 32 bits).
+    fn note_cast(&mut self, state: &State, value: TermId, from: Ty<'db>, to: Ty<'db>) {
+        if !self.recording {
+            return;
+        }
+        let Some((least, most)) = int_range(to, self.word.min(32)) else { return };
+        if wide(from) || wide(to) {
+            return self.note(OpKind::Cast, Some(Missing::Wide));
+        }
+        let (low, high) = (self.constant(least), self.constant(most));
+        let missing = if !self.entails(state, Atom::new(Rel::Le, low, value)) {
+            Some(Missing::Below(least))
+        } else if !self.entails(state, Atom::new(Rel::Le, value, high)) {
+            Some(Missing::Above(most))
+        } else {
+            None
+        };
+        self.note(OpKind::Cast, missing);
+    }
+
+    /// What is missing for `a op b`, a `ty` in `range`, to fit: an operand nothing bounds on
+    /// the side the result needs, `b <= a` for an unsigned difference, or how far what bounds
+    /// them lets it reach.
+    fn missing_arith(
+        &self,
+        state: &State,
+        op: &BinOp,
+        (a, b): (TermId, TermId),
+        exact: Option<&Form>,
+        ty: Ty<'db>,
+        (least, most): (i128, i128),
+    ) -> Missing {
+        if wide(ty) {
+            return Missing::Wide;
+        }
+        let mut ask = Ask::new();
+        let zero: Form = (Vec::new(), 0);
+        let (high_ok, low_ok) = match exact {
+            Some(form) => {
+                let high = self.lin_le(state, form, most, LINEAR_DEPTH, &mut ask);
+                let low = match (form_add(&zero, form, -1), least.checked_neg()) {
+                    (Some(negated), Some(floor)) => {
+                        self.lin_le(state, &negated, floor, LINEAR_DEPTH, &mut ask)
+                    }
+                    _ => false,
+                };
+                (high, low)
+            }
+            None => (false, false),
+        };
+        let sub = matches!(op, BinOp::Sub | BinOp::SubWithOverflow);
+        let mul = matches!(op, BinOp::Mul | BinOp::MulWithOverflow);
+        if sub && least == 0 && high_ok && !low_ok {
+            return Missing::Order;
+        }
+        let ((low_a, high_a), (low_b, high_b)) =
+            (self.bounds_in(state, a, &mut ask), self.bounds_in(state, b, &mut ask));
+        let above = |high: i128| high >= most;
+        let below = |low: i128| least < 0 && low <= least;
+        let (left, right) = match (mul, sub) {
+            (true, _) => (above(high_a) || below(low_a), above(high_b) || below(low_b)),
+            (false, true) => (
+                (!high_ok && above(high_a)) || (!low_ok && below(low_a)),
+                (!high_ok && below(low_b)) || (!low_ok && above(high_b)),
+            ),
+            (false, false) => (
+                (!high_ok && above(high_a)) || (!low_ok && below(low_a)),
+                (!high_ok && above(high_b)) || (!low_ok && below(low_b)),
+            ),
+        };
+        if left || right {
+            return Missing::Unbounded { left, right };
+        }
+        // Both are bounded: how far the bounds let it go, on the side that fails.
+        let reach = match (exact, mul) {
+            (Some(form), false) if !high_ok => self.form_high(state, form),
+            (Some(form), false) => form_add(&zero, form, -1)
+                .and_then(|negated| self.form_high(state, &negated))
+                .and_then(i128::checked_neg),
+            _ => {
+                let ends = [
+                    low_a.checked_mul(low_b),
+                    low_a.checked_mul(high_b),
+                    high_a.checked_mul(low_b),
+                    high_a.checked_mul(high_b),
+                ];
+                ends.into_iter()
+                    .flatten()
+                    .filter(|&it| it < least || most < it)
+                    .max_by_key(|it| it.unsigned_abs())
+            }
+        };
+        match reach {
+            Some(value) => Missing::Reaches(value),
+            None => Missing::Unbounded { left: true, right: true },
+        }
     }
 
     fn not(&mut self, of: TermId) -> TermId {
@@ -1051,26 +2288,48 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     // Entailment.
 
-    /// The least and greatest value `term` can have in `state`: [`Self::bounds_by_constants`],
+    /// The least and greatest value `term` can have in `state`: [`Self::by_constants_in`],
     /// narrowed once more by the facts that compare it with another term (`i < n` and
-    /// `n <= MAX` give `i <= MAX - 1`).
+    /// `n <= MAX` give `i <= MAX - 1`), and by the facts that have a multiple of it alone on
+    /// one side (`4 * q <= x` and `x <= MAX` give `q <= MAX / 4`).
     fn bounds(&self, state: &State, term: TermId) -> (i128, i128) {
-        let (mut low, mut high) = self.bounds_by_constants(state, term);
+        self.bounds_in(state, term, &mut Ask::new())
+    }
+
+    /// [`Self::bounds`], each term's worked out once per question.
+    fn bounds_in(&self, state: &State, term: TermId, ask: &mut Ask) -> (i128, i128) {
+        if let Some(known) = ask.bounds.get(&term) {
+            let _ = self.charge(1);
+            return known;
+        }
+        let found = self.bounds_uncached(state, term, ask);
+        ask.bounds.insert(term, found);
+        found
+    }
+
+    fn bounds_uncached(&self, state: &State, term: TermId, ask: &mut Ask) -> (i128, i128) {
+        let (mut low, mut high) = self.by_constants_in(state, term, ask);
         if self.const_of(term).is_some() {
             return (low, high);
         }
-        let comparisons = state.comparisons();
-        self.visit(comparisons.len());
-        for fact in comparisons {
+        for &(_, fact) in state.comparisons(term) {
+            // Out of work, what is narrowed so far is still true.
+            if !self.charge(1) {
+                break;
+            }
             let (left, right) = (fact.a == term, fact.b == term);
-            if left == right {
+            if left && right {
+                continue;
+            }
+            if !left && !right {
+                self.bound_multiple(state, term, fact, ask, (&mut low, &mut high));
                 continue;
             }
             let other = if left { fact.b } else { fact.a };
             if self.const_of(other).is_some() {
                 continue;
             }
-            let (least, most) = self.bounds_by_constants(state, other);
+            let (least, most) = self.by_constants_in(state, other, ask);
             match (fact.rel, left) {
                 (Rel::Lt, true) => high = high.min(most.saturating_sub(1)),
                 (Rel::Le, true) => high = high.min(most),
@@ -1086,17 +2345,70 @@ impl<'a, 'db> Solver<'a, 'db> {
         (low, high)
     }
 
+    /// Narrows `low..=high`, the bounds of `term`, by `fact` when one of its sides is
+    /// `c * term + k`: the other side's bounds by constants bound `c * term`.
+    fn bound_multiple(
+        &self,
+        state: &State,
+        term: TermId,
+        fact: Atom,
+        ask: &mut Ask,
+        (low, high): (&mut i128, &mut i128),
+    ) {
+        for (side, other, on_left) in [(fact.a, fact.b, true), (fact.b, fact.a, false)] {
+            let Term::Lin(parts, k) = &self.terms[side as usize] else { continue };
+            let &[(part, c)] = &parts[..] else { continue };
+            if part != term || c == 0 {
+                continue;
+            }
+            let (least, most) = self.by_constants_in(state, other, ask);
+            let strict = i128::from(fact.rel == Rel::Lt);
+            // `c * term` is at most `upper` and at least `lower`.
+            let at_most = || closed(most)?.checked_sub(*k)?.checked_sub(strict);
+            let at_least = || closed(least)?.checked_sub(*k)?.checked_add(strict);
+            let (upper, lower) = match (fact.rel, on_left) {
+                (Rel::Lt | Rel::Le, true) => (at_most(), None),
+                (Rel::Lt | Rel::Le, false) => (None, at_least()),
+                (Rel::Eq, _) => (at_most(), at_least()),
+                (Rel::Ne, _) => (None, None),
+            };
+            if let Some(upper) = upper {
+                match c > 0 {
+                    true => *high = (*high).min(floor_div(upper, c).unwrap_or(i128::MAX)),
+                    false => *low = (*low).max(ceil_div(upper, c).unwrap_or(i128::MIN)),
+                }
+            }
+            if let Some(lower) = lower {
+                match c > 0 {
+                    true => *low = (*low).max(ceil_div(lower, c).unwrap_or(i128::MIN)),
+                    false => *high = (*high).min(floor_div(lower, c).unwrap_or(i128::MAX)),
+                }
+            }
+        }
+    }
+
     /// The least and greatest value `term` can have in `state`: its type's, narrowed by the
     /// facts that compare it with a constant.
-    fn bounds_by_constants(&self, state: &State, term: TermId) -> (i128, i128) {
+    fn by_constants_in(&self, state: &State, term: TermId, ask: &mut Ask) -> (i128, i128) {
         if let Some(value) = self.const_of(term) {
             return (value, value);
         }
+        if let Some(known) = ask.by_constants.get(&term) {
+            let _ = self.charge(1);
+            return known;
+        }
+        let found = self.by_constants_uncached(state, term, ask);
+        ask.by_constants.insert(term, found);
+        found
+    }
+
+    fn by_constants_uncached(&self, state: &State, term: TermId, ask: &mut Ask) -> (i128, i128) {
         // A form's bounds are its terms', added up; an end a term leaves open is open.
         if let Term::Lin(parts, constant) = &self.terms[term as usize] {
             let (mut low, mut high) = (Some(*constant), Some(*constant));
             for &(part, coefficient) in parts.iter() {
-                let (least, most) = self.bounds_by_constants(state, part);
+                let _ = self.charge(1);
+                let (least, most) = self.by_constants_in(state, part, ask);
                 let (down, up) = if coefficient > 0 { (least, most) } else { (most, least) };
                 let end = |sum: Option<i128>, end: i128| {
                     let open = end == i128::MAX || end == i128::MIN;
@@ -1107,9 +2419,11 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
-        let comparisons = state.comparisons();
-        self.visit(comparisons.len());
-        for fact in comparisons {
+        let about = state.about(term);
+        for &(_, fact) in state.comparisons(term) {
+            if !self.charge(1) {
+                break;
+            }
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
                 continue;
@@ -1126,16 +2440,15 @@ impl<'a, 'db> Solver<'a, 'db> {
                     low = low.max(value);
                     high = high.min(value);
                 }
-                (Rel::Ne, _) => {}
+                (Rel::Ne, _) => unreachable!(),
             }
         }
-        // A value ruled out at an end moves the end: at most as many turns as such facts.
         let excluded = |value| {
-            self.visit(0);
-            self.ids.get(&Term::Const(value)).is_some_and(|&id| state.has(Atom::new(Rel::Ne, term, id)))
+            #[cfg(test)]
+            PROOF_VISITS.set(PROOF_VISITS.get() + 1);
+            self.charge(1) && self.ids.get(&Term::Const(value))
+                .is_some_and(|&id| state.has(Atom::new(Rel::Ne, term, id)))
         };
-        // No exclusion can move either end without one naming its current value. This
-        // is the usual case, even on a dispatch path carrying hundreds of exclusions.
         match (excluded(low), excluded(high)) {
             (false, false) => return (low, high),
             (true, false) => {
@@ -1146,15 +2459,17 @@ impl<'a, 'db> Solver<'a, 'db> {
                 while low < high && excluded(high) { high -= 1; }
                 return (low, high);
             }
-            // If both ends are excluded their meeting point can depend on fact order.
-            // Preserve that order, including the empty-range and saturating cases.
-            (true, true) => {}
+            (true, true) => {} // Both ends can meet: preserve the original sorted order.
         }
+        // A value ruled out at an end moves the end: at most as many turns as such facts.
         let mut turns = state.facts.len();
         loop {
-            self.visit(state.facts.len());
             let mut moved = false;
-            for fact in &state.facts {
+            // clone: an iterator over the index, one walk per turn
+            for &(_, fact) in about.clone() {
+                if !self.charge(1) {
+                    return (low, high);
+                }
                 if fact.rel != Rel::Ne || (fact.a != term && fact.b != term) {
                     continue;
                 }
@@ -1177,23 +2492,29 @@ impl<'a, 'db> Solver<'a, 'db> {
         (low, high)
     }
 
-    /// Whether `state` entails `atom`, following at most `depth` facts or implications.
-    fn holds(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
-        if let Some(result) = memo.as_ref().and_then(|q| q.answers.get(&(atom, depth))) {
-            return *result;
-        }
-        let result = self.search(state, atom, depth, memo);
-        if let Some(q) = memo { q.answers.insert((atom, depth), result); }
-        result
-    }
-
-    fn search(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
-        let Atom { rel, a, b } = atom;
-        if a == b {
-            return matches!(rel, Rel::Le | Rel::Eq);
+    /// Whether `state` entails `atom`, following at most `depth` facts or implications. Each
+    /// atom and depth is asked once per question ([`Ask::held`]): the paths through the facts
+    /// that meet again cost one look-up.
+    fn holds(&self, state: &State, atom: Atom, depth: u8, ask: &mut Ask) -> bool {
+        if atom.a == atom.b {
+            return matches!(atom.rel, Rel::Le | Rel::Eq);
         }
         if state.has(atom) {
             return true;
+        }
+        if let Some(known) = ask.held.get(&(atom, depth)) {
+            let _ = self.charge(1);
+            return known;
+        }
+        let held = self.holds_uncached(state, atom, depth, ask);
+        ask.held.insert((atom, depth), held);
+        held
+    }
+
+    fn holds_uncached(&self, state: &State, atom: Atom, depth: u8, ask: &mut Ask) -> bool {
+        let Atom { rel, a, b } = atom;
+        if !self.charge(1) {
+            return false;
         }
         let known = |rel, a, b| state.has(Atom::new(rel, a, b));
         let stated = match rel {
@@ -1204,11 +2525,8 @@ impl<'a, 'db> Solver<'a, 'db> {
         if stated {
             return true;
         }
-        let mut bounds = |term| match memo {
-            Some(q) => *q.bounds.entry(term).or_insert_with(|| self.bounds(state, term)),
-            None => self.bounds(state, term),
-        };
-        let ((low_a, high_a), (low_b, high_b)) = (bounds(a), bounds(b));
+        let ((low_a, high_a), (low_b, high_b)) =
+            (self.bounds_in(state, a, ask), self.bounds_in(state, b, ask));
         let bounded = match rel {
             Rel::Lt => high_a < low_b,
             Rel::Le => high_a <= low_b,
@@ -1230,14 +2548,14 @@ impl<'a, 'db> Solver<'a, 'db> {
                 match self.terms[term as usize] {
                     Term::Cmp(rel, x, y) => {
                         let inner = Atom { rel, a: x, b: y };
-                        if self.holds(state, if truth { inner } else { inner.not() }, depth, memo) {
+                        if self.holds(state, if truth { inner } else { inner.not() }, depth, ask) {
                             return true;
                         }
                     }
                     Term::Not(inner) if depth > 0 => {
                         let want = self.ids.get(&Term::Const(i128::from(!truth)));
                         if let Some(&want) = want
-                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1, memo)
+                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1, ask)
                         {
                             return true;
                         }
@@ -1248,56 +2566,46 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // Adding facts up: `i + 1 < n` gives `i < n`, `k <= n` gives `0 <= n - k`. Once, at
         // the top: the steps below ask about single facts.
-        if depth >= 2 {
-            let known;
-            let forms = match memo {
-                Some(q) => q.known.get_or_insert_with(|| self.known(state)),
-                None => { known = self.known(state); &known }
-            };
-            if self.linear(state, atom, forms) { return true; }
+        if depth >= 2 && self.linear(state, atom, ask) {
+            return true;
         }
         if depth == 0 {
             return false;
         }
-        let concluding = state.concluding(atom);
-        let comparisons = state.comparisons();
-        self.visit(comparisons.len() + concluding.len());
-        // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
-        for fact in comparisons {
-            let mut through = |mid: TermId, strict: bool| -> bool {
-                match rel {
-                    Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
-                    Rel::Lt => self.holds(state, Atom::new(Rel::Lt, mid, b), depth - 1, memo),
-                    Rel::Le => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
-                    Rel::Eq | Rel::Ne => false,
-                }
+        // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites. Only
+        // a fact about `a` or `b` can be one: those about `a`, then those about `b` alone.
+        let about_b = state.comparisons(b).filter(|(_, it)| it.a != a && it.b != a);
+        for &(_, fact) in state.comparisons(a).chain(about_b) {
+            if !self.charge(1) {
+                return false;
+            }
+            let next = match fact.rel {
+                // `a < m` (strict) or `a <= m`, then `m` against `b`.
+                Rel::Lt | Rel::Le if fact.a == a && fact.b != b => match (rel, fact.rel) {
+                    (Rel::Lt, Rel::Le) => Some(Atom::new(Rel::Lt, fact.b, b)),
+                    (Rel::Lt | Rel::Le, _) => Some(Atom::new(Rel::Le, fact.b, b)),
+                    _ => None,
+                },
+                Rel::Eq if fact.a == a && fact.b != b => Some(Atom::new(rel, fact.b, b)),
+                Rel::Eq if fact.b == a && fact.a != b => Some(Atom::new(rel, fact.a, b)),
+                Rel::Eq if fact.a == b && fact.b != a => Some(Atom::new(rel, a, fact.b)),
+                Rel::Eq if fact.b == b && fact.a != a => Some(Atom::new(rel, a, fact.a)),
+                _ => None,
             };
-            let stepped = match fact.rel {
-                Rel::Lt if fact.a == a && fact.b != b => through(fact.b, true),
-                Rel::Le if fact.a == a && fact.b != b => through(fact.b, false),
-                Rel::Eq if fact.a == a && fact.b != b => {
-                    self.holds(state, Atom::new(rel, fact.b, b), depth - 1, memo)
-                }
-                Rel::Eq if fact.b == a && fact.a != b => {
-                    self.holds(state, Atom::new(rel, fact.a, b), depth - 1, memo)
-                }
-                Rel::Eq if fact.a == b && fact.b != a => {
-                    self.holds(state, Atom::new(rel, a, fact.b), depth - 1, memo)
-                }
-                Rel::Eq if fact.b == b && fact.a != a => {
-                    self.holds(state, Atom::new(rel, a, fact.a), depth - 1, memo)
-                }
-                _ => false,
-            };
-            if stepped {
+            if let Some(next) = next
+                && self.holds(state, next, depth - 1, ask)
+            {
                 return true;
             }
         }
-        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1, memo))
+        state
+            .concluding(atom)
+            .any(|&(_, premise)| self.charge(1) && self.holds(state, premise, depth - 1, ask))
     }
 
+    /// Whether `state` entails `atom`: one question ([`Ask`]), two steps deep.
     fn entails(&self, state: &State, atom: Atom) -> bool {
-        self.holds(state, atom, 2, &mut None)
+        self.holds(state, atom, 2, &mut Ask::new())
     }
 
     /// Adds `atom` to `state`: false when the state then has no run (the atom contradicts it).
@@ -1332,7 +2640,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         let trivial = atom.a == atom.b
             || (self.const_of(atom.a).is_some() && self.const_of(atom.b).is_some());
         if !trivial && !state.has(atom) {
-            state.put(atom);
+            self.put(state, atom);
             for term in [atom.a, atom.b] {
                 let (low, high) = self.bounds(state, term);
                 if low > high {
@@ -1345,15 +2653,11 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// Writes down what the state's implications give: the conclusion of each whose premise
     /// holds. False when one contradicts the state. Each implication fires at most once.
-    fn saturate(&self, state: &mut State) -> bool {
-        let mut memo = (state.imps.len() >= 16).then(Questions::default);
-        saturate(state, |state, atom| {
-            if let Some(q) = &mut memo && q.facts != state.facts.len() {
-                q.answers.clear(); q.bounds.clear(); q.known = None;
-                q.facts = state.facts.len();
-            }
-            self.holds(state, atom, 2, &mut memo)
-        })
+    ///
+    /// Every missing premise is asked once per pass. A new fact can enable an earlier
+    /// premise through a linear sum arbitrarily far from either endpoint.
+    fn saturate(&mut self, state: &mut State) -> bool {
+        saturate(self, state)
     }
 
     // The state.
@@ -1362,18 +2666,174 @@ impl<'a, 'db> Solver<'a, 'db> {
         self.body.locals.len()
     }
 
+    /// The type of the local in `slot`; none for the epoch.
     fn local_ty(&self, slot: usize) -> Option<Ty<'db>> {
-        self.body.locals.iter().nth(slot).map(|(_, local)| local.ty.as_ref())
+        self.local_tys.get(slot).copied()
+    }
+
+    /// The blocks the start reaches, in reverse postorder (unwinding included).
+    fn reverse_postorder(&self) -> Vec<u32> {
+        let count = self.blocks.len();
+        let mut visited = vec![false; count]; // alloc: one flag per block, once per proof
+        let mut post = Vec::with_capacity_in(count, Global);
+        // Each block on the path and how many of its successors it has gone to.
+        let mut stack: Vec<(u32, usize)> = Vec::with_capacity_in(count, Global);
+        let start = index(self.body.start_block);
+        visited[start] = true;
+        stack.push((start as u32, 0));
+        while let Some((block, at)) = stack.last_mut() {
+            let next = self.blocks[*block as usize]
+                .terminator
+                .as_ref()
+                .and_then(|it| it.kind.all_successors().nth(*at));
+            match next {
+                Some(target) => {
+                    *at += 1;
+                    let target = index(target);
+                    if !visited[target] {
+                        visited[target] = true;
+                        stack.push((target as u32, 0));
+                    }
+                }
+                None => {
+                    post.push(*block);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// Fills [`Self::live`] and [`Self::written`]: per block, the locals that may be read
+    /// from its entry on before a statement writes all of them (a statement or terminator
+    /// reads them, or writes part of them), and the locals the block writes. The parameters,
+    /// the return place and every exposed local are live everywhere. So a local not live at
+    /// a block is not read on any path from it before it is written whole: what a join would
+    /// work out of its slot is never asked, and [`Self::clear_dead`] gives its slot back its
+    /// entry value. A local's reads and whole writes are found once, in one backward scan of
+    /// each block; then each pass, in postorder, charges a unit per word per edge, carries
+    /// reads back along every forward edge, and the passes are at most one more than the back
+    /// edges on a path, and never more than the blocks.
+    fn liveness(&mut self, order: &[u32]) {
+        let words = self.live_words;
+        let count = self.blocks.len();
+        let zeros = |len: usize| {
+            let mut bits = Vec::with_capacity_in(len, Global);
+            bits.resize(len, 0u64);
+            bits
+        };
+        let mut always = zeros(words);
+        set_bit(&mut always, 0);
+        for &local in self.body.param_locals.iter() {
+            set_bit(&mut always, local_index(local));
+        }
+        for &slot in &self.exposed_slots {
+            set_bit(&mut always, slot as usize);
+        }
+        // Each block's reads not after a whole write in it, its whole writes, and its writes.
+        let (mut uses, mut defs, mut written) = (zeros(count * words), zeros(count * words), zeros(count * words));
+        let mut scanned = 0u64;
+        for (block, data) in self.blocks.iter().enumerate() {
+            let range = block * words..(block + 1) * words;
+            let uses = &mut uses[range.clone()];
+            let defs = &mut defs[range.clone()];
+            let written = &mut written[range];
+            if let Some(terminator) = &data.terminator {
+                terminator_reads(&terminator.kind, &mut |slot| set_bit(uses, slot));
+                terminator_writes(&terminator.kind, &mut |slot| set_bit(written, slot));
+            }
+            for statement in data.statements.iter().rev() {
+                scanned += 1;
+                if let Some(def) = statement_def(&statement.kind) {
+                    clear_bit(uses, def);
+                    set_bit(defs, def);
+                }
+                statement_reads(&statement.kind, &mut |slot| set_bit(uses, slot));
+                statement_writes(&statement.kind, &mut |slot| set_bit(written, slot));
+            }
+        }
+        let _ = self.charge(scanned + (count * words) as u64);
+        let mut live = zeros(count * words);
+        for block in 0..count {
+            for at in 0..words {
+                live[block * words + at] = uses[block * words + at] | always[at];
+            }
+        }
+        let mut out = zeros(words);
+        for _ in 0..=count {
+            let mut changed = false;
+            for &block in order.iter().rev() {
+                let block = block as usize;
+                let Some(terminator) = &self.blocks[block].terminator else { continue };
+                out.fill(0);
+                for target in terminator.kind.all_successors() {
+                    let _ = self.charge(words as u64);
+                    let target = index(target);
+                    for (word, &add) in out.iter_mut().zip(&live[target * words..(target + 1) * words]) {
+                        *word |= add;
+                    }
+                }
+                for at in 0..words {
+                    let here = block * words + at;
+                    let now = live[here] | uses[here] | (out[at] & !defs[here]) | always[at];
+                    changed |= now != live[here];
+                    live[here] = now;
+                }
+            }
+            // Out of work, [`Self::solve`] stops before any join reads it.
+            if !changed || self.spent() {
+                break;
+            }
+        }
+        self.live = live;
+        self.written = written;
+    }
+
+    /// Gives back their entry values ([`Self::entry`]) to the slots of an edge's `state` from
+    /// `block` to `target` that are not live at `target` and that the block may have changed
+    /// (live at its entry, or written in it). Nothing on a path from `target` reads them
+    /// before writing all of them, and every state at a block's entry then holds the entry
+    /// value in each slot not live there: paths that meet agree on what none of them reads, so
+    /// a join of many paths sees only what differs that matters. Each slot dies once on a
+    /// path, so this costs the body's writes, and a word per 64 locals per edge.
+    fn clear_dead(&mut self, block: u32, target: u32, state: &mut State) {
+        let words = self.live_words;
+        let _ = self.charge(words as u64);
+        for at in 0..words {
+            let (here, there) = (block as usize * words + at, target as usize * words + at);
+            let mut dead = (self.live[here] | self.written[here]) & !self.live[there];
+            while dead != 0 {
+                let slot = at * 64 + dead.trailing_zeros() as usize;
+                dead &= dead - 1;
+                if let Some(&value) = self.entry_vals.get(slot) {
+                    let _ = self.charge(1);
+                    state.vals.set(slot, value, &self.marks);
+                }
+            }
+        }
+    }
+
+    /// Whether the local in `slot` may be read from `block`'s entry on before it is written
+    /// whole ([`Self::liveness`]). The epoch is always.
+    fn live_at(&self, block: u32, slot: usize) -> bool {
+        if slot >= self.local_tys.len() {
+            return true;
+        }
+        let word = self.live[block as usize * self.live_words + slot / 64];
+        word & (1 << (slot % 64)) != 0
     }
 
     fn entry(&mut self) -> State {
         let slots = self.epoch_slot() + 1;
+        let mut vals = Vec::with_capacity_in(slots, Global);
         for slot in 0..slots {
             let ty = self.local_ty(slot);
-            let id = self.unknown(Key::Entry(slot as u32), ty);
-            debug_assert_eq!(id, slot as u32);
+            vals.push(self.unknown(Key::Entry(slot as u32), ty));
         }
-        State { vals: Slots::default(), facts: Vec::new(), imps: Vec::new() }
+        let state = State::new(Slots::new(&vals, &self.marks));
+        self.entry_vals = vals;
+        state
     }
 
     /// Forgets what statement `at` made the last time it ran: the facts that mention it, and
@@ -1383,21 +2843,37 @@ impl<'a, 'db> Solver<'a, 'db> {
             return;
         }
         let of = |key: Key| matches!(key, Key::At(block, stmt, _) if (block, stmt) == at);
-        self.kill(state, &of, |slot| Key::At(at.0, at.1, STALE + slot));
+        self.kill(state, &of, at_mark(at.0), |slot| Key::At(at.0, at.1, STALE + slot));
     }
 
-    /// Forgets every unknown `of` says yes to: the facts that mention one go, and a slot that
-    /// holds one gets the unknown `stale` names for it.
-    fn kill(&mut self, state: &mut State, of: &impl Fn(Key) -> bool, stale: impl Fn(u32) -> Key) {
-        state.facts.retain(|fact| !self.mentions(fact.a, of) && !self.mentions(fact.b, of));
-        state.imps.retain(|Imp { then, premise }| {
-            ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
-        });
-        for (slot, value) in &mut state.vals.0 {
-            if self.mentions(*value, of) {
-                let slot = *slot as usize;
+    /// Forgets every unknown `of` says yes to, each of a term whose mark has a bit of
+    /// `mark`: the facts that mention one go, and a slot that holds one gets the unknown
+    /// `stale` names for it. Only the facts of a state whose marks have the bit, and the
+    /// slots under nodes whose marks have it, are looked at.
+    fn kill(
+        &mut self,
+        state: &mut State,
+        of: &impl Fn(Key) -> bool,
+        mark: u64,
+        stale: impl Fn(u32) -> Key,
+    ) {
+        // Forgetting is never cut short by the work bound: a fact kept past its point would be
+        // unsound. It is charged, and the walk stops after it.
+        if state.marks & mark != 0 {
+            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
+            state.retain_facts(|fact| !self.mentions(fact.a, of) && !self.mentions(fact.b, of));
+            state.retain_imps(|(premise, then)| {
+                ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
+            });
+        }
+        let mut hit = smallvec::SmallVec::<[usize; 8]>::new();
+        state.vals.marked(mark, &self.marks, &mut |slot| hit.push(slot));
+        let _ = self.charge(1 + hit.len() as u64);
+        for slot in hit {
+            if self.mentions(state.vals[slot], of) {
                 let ty = self.local_ty(slot);
-                *value = self.unknown(stale(slot as u32), ty);
+                let value = self.unknown(stale(slot as u32), ty);
+                state.vals.set(slot, value, &self.marks);
             }
         }
     }
@@ -1407,22 +2883,22 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn bump(&mut self, state: &mut State) {
         let (block, stmt) = self.at;
         let epoch = self.epoch_slot();
-        state.vals.set(epoch, self.unknown(Key::At(block, stmt, EPOCH), None));
-        for slot in 0..epoch {
-            if self.exposed[slot] {
-                let ty = self.local_ty(slot);
-                state.vals.set(slot, self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty));
-            }
+        let value = self.unknown(Key::At(block, stmt, EPOCH), None);
+        state.vals.set(epoch, value, &self.marks);
+        for at in 0..self.exposed_slots.len() {
+            let slot = self.exposed_slots[at];
+            let ty = self.local_ty(slot as usize);
+            let value = self.unknown(Key::At(block, stmt, HAVOC + slot), ty);
+            state.vals.set(slot as usize, value, &self.marks);
         }
     }
 
     /// The locals a `&mut` borrow or a raw pointer was made of: what a write through a pointer
     /// or an unknown call may change. A shared borrow counts too when the body casts a
-    /// reference to a raw pointer anywhere. Then the locals any borrow was made of.
-    fn exposed_locals(&self) -> (Vec<bool>, Vec<bool>) {
+    /// reference to a raw pointer anywhere.
+    fn exposed_locals(&self) -> Vec<bool> {
         let mut exposed = vec![false; self.body.locals.len()]; // alloc: one flag per local, once per proof
         let mut shared = vec![false; self.body.locals.len()]; // alloc: as above
-        let mut addressed = vec![false; self.body.locals.len()]; // alloc: as above
         let mut cast_to_raw = false;
         for block in self.blocks {
             for statement in &block.statements {
@@ -1439,7 +2915,6 @@ impl<'a, 'db> Solver<'a, 'db> {
                         }
                         let raw = matches!(self.place_ty(to).kind(), TyKind::RawPtr(..));
                         let slot = local_index(place.local);
-                        addressed[slot] = true;
                         if raw || matches!(kind, BorrowKind::Mut { .. }) {
                             exposed[slot] = true;
                         } else {
@@ -1463,7 +2938,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 exposed[slot] |= shared;
             }
         }
-        (exposed, addressed)
+        exposed
     }
 
     fn place_ty(&self, place: &StoredPlace) -> Ty<'db> {
@@ -1483,7 +2958,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn deref(&mut self, state: &State, pointer: TermId, ty: Ty<'db>) -> TermId {
         match self.terms[pointer as usize] {
             Term::RefTo(value) => return value,
-            Term::MutRef(_, value, epoch) if epoch == state.vals.get(self.epoch_slot()) => {
+            Term::MutRef(_, value, epoch) if epoch == state.vals[self.epoch_slot()] => {
                 return value;
             }
             _ => {}
@@ -1495,12 +2970,12 @@ impl<'a, 'db> Solver<'a, 'db> {
                 if fixed || mutability == rustc_type_ir::Mutability::Not {
                     self.term(Term::Deref(pointer), ANY)
                 } else {
-                    let epoch = state.vals.get(self.epoch_slot());
+                    let epoch = state.vals[self.epoch_slot()];
                     self.term(Term::DerefAt(pointer, epoch), ANY)
                 }
             }
             TyKind::Adt(def, _) if def.is_box() => {
-                let epoch = state.vals.get(self.epoch_slot());
+                let epoch = state.vals[self.epoch_slot()];
                 self.term(Term::DerefAt(pointer, epoch), ANY)
             }
             _ => self.fresh(None),
@@ -1509,7 +2984,7 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// The value `place` holds in `state`.
     fn read(&mut self, state: &State, place: &StoredPlace) -> TermId {
-        let mut term = state.vals.get(local_index(place.local));
+        let mut term = state.vals[local_index(place.local)];
         let mut ty = PlaceTy::from_ty(self.body.locals[place.local].ty.as_ref());
         let mut variant = None;
         for elem in place.projection.as_slice() {
@@ -1550,20 +3025,22 @@ impl<'a, 'db> Solver<'a, 'db> {
         let slot = local_index(place.local);
         let projection = place.projection.as_slice();
         if projection.is_empty() {
-            state.vals.set(slot, value);
+            state.vals.set(slot, value, &self.marks);
             if self.named[slot] && !self.names.contains_key(&value) {
                 self.names.insert(value, slot as u32);
             }
             return;
         }
         if projection.iter().any(|it| matches!(it, ProjectionElem::Deref)) {
+            let before = (state.vals[slot], state.vals[self.epoch_slot()]);
             self.bump(state);
+            self.kept_fields(state, place, before, value);
             return;
         }
         // A part of the local: one field of a known aggregate is replaced, anything else
         // leaves the local unknown.
         let (block, stmt) = self.at;
-        let replaced = match (projection, &self.terms[state.vals.get(slot) as usize]) {
+        let replaced = match (projection, &self.terms[state.vals[slot] as usize]) {
             ([ProjectionElem::Field(field)], Term::Agg(variant, fields))
                 if *variant == NO_VARIANT && (field.0 as usize) < fields.len() =>
             {
@@ -1580,7 +3057,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty)
             }
         };
-        state.vals.set(slot, value);
+        state.vals.set(slot, value, &self.marks);
     }
 
     fn rvalue(&mut self, state: &mut State, to: &StoredPlace, rvalue: &Rvalue) -> TermId {
@@ -1594,7 +3071,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                     _ if raw => self.fresh(None),
                     BorrowKind::Shared | BorrowKind::Shallow => self.term(Term::RefTo(value), ANY),
                     BorrowKind::Mut { .. } if place.projection.as_slice().is_empty() => {
-                        let epoch = state.vals.get(self.epoch_slot());
+                        let epoch = state.vals[self.epoch_slot()];
                         let local = local_index(place.local) as u32;
                         self.term(Term::MutRef(local, value, epoch), ANY)
                     }
@@ -1602,7 +3079,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                     BorrowKind::Mut { .. }
                         if matches!(place.projection.as_slice(), [ProjectionElem::Deref]) =>
                     {
-                        state.vals.get(local_index(place.local))
+                        state.vals[local_index(place.local)]
                     }
                     BorrowKind::Mut { .. } => self.fresh(None),
                 }
@@ -1621,6 +3098,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 // Decided by the two types, never by what this state knows of the value: a
                 // term's range is its type's in every state it appears in.
                 let value = self.operand(state, operand);
+                if self.mode == Mode::Overflow
+                    && let Some(from) = self.operand_ty(operand)
+                {
+                    self.note_cast(state, value, from, ty.as_ref());
+                }
                 let from = self.operand_ty(operand).and_then(|it| int_range(it, self.word));
                 match (from, int_range(ty.as_ref(), self.word)) {
                     (Some((low, high)), Some((least, most))) if least <= low && high <= most => {
@@ -1634,6 +3116,25 @@ impl<'a, 'db> Solver<'a, 'db> {
             {
                 let value = self.operand(state, operand);
                 self.not(value)
+            }
+            Rvalue::UnaryOp(UnOp::Neg, operand)
+                if self.mode == Mode::Overflow
+                    && self.operand_ty(operand).is_some_and(|it| matches!(it.kind(), TyKind::Int(_))) =>
+            {
+                let ty = self.operand_ty(operand);
+                let value = self.operand(state, operand);
+                let least = ty.and_then(|it| int_range(it, self.word)).map_or(i128::MIN, |it| it.0);
+                let min = self.constant(least);
+                let not_min = Atom::new(Rel::Ne, value, min);
+                let shown = self.entails(state, not_min);
+                self.note(OpKind::Neg, (!shown).then_some(Missing::NotMin));
+                // Taken to fit after it, as every operation an overflow proof reports.
+                let _ = self.assume(state, not_min);
+                let zero: Form = (Vec::new(), 0);
+                match form_add(&zero, &self.form(value), -1) {
+                    Some(negated) => self.lin(negated),
+                    None => self.fresh(ty),
+                }
             }
             // Arithmetic that is linear: the exact sum, difference or multiple, as a form. A
             // local holds it only where it fits the type: shown by the state, or, for a
@@ -1685,20 +3186,59 @@ impl<'a, 'db> Solver<'a, 'db> {
                     (Some(form), Some((least, most))) => self.form_within(state, form, least, most),
                     _ => false,
                 };
+                // A product of two unknowns fits when every product of their bounds does.
+                let product = matches!(op, BinOp::Mul | BinOp::MulWithOverflow) && exact.is_none();
+                let inside = product && self.product_within(state, a, b, range);
+                let integral = ty.is_some_and(|it| matches!(it.kind(), TyKind::Int(_) | TyKind::Uint(_)));
+                if self.mode == Mode::Overflow
+                    && integral
+                    && let (Some(ty), Some(range)) = (ty, range)
+                {
+                    match op {
+                        BinOp::Shl => self.note_shift(state, ty, b),
+                        _ => {
+                            #[cfg(test)]
+                            let planted = matches!(op, BinOp::Add | BinOp::AddWithOverflow)
+                                && PLANT_ADD_ALWAYS_FITS.get();
+                            #[cfg(not(test))]
+                            let planted = false;
+                            let shown = (fits || inside || planted) && !wide(ty);
+                            let missing = (!shown)
+                                .then(|| self.missing_arith(state, op, (a, b), exact.as_ref(), ty, range));
+                            self.note(OpKind::Arith, missing);
+                        }
+                    }
+                }
                 let pair = |this: &mut Self, value, flag| {
                     this.term(Term::Agg(NO_VARIANT, Box::new([value, flag])), ANY)
                 };
+                let shift = matches!(op, BinOp::Shl);
                 match (exact, range) {
                     (Some(form), Some(_)) if fits && !checked => self.lin(form),
                     (Some(form), Some(_)) if fits => {
                         let (value, flag) = (self.lin(form), self.constant(0));
                         pair(self, value, flag)
                     }
+                    // An overflow proof takes an operation it could not show to fit to fit:
+                    // it is reported, and a run past it with overflow checks had it fit.
+                    // `<<` drops its high bits in every profile, so it is not one.
+                    (Some(form), Some(_)) if self.mode == Mode::Overflow && !shift => {
+                        let value = self.fresh(ty);
+                        let exact = self.lin(form);
+                        self.put(state, Atom::new(Rel::Eq, value, exact));
+                        match checked {
+                            true => {
+                                let flag = self.constant(0);
+                                pair(self, value, flag)
+                            }
+                            false => value,
+                        }
+                    }
                     (Some(form), Some(_)) if checked => {
                         let (value, flag) = (self.fresh(ty), self.fresh(None));
                         self.ranges[flag as usize] = (0, 1);
                         let (exact, zero) = (self.lin(form), self.constant(0));
-                        state.put_imp((
+                        self.put_imp(state, (
                             Atom::new(Rel::Eq, flag, zero),
                             Atom::new(Rel::Eq, value, exact),
                         ));
@@ -1715,24 +3255,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                         }
                     }
                     _ if checked => {
-                        // A product of two unknowns: its check holds when every product of
-                        // their bounds fits the type.
-                        let ((low_a, high_a), (low_b, high_b)) =
-                            (self.bounds(state, a), self.bounds(state, b));
-                        let ends = [
-                            low_a.checked_mul(low_b),
-                            low_a.checked_mul(high_b),
-                            high_a.checked_mul(low_b),
-                            high_a.checked_mul(high_b),
-                        ];
-                        let inside = match (ends, range) {
-                            ([Some(a), Some(b), Some(c), Some(d)], Some((least, most))) => {
-                                least <= a.min(b).min(c).min(d) && a.max(b).max(c).max(d) <= most
-                            }
-                            _ => false,
-                        };
                         let value = self.fresh(ty);
-                        let flag = match inside {
+                        let flag = match inside || self.mode == Mode::Overflow {
                             true => self.constant(0),
                             false => {
                                 let flag = self.fresh(None);
@@ -1755,6 +3279,26 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let ty = self.operand_ty(left);
                 let integral = ty.is_some_and(|it| int_range(it, self.word).is_some());
                 let (a, b) = (self.operand(state, left), self.operand(state, right));
+                if self.mode == Mode::Overflow
+                    && *op == BinOp::Shr
+                    && let Some(ty) = ty
+                    && matches!(ty.kind(), TyKind::Int(_) | TyKind::Uint(_))
+                {
+                    self.note_shift(state, ty, b);
+                }
+                // Two constants: the quotient itself (`i32::MAX / 2`). `Div` truncates toward 0
+                // as `checked_div` does; a divisor of 0 or `MIN / -1` was refused by its check.
+                if integral
+                    && let (Some(x), Some(y)) = (self.const_of(a), self.const_of(b))
+                {
+                    let folded = match op {
+                        BinOp::Div => x.checked_div(y),
+                        _ => u32::try_from(y).ok().filter(|&it| it < 128).map(|it| x >> it),
+                    };
+                    if let Some(value) = folded {
+                        return self.constant(value);
+                    }
+                }
                 let by = match (op, self.const_of(b)) {
                     (BinOp::Div, Some(by)) if by > 0 => Some(by),
                     (BinOp::Shr, Some(by)) if (0..=100).contains(&by) => Some(1i128 << by),
@@ -1767,19 +3311,19 @@ impl<'a, 'db> Solver<'a, 'db> {
                         let quotient = self.fresh(ty);
                         let single: Form = (vec![(quotient, 1)], 0); // alloc: one term
                         let none: Form = (Vec::new(), 0);
-                        state.put(Atom::new(Rel::Le, zero, quotient));
-                        state.put(Atom::new(Rel::Le, quotient, a));
+                        self.put(state, Atom::new(Rel::Le, zero, quotient));
+                        self.put(state, Atom::new(Rel::Le, quotient, a));
                         if let Some(low) = form_add(&none, &single, by) {
                             let top = form_add(&low, &(Vec::new(), by - 1), 1);
                             let low = self.lin(low);
-                            state.put(Atom::new(Rel::Le, low, a));
+                            self.put(state, Atom::new(Rel::Le, low, a));
                             if let Some(top) = top {
                                 let top = self.lin(top);
-                                state.put(Atom::new(Rel::Le, a, top));
+                                self.put(state, Atom::new(Rel::Le, a, top));
                             }
                         }
                         if by >= 2 && self.entails(state, Atom::new(Rel::Lt, zero, a)) {
-                            state.put(Atom::new(Rel::Lt, quotient, a));
+                            self.put(state, Atom::new(Rel::Lt, quotient, a));
                         }
                         quotient
                     }
@@ -1788,6 +3332,45 @@ impl<'a, 'db> Solver<'a, 'db> {
                         self.fresh(Some(ty))
                     }
                 }
+            }
+            // `x & m` of a constant `m >= 0` is in `0..=m`, and at most `x` when `x >= 0`;
+            // `x % d` of `x >= 0` and `d > 0` is in `0..d`, and at most `x`: the masks and
+            // remainders that say which bits or which slot is meant.
+            Rvalue::BinaryOp(op @ (BinOp::BitAnd | BinOp::Rem), left, right)
+                if self.operand_ty(left).is_some_and(|it| {
+                    matches!(it.kind(), TyKind::Int(_) | TyKind::Uint(_))
+                }) =>
+            {
+                let ty = self.operand_ty(left);
+                let (a, b) = (self.operand(state, left), self.operand(state, right));
+                let zero = self.constant(0);
+                let natural =
+                    |this: &Self, state: &State, it| this.entails(state, Atom::new(Rel::Le, zero, it));
+                let result = self.fresh(ty);
+                match op {
+                    BinOp::BitAnd => {
+                        let mask = [(a, b), (b, a)].into_iter().find_map(|(value, mask)| {
+                            self.const_of(mask).filter(|&it| it >= 0).map(|it| (value, it))
+                        });
+                        if let Some((value, mask)) = mask {
+                            let mask = self.constant(mask);
+                            self.put(state, Atom::new(Rel::Le, zero, result));
+                            self.put(state, Atom::new(Rel::Le, result, mask));
+                            if natural(self, state, value) {
+                                self.put(state, Atom::new(Rel::Le, result, value));
+                            }
+                        }
+                    }
+                    _ => {
+                        let positive = self.entails(state, Atom::new(Rel::Lt, zero, b));
+                        if positive && natural(self, state, a) {
+                            self.put(state, Atom::new(Rel::Le, zero, result));
+                            self.put(state, Atom::new(Rel::Lt, result, b));
+                            self.put(state, Atom::new(Rel::Le, result, a));
+                        }
+                    }
+                }
+                result
             }
             Rvalue::BinaryOp(op, left, right) => {
                 let rel = match op {
@@ -1827,7 +3410,15 @@ impl<'a, 'db> Solver<'a, 'db> {
                         // alloc: the aggregate's fields, once per term
                         let fields: Box<[TermId]> =
                             operands.iter().map(|it| self.operand(state, it)).collect();
-                        self.term(Term::Agg(variant, fields), ANY)
+                        let built = self.term(Term::Agg(variant, fields), ANY);
+                        // A struct with an invariant is shown it where it is built.
+                        if self.recording
+                            && let AggregateKind::Adt(VariantId::StructId(it), _) = kind
+                        {
+                            let ty = self.place_ty(to);
+                            self.check_built(state, *it, built, ty);
+                        }
+                        built
                     }
                     None => self.fresh(None),
                 }
@@ -1844,9 +3435,19 @@ impl<'a, 'db> Solver<'a, 'db> {
         let data = self.blocks[block as usize];
         for (stmt, statement) in data.statements.iter().enumerate() {
             self.at = (block, stmt as u32);
+            let _ = self.charge(1);
             self.made = 0;
             self.kill_point(state, self.at);
+            self.span = statement.span;
             if let StatementKind::Assign(to, rvalue) = &statement.kind {
+                // A field of a struct with an invariant written or lent `&mut` outside a
+                // `&mut` parameter of it is refused (`obligations`).
+                if self.recording {
+                    self.check_write(to, false);
+                    if let Rvalue::Ref(BorrowKind::Mut { .. }, place) = rvalue {
+                        self.check_write(place, true);
+                    }
+                }
                 let value = self.rvalue(state, to, rvalue);
                 self.write(state, to, value);
             }
@@ -1891,6 +3492,15 @@ impl<'a, 'db> Solver<'a, 'db> {
                     out.edges.push((index(targets.otherwise()) as u32, rest));
                 }
             }
+            // An overflow check proves nothing of an overflow proof: the operation it guards
+            // made its own verdict and took itself to fit, which a crate built without the
+            // check must agree with.
+            TerminatorKind::Assert { msg, target, .. }
+                if self.mode == Mode::Overflow && msg.is_optional_overflow_check() =>
+            {
+                out.safe = true;
+                out.edges.push((index(*target) as u32, state.clone()));
+            }
             TerminatorKind::Assert { cond, expected, target, cleanup, .. } => {
                 let value = self.operand(state, cond);
                 let want = self.constant(i128::from(*expected));
@@ -1932,11 +3542,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                             runs = self.assume(&mut returned, goal);
                         }
                         if let Some((local, value)) = call.sets {
-                            returned.vals.set(local as usize, value);
+                            returned.vals.set(local as usize, value, &self.marks);
                         }
                         self.write(&mut returned, destination, call.result);
                         for (premise, then) in call.implies {
-                            returned.put_imp((premise, then));
+                            self.put_imp(&mut returned, (premise, then));
                         }
                         runs = runs && self.saturate(&mut returned);
                         for fact in call.facts {
@@ -1947,15 +3557,21 @@ impl<'a, 'db> Solver<'a, 'db> {
                         }
                     }
                     None => {
+                        // What the callee's contract and the types' invariants need of the
+                        // arguments as they are now, before the call may change them.
+                        let ty = self.place_ty(destination);
+                        let contracted = self.check_call(state, func, args, ty, terminator.span);
                         self.bump(state);
                         if let Some(cleanup) = cleanup {
                             out.edges.push((index(*cleanup) as u32, state.clone()));
                         }
                         if let Some(target) = target {
-                            let ty = self.place_ty(destination);
                             let result = self.fresh(Some(ty));
                             let mut returned = state.clone();
                             self.write(&mut returned, destination, result);
+                            if let Some(call) = &contracted {
+                                self.after_call(&mut returned, call, result, ty);
+                            }
                             out.edges.push((index(*target) as u32, returned));
                         }
                     }
@@ -1977,8 +3593,9 @@ impl<'a, 'db> Solver<'a, 'db> {
                 self.write(state, place, value);
                 out.edges.push((index(*target) as u32, state.clone()));
             }
-            TerminatorKind::Return
-            | TerminatorKind::Unreachable
+            // The body's `ensures`, and the invariant of what each `&mut` parameter leads to.
+            TerminatorKind::Return => self.check_return(state, terminator.span),
+            TerminatorKind::Unreachable
             | TerminatorKind::UnwindResume
             | TerminatorKind::Abort
             | TerminatorKind::TailCall { .. }
@@ -1987,6 +3604,8 @@ impl<'a, 'db> Solver<'a, 'db> {
             | TerminatorKind::ComptimeFor { .. }
             | TerminatorKind::ComptimeNext { .. } => {}
         }
+        // Each edge leaves with a copy of the state.
+        let _ = self.charge(state.size().saturating_mul(out.edges.len() as u64));
         out
     }
 
@@ -2012,44 +3631,57 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// The entry state of `block` from the states along the edges into it, or none when no
     /// edge is feasible. `prior` is its entry state the last time, which the joined slots'
     /// bounds are widened against.
+    ///
+    /// One path with nothing joined at the block is its state as it is. Otherwise a join
+    /// looks only at the slots the paths' states do not share ([`Slots::diff`]) and those
+    /// whose marks say they may hold this join's unknowns ([`Slots::marked`]), never at the
+    /// rest; it intersects the facts from the path with the fewest; and what it works out of
+    /// a joined slot (the relations every path holds of it, its bounds, what a `bool` meant)
+    /// only for one that may be read from the block on ([`Self::live_at`]): a dead slot is one
+    /// unknown and nothing more.
     fn join(&mut self, block: u32, incoming: &mut [State], prior: Option<&State>) -> Option<State> {
-        // Nothing to merge or recreate on an edge that carries the only state and has
-        // never joined a slot. In particular don't walk every local of every basic block.
-        if let [only] = incoming && self.joined[block as usize].is_empty() {
-            return Some(only.clone());
+        if incoming.is_empty() {
+            return None;
         }
-        incoming.first()?;
-        // An unwritten slot is its entry unknown on every path. Only a slot present on an
-        // incoming path, or previously joined here, can differ or mention this join.
-        // A local overwritten before any read needs no phi. Addresses and the epoch are
-        // implicit reads (notably RangeNext through MutRef). This drops no path facts:
-        // their operands are immutable term IDs, not references to local slots.
-        let live = |slot: usize| slot == self.epoch_slot() || self.addressed[slot]
-            || self.read.contains(block as usize, slot);
-        let mut slots: Vec<usize> = incoming.iter()
-            .flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize))
-            .filter(|&slot| live(slot)).collect(); // alloc: written and live incoming slots
-        slots.extend(self.joined[block as usize].iter().map(|&k| if k >= FIELD { ((k - FIELD) / 64) as usize } else { k as usize }));
-        slots.sort_unstable();
-        slots.dedup();
+        if incoming.len() == 1 && self.joined[block as usize].is_empty() {
+            let empty = State::new(Slots::new(&[], &[]));
+            return Some(std::mem::replace(&mut incoming[0], empty));
+        }
         let before = self.joined[block as usize].len();
+        let mark = join_mark(block);
+        // The slots worth a look: where a path's value differs from the first's, and where the
+        // first's (so, when none differs, every path's) may mention this join's unknowns.
+        let mut looked = Vec::new_in(Global);
+        for other in incoming.iter().skip(1) {
+            incoming[0].vals.diff(&other.vals, &mut |slot| looked.push(slot as u32));
+        }
+        incoming[0].vals.marked(mark, &self.marks, &mut |slot| looked.push(slot as u32));
+        looked.sort_unstable();
+        looked.dedup();
+        let _ = self.charge(incoming.len() as u64 + looked.len() as u64);
         // A slot whose values differ is joined; so is one that holds an unknown this join
-        // makes again, until no more are found (each turn adds a slot).
+        // makes again, until no more are found (each turn adds a slot). `joined` is sorted.
         loop {
+            let _ = self.charge((looked.len() * incoming.len()) as u64);
             let mut grew = false;
-            for &slot in &slots {
-                let whole = slot as u32;
-                if self.joined[block as usize].contains(&whole) {
+            for &whole in &looked {
+                let slot = whole as usize;
+                if self.joined[block as usize].binary_search(&whole).is_ok() {
                     continue;
                 }
-                let value = incoming[0].vals.get(slot);
-                let differ = incoming.iter().any(|it| it.vals.get(slot) != value);
+                // A slot nothing reads from here on is one unknown, whatever the paths say.
+                if !self.live_at(block, slot) {
+                    insert_sorted(&mut self.joined[block as usize], whole);
+                    grew = true;
+                    continue;
+                }
+                let value = incoming[0].vals[slot];
+                let differ = incoming.iter().any(|it| it.vals[slot] != value);
                 let joined = &self.joined[block as usize];
                 let stale = |key: Key| {
-                    matches!(key, Key::Join(at, of) if at == block && joined.contains(&of))
+                    matches!(key, Key::Join(at, of) if at == block && joined.binary_search(&of).is_ok())
                 };
-                let holds_stale = self.cyclic[block as usize]
-                    && incoming.iter().any(|it| self.mentions(it.vals.get(slot), &stale));
+                let holds_stale = incoming.iter().any(|it| self.mentions(it.vals[slot], &stale));
                 if !differ && !holds_stale {
                     continue;
                 }
@@ -2060,22 +3692,22 @@ impl<'a, 'db> Solver<'a, 'db> {
                     Some(count) if !holds_stale => {
                         for field in 0..count {
                             let key = FIELD + whole * 64 + field as u32;
-                            if self.joined[block as usize].contains(&key) {
+                            if self.joined[block as usize].binary_search(&key).is_ok() {
                                 continue;
                             }
-                            let of = |state: &State| match &self.terms[state.vals.get(slot) as usize] {
+                            let of = |state: &State| match &self.terms[state.vals[slot] as usize] {
                                 Term::Agg(_, fields) => fields[field],
                                 _ => unreachable!("`same_shape` saw an aggregate"),
                             };
                             let value = of(&incoming[0]);
                             if incoming.iter().any(|it| of(it) != value) {
-                                self.joined[block as usize].push(key);
+                                insert_sorted(&mut self.joined[block as usize], key);
                                 grew = true;
                             }
                         }
                     }
                     _ => {
-                        self.joined[block as usize].push(whole);
+                        insert_sorted(&mut self.joined[block as usize], whole);
                         grew = true;
                     }
                 }
@@ -2085,31 +3717,44 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
         }
         let joined = self.joined[block as usize].clone(); // clone: read while states change
-        let made = |key: Key| matches!(key, Key::Join(at, of) if at == block && joined.contains(&of));
+        let is_joined = |key: u32| joined.binary_search(&key).is_ok();
+        let made = |key: Key| matches!(key, Key::Join(at, of) if at == block && is_joined(of));
         // What every path holds of a joined integer against the values the paths bring for
         // it (a loop's `hi <= len`: `len` on the way in, `mid` on the way round): `j <= y`
         // and `y <= j` for each such value `y` that this join does not make again, kept when
         // every path's own value satisfies it in that path's state. Asked before the states
         // forget what this join makes again: a path round a loop proves it from what held of
         // the last turn's values.
+        // The slots joined whole, in order (a field's key is past every slot's number), and
+        // those with a field joined.
+        let wholes = &joined[..joined.partition_point(|&it| it < FIELD)];
+        let mut by_field: Vec<usize> = Vec::new_in(Global);
+        by_field.extend(
+            joined[wholes.len()..]
+                .iter()
+                .map(|&key| ((key - FIELD) / 64) as usize)
+                .filter(|&slot| slot < FIELD_LOCALS && !is_joined(slot as u32)),
+        );
+        by_field.dedup();
+        let _ = self.charge(joined.len() as u64);
         let mut invariants = Vec::new(); // alloc: the joined slots' relations, few
-        for &slot in &slots {
-            let whole = slot as u32;
+        for &whole in wholes {
+            let slot = whole as usize;
             let integer = self
                 .local_ty(slot)
                 .is_some_and(|ty| !ty.is_bool() && int_range(ty, self.word).is_some());
-            if !integer || !joined.contains(&whole) || !self.read.contains(block as usize, slot) {
+            if !integer || !self.live_at(block, slot) {
                 continue;
             }
             for at in 0..incoming.len().min(4) {
-                let anchor = incoming[at].vals.get(slot);
-                let repeated = incoming[..at].iter().any(|it| it.vals.get(slot) == anchor);
+                let anchor = incoming[at].vals[slot];
+                let repeated = incoming[..at].iter().any(|it| it.vals[slot] == anchor);
                 if repeated || self.mentions(anchor, &made) || self.const_of(anchor).is_some() {
                     continue;
                 }
                 for below in [true, false] {
                     let holds = incoming.iter().all(|it| {
-                        let value = it.vals.get(slot);
+                        let value = it.vals[slot];
                         let atom = match below {
                             true => Atom::new(Rel::Le, value, anchor),
                             false => Atom::new(Rel::Le, anchor, value),
@@ -2122,68 +3767,77 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
         }
-        // What this join makes again is forgotten in each state first.
+        // What this join makes again is forgotten in each state first. Never cut short by the
+        // work bound (a fact kept past what makes it true would be unsound): it is charged.
+        // Only a state whose marks have this join's bit can have one.
         for state in incoming.iter_mut() {
-            state.facts.retain(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
-            state.imps.retain(|Imp { then, premise }| {
+            if state.marks & mark == 0 {
+                continue;
+            }
+            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
+            state.retain_facts(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
+            state.retain_imps(|(premise, then)| {
                 ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, &made))
             });
         }
-        let mut state = State {
-            vals: incoming[0].vals.clone(), // clone: the joined state starts from the first
-            facts: incoming[0].facts.clone(),
-            imps: incoming[0].imps.clone(),
-        };
-        for other in incoming.iter().skip(1) {
-            state.facts.retain(|fact| other.has(*fact));
-            state.imps.retain(|imp| other.imps.binary_search(imp).is_ok());
+        // The joined state starts from the path with the fewest facts, and keeps what every
+        // other path has: a look-up per fact it has, per other path. Its slots are every
+        // path's where none differs, and the joined slots are made again below.
+        let base = (0..incoming.len())
+            .min_by_key(|&at| incoming[at].facts.len() + incoming[at].imps.len())
+            .unwrap_or(0);
+        let mut state = incoming[base].clone(); // clone: shared, O(1)
+        let _ = self.charge(state.size());
+        for (at, other) in incoming.iter().enumerate() {
+            if at == base {
+                continue;
+            }
+            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
+            state.retain_facts(|fact| other.has(fact));
+            state.retain_imps(|imp| other.has_imp(imp));
         }
         // The joined slots' values, with the bounds every path gives them.
         let mut bounds = Vec::new(); // alloc: the joined slots' bounds, few
-        for &slot in &slots {
-            let whole = slot as u32;
+        for &whole in wholes {
+            let slot = whole as usize;
             let ty = self.local_ty(slot);
-            if joined.contains(&whole) {
-                let value = self.unknown(Key::Join(block, whole), ty);
+            let value = self.unknown(Key::Join(block, whole), ty);
+            if self.live_at(block, slot) {
                 let (mut low, mut high) = (i128::MAX, i128::MIN);
                 for it in incoming.iter() {
-                    let (least, most) = self.bounds(it, it.vals.get(slot));
+                    let (least, most) = self.bounds(it, it.vals[slot]);
                     (low, high) = (low.min(least), high.max(most));
-                    let (floor, ceiling) = self.ranges[value as usize];
-                    if low <= floor && high >= ceiling { break; }
                 }
                 bounds.push((value, low, high));
-                state.vals.set(slot, value);
-                continue;
             }
-            let low_key = FIELD.wrapping_add(whole.wrapping_mul(64));
-            let any = slot < FIELD_LOCALS
-                && joined.iter().any(|&it| it >= low_key && it - low_key < 64);
-            if !any {
-                continue;
-            }
-            let (variant, mut fields) = match &self.terms[state.vals.get(slot) as usize] {
+            state.vals.set(slot, value, &self.marks);
+        }
+        for &slot in &by_field {
+            let whole = slot as u32;
+            let (variant, mut fields) = match &self.terms[state.vals[slot] as usize] {
                 Term::Agg(variant, fields) => (*variant, fields.clone()), // clone: rebuilt with its joined fields
                 _ => continue,
             };
             let mut changed = false;
             for field in 0..fields.len().min(64) {
                 let key = FIELD + whole * 64 + field as u32;
-                if slot < FIELD_LOCALS && joined.contains(&key) {
+                if slot < FIELD_LOCALS && is_joined(key) {
                     fields[field] = self.unknown(Key::Join(block, key), None);
                     changed = true;
                 }
             }
             if changed {
-                state.vals.set(slot, self.term(Term::Agg(variant, fields), ANY));
+                let value = self.term(Term::Agg(variant, fields), ANY);
+                state.vals.set(slot, value, &self.marks);
             }
         }
         for (slot, anchor, below) in invariants {
-            let value = state.vals.get(slot as usize);
-            state.put(match below {
+            let value = state.vals[slot as usize];
+            let fact = match below {
                 true => Atom::new(Rel::Le, value, anchor),
                 false => Atom::new(Rel::Le, anchor, value),
-            });
+            };
+            self.put(&mut state, fact);
         }
         // Widening: once the joined slots stop growing, a bound is kept only if the entry
         // state had it the last time, so bounds that move each turn (a counter's) are dropped
@@ -2196,37 +3850,43 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let low = self.constant(low);
                 let fact = Atom::new(Rel::Le, low, value);
                 if widen.is_none_or(|it| it.has(fact)) {
-                    state.put(fact);
+                    self.put(&mut state, fact);
                 }
             }
             if high < most {
                 let high = self.constant(high);
                 let fact = Atom::new(Rel::Le, value, high);
                 if widen.is_none_or(|it| it.has(fact)) {
-                    state.put(fact);
+                    self.put(&mut state, fact);
                 }
             }
         }
         // A joined `bool` keeps what each of its values meant on the paths that gave it (`a &&
         // b` is lowered to a temporary both arms write): what every path that can give the
         // value holds, once its own value is taken to be that, is implied by the value.
-        for &slot in &slots {
+        for &whole in wholes {
+            let slot = whole as usize;
             let is_bool = self.local_ty(slot).is_some_and(|ty| ty.is_bool());
-            if !is_bool || !joined.contains(&(slot as u32)) || !self.read.contains(block as usize, slot) {
+            if !is_bool || !self.live_at(block, slot) {
                 continue;
             }
-            let value = state.vals.get(slot);
+            let value = state.vals[slot];
             for case in [0, 1] {
                 let case = self.constant(case);
                 let mut common: Option<Vec<Atom>> = None;
                 for it in incoming.iter() {
-                    if common.as_ref().is_some_and(Vec::is_empty) { break; }
+                    let _ = self.charge(it.size());
                     let mut given = it.clone(); // clone: the path with the value assumed
-                    if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals.get(slot), case)) {
+                    if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals[slot], case)) {
                         continue;
                     }
+                    let _ = self.charge(given.facts.len() as u64);
                     common = Some(match common {
-                        None => given.facts,
+                        None => {
+                            let mut all = Vec::with_capacity_in(given.facts.len(), Global);
+                            all.extend(given.facts.iter().copied());
+                            all
+                        }
                         Some(mut have) => {
                             have.retain(|fact| given.has(*fact));
                             have
@@ -2236,7 +3896,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 for fact in common.unwrap_or_default() {
                     let stale = self.mentions(fact.a, &made) || self.mentions(fact.b, &made);
                     if !stale && !state.has(fact) {
-                        state.put_imp((Atom::new(Rel::Eq, value, case), fact));
+                        self.put_imp(&mut state, (Atom::new(Rel::Eq, value, case), fact));
                     }
                 }
             }
@@ -2255,18 +3915,19 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// the end of the body: 18,570 in one state of rune's `dispatch_action`, each re-asked
     /// at every `assume` (INTEGRATION I49). Forgetting only proves less.
     fn forget_dead_implications(&self, block: u32, state: &mut State) {
-        if state.imps.is_empty() {
+        if state.imps.len() == 0 {
             return;
         }
         let epoch = self.epoch_slot();
         // alloc: the unknowns still reachable, once per join
         let mut live: blaze_hash::HashSet<TermId, Global> = blaze_hash::HashSet::new_in(Global);
+        if !self.charge((epoch + 1 + state.facts.len()) as u64) { return; }
         for slot in 0..=epoch {
-            if slot == epoch || self.addressed[slot] || self.read.contains(block as usize, slot) {
-                self.unknowns(state.vals.get(slot), &mut |it| { live.insert(it); });
+            if self.live_at(block, slot) {
+                self.unknowns(state.vals[slot], &mut |it| { live.insert(it); });
             }
         }
-        for fact in &state.facts {
+        for fact in state.facts.iter() {
             self.unknowns(fact.a, &mut |it| { live.insert(it); });
             self.unknowns(fact.b, &mut |it| { live.insert(it); });
         }
@@ -2282,14 +3943,15 @@ impl<'a, 'db> Solver<'a, 'db> {
         };
         let mut kept = vec![false; state.imps.len()]; // alloc: a flag per implication, once per join
         loop {
+            if !self.charge(state.imps.len() as u64) { return; }
             let mut grew = false;
             for (at, imp) in state.imps.iter().enumerate() {
-                if kept[at] || !reaches(&live, imp.premise) {
+                if kept[at] || !reaches(&live, imp.0) {
                     continue;
                 }
                 kept[at] = true;
                 grew = true;
-                for side in [imp.then.a, imp.then.b] {
+                for side in [imp.1.a, imp.1.b] {
                     self.unknowns(side, &mut |it| { live.insert(it); });
                 }
             }
@@ -2298,7 +3960,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
         }
         let mut at = 0;
-        state.imps.retain(|_| {
+        state.retain_imps(|_| {
             at += 1;
             kept[at - 1]
         });
@@ -2306,6 +3968,7 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// Calls `found` with each unknown `term` is made of.
     fn unknowns(&self, term: TermId, found: &mut impl FnMut(TermId)) {
+        let _ = self.charge(1);
         match &self.terms[term as usize] {
             Term::Const(_) => {}
             Term::Unknown(_) => found(term),
@@ -2329,11 +3992,11 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// How many fields the aggregates all of `incoming` hold in `slot` have, when they are
     /// aggregates of one variant and length.
     fn same_shape(&self, incoming: &[State], slot: usize) -> Option<usize> {
-        let Term::Agg(variant, fields) = &self.terms[incoming[0].vals.get(slot) as usize] else {
+        let Term::Agg(variant, fields) = &self.terms[incoming[0].vals[slot] as usize] else {
             return None;
         };
         let same = incoming.iter().all(|it| {
-            matches!(&self.terms[it.vals.get(slot) as usize],
+            matches!(&self.terms[it.vals[slot] as usize],
                 Term::Agg(other, others) if other == variant && others.len() == fields.len())
         });
         (same && fields.len() <= 64).then_some(fields.len())
@@ -2348,29 +4011,64 @@ impl<'a, 'db> Solver<'a, 'db> {
         // alloc: the feasible edges out of each block, once per proof
         let mut edges: Vec<Vec<(u32, State)>> = vec![Vec::new(); count];
         let mut grown = vec![0usize; count]; // alloc: once per proof
-        let mut queued = vec![false; count]; // alloc: once per proof
-        // All feasible predecessors of an acyclic join run before the join. FIFO alone
-        // propagated each partial match down the shared cleanup before the next arm arrived.
-        let mut queue = std::collections::BinaryHeap::new(); // alloc: once per proof
-        let mut serial = 0usize;
-        let entry = self.entry();
-        queue.push(std::cmp::Reverse((self.rank[start], serial, start)));
-        queued[start] = true;
+        // The pass each block is queued for, `NONE` when it is not.
+        const NONE: u32 = u32::MAX;
+        let mut queued = vec![NONE; count]; // alloc: once per proof
+        // The worklist, in passes, each in reverse postorder ([`Self::rpo`]): a block is
+        // walked once every block before it on an acyclic path has been, so a join with many
+        // paths into it is made once, not once per path that arrives. A back edge (to a block
+        // no later in the order) queues its target for the next pass, so a loop's head is
+        // joined again only after the whole body has been walked with what the head gave it:
+        // each turn of the loop is one pass, and the head's widening sees every path round it.
+        let mut queue = std::collections::BinaryHeap::with_capacity(count); // alloc: this pass's worklist, once per proof
+        let mut next = std::collections::BinaryHeap::with_capacity(count); // alloc: the next pass's, once per proof
+        let mut pass = 0u32;
+        let order = self.reverse_postorder();
+        let mut rpo = vec![u32::MAX; count]; // alloc: one place per block, once per proof
+        for (at, &block) in order.iter().enumerate() {
+            rpo[block as usize] = at as u32;
+        }
+        self.rpo = rpo;
+        self.liveness(&order);
+        let mut entry = self.entry();
+        // The parameters' invariants and the body's `requires`: none in a program that states
+        // neither (docs/v2/plan/design/refined-values.md).
+        self.assume_entry(&mut entry);
+        queue.push(std::cmp::Reverse((self.rpo[start], start as u32)));
+        queued[start] = pass;
         let mut budget = count * 8 + 64;
-        while let Some(std::cmp::Reverse((_, _, block))) = queue.pop() {
-            queued[block] = false;
-            if budget == 0 {
+        loop {
+            let Some(std::cmp::Reverse((_, block))) = queue.pop() else {
+                if next.is_empty() {
+                    break;
+                }
+                std::mem::swap(&mut queue, &mut next);
+                pass += 1;
+                continue;
+            };
+            let block = block as usize;
+            // An entry left behind when the block was queued for an earlier pass.
+            if queued[block] != pass {
+                continue;
+            }
+            queued[block] = NONE;
+            // Out of work: no fixed point is claimed ([`Self::unsettled`] says which bound).
+            if budget == 0 || self.spent() {
                 return None;
             }
             budget -= 1;
+            self.at = (block as u32, 0);
+            let _ = self.charge(1);
             // alloc: the states into this block, a few
             let mut incoming: Vec<State> = Vec::new();
             if block == start {
+                let _ = self.charge(entry.size());
                 incoming.push(entry.clone()); // clone: the entry state joins the back edges
             }
             for &from in &self.predecessors[block] {
                 for (to, state) in &edges[from as usize] {
                     if *to as usize == block {
+                        let _ = self.charge(state.size());
                         incoming.push(state.clone()); // clone: joined in place
                     }
                 }
@@ -2383,28 +4081,43 @@ impl<'a, 'db> Solver<'a, 'db> {
                 entries[block] = prior;
                 continue;
             }
+            let _ = self.charge(joined.as_ref().map_or(0, State::size));
             entries[block] = joined.clone(); // clone: kept as the block's entry, walked below
-            #[cfg(test)]
-            WALKS.set(WALKS.get() + 1);
-            let out = match joined {
-                Some(mut state) => self.transfer(block as u32, &mut state).edges,
+            let mut out = match joined {
+                Some(mut state) => {
+                    #[cfg(test)]
+                    WALKS.set(WALKS.get() + 1);
+                    self.transfer(block as u32, &mut state).edges
+                }
                 None => Vec::new(),
             };
-            if self.terms.len() > 1 << 16 {
+            for (target, state) in out.iter_mut() {
+                self.clear_dead(block as u32, *target, state);
+            }
+            if self.terms.len() > 1 << 16 || self.spent() {
                 return None;
             }
+            let _ = self.charge(out.iter().map(|it| it.1.size()).sum());
             let changed = out != edges[block];
             // alloc: the blocks this one now goes to and went to before
             let mut targets: Vec<u32> = out.iter().map(|it| it.0).collect();
             targets.extend(edges[block].iter().map(|it| it.0));
             edges[block] = out;
             if changed {
+                let here = self.rpo[block];
                 for target in targets {
-                    if !queued[target as usize] {
-                        queued[target as usize] = true;
-                        serial += 1;
-                        let block = target as usize;
-                        queue.push(std::cmp::Reverse((self.rank[block], serial, block)));
+                    let (at, slot) = (self.rpo[target as usize], &mut queued[target as usize]);
+                    let entry = std::cmp::Reverse((at, target));
+                    if at > here {
+                        // Later in this pass. Queued for the next instead, it is walked now,
+                        // and that entry is left behind.
+                        if *slot != pass {
+                            *slot = pass;
+                            queue.push(entry);
+                        }
+                    } else if *slot == NONE {
+                        *slot = pass + 1;
+                        next.push(entry);
                     }
                 }
             }
@@ -2583,7 +4296,7 @@ const FIELD_LOCALS: usize = (FIELD / 64) as usize;
 
 /// The values an integer, `bool` or `char` type holds; none for any other type. `usize` and
 /// `isize` are `word` bits wide, the target's.
-fn int_range(ty: Ty<'_>, word: u32) -> Option<(i128, i128)> {
+pub(crate) fn int_range(ty: Ty<'_>, word: u32) -> Option<(i128, i128)> {
     let bits = |bits: u32, signed: bool| -> (i128, i128) {
         match (bits, signed) {
             (128, false) => (0, i128::MAX),
@@ -2607,6 +4320,11 @@ fn uint_bits(ty: UintTy, word: u32) -> u32 {
 
 fn int_bits(ty: IntTy, word: u32) -> u32 {
     ty.bit_width().map_or(word, |it| it as u32)
+}
+
+/// Whether `ty` is `u128`, whose values past `i128::MAX` the prover's integers do not hold.
+fn wide(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Uint(UintTy::U128))
 }
 
 /// How many bits an integer type has; 0 for any other type.
@@ -2661,6 +4379,26 @@ impl<'a, 'db> Solver<'a, 'db> {
         args: &[Operand],
         destination: &StoredPlace,
     ) -> Option<Applied> {
+        // The constructors: a new value of a stated length, from no receiver.
+        if matches!(model, Model::Empty | Model::FromElem) {
+            let result_ty = self.place_ty(destination);
+            let length = match model {
+                Model::FromElem => {
+                    let count = args.get(1)?;
+                    self.operand(state, count)
+                }
+                _ => self.constant(0),
+            };
+            let result = self.fresh(Some(result_ty));
+            let len = self.len(result);
+            return Some(Applied {
+                result,
+                requires: None,
+                facts: vec![Atom::new(Rel::Eq, len, length)], // alloc: one fact
+                implies: Vec::new(),
+                sets: None,
+            });
+        }
         let first = args.first()?;
         let first_ty = self.operand_ty(first)?;
         let receiver = self.operand(state, first);
@@ -2759,7 +4497,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let Term::MutRef(local, value, epoch) = self.terms[receiver as usize] else {
                     return None;
                 };
-                if epoch != state.vals.get(self.epoch_slot()) || state.vals.get(local as usize) != value {
+                if epoch != state.vals[self.epoch_slot()] || state.vals[local as usize] != value {
                     return None;
                 }
                 let (start, end) = (self.field(value, 0), self.field(value, 1));
@@ -2776,6 +4514,62 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let after = self.term(Term::Agg(NO_VARIANT, Box::new([next, end])), ANY);
                 applied.sets = Some((local, after));
             }
+            Model::Push | Model::Pop | Model::Clear | Model::Truncate | Model::ExtendFromSlice => {
+                // `&mut self` of a local this state knows, borrowed whole: it gets a new value
+                // whose length is stated against the old one's.
+                let Term::MutRef(local, value, epoch) = self.terms[receiver as usize] else {
+                    return None;
+                };
+                if epoch != state.vals[self.epoch_slot()] || state.vals[local as usize] != value {
+                    return None;
+                }
+                let local_ty = self.local_ty(local as usize);
+                let after = self.fresh(local_ty);
+                let (old, new) = (self.len(value), self.len(after));
+                let plus = |this: &mut Self, by: Form| {
+                    let sum = form_add(&this.form(old), &by, 1)?;
+                    Some(this.lin(sum))
+                };
+                applied.result = self.fresh(Some(result_ty));
+                match model {
+                    Model::Push => {
+                        let grown = plus(self, (Vec::new(), 1))?;
+                        applied.facts.push(Atom::new(Rel::Eq, new, grown));
+                    }
+                    Model::Pop => {
+                        let shrunk = plus(self, (Vec::new(), -1))?;
+                        let tag = self.discr(applied.result, Some(result_ty));
+                        let (some, none) = (Atom::new(Rel::Eq, tag, one), Atom::new(Rel::Eq, tag, zero));
+                        let (filled, empty) = (Atom::new(Rel::Lt, zero, old), Atom::new(Rel::Eq, old, zero));
+                        applied.facts.push(Atom::new(Rel::Le, new, old));
+                        applied.implies.push((filled, some));
+                        applied.implies.push((some, filled));
+                        applied.implies.push((empty, none));
+                        applied.implies.push((filled, Atom::new(Rel::Eq, new, shrunk)));
+                        applied.implies.push((empty, Atom::new(Rel::Eq, new, zero)));
+                    }
+                    Model::Clear => applied.facts.push(Atom::new(Rel::Eq, new, zero)),
+                    Model::Truncate => {
+                        let to = usize_arg(self)?;
+                        applied.facts.push(Atom::new(Rel::Le, new, to));
+                        applied.facts.push(Atom::new(Rel::Le, new, old));
+                        applied.implies.push((Atom::new(Rel::Le, old, to), Atom::new(Rel::Eq, new, old)));
+                        applied.implies.push((Atom::new(Rel::Le, to, old), Atom::new(Rel::Eq, new, to)));
+                    }
+                    _ => {
+                        let slice = args.get(1)?;
+                        let slice_ty = self.operand_ty(slice)?;
+                        let pointer = self.operand(state, slice);
+                        let of = self.deref(state, pointer, slice_ty);
+                        let added = self.len(of);
+                        let by = self.form(added);
+                        let grown = plus(self, by)?;
+                        applied.facts.push(Atom::new(Rel::Eq, new, grown));
+                    }
+                }
+                applied.sets = Some((local, after));
+            }
+            Model::Empty | Model::FromElem => unreachable!("constructors are applied above"),
             Model::Itself => {}
             Model::View => {
                 // `Vec`'s slice, `String`'s `str`: the same length, so the same value here.

@@ -15,18 +15,22 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// blaze's home: `$BLAZE_HOME`, else `%LOCALAPPDATA%\blaze` on Windows, else `.blaze` in
-/// `$HOME` (`blaze_core::platform::home`). None when no variable names one; the caller says
-/// what needed it.
-pub fn home() -> Option<PathBuf> {
-    blaze_core::platform::home::homes(|name| std::env::var_os(name)).ok().map(|it| it.home)
+/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home ([`blaze_core::home::user`]:
+/// `HOME`, else the system's record of the user).
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home, saying
+/// what was tried; the caller says what needed it.
+pub fn home() -> Result<PathBuf, blaze_core::home::NoHome> {
+    blaze_core::platform::home::config_dir(|k| std::env::var_os(k), blaze_core::home::record)
 }
 
-/// The home blaze has without `BLAZE_HOME`: what every home of the machine shares (its
-/// toolchains). None when no variable names one.
+/// The installation shared by this user's homes, independent of a `BLAZE_HOME` override.
 pub fn machine_home() -> Option<PathBuf> {
-    let var = |name: &str| (name != "BLAZE_HOME").then(|| std::env::var_os(name)).flatten();
-    blaze_core::platform::home::homes(var).ok().map(|it| it.home)
+    blaze_core::platform::home::config_dir(
+        |key| (key != "BLAZE_HOME").then(|| std::env::var_os(key)).flatten(), blaze_core::home::record,
+    ).ok()
 }
 
 /// `config.toml` under `home`.

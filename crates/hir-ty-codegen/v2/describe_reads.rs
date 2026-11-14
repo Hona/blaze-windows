@@ -17,7 +17,7 @@ use crate::v2::{ItemHashes, tests::policy};
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Census {
     // One count per visited read, not one count per executed query. Sorted for --nocapture.
-    reads: BTreeMap<&'static str, [usize; 3]>,
+    reads: BTreeMap<&'static str, [usize; 4]>,
     // In walk order, not sorted. Only direct function refs in this all-monomorphic fixture.
     calls: Vec<ItemKey>,
 }
@@ -25,8 +25,9 @@ struct Census {
 #[blaze_query::tracked(returns(ref))]
 fn census(db: &Db, func: FunctionId, requester: Origin, facing: Facing) -> Census {
     let instance = root_in(db, func);
-    let (described, reads) = capture_reads(db, || fresh_describe(db, &instance, requester, facing));
-    let Memoed::Described(Ok(answer)) = described else { panic!("{func:?}: {described:?}") };
+    let front = facing.front(db).unwrap();
+    let (answer, reads) = capture_reads(db, || front.described(db, &instance, &requester, facing.world));
+    let answer = answer.expect("the fixture's caller describes");
     let mut census = Census::default();
     for reference in answer.refs {
         if let FrontRef::Function(instance) = reference {
@@ -44,8 +45,9 @@ fn census(db: &Db, func: FunctionId, requester: Origin, facing: Facing) -> Censu
             let class = Bodies.classify(db, func.into(), Step::Borrowck, read.key, read.kind, name);
             let index = match class {
                 Classified::Covered => 0,
-                Classified::Fact(_) => 1,
+                Classified::Fact(_) | Classified::Scan(_) => 1,
                 Classified::Refused => 2,
+                Classified::Through => 3,
             };
             census.reads.entry(name).or_default()[index] += 1;
             ControlFlow::Continue(())
@@ -76,7 +78,7 @@ fn an_unchanged_callers_body_identity_cannot_validate_its_walk() {
             let caller = func("caller");
             let identity = Bodies.identity(db, caller.into()).expect("the caller's body identity");
             let measured = census(db, caller, front.origin(db, krate), front.facing(None));
-            eprintln!("{next}: describe reads (covered, fact, refused): {:?}", measured.reads);
+            eprintln!("{next}: describe reads (covered, fact, refused, through): {:?}", measured.reads);
             let unknown = measured.reads.get("code_walk").expect("the describe read code_walk");
             assert!(unknown[2] > 0, "the missing walk fact has changed: {unknown:?}");
             let calls = |name| measured.calls.contains(&item_key(db, ItemId::Function(func(name))));

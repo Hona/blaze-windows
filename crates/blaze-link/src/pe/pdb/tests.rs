@@ -398,12 +398,10 @@ enum Op {
     Empty(u8),
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    use hegel::generators as gs;
-    let n = tc.draw(gs::integers::<u8>().max_value(11));
-    let seed = tc.draw(gs::integers::<u8>());
-    match tc.draw(gs::integers::<u8>().max_value(6)) {
+fn op(tape: &blaze_sim::Tape) -> Op {
+    let n = tape.int_in(0..=11u8, "function");
+    let seed = tape.int::<u8>("body");
+    match tape.int_in(0..=6u8, "edit kind") {
         0..=2 => Op::Edit(n, seed),
         3 => Op::Add(n, seed),
         4 => Op::Remove(n),
@@ -489,13 +487,11 @@ fn refines(ops: &[Op], plant: Plant) -> Result<(), String> {
 /// The refinement: after any sequence of edits (bodies, added, removed and renamed
 /// functions, a function's code made none), the PDB patched by each link's change reads as the one laid out whole from the
 /// same program: the same procedures, places, rows and references.
-#[hegel::test(test_cases = 200)]
-fn a_pdb_kept_by_patches_reads_as_one_laid_out_whole(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(24));
-    if let Err(why) = refines(&ops, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_pdb_kept_by_patches_reads_as_one_laid_out_whole() {
+    blaze_sim::check(blaze_sim::Config::cases(200), |tape| {
+        refines(&tape.vec(0..=24, "edits", op), Plant::None)
+    });
 }
 
 /// The oracle's control: a patch applied without one of its writes is caught.

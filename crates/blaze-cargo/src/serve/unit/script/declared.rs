@@ -52,7 +52,7 @@ pub(super) fn given(
     }
     mutable.sort();
     mutable.dedup();
-    let mut disk = Disk::new(Vec::new()).declared_inputs(roots.to_vec());
+    let mut disk = Disk::new(Vec::new(), &job.input.looks).declared_inputs(roots.to_vec());
     for path in mutable {
         h.part(path.as_os_str().as_encoded_bytes());
         if path.parent().is_none() || !path.is_absolute() {
@@ -88,7 +88,6 @@ pub(super) fn given(
     // higher-priority executable appearing between runs. Do not open arbitrary devices.
     let tool = |h: &mut Hasher, path: &Path| -> Result<(), String> {
         use std::os::windows::fs::MetadataExt;
-        blaze_vfs::outside::looked(path);
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() => {
                 h.part(path.as_os_str().as_encoded_bytes())

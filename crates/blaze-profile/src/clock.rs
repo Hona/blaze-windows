@@ -58,7 +58,9 @@ pub fn mono_ns() -> i64 {
         assert_eq!(read, 0, "the monotonic clock is always readable");
         at.tv_sec as i64 * 1_000_000_000 + at.tv_nsec as i64
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    #[cfg(windows)]
+    { blaze_core::platform::clock::mono_ns() }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
     {
         let (_, began) = origin();
         began.elapsed().as_nanos() as i64

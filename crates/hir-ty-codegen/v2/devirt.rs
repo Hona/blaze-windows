@@ -570,7 +570,7 @@ fn contribution(
     Ok(Arc::new(Contribution {
         origin,
         edges,
-        count: super::frontend::counted_memo(db, i, ()),
+        count: super::frontend::counted(db, &i.0),
         sites,
         facts,
         foreign,

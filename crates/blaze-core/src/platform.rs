@@ -6,6 +6,9 @@
 //! is what a driver, the daemon or the command line has to know before it asks for them.
 
 pub mod command;
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "the shared Win32 performance counter and process creation time")]
+pub mod clock;
 pub mod env;
 pub mod home;
 #[cfg(windows)]

@@ -126,22 +126,26 @@ fn reading_relative(relative: &str) -> String {
 
 /// A workspace whose member `pkg` holds `data/a.txt`, with `secret.txt` in its root outside
 /// the member, in a fresh directory of its own: its real path.
-struct Workspace(std::path::PathBuf);
+struct Workspace {
+    top: std::path::PathBuf,
+    /// The directory `top` is (canonicalized), removed with it when this drops.
+    _held: blaze_core::temp::TempDir,
+}
 
 impl Workspace {
     fn new(name: &str) -> Workspace {
-        let top = std::env::temp_dir()
-            .join(format!("blaze-macro-eval-wasm-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&top);
+        let held = blaze_core::temp::TempDir::for_test(&format!("blaze-macro-eval-wasm-{name}-"));
+        let top = held.path();
         std::fs::create_dir_all(top.join("pkg/data")).unwrap();
         std::fs::write(top.join("pkg/data/a.txt"), "hello, macro").unwrap();
         std::fs::write(top.join("secret.txt"), "not yours").unwrap();
-        Workspace(std::fs::canonicalize(&top).unwrap())
+        let top = std::fs::canonicalize(top).unwrap();
+        Workspace { top, _held: held }
     }
 
     fn path(&self, rel: &str) -> String {
         // The walk's name of it, as the daemon names paths (`/C:/...` on Windows).
-        let top = crate::os::host::guest_path(self.0.to_str().unwrap());
+        let top = crate::os::host::guest_path(self.top.to_str().unwrap());
         if rel.is_empty() { top.into_owned() } else { format!("{top}/{rel}") }
     }
 
@@ -151,12 +155,6 @@ impl Workspace {
         env.set("CARGO_MANIFEST_DIR", self.path("pkg"));
         env.set("OUT_DIR", self.path("pkg/target/out"));
         env
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -276,7 +274,7 @@ fn at(start: u32, end: u32) -> Span {
 /// A store in `sim`, open and ready.
 fn opened(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         let durable = store.complete(completion, effects);
@@ -295,7 +293,7 @@ fn modules() -> Modules {
 fn opened_in(sim: &mut Sim, dir: &str, layers: &[&str]) -> Store {
     let mut effects = Vec::new();
     let layers = layers.iter().map(|it| FileName::new(it).unwrap()).collect();
-    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
+    let config = Config { dir: FileName::new(dir).unwrap(), layers, tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     run_until_idle(sim, &mut effects, |completion, effects| {
         store.complete(completion, effects);
@@ -603,7 +601,7 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
     let (library, _) = Library::load_with(&modules(), &binary(&reading_a()), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let first = env("1", "/tmp/blaze-lanes/profile-1855");
+    let first = env("1", "/profiles/blaze-lanes/profile-1855");
     let ran = library.expand(&db, &first, &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert_eq!(
         ran.seen,
@@ -633,11 +631,11 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
         matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }))
     };
     assert!(
-        found(&env("1", "/tmp/blaze-profile-1910")),
+        found(&env("1", "/profiles/blaze-profile-1910")),
         "a variable it never read made it miss"
     );
     assert!(
-        !found(&env("2", "/tmp/blaze-profile-1855")),
+        !found(&env("2", "/profiles/blaze-profile-1855")),
         "the variable it read changed and it was found"
     );
 }
@@ -740,7 +738,8 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     use blaze_cas::{Kind, Origin};
     let (key, code) = echo_code();
     let mut sim = Sim::new(5, Faults::default());
-    let mut base = opened_in(&mut sim, "base", &[]);
+    // A layer is a shared directory of writers' stores: this one has one writer, `w-1`.
+    let mut base = opened_in(&mut sim, "base/w-1", &[]);
     let put = Put { keep: Keep::Machine(key), value: code, what: WHAT.to_owned() };
     let published = publish(&mut base, vec![put]);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
@@ -750,7 +749,7 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     let mine = opened_in(&mut sim, "mine", &["base"]);
     let daemon = modules();
     let error = Library::load_with(&daemon, &echo(), Some(&mine.reader()), WHAT).unwrap_err();
-    let base = FileName::new("base").unwrap();
+    let base = FileName::new("base/w-1").unwrap();
     assert!(
         matches!(&error, LoadError::NotLocal { origin: Origin::Behind(dir), kind: Kind::Machine } if *dir == base),
         "{error:?}"

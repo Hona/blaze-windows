@@ -31,14 +31,30 @@ const RECEIVE: usize = 64 << 10;
 /// else `%LOCALAPPDATA%\blaze\v2.sock` on Windows, else `blaze/v2.sock` in `XDG_RUNTIME_DIR`,
 /// else `~/.cache/blaze/v2.sock`.
 pub fn socket() -> Result<PathBuf, String> {
-    Ok(blaze_core::platform::home::homes(|name| std::env::var_os(name))?.socket)
+    Ok(home()?.join("v2.sock"))
 }
 
-/// Where the daemon's socket lives: the directory of [`socket`].
+/// Where the daemon's socket lives: `BLAZE_HOME`, else `blaze` in `XDG_RUNTIME_DIR`, else
+/// `~/.cache/blaze` (`~` is [`blaze_core::home::user`]: `HOME`, else the system's record of
+/// the user).
 pub fn home() -> Result<PathBuf, String> {
-    let socket = socket()?;
-    // alloc: the directory, once a lookup
-    Ok(socket.parent().map_or_else(|| socket.clone(), Path::to_path_buf))
+    #[cfg(windows)]
+    { blaze_core::platform::home::config_dir(|k| std::env::var_os(k), blaze_core::home::record).map_err(|why| why.to_string()) }
+    #[cfg(not(windows))]
+    {
+    let set = |name| std::env::var_os(name).filter(|it| !it.is_empty());
+    if let Some(home) = set("BLAZE_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    if let Some(runtime) = set("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(runtime).join("blaze"));
+    }
+    let home = blaze_core::home::user().map_err(|why| {
+        // alloc: error path
+        format!("no BLAZE_HOME or XDG_RUNTIME_DIR says where the daemon's socket is, and {why}")
+    })?;
+    Ok(home.join(".cache/blaze"))
+    }
 }
 
 /// The checkout a manifest in `dir` is part of, whose absolute path names its head

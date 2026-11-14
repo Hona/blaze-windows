@@ -20,13 +20,14 @@ struct Scratch {
     pkg: String,
     out: String,
     secret: String,
+    /// The directory `top` is (canonicalized), removed with it when this drops.
+    _held: blaze_core::temp::TempDir,
 }
 
 impl Scratch {
     fn new(name: &str) -> Scratch {
-        let top =
-            std::env::temp_dir().join(format!("blaze-macro-eval-os-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&top);
+        let held = blaze_core::temp::TempDir::for_test(&format!("blaze-macro-eval-os-{name}-"));
+        let top = held.path();
         fs::create_dir_all(top.join("pkg/src")).unwrap();
         fs::create_dir_all(top.join("pkg/data")).unwrap();
         fs::create_dir_all(top.join("out")).unwrap();
@@ -39,10 +40,10 @@ impl Scratch {
         std::os::unix::fs::symlink("../secret.txt", top.join("pkg/escape")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("data/a.txt", top.join("pkg/inner")).unwrap();
-        let top = fs::canonicalize(&top).unwrap();
+        let top = fs::canonicalize(top).unwrap();
         let top_name = walk_name(&top);
         let real = |rel: &str| format!("{top_name}/{rel}");
-        Scratch { pkg: real("pkg"), out: real("out"), secret: real("secret.txt"), top, top_name }
+        Scratch { pkg: real("pkg"), out: real("out"), secret: real("secret.txt"), top, top_name, _held: held }
     }
 
     fn env(&self) -> Env {
@@ -51,12 +52,6 @@ impl Scratch {
         env.set(OUT_DIR, self.out.clone());
         env.set("FOO", "bar");
         env
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.top);
     }
 }
 

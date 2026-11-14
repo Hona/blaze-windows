@@ -58,9 +58,26 @@ pub fn homes(var: impl Fn(&str) -> Option<OsString>) -> Result<Homes, String> {
 /// The root as it is without `BLAZE_HOME`: the machine's directory.
 #[cfg(windows)]
 fn machine(set: &impl Fn(&str) -> Option<PathBuf>) -> Result<PathBuf, String> {
-    let local = set("LOCALAPPDATA")
-        .ok_or("no BLAZE_HOME or LOCALAPPDATA says where blaze keeps its state and builds")?;
-    Ok(local.join("blaze"))
+    local_data(set("LOCALAPPDATA")).map_err(|why| why.to_string())
+}
+
+#[cfg(windows)]
+fn local_data(local: Option<PathBuf>) -> Result<PathBuf, crate::home::NoHome> {
+    local.map(|dir| dir.join("blaze")).ok_or(crate::home::NoHome { record: crate::home::NoRecord::NoLocalAppData })
+}
+
+/// The installation/config directory, from this invocation's environment. On Windows
+/// shell-specific `HOME` and roaming profile directories never select a different blaze.
+pub fn config_dir(
+    var: impl Fn(&str) -> Option<OsString>,
+    record: impl FnOnce() -> Result<PathBuf, crate::home::NoRecord>,
+) -> Result<PathBuf, crate::home::NoHome> {
+    let set = |name: &str| var(name).filter(|it| !it.is_empty()).map(PathBuf::from);
+    if let Some(home) = set("BLAZE_HOME") { return Ok(home); }
+    #[cfg(windows)]
+    { let _ = record; local_data(set("LOCALAPPDATA")) }
+    #[cfg(not(windows))]
+    { Ok(crate::home::decide(var, record)?.join(".blaze")) }
 }
 
 #[cfg(not(windows))]

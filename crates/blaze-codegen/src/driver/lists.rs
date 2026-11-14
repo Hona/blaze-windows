@@ -79,6 +79,8 @@ struct FunctionRow {
     owner: Owner,
     made_as: crate::Made,
     identity: ContentId,
+    /// [`Described::abi`](crate::backend::Described::abi).
+    abi: ContentId,
     version: (ContentId, Result<ContentId, String>),
     /// Its function as its template was instantiated, before dedupe.
     made: Arc<CompiledFunction>,
@@ -271,6 +273,7 @@ impl Lists {
                 owner: node.described.owner,
                 made_as: crate::Made { backend: node.spec.backend, origin: node.least_origin },
                 identity: node.subject(),
+                abi: node.described.abi,
                 version: built.versions[at].clone(), // clone: per build kept by row
                 kept: kept.cloned(), // clone: a reference count
                 digest: digests::function_digest(node.unit.instance.code, &made.inlined),
@@ -407,6 +410,7 @@ impl Lists {
         set(&mut built.owners, key, |it| it.0, row.map(|row| (*key, row.owner, row.code)));
         set(&mut built.made, key, |it| it.0, row.map(|row| (*key, row.made_as)));
         set(&mut built.identities, key, |it| it.0, row.map(|row| (*key, row.identity)));
+        set(&mut built.abis, key, |it| it.0, row.map(|row| (*key, row.abi)));
         let kept = row.and_then(|row| row.kept.as_ref());
         // clone: a reference count
         set(&mut built.functions, key, |it| it.key, kept.cloned());
@@ -762,6 +766,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 },
                 made_as: crate::Made { backend: node.spec.backend, origin: node.least_origin },
                 identity: node.subject(),
+                abi: node.described.abi,
                 version,
                 made: function,
                 kept: Some(kept),
@@ -1046,6 +1051,7 @@ impl Lists {
             owners: Vec::with_capacity(count),
             versions: Vec::with_capacity(count),
             identities: Vec::with_capacity(count),
+            abis: Vec::with_capacity(count),
             made: Vec::with_capacity(count),
             kernel: Vec::with_capacity(count),
             digests: Digests {
@@ -1078,6 +1084,7 @@ impl Lists {
             built.owners.push((key, row.owner, row.code));
             built.made.push((key, row.made_as));
             built.identities.push((key, row.identity));
+            built.abis.push((key, row.abi));
             built.versions.push(row.version.clone()); // clone: the view's copy
             if let Some(kept) = &row.kept {
                 built.functions.push(kept.clone()); // clone: a reference count

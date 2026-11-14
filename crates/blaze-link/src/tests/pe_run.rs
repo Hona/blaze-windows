@@ -27,7 +27,7 @@ fn fixture(file: &str) -> PathBuf {
 /// bare input files.
 fn output(dll: Option<&str>, inputs: &[&str]) -> Output {
     let shared = dll.map(|it| (it.to_owned(), Vec::new()));
-    let mut output = crate::target::output(TRIPLE, shared, Debug::None, false).unwrap();
+    let mut output = crate::target::output(TRIPLE, shared, Debug::None, false, crate::target::RunsOn::Here).unwrap();
     // The effects' tags the simulated disk checks (`Disk::run`).
     output.tags = 1 << 32;
     output.link.inputs = inputs.iter().map(|it| fixture(it)).collect();
@@ -532,9 +532,10 @@ fn dbghelp_names_a_rust_function_and_its_line_from_the_pdb() {
     let spans = super::SpanTable {
         files: vec!["src/answer.rs".into()],
         spans: vec![
-            super::Position { file: 0, line: 7, column: 5 },
-            super::Position { file: 0, line: 8, column: 5 },
+            super::Span::At(super::Position { file: 0, line: 7, column: 5 }),
+            super::Span::At(super::Position { file: 0, line: 8, column: 5 }),
         ],
+        bases: Vec::new(),
     }
     .encode();
     let anchor = super::id(91);

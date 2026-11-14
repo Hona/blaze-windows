@@ -46,7 +46,7 @@ mod flight;
 mod ops;
 
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
     fmt::Write as _,
@@ -83,6 +83,9 @@ use crate::{
 /// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
 const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
+/// `fsync_flags` of an `IORING_OP_FSYNC`: the file's data and what a read of it needs (its
+/// length), as `fdatasync` ([`crate::Effect::Barrier`]).
+const IORING_FSYNC_DATASYNC: u32 = 1;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -337,6 +340,7 @@ const _: () = assert!(size_of::<ProvidedBuf>() == 16);
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct StatxTime {
     sec: i64,
     nsec: u32,
@@ -348,6 +352,7 @@ struct StatxTime {
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code, reason = "made by the kernel, read through a pointer")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout the kernel fills, read through a pointer")]
 struct Statx {
     mask: u32,
     /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
@@ -1186,6 +1191,13 @@ fn setup_refused(errno: i32, error: &io::Error, disabled: Option<u8>, kernel: &s
     out
 }
 
+/// An [`Effect::ReadMany`] in flight: the asker's parts, handed back with each `got` set, and
+/// how many of its requests have not ended.
+struct Batch {
+    parts: Vec<crate::ReadPart>,
+    left: usize,
+}
+
 /// A watch's read and what it reads for, in [`Uring::watchings`], which is not freed while the
 /// kernel may still write into `buffer` (see `Drop`).
 struct Watching {
@@ -1201,10 +1213,10 @@ struct Watching {
     journal: Option<FileName>,
 }
 
-/// A file opened for reading and appending, kept open: under its name in [`Uring::names`]
-/// while `named`, and kept while any request in flight uses it (its open among them). Opened
-/// through the ring into its slot of the table, by which every request on it names it; until
-/// `open`, they wait.
+/// A file opened for reading and appending (for a sync alone, reading: `read_only`), kept
+/// open: under its name in [`Uring::names`] while `named`, and kept while any request in
+/// flight uses it (its open among them). Opened through the ring into its slot of the table,
+/// by which every request on it names it; until `open`, they wait.
 struct Kept {
     fixed: Fixed,
     users: u32,
@@ -1217,6 +1229,31 @@ struct Kept {
     positional: bool,
     /// A positional file opened `O_DIRECT`, around the page cache.
     direct: bool,
+    /// Opened `O_RDONLY`: kept by a sync or a barrier of a name no request kept
+    /// ([`Wants::Flush`]), of a file that is there. A sync needs no write access, and a file
+    /// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+    /// Cleared where its open found the file missing and made it, as an append's open does
+    /// (`O_RDWR | O_APPEND | O_CREAT`).
+    ///
+    /// The invariant: nothing is written through a kept file while it is `read_only`.
+    /// Upheld by [`Uring::file`], the one way a request reaches a kept file by name: one that
+    /// writes ([`Wants::Append`]) and finds the name kept read-only lets that file go (its
+    /// requests in flight keep it until they end) and keeps the name opened to append; reads
+    /// and syncs take it as it is. A positional file is kept apart ([`Uring::positional`])
+    /// and is never read-only.
+    read_only: bool,
+}
+
+/// What a request asks of the file kept under its name ([`Uring::file`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wants {
+    /// Reads of a file already kept: never made.
+    Read,
+    /// Appends: opened to read and append, made with its directories where missing.
+    Append,
+    /// A sync or a barrier ([`crate::Effect::Sync`], [`crate::Effect::Barrier`]): opened
+    /// read-only where it is there; made, as for an append, only where it is missing.
+    Flush,
 }
 
 /// The bits of a `user_data` that are its link.
@@ -1277,7 +1314,7 @@ impl Offload {
         let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false) }); // alloc: setup, once per driver.
+        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
@@ -1662,6 +1699,18 @@ struct Wake {
     /// Set by the ring's thread before it waits in the kernel, cleared by it after, and by
     /// the first sender that wakes it.
     parked: AtomicBool,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]) with no completion of the
+    /// ring's own: set before `parked` is swapped, read by the ring's thread after it set
+    /// `parked`, so, both sequentially consistent, either the thread reads it before it sleeps
+    /// or the waker finds `parked` and writes the eventfd.
+    asked: AtomicBool,
+}
+
+impl crate::Wake for Wake {
+    fn wake(&self) {
+        self.asked.store(true, Ordering::SeqCst);
+        wake_ring(self);
+    }
 }
 
 /// Tells the ring's wait that work off the ring has sent its completion: a write of the
@@ -1689,6 +1738,13 @@ pub struct Uring {
     /// Each file opened for reads into and writes from memory ([`Effect::ReadInto`],
     /// [`Effect::WriteFrom`]), by its name: the store's pool's packs, opened once and kept.
     positional: HashMap<FileName, Handle<Kept>, Global>,
+    /// Each [`Effect::ReadMany`] in flight, by its tag: its parts, each read by a request of
+    /// its own on the ring (`ops::PART`), and how many of them are not in yet.
+    batches: HashMap<Tag, Batch, Global>,
+    /// The table [`crate::threads::run`] is handed for the work done off the ring, which reads
+    /// nothing into memory (this driver's reads are on the ring, `positional`'s): it stays
+    /// empty, allocating nothing.
+    descriptors: Arc<crate::descriptors::Descriptors>,
     /// Every request in flight or waiting, by the handle its `user_data` carries ([`data`]).
     /// Not freed while the kernel may still read or write what a request holds (see `Drop`).
     ops: ManuallyDrop<ops::Ops>,
@@ -1750,6 +1806,10 @@ pub struct Uring {
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     in_flight: usize,
+    /// Whether a [`crate::Waker`] was handed out ([`Driver::waker`]): a poll with nothing in
+    /// flight then waits for its wake, to its deadline, rather than returning at once (which
+    /// turned a caller's loop into a spin).
+    waker_given: Cell<bool>,
 }
 
 /// Where the host's effects are told: the channel of the work off the ring, and its wake.
@@ -1792,6 +1852,9 @@ impl Uring {
             kept: slab(KEPT)?,
             names: HashMap::new_in(Global),
             positional: HashMap::new_in(Global),
+            batches: HashMap::new_in(Global),
+            // alloc: setup, once per driver: an empty table, which nothing reads through.
+            descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
@@ -1828,6 +1891,7 @@ impl Uring {
             offload,
             locks: crate::locks::Locks::new(),
             in_flight: 0,
+            waker_given: Cell::new(false),
         })
     }
 
@@ -1861,15 +1925,22 @@ impl Uring {
         forget(&mut self.positional, &mut self.kept, name);
     }
 
-    /// The file kept under `name`, its open through the ring started where none is; `make`
-    /// makes it if missing, with its directories. Requests on it wait for the open
-    /// ([`Uring::prepared`]); where the driver's half of the table is full, the files kept
-    /// are let go (each request in flight holds its own until it ends) to make room.
-    fn file(&mut self, name: &FileName, make: bool) -> io::Result<Handle<Kept>> {
+    /// The file kept under `name` for what a request `wants`, its open through the ring
+    /// started where none is: an append's makes it if missing, with its directories; a
+    /// sync's opens it read-only, and makes it only where its open finds it missing.
+    /// Requests on it wait for the open ([`Uring::prepared`]); where the driver's half of the
+    /// table is full, the files kept are let go (each request in flight holds its own until
+    /// it ends) to make room.
+    fn file(&mut self, name: &FileName, wants: Wants) -> io::Result<Handle<Kept>> {
+        let make = wants != Wants::Read;
         if let Some(&file) = self.names.get(name) {
             let kept = self.kept.get_mut(file).expect("named files are kept");
-            kept.make |= make && !kept.open;
-            return Ok(file);
+            // `Kept::read_only`'s invariant: a write never goes through a read-only file.
+            if !(wants == Wants::Append && kept.read_only) {
+                kept.make |= make && !kept.open;
+                return Ok(file);
+            }
+            forget(&mut self.names, &mut self.kept, name);
         }
         let fixed = Fixed::unopened(&self.table);
         // Held by its open until it ends.
@@ -1881,6 +1952,7 @@ impl Uring {
             make,
             positional: false,
             direct: false,
+            read_only: wants != Wants::Append,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
@@ -1913,6 +1985,7 @@ impl Uring {
             make: false,
             positional: true,
             direct,
+            read_only: false,
         });
         // clone: the name once per file opened, as the key it is kept under.
         self.positional.insert(name.clone(), file);
@@ -1939,9 +2012,11 @@ impl Uring {
         span: &crate::Span,
         cache: crate::Cache,
         idle: bool,
+        part: Option<u32>,
     ) -> io::Result<()> {
-        let what = match kind {
-            Kind::ReadInto => "a read into memory of",
+        let what = match (kind, part) {
+            (Kind::ReadInto, None) => "a read into memory of",
+            (Kind::ReadInto, Some(_)) => "a batched read into memory of",
             _ => "a write from memory to",
         };
         let span = crate::spans::resolve(span, name, at, cache, what)
@@ -1957,11 +2032,84 @@ impl Uring {
         if idle {
             hot.flags |= ops::IDLE;
         }
+        if part.is_some() {
+            hot.flags |= ops::PART;
+        }
         let addr = span.addr();
-        let len = u32::try_from(span.len()).expect("a span's length is a u32");
-        let cold = Cold { at, names: [addr as u32, (addr >> 32) as u32, len, 0, 0], ..Cold::EMPTY };
+        let len = u32::try_from(span.len()).map_err(|_| {
+            // alloc: an error path.
+            io::Error::other(format!(
+                "{what} {name}: a span of {} bytes, past the u32 length one io_uring op carries",
+                span.len()
+            ))
+        })?;
+        let index = part.unwrap_or(0);
+        let cold =
+            Cold { at, names: [addr as u32, (addr >> 32) as u32, len, index, 0], ..Cold::EMPTY };
         self.start(hot, ops::NO_BYTES, cold);
         Ok(())
+    }
+
+    /// Starts [`Effect::ReadMany`] `tag`: each part a [`Kind::ReadInto`] of its own on its
+    /// file's kept positional descriptor, all written to the ring before the next submit, so
+    /// the batch is one `io_uring_enter` where the ring has room. A part refused before it is
+    /// asked (its span, its file's open) fails alone, at once; the batch is told when its last
+    /// part is in ([`Uring::read_part_ended`]).
+    fn read_many(
+        &mut self,
+        tag: Tag,
+        parts: Vec<crate::ReadPart>,
+        cache: crate::Cache,
+        idle: bool,
+    ) -> io::Result<()> {
+        let count = parts.len();
+        if count == 0 {
+            self.ready.push(Completion { tag, done: Done::ReadMany(parts) });
+            return Ok(());
+        }
+        if self.batches.contains_key(&tag) {
+            // alloc: an error path.
+            return Err(io::Error::other(format!("a batched read is in flight as {tag:?} already")));
+        }
+        // alloc: a slot of the table of batches, grown once to the most at once.
+        self.batches.insert(tag, Batch { parts, left: count });
+        for index in 0..count {
+            let (file, at, into) = {
+                let part = &self.batches[&tag].parts[index];
+                (part.file.clone(), part.at, part.into) // clone: a refcount
+            };
+            let index32 = u32::try_from(index).expect("a batch of at most u32::MAX parts");
+            if let Err(error) =
+                self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, Some(index32))
+            {
+                // alloc: an error path.
+                let why = IoError(format!("{file} at {at} ({} bytes): {error}", into.len));
+                self.read_part_ended(tag, index32, Done::Failed(why));
+            }
+        }
+        Ok(())
+    }
+
+    /// The part `index` of the batch `tag` ended as `done`; the batch is told once its last
+    /// part has.
+    pub(super) fn read_part_ended(&mut self, tag: Tag, index: u32, done: Done) {
+        let batch = self.batches.get_mut(&tag).expect("a part's batch in flight");
+        let part = &mut batch.parts[index as usize];
+        part.got = match done {
+            Done::ReadInto { len } => crate::Got::Read(len),
+            // alloc: an error path, its file and offset named.
+            Done::Failed(why) if why.0.starts_with(part.file.as_str()) => crate::Got::Failed(why),
+            Done::Failed(why) => crate::Got::Failed(IoError(format!(
+                "{} at {} ({} bytes): {}",
+                part.file, part.at, part.into.len, why.0
+            ))),
+            other => unreachable!("a part of a batched read ends as a read: {other:?}"),
+        };
+        batch.left -= 1;
+        if batch.left == 0 {
+            let batch = self.batches.remove(&tag).expect("just seen");
+            self.ready.push(Completion { tag, done: Done::ReadMany(batch.parts) });
+        }
     }
 
     /// A kept file's sync, done: [`Done::Synced`], unless the file kept under its name has no
@@ -2018,18 +2166,21 @@ impl Uring {
     /// in at a poll once the thread wakes the ring.
     fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
         let tag = effect.tag();
+        let descriptors = Arc::clone(&self.descriptors); // clone: a count, for the thread.
         self.off_ring_with(tag, move |root| {
             // What the thread waits in is said by file (every-wait-says-what): a write-back
             // of 162 MB is a second of this thread, and was in no span.
             let (op, file) = match &effect {
                 Effect::WriteBack { file, .. } => ("write back", file.as_str()),
+                Effect::Prewarm { file, .. } => ("prewarm", file.as_str()),
+                Effect::CopyData { from, .. } => ("copy the data of", from.as_str()),
                 Effect::List { dir, .. } => ("list", dir.as_str()),
                 Effect::Private { dir, .. } => ("make private", dir.as_str()),
                 _ => ("carry out", ""),
             };
             // alloc: clone: the file's name for the span, once a call off the ring
             let file = file.to_owned();
-            crate::lock::io_wait(op, &file, move || crate::threads::run(root, effect))
+            crate::lock::io_wait(op, &file, move || crate::threads::run(root, &descriptors, effect))
         })
     }
 
@@ -2091,6 +2242,20 @@ impl Uring {
         self.offloaded(tag);
         self.stampers.as_ref().expect("made above").start(job);
         Ok(())
+    }
+
+    /// Puts the read of the wake's eventfd in flight unless it is: asked before every wait in
+    /// the kernel, so a write of [`wake_ring`] (a [`crate::Waker`]'s, or a thread's off the
+    /// ring) completes it and ends the wait. Before, it was asked only while work off the ring
+    /// was out ([`Uring::offloaded`]), and a waker's write with none out ended nothing: the
+    /// thread slept to its next deadline, and the turn it was woken for waited with it. Its
+    /// completion is nobody's ([`Kind::Wake`] ends with no effect's completion); the eventfd's
+    /// count is level, so a write made before the read is asked completes it as it is asked.
+    fn read_wakes(&mut self) {
+        if self.offload.reading.is_none() {
+            let id = self.start(Hot::new(NOBODYS, Kind::Wake, 0), ops::NO_BYTES, Cold::EMPTY);
+            self.offload.reading = Some(id);
+        }
     }
 
     /// The completions the threads off the ring have sent.
@@ -2422,6 +2587,13 @@ impl Driver for Uring {
                 // On a thread of its own (`sync_file_range`, waited for there): the ring's
                 // submitter never waits for a device, and the asker waits for nothing.
                 back @ Effect::WriteBack { .. } => self.off_ring(back).map(|()| None),
+                // `mincore` of a mapping and a read-ahead call a run: on a thread of its own,
+                // as a write-back is.
+                warm @ Effect::Prewarm { .. } => self.off_ring(warm).map(|()| None),
+                // `lseek` and `copy_file_range` an extent: on a thread of its own, as the
+                // `FICLONE` of a clone is (`uring/files.rs`), since a copy of tens of MB of
+                // data is milliseconds the submitter must not wait in.
+                copy @ Effect::CopyData { .. } => self.off_ring(copy).map(|()| None),
                 // A directory's `fsync`, waited for on a thread of its own as a list is.
                 names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
@@ -2457,7 +2629,7 @@ impl Driver for Uring {
                 // One `mkdir` or `rmdir` here on the driver's thread, as a mode is set: the
                 // ring's `IORING_OP_MKDIRAT` and `IORING_OP_UNLINKAT` are not used for them yet.
                 effect @ (Effect::MakeDir { .. } | Effect::RemoveDir { .. }) => {
-                    crate::threads::run(&self.root, effect).map(Some)
+                    crate::threads::run(&self.root, &self.descriptors, effect).map(Some)
                 }
                 // No io_uring op takes a lock, and `flock` without waiting is one call: here on
                 // the driver's thread, as a mode is set.
@@ -2490,6 +2662,7 @@ impl Driver for Uring {
                 | Effect::SendTo { .. }
                 | Effect::RecvFrom { .. }
                 | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }
                 | Effect::Now { .. }
@@ -2499,7 +2672,7 @@ impl Driver for Uring {
                 // alone. Its buffer is the file's size, once it is open (a missing file's,
                 // empty).
                 Effect::ReadAll { file, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
                         hot.flags |= ops::WHOLE;
@@ -2509,7 +2682,7 @@ impl Driver for Uring {
                     false => self.load(tag, &file, 0, None).map(|()| None),
                 },
                 Effect::Read { file, at, len, .. } => match self.names.contains_key(&file) {
-                    true => self.file(&file, false).map(|file| {
+                    true => self.file(&file, Wants::Read).map(|file| {
                         let file = self.hold(file);
                         let hot = Hot::new(tag, Kind::Read, file.to_bits());
                         // alloc: the read's result, handed to its asker.
@@ -2520,25 +2693,37 @@ impl Driver for Uring {
                 },
                 Effect::ReadInto { file, at, into, cache, priority, .. } => {
                     let idle = priority == crate::Priority::Idle;
-                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle)
+                    self.on_memory(tag, Kind::ReadInto, &file, at, &into, cache, idle, None)
                         .map(|()| None)
                 }
+                Effect::ReadMany { parts, cache, priority, .. } => {
+                    let idle = priority == crate::Priority::Idle;
+                    self.read_many(tag, parts, cache, idle).map(|()| None)
+                }
                 Effect::WriteFrom { file, at, from, cache, .. } => self
-                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false)
+                    .on_memory(tag, Kind::WriteFrom, &file, at, &from, cache, false, None)
                     .map(|()| None),
                 // An empty one too, so it answers once the file it makes is there.
-                Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
+                Effect::Append { file, bytes, .. } => self.file(&file, Wants::Append).map(|file| {
                     let file = self.hold(file);
                     self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
                     None
                 }),
-                Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
+                Effect::Sync { file, .. } => self.file(&file, Wants::Flush).map(|file| {
                     let file = self.hold(file);
                     self.start(
                         Hot::new(tag, Kind::Sync, file.to_bits()),
                         ops::NO_BYTES,
                         Cold::EMPTY,
                     );
+                    None
+                }),
+                // The same request with `IORING_FSYNC_DATASYNC`: Linux's cheapest ordering.
+                Effect::Barrier { file, .. } => self.file(&file, Wants::Flush).map(|file| {
+                    let file = self.hold(file);
+                    let mut hot = Hot::new(tag, Kind::Sync, file.to_bits());
+                    hot.flags |= ops::DATA;
+                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
                 // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
@@ -2558,7 +2743,7 @@ impl Driver for Uring {
                     self.timers.insert(due, tag);
                     Ok(None)
                 }
-                Effect::Map { file, .. } => self.look(tag, Kind::Map, true, &file).map(|()| None),
+                Effect::Map { file, extent, .. } => self.map(tag, &file, extent).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
                     .and_then(|listener| {
@@ -2628,7 +2813,10 @@ impl Driver for Uring {
         self.reap();
         self.fire_timers();
         out.append(&mut self.ready);
-        if out.len() == before && self.in_flight > 0 {
+        // With nothing in flight only a waker can end the wait, so it is waited for once one
+        // has been handed out; with neither, nothing can come and the poll only looks (the
+        // rule on `Driver::waker`).
+        if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
             let clock = Monotonic::since(self.start);
             while out.len() == before {
                 // The caller's deadline or the next timer's, whichever is sooner.
@@ -2636,12 +2824,18 @@ impl Driver for Uring {
                     .timers
                     .next_deadline()
                     .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
+                // The eventfd's read, in flight before the thread parks: the write of a waker or
+                // of a thread off the ring ends the kernel's wait only by completing it.
+                self.read_wakes();
                 // Parked from here ([`Wake`]): a thread off the ring that sends its completion
                 // after this writes the eventfd; one that sent before it is found by the look
                 // below, and the kernel is not entered to wait.
                 self.offload.wake.parked.store(true, Ordering::SeqCst);
                 self.take_offloaded();
-                if !self.ready.is_empty() {
+                // A waker's ask ends the poll with what there is, which may be nothing: what
+                // it woke the loop for is in a queue of the caller's own.
+                let asked = self.offload.wake.asked.swap(false, Ordering::SeqCst);
+                if !self.ready.is_empty() || asked {
                     self.offload.wake.parked.store(false, Ordering::SeqCst);
                     out.append(&mut self.ready);
                     break;
@@ -2686,6 +2880,16 @@ impl Driver for Uring {
     fn now(&self) -> Duration {
         self.start.elapsed()
     }
+
+    fn wall_ns(&self) -> u64 {
+        crate::system_wall_ns()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        self.waker_given.set(true);
+        // clone: a handle to the ring's wake, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
+    }
 }
 
 #[cfg(test)]
@@ -2698,6 +2902,12 @@ mod tests {
         run_until_idle, threads::Threads,
     };
 
+    #[expect(
+        blaze::tmp_path,
+        reason = "the ring's tests take a root not made yet (one sweeps a root that is not there) and clone it as a \
+                  PathBuf; moving them onto TempDir means each of some fifty callers holds a guard and a child path \
+                  under it, to be done and run on Linux, where these tests compile"
+    )]
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3232,12 +3442,40 @@ mod tests {
         assert_ne!(at.port(), 0);
         assert_eq!(round_trip(&mut ring, &Address::Tcp(at)), round_tripped());
         assert_eq!(ring.local_addr(Tag(1)), None);
-        // Nothing listens there now.
-        let mut effects = vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(1) }];
+        // A connect to a port held and refusing, not to the port just let go of, which another
+        // test or process may bind before the connect (it failed 2 runs in 24 that way, told
+        // `[Connected { .. }]`).
+        let (refusing, _held) = held_refusing_port();
+        let mut effects = vec![Effect::Connect { at: Address::Tcp(refusing), tag: Tag(1) }];
         let mut seen = Vec::new();
         run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
         assert!(matches!(&seen[..], [Done::Failed(_)]), "{seen:?}");
+    }
+
+    /// A loopback address that refuses every connect for as long as the second value lives,
+    /// and that no other socket is handed meanwhile: the local port of a connection held open
+    /// (its client end, its listener). Closing a listener and connecting to its port instead
+    /// races whoever binds next; a port held this way cannot be taken by a bind to port 0.
+    ///
+    /// Why it refuses and is held, as each kernel's source reads:
+    /// - Linux: a SYN is matched against established sockets by their four-tuple, then against
+    ///   listening ones (`__inet_lookup_listener`); none listens on the port, so the kernel
+    ///   answers with a reset (`ECONNREFUSED`). The port is in the bind table with a socket that
+    ///   has no `SO_REUSEADDR`, so every other bind of it conflicts (`inet_csk_bind_conflict`),
+    ///   and port 0's search skips it.
+    /// - macOS (xnu, `tcp_input`): the wildcard lookup (`in_pcblookup_hash`) walks only sockets
+    ///   with no foreign address, so a connected one is not found, and a segment to no socket
+    ///   is dropped with a reset (`dropwithresetnosock`). A bind to port 0 searches with the
+    ///   wildcard (`in_pcbbind`, `wild = 1`), which counts the connected socket, so its port is
+    ///   never handed out. A socket bound and never listening would not do here: xnu finds it,
+    ///   sees `TCPS_CLOSED` and drops the SYN with no reset, so the connect hangs to its timeout.
+    fn held_refusing_port() -> (std::net::SocketAddr, (std::net::TcpListener, std::net::TcpStream)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = listener.local_addr().unwrap();
+        // A loopback connect to a listener completes in the kernel at once; the bound says so.
+        let client = std::net::TcpStream::connect_timeout(&to, Duration::from_secs(10)).unwrap();
+        (client.local_addr().unwrap(), (listener, client))
     }
 
     fn maps(driver: &mut impl Driver, root: &Path) -> BTreeMap<u64, String> {
@@ -3245,10 +3483,22 @@ mod tests {
         std::fs::write(root.join("store/pack"), b"packed").unwrap();
         std::fs::write(root.join("store/empty"), b"").unwrap();
         let name = |it: &str| FileName::new(it).unwrap();
+        let whole = crate::Extent::Whole;
         let mut effects = vec![
-            Effect::Map { file: name("store/pack"), tag: Tag(1) },
-            Effect::Map { file: name("store/empty"), tag: Tag(2) },
-            Effect::Map { file: name("store/missing"), tag: Tag(3) },
+            Effect::Map { file: name("store/pack"), extent: whole, tag: Tag(1) },
+            Effect::Map { file: name("store/empty"), extent: whole, tag: Tag(2) },
+            Effect::Map { file: name("store/missing"), extent: whole, tag: Tag(3) },
+            // A range sees its bytes and nothing past its length; one past the end fails.
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 2, len: 3 },
+                tag: Tag(4),
+            },
+            Effect::Map {
+                file: name("store/pack"),
+                extent: crate::Extent::Range { at: 4, len: 3 },
+                tag: Tag(5),
+            },
         ];
         let mut seen = BTreeMap::new();
         run_until_idle(driver, &mut effects, |done, _| {
@@ -3267,6 +3517,8 @@ mod tests {
                 (1, "mapped \"packed\"".to_owned()),
                 (2, "mapped \"\"".to_owned()),
                 (3, "failed".to_owned()),
+                (4, "mapped \"cke\"".to_owned()),
+                (5, "failed".to_owned()),
             ])
         );
         let root = dir("uring-map-threads");
@@ -3418,6 +3670,64 @@ mod tests {
             assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
         }
         assert_eq!(std::fs::read(root.join("log")).unwrap(), [0, 1, 2]);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant: a [`crate::Waker`]'s wake ends the poll under way while the ring's thread
+    /// is parked in the kernel with no work off the ring, first with nothing in flight (a poll
+    /// then waits for the wake, to its deadline, rather than returning at once and spinning its
+    /// caller), then with a timer far past the deadline in flight. Each wake comes once the
+    /// thread has parked and had time to enter the kernel, so it is the eventfd's write, not the
+    /// `asked` look before the enter, that ends the wait.
+    ///
+    /// Its control is the driver before the fix, where the eventfd was read only while work off
+    /// the ring was out (`Uring::offloaded`): the first poll returned at once and never parked
+    /// (the waking thread times out waiting for it), and with that skipped the second slept to
+    /// its deadline. That lost wake is why blaze-http's driver thread on Linux slept to an old
+    /// deadline with a request in its inbox (the registry client's
+    /// `requests_reuse_a_pooled_connection_and_a_refused_one_says_where`, "no answer ... in 10s").
+    #[test]
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        const BOUND: Duration = Duration::from_secs(20);
+        /// How long the waking thread lets the parked thread get into `io_uring_enter`.
+        const SETTLE: Duration = Duration::from_millis(100);
+        let root = dir("uring-wake");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let waker = driver.waker().expect("the ring driver has a waker");
+        for timer_in_flight in [false, true] {
+            if timer_in_flight {
+                let mut effects = vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }];
+                driver.submit(&mut effects);
+            }
+            assert_eq!(driver.in_flight(), usize::from(timer_in_flight));
+            // clone: the wake's count and the waker, for the waking thread.
+            let (parked, waker) = (Arc::clone(&driver.offload.wake), waker.clone());
+            let waking = std::thread::spawn(move || {
+                blaze_spin::SpinWait::within("the ring's thread to park", BOUND, || {
+                    parked.parked.load(Ordering::SeqCst)
+                });
+                let clock = Monotonic::new();
+                wait::sleep_until(
+                    "the parked ring's thread to enter the kernel",
+                    Deadline::after(clock.now(), SETTLE),
+                    &clock,
+                )
+                .unwrap();
+                waker.wake();
+            });
+            let began = Instant::now();
+            let mut out = Vec::new();
+            driver.poll(&mut out, Deadline::after(driver.now(), BOUND));
+            let waited = began.elapsed();
+            waking.join().expect("the waking thread saw the ring's thread park, and woke it");
+            assert!(out.is_empty(), "a wake completes nothing: {out:?}");
+            assert!(
+                waited >= SETTLE && waited < BOUND / 2,
+                "with a timer in flight: {timer_in_flight}, the poll waited {waited:?}: the wake did not end it"
+            );
+        }
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4030,8 +4340,32 @@ mod tests {
     }
 
     /// Each request in flight, by its handle.
+    /// The effects' requests in flight. The read of the wake's eventfd is the driver's own,
+    /// in flight across every wait once a waker is given, and no effect's: it is left out.
     fn requests(driver: &Uring) -> Vec<Id> {
-        driver.ops.iter().map(|(id, _)| id).collect()
+        driver.ops.iter().filter(|(_, hot)| hot.kind != Kind::Wake).map(|(id, _)| id).collect()
+    }
+
+    /// The invariant: a sync and a barrier of a file sealed read-only succeed through the
+    /// ring and through the threads driver, and of a missing file make it
+    /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control); on the ring a file a
+    /// sync kept read-only (`Kept::read_only`) is let go by the append after it, which writes
+    /// through a descriptor of its own.
+    #[test]
+    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+        let root = dir("uring-sync-sealed");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut driver, &root);
+        let plain = FileName::new("sealed/plain").unwrap();
+        let kept = driver.names.get(&plain).copied().expect("the append's file is named");
+        assert!(!driver.kept.get(kept).expect("kept").read_only, "the append's file is kept");
+        drop(driver);
+        let threads = dir("uring-sync-sealed-threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        crate::fs::assert_syncs_a_sealed_file(&mut Threads::new(&threads, 2), &threads);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(threads).unwrap();
     }
 
     /// A completion that comes after its request ended, once the request's slot holds another

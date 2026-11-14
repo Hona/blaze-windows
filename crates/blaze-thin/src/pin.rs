@@ -56,10 +56,21 @@ pub fn stamp(path: &Path) -> Result<Option<Stamp>, ()> {
 /// The first line of a kept lookup: its format's name and version.
 pub const KEPT: &str = "blaze pin lookup 1";
 
-/// blaze's home, where what it installs and what its user says live
-/// (`blaze_core::platform::home`, as `blaze_manifest::user_config::home` finds it).
-pub fn home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
-    blaze_core::platform::home::homes(var).ok().map(|it| it.home)
+/// blaze's home, where what it installs and what its user says live: `$BLAZE_HOME`, else
+/// `.blaze` in the user's home ([`blaze_core::home::decide`] of `var` and `record`, the
+/// system's record of the user, asked only when no variable answers: a driver passes
+/// [`blaze_core::home::record`]). The rule of `blaze_manifest::user_config::home`, which this
+/// crate does not link (it brings cargo's manifest schema); blaze-engine's tests hold the two
+/// to one answer.
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home.
+pub fn home(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    record: impl FnOnce() -> Result<PathBuf, blaze_core::home::NoRecord>,
+) -> Result<PathBuf, blaze_core::home::NoHome> {
+    blaze_core::platform::home::config_dir(var, record)
 }
 
 /// Where the lookup from `start` is kept under blaze's `home`: `pins/<hash of start>`. None
@@ -191,12 +202,9 @@ pub fn says(this: &str, found: &Found) -> String {
 mod tests {
     use super::*;
 
-    /// A directory of this test's under the system's temporary one, emptied.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("blaze-thin-pin-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A new directory of this test's, removed when it drops.
+    fn scratch(name: &str) -> blaze_core::temp::TempDir {
+        blaze_core::temp::TempDir::for_test(&format!("blaze-thin-pin-{name}-"))
     }
 
     fn keep(home: &Path, start: &Path, lines: &str) {
@@ -208,13 +216,15 @@ mod tests {
 
     #[test]
     fn nothing_kept_is_the_engines_to_decide() {
-        let home = scratch("none");
+        let held = scratch("none");
+        let home = held.path();
         assert_eq!(here(&home, Path::new("/w"), "0.0.0-dev"), Err(Unsure::NotKept));
     }
 
     #[test]
     fn a_kept_lookup_holds_while_its_stamps_do_and_names_who_runs() {
-        let home = scratch("kept");
+        let held = scratch("kept");
+        let home = held.path();
         let start = home.join("w");
         std::fs::create_dir_all(&start).unwrap();
         let manifest = start.join("Cargo.toml");
@@ -238,12 +248,12 @@ mod tests {
         // The manifest grew: the lookup is no longer of it.
         std::fs::write(&manifest, "[package]\nname = \"a\"\nversion = \"1.0.0\"\n").unwrap();
         assert_eq!(here(&home, &start, "0.20261101.1"), Err(Unsure::NotKept));
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn a_file_that_is_not_the_launchers_is_not_read_as_one() {
-        let home = scratch("bad");
+        let held = scratch("bad");
+        let home = held.path();
         let start = Path::new("/w");
         let file = kept_at(&home, start).unwrap();
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -254,6 +264,5 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             assert_eq!(kept(&file, start, |_| true), None, "{text:?}");
         }
-        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -34,10 +34,11 @@ span.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
 blaze-items.workspace = true
-hegeltest.workspace = true
 hir-ty-pure.workspace = true
 hir-ty.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

@@ -768,9 +768,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
-// The whole file mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix. Windows
-// refuses to replace or cut a file a view of which is open.
-pub(crate) use crate::fs::map;
+pub(crate) use crate::fs::map_extent;
 
 #[cfg(test)]
 mod image_tests {

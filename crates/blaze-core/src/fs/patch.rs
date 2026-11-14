@@ -114,7 +114,6 @@ mod power_cut {
         PATCH_PUBLICATION,
         PublishStep::{self, *},
     };
-    use hegel::{TestCase, generators as gs};
 
     /// Before sync, a crash can expose the old or new namespace and any subset
     /// of the dirty sectors. Power can fail after any individual range write.
@@ -149,9 +148,11 @@ mod power_cut {
     }
 
     /// The invariant: absent or old or new, never a public mix of the two generations.
-    #[hegel::test(test_cases = 128)]
-    fn every_power_cut_of_a_patch_leaves_only_a_whole_public_generation(tc: TestCase) {
-        assert!(sound(&PATCH_PUBLICATION, tc.draw(gs::integers())));
+    #[test]
+    fn every_power_cut_of_a_patch_leaves_only_a_whole_public_generation() {
+        for torn in u8::MIN..=u8::MAX {
+            assert!(sound(&PATCH_PUBLICATION, torn), "torn sectors {torn:08b}");
+        }
     }
 
     #[test]

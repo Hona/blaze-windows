@@ -39,6 +39,18 @@ pub struct Conf {
     /// lint query keyed by the configuration is keyed by the profile's bytes.
     #[serde(skip)]
     pub profile: Option<crate::profile::Loaded>,
+    /// The measured items' held values the complexity lints read
+    /// ([`crate::baseline::items::load`], from the workspace ratchet's baselines directory):
+    /// hashed by the file's bytes, as the profile is. None when nothing loaded one: every item
+    /// over its bound is a finding then, which is what a bless runs under.
+    #[serde(skip)]
+    pub items: Option<crate::baseline::items::Loaded>,
+    /// What the workspace's root manifest grants its dependencies
+    /// (`[workspace.metadata.blaze.trust]`, [`crate::trust::grants::Grants::of_metadata`]), as
+    /// the driver read it: the trust lints run only when it is given, as the profile lints
+    /// only with a profile. Hashed by what it says.
+    #[serde(skip)]
+    pub trust: Option<crate::trust::grants::Grants>,
 }
 
 /// A `clippy.toml` holds no NaN that two equal configurations could differ by in practice; a
@@ -51,6 +63,8 @@ impl std::hash::Hash for Conf {
         self.msrv.hash(state);
         state.write_u64(table_hash(&self.table));
         self.profile.hash(state);
+        self.items.hash(state);
+        self.trust.hash(state);
     }
 }
 
@@ -83,7 +97,7 @@ fn value_hash(value: &toml::Value) -> u64 {
 }
 
 /// The counts the lints read ([`Conf::int`]): `u64` in clippy's `Conf`, and blaze's own.
-const COUNTS: [&str; 19] = [
+const COUNTS: [&str; 33] = [
     "array-size-threshold",
     "stack-size-threshold",
     "enum-variant-size-threshold",
@@ -104,6 +118,21 @@ const COUNTS: [&str; 19] = [
     "bounded-heap-field-string-bytes",
     "bounded-heap-field-vec-len",
     "large-box-threshold",
+    // The complexity lints' bounds (docs/lints.md, "Complexity"; `blaze::complexity::Measure`).
+    "function-weight-threshold",
+    "path-count-threshold",
+    "live-state-threshold",
+    "effect-breadth-threshold",
+    "exits-threshold",
+    "function-lines-threshold",
+    "function-statements-threshold",
+    "file-lines-threshold",
+    "params-threshold",
+    "struct-fields-threshold",
+    "enum-variants-threshold",
+    "nesting-threshold",
+    "fan-out-threshold",
+    "module-cycle-threshold",
 ];
 
 /// The flags the lints read ([`Conf::bool`]).
@@ -148,6 +177,18 @@ fn checked(table: &toml::Table) -> Result<(), String> {
                     other.type_str()
                 ));
             }
+        }
+    }
+    // A list of module paths (`blaze::env_read`): anything else is refused, never read as none.
+    match table.get(crate::blaze::ENV_READ_ALLOWED_KEY) {
+        None => {}
+        Some(toml::Value::Array(items)) if items.iter().all(toml::Value::is_str) => {}
+        Some(other) => {
+            return Err(format!(
+                "error reading Clippy's configuration file: invalid type: {}, expected a list of module paths for `{}`",
+                other.type_str(),
+                crate::blaze::ENV_READ_ALLOWED_KEY
+            ));
         }
     }
     for kind in Kind::ALL {
@@ -372,7 +413,7 @@ impl Conf {
             }
             None => rust_version.and_then(Version::parse),
         };
-        Ok(Conf { path, table, msrv, profile: None })
+        Ok(Conf { path, table, msrv, profile: None, items: None, trust: None })
     }
 
     /// The profile the lints are to read: `profile` and its percents from this file, each key
@@ -431,13 +472,15 @@ impl Conf {
     }
 
     /// This configuration with the profile of [`Conf::profile_settings`] read in; an error
-    /// naming the profile's path when it doesn't read.
+    /// naming the profile's path when it doesn't read. The read's look at the disk is pushed
+    /// to `looks` ([`crate::profile::load`]).
     pub fn with_profile(
         mut self,
         workspace: Option<&crate::profile::Workspace<'_>>,
+        looks: &blaze_vfs::outside::Looks,
     ) -> Result<Conf, String> {
         if let Some(settings) = self.profile_settings(workspace)? {
-            self.profile = Some(crate::profile::load(settings)?);
+            self.profile = Some(crate::profile::load(settings, looks)?);
         }
         Ok(self)
     }
@@ -484,7 +527,7 @@ mod tests {
 
     #[test]
     fn msrv_from_the_file_before_the_manifest() {
-        let dir = std::env::temp_dir().join(format!("blaze-lints-conf-{}", std::process::id()));
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-conf-");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("clippy.toml"), "msrv = \"1.60\"\nallow-dbg-in-tests = true\n")
             .unwrap();
@@ -495,16 +538,13 @@ mod tests {
         assert!(!conf.meets(Version(1, 70, 0)));
         let conf = Conf::load(None, Some("1.80")).unwrap();
         assert!(conf.meets(Version(1, 70, 0)));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A value of the wrong type, a negative count or a version that does not read is the
     /// load's error, never the default.
     #[test]
     fn a_value_of_the_wrong_type_is_an_error() {
-        let dir =
-            std::env::temp_dir().join(format!("blaze-lints-conf-types-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-lints-conf-types-");
         let path = dir.join("clippy.toml");
         for (text, says) in [
             ("too-large-for-stack = -1\n", "integer `-1`"),
@@ -518,7 +558,6 @@ mod tests {
         }
         std::fs::write(&path, "too-large-for-stack = 10\nallow-dbg-in-tests = true\n").unwrap();
         assert_eq!(Conf::load(Some(path), None).unwrap().int("too-large-for-stack", 200), 10);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

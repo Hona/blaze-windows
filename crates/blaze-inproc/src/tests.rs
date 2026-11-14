@@ -885,23 +885,37 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
+/// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
+/// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
+/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
+/// the `host` tests of `linux` below are.
+#[cfg(feature = "host")]
+#[test]
+fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
+    let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";
+    assert_eq!(crate::host::innermost(nested), Some(2));
+    assert_eq!(crate::host::innermost("Name:\tt\nNSpid:\t4711\n"), Some(4711));
+    assert_eq!(crate::host::innermost("Name:\tt\nPid:\t4711\n"), None);
+    assert_eq!(crate::host::innermost("NSpid:\t4711\tx\n"), None);
+}
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::channel::Channel;
     use crate::sys;
 
-    fn temp_dir() -> PathBuf {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        std::env::temp_dir().join(format!(
-            "bzi-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+    /// A path not yet made, in a directory of its own short enough for a socket's path
+    /// (`TempDir::for_test_socket`): the guard removes it, and all it holds, when it drops,
+    /// so the caller holds it as long as the path is used.
+    fn temp_dir() -> (blaze_core::temp::TempDir, PathBuf) {
+        let held = blaze_core::temp::TempDir::for_test_socket("bzi-");
+        let path = held.join("d");
+        (held, path)
     }
 
     /// A function returning `value`, as bytes.
@@ -1105,7 +1119,7 @@ mod linux {
     }
 
     fn connected() -> (Channel, Channel, u32) {
-        let dir = temp_dir();
+        let (_held, dir) = temp_dir();
         let (listener, address) = sys::Listener::bind(&dir).unwrap();
         let hook = sys::connect(&address).unwrap();
         let (daemon, pid) = listener.accept().unwrap();
@@ -1116,7 +1130,7 @@ mod linux {
 
     #[test]
     fn the_listener_is_this_users_alone_and_knows_its_peer() {
-        let dir = temp_dir();
+        let (_held, dir) = temp_dir();
         let (listener, address) = sys::Listener::bind(&dir).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(&dir).unwrap().permissions(),
@@ -1129,7 +1143,7 @@ mod linux {
         assert!(!std::path::Path::new(&address).exists());
         let _ = std::fs::remove_dir(&dir);
 
-        let open = temp_dir();
+        let (_open, open) = temp_dir();
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
@@ -1378,7 +1392,7 @@ mod linux {
         fn an_executable_is_written_once_per_key_and_never_from_a_patched_memory() {
             let Some(mut memory) = laid_out("write") else { return };
             let page = memory.page();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
             let host = Host::new(&dir.join("host")).unwrap();
             let path = dir.join("prog");
@@ -1490,7 +1504,7 @@ mod linux {
         fn the_host_grants_the_code_segments_arena_and_cells_and_learns_the_slide() {
             let Some(memory) = laid_out("host") else { return };
             let page = memory.page();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             let host = Host::new(&dir).unwrap();
             let program = dir.join("prog");
             let launch = Launch {
@@ -1526,7 +1540,13 @@ mod linux {
             } else {
                 assert!(services.is_empty());
             }
-            assert_eq!(write.len(), 1);
+            // The host's socket is connected to by its path, given readable: a launch adds
+            // nothing writable to the run's sandbox.
+            assert!(write.is_empty(), "{write:?}");
+            if cfg!(unix) {
+                let socket = dir.join(format!("inproc-{}.sock", std::process::id()));
+                assert!(read.contains(&socket), "{read:?}");
+            }
             assert!(!network);
 
             let slide = 0x5555_0000_0000;
@@ -1619,7 +1639,7 @@ mod linux {
             let Some(memory) = laid_out("program") else { return };
             let page = memory.page();
             let own = memory.layout().unwrap().clone();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
             let memory = Arc::new(Lock::new("inproc.test.memory", memory));
@@ -1729,7 +1749,7 @@ mod linux {
             };
             let page = memory.page();
             let own = memory.layout().unwrap().clone();
-            let dir = temp_dir();
+            let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
             let memory = Arc::new(Lock::new("inproc.test.memory", memory));

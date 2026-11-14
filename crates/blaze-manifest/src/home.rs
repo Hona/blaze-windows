@@ -11,6 +11,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use blaze_core::home::{NoHome, NoRecord};
 use blaze_ids::{ContentId, Hasher};
 
 /// The domain [`workspace_id`] hashes a workspace root's path in.
@@ -20,20 +21,46 @@ pub const WORKSPACE_ID_DOMAIN: &str = "blaze workspace build dir 1";
 /// query's fingerprint, so two roots on one machine never share one.
 const ID_DIGITS: usize = 32;
 
-/// blaze's root on this machine, from the variables `var` reads: `blaze_core::platform::home`'s
-/// (`$BLAZE_HOME`, else `%LOCALAPPDATA%\blaze` on Windows, else `$XDG_CACHE_HOME/blaze`, else
-/// `$HOME/.cache/blaze`). None when no variable names one; the caller says what needed it.
-pub fn root(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    blaze_core::platform::home::homes(var).ok().map(|it| it.root)
+/// blaze's root on this machine, from the variables `var` reads: `$BLAZE_HOME`, else
+/// `$XDG_CACHE_HOME/blaze`, else `.cache/blaze` in the user's home, which is
+/// [`blaze_core::home::decide`] of `var` and `record` (the system's record of the user, asked
+/// only when no variable answers: a driver passes [`blaze_core::home::record`]). An empty
+/// variable is unset.
+///
+/// # Errors
+///
+/// [`NoHome`] when no variable names a root and the user has no home; the caller says what
+/// needed it.
+pub fn root(
+    var: impl Fn(&str) -> Option<OsString>,
+    record: impl FnOnce() -> Result<PathBuf, NoRecord>,
+) -> Result<PathBuf, NoHome> {
+    #[cfg(windows)]
+    { blaze_core::platform::home::config_dir(var, record) }
+    #[cfg(not(windows))]
+    {
+    let set = |name: &str| var(name).filter(|it| !it.is_empty());
+    if let Some(home) = set("BLAZE_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    if let Some(caches) = set("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(caches).join("blaze"));
+    }
+    Ok(blaze_core::home::decide(&var, record)?.join(".cache/blaze"))
+    }
 }
 
-/// [`root`] of this process's environment, `Ok(None)` when no variable names one. A relative
-/// one (`BLAZE_HOME=.blaze`, a relative `HOME`) is taken against the current directory, as
-/// cargo takes a relative `CARGO_HOME`; when the current directory cannot be read that is an
-/// error naming the root and why.
-pub fn process_root() -> Result<Option<PathBuf>, String> {
-    let Some(it) = root(|name| std::env::var_os(name)) else { return Ok(None) };
-    std::path::absolute(&it).map(Some).map_err(|error| {
+/// [`root`] of this process's environment and user. A relative one (`BLAZE_HOME=.blaze`, a
+/// relative `HOME`) is taken against the current directory, as cargo takes a relative
+/// `CARGO_HOME`; when the current directory cannot be read that is an error naming the root
+/// and why. With no root, the error says which variables name one and why the user has no
+/// home.
+pub fn process_root() -> Result<PathBuf, String> {
+    let it = root(|name| std::env::var_os(name), blaze_core::home::record).map_err(|why| {
+        // alloc: error path
+        format!("no BLAZE_HOME or XDG_CACHE_HOME names blaze's root, and {why}")
+    })?;
+    std::path::absolute(&it).map_err(|error| {
         format!(
             "blaze's root {} is relative, and the current directory it is taken against: {error}",
             it.display()
@@ -129,11 +156,15 @@ mod tests {
                 pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| OsString::from(*value))
             }
         };
-        assert_eq!(root(env(&[("BLAZE_HOME", "/b"), ("HOME", "/u")])), Some(PathBuf::from("/b")));
+        let none = || Err(NoRecord::NoEntry { uid: 7 });
+        let recorded = || Ok(PathBuf::from("/recorded"));
+        assert_eq!(root(env(&[("BLAZE_HOME", "/b"), ("HOME", "/u")]), none), Ok(PathBuf::from("/b")));
         let cache = env(&[("BLAZE_HOME", ""), ("XDG_CACHE_HOME", "/c"), ("HOME", "/u")]);
-        assert_eq!(root(cache), Some(PathBuf::from("/c/blaze")));
-        assert_eq!(root(env(&[("HOME", "/u")])), Some(PathBuf::from("/u/.cache/blaze")));
-        assert_eq!(root(env(&[])), None);
+        assert_eq!(root(cache, none), Ok(PathBuf::from("/c/blaze")));
+        assert_eq!(root(env(&[("HOME", "/u")]), none), Ok(PathBuf::from("/u/.cache/blaze")));
+        // No `HOME` (a systemd unit, cron): the system's record of the user.
+        assert_eq!(root(env(&[]), recorded), Ok(PathBuf::from("/recorded/.cache/blaze")));
+        assert_eq!(root(env(&[]), none), Err(NoHome { record: NoRecord::NoEntry { uid: 7 } }));
         assert_eq!(state(Path::new("/b")), PathBuf::from("/b/v2"));
         assert_eq!(builds(Path::new("/b")), PathBuf::from("/b/build"));
     }

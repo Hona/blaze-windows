@@ -241,6 +241,12 @@ pub struct Built {
     /// its members' identities: what a profile of an earlier build names it by
     /// (docs/v2/plan/design/code-layout.md).
     pub identities: Vec<(InstanceKey, ContentId)>,
+    /// Every instance the walk reached by key, with what a caller's code assumes of it
+    /// beyond its address ([`Described::abi`]): with [`Self::identities`], what a running
+    /// program's slot of it is keyed by. Whole in every `Built`; [`Delta`] does not name a
+    /// function whose `abi` alone changed (its key and code are what they were), so a reader
+    /// that applies deltas reads this list whole.
+    pub abis: Vec<(InstanceKey, ContentId)>,
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.
     pub cold: Vec<InstanceKey>,
@@ -835,6 +841,41 @@ fn summarized(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
     CodegenError { unit, item, what: what.into(), front: None }
+}
+
+/// The bugs a test plants in the driver.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    use blaze_core::lock::Lock;
+
+    use super::Prepare;
+
+    thread_local! {
+        /// `dev_of` keeps each fold candidate's IR until it ends, as it did when it kept it
+        /// for the compiles after (the IR beside each shape in its map of prepared functions).
+        pub(crate) static KEEPS_MADE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The fold candidates' IR `dev_of` keeps while [`KEEPS_MADE`] is set on its thread.
+    pub(super) struct Held<B: Prepare> {
+        keeps: bool,
+        held: Lock<Vec<B::Prepared>>,
+    }
+
+    impl<B: Prepare> Held<B> {
+        pub(super) fn new() -> Self {
+            let held = Lock::new("test.codegen.driver.plant.held", Vec::new());
+            Held { keeps: KEEPS_MADE.get(), held }
+        }
+
+        pub(super) fn keep(&self, made: B::Prepared) {
+            if self.keeps {
+                self.held.lock().push(made);
+            }
+        }
+    }
 }
 
 /// [`Prepare::prepare`] of `node` as `unit`, its shape [`Shape::relative`] when its template
@@ -1635,6 +1676,13 @@ pub struct Build<'a, B: Prepare> {
     /// The bug planted in a patched build, for a control of the test that holds it to the
     /// whole one: none, but in that control.
     planted: Option<Planted>,
+    /// The store the walk asks for a function's describe before it asks the front end
+    /// ([`Build::recording`]); `None` for a build whose every describe is the front end's.
+    // dyn: one call a function the walk has no kept describe of, against a store lookup
+    records: Option<&'a dyn Records>,
+    /// The records of the describes the front end made in this build, pushed by whichever
+    /// core made each: taken as the build ends ([`records::sorted`]), into its puts.
+    recorded: SegQueue<Put>,
 }
 
 /// What the walk's worklist visits: a function or static the walk reached and has not
@@ -1657,8 +1705,8 @@ struct Walking<'w, I, S> {
     /// Writes the walk's entries refused, as errors: none, but for a bug of the walk.
     refused: SegQueue<CodegenError>,
     counts: &'w kept::Counts,
-    /// Which round of the walk, from 0 ([`Build::described`]).
-    round: usize,
+    /// How far the round is, said on the walk's span while it runs.
+    progress: progress::Progress,
 }
 
 impl<I, S> Walking<'_, I, S> {
@@ -1753,6 +1801,7 @@ impl<I, S> Hints<I, S> {
 /// of [`patch`] or [`lists`], and the refinement's oracle must find the difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(test), expect(dead_code, reason = "made only by the controls of the tests"))]
+#[cfg_attr(not(test), expect(blaze::unwired, reason = "wired: a planted-bug control only its tests make"))]
 enum Planted {
     /// A referrer of a function whose key changed keeps the function it was made of.
     KeptTemplates,
@@ -1766,6 +1815,13 @@ enum Planted {
     DeltaOmitsRemoved,
     /// A `Built` given back keeps the rows of the functions the build removed.
     StaleBuilt,
+    /// A walk kept by a front end that may close dyn facts is patched once it closes none.
+    PatchesClosed,
+    /// What a describe sends on is not counted as known ([`progress`]): only the roots are.
+    UncountedSends,
+    /// A launched function's call to a weakly defined callee names its key, not its symbol
+    /// ([`Build::resolve`]).
+    WeakByKey,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -1896,7 +1952,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             checks_shape: true,
             renames: true,
             planted: None,
+            records: None,
+            recorded: SegQueue::new(),
         }
+    }
+
+    /// Asks `records` for each function's describe before the front end, where the front end
+    /// has a content key for it ([`Frontend::record_key`]), and gives back, among the build's
+    /// puts, a record of each describe the front end made
+    /// (docs/v2/plan/design/store.md, "Describe records"). The walk reaches the same
+    /// functions either way; with it, a function another database of the same sources
+    /// described costs a store lookup and its record's decode in place of a describe.
+    // dyn: as the field's
+    pub fn recording(mut self, records: &'a dyn Records) -> Self {
+        self.records = Some(records);
+        self
     }
 
     /// Plants `bug` in this build's patch ([`Planted`]), for a control.
@@ -2031,49 +2101,75 @@ impl<'a, B: Prepare> Build<'a, B> {
         })
     }
 
-    /// What the front end says of `asked`, a function and whose code asks for it, in the
-    /// walk's round `round` (from 0): the describe an earlier walk kept, where the front end
-    /// says a describe now would give it ([`Frontend::redescribe`]); else a describe, kept
-    /// for the next walk. A describe that fails is the build's error and nothing is kept of
-    /// it, so the next walk asks again.
+    /// What the front end says of `asked`, a function and whose code asks for it, as a walk
+    /// that visits it takes it: the store's record of it, else a describe
+    /// ([`Self::found_or_described`]). Nothing is kept of it but the walk's node, so between
+    /// builds the record is its one holder (docs/v2/plan/design/end-state/memory.md 4.4): a
+    /// describe is never held a second time by the instance it is of. A describe that fails
+    /// is the build's error.
     fn described(
         &self,
         asked: &(FrontInstance<B>, Origin),
-        round: usize,
         counts: &kept::Counts,
     ) -> Result<Arc<Described<FrontInstance<B>, FrontStatic<B>>>, CodegenError> {
         let (instance, requester) = asked;
-        let now = match self.kept.and_then(|kept| kept.function(round, asked)) {
-            Some(was) if !self.asks => {
-                counts.verified();
-                return Ok(was);
-            }
-            Some(was) => match self.frontend.redescribe(instance, requester, &was) {
-                Ok(None) => {
-                    counts.verified();
-                    return Ok(was);
-                }
-                Ok(Some(now)) => {
-                    counts.described();
-                    now
-                }
-                Err(why) => {
-                    counts.described();
-                    return Err(why);
-                }
-            },
-            None => {
-                counts.described();
-                self.frontend.describe(instance, requester)?
-            }
+        // alloc: once per function a walk visits, its node's, freed with the node
+        Ok(Arc::new(self.found_or_described(instance, requester, counts)?))
+    }
+
+    /// The describe of `instance` for `requester`, as a whole walk or a frontier form visits
+    /// it: the store's record of it where the build reads records ([`Build::recording`]) and the
+    /// front end has a content key for it ([`Frontend::record_key`]); else the front end's
+    /// describe, with its record pushed for the build's puts where the front end can write
+    /// one. A record that is there and does not read is the build's error, naming the
+    /// function and the key: never a reason to describe again.
+    fn found_or_described(
+        &self,
+        instance: &FrontInstance<B>,
+        requester: &Origin,
+        counts: &kept::Counts,
+    ) -> Result<Described<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
+        let key = match self.records {
+            Some(_) => self.frontend.record_key(instance, requester),
+            None => None,
         };
-        // alloc: once per describe, shared by the walk's node and the walk kept
-        let now = Arc::new(now);
-        if let Some(kept) = self.kept {
-            // clone: a reference count, once per describe
-            kept.keep(round, asked, now.clone());
+        let (Some(records), Some(key)) = (self.records, key) else {
+            counts.described();
+            return self.frontend.describe(instance, requester);
+        };
+        let unread = |why: String| {
+            error(
+                InstanceKey(ContentId::default()),
+                ItemKey(ContentId::default()),
+                // alloc: an error
+                format!(
+                    "the record of the describe of `{}` under the store key {:x} does not read: \
+                     {why}",
+                    self.frontend.spell(instance),
+                    key.0
+                ),
+            )
+        };
+        let mut found = None;
+        let had = records
+            .read(&key, &mut |bytes| {
+                found = Some(self.frontend.from_record(instance, requester, bytes));
+            })
+            .map_err(unread)?;
+        match (had, found) {
+            (true, Some(read)) => {
+                counts.found();
+                read.map_err(unread)
+            }
+            _ => {
+                counts.described();
+                let now = self.frontend.describe(instance, requester)?;
+                if let Some(bytes) = self.frontend.to_record(instance, requester, &now) {
+                    self.recorded.push(Put { key, kind: records::KIND, bytes });
+                }
+                Ok(now)
+            }
         }
-        Ok(now)
     }
 
     fn static_node(
@@ -2119,7 +2215,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             hints: Hints::new(),
             refused: SegQueue::new(),
             counts,
-            round,
+            progress: progress::Progress::here(),
         };
         // alloc: none unless the check refuses
         let mut errors = Vec::new();
@@ -2143,15 +2239,22 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut passes = 0;
         let order = loop {
             {
-                let _span = tracing::info_span!(
+                let span = tracing::info_span!(
                     target: "blaze",
                     "codegen walk describe",
                     round,
                     pass = passes + 1,
-                )
-                .entered();
+                    done = tracing::field::Empty,
+                    known = tracing::field::Empty,
+                );
+                let _entered = span.enter();
                 walking.work.run(&|ask: &Ask<_, _>| self.visit(&walking, ask));
                 walking.hints.flush(self.frontend);
+                // The pass's own counts as it ends, and the walk's on the span above it.
+                let (done, known) = walking.progress.counts();
+                span.record("done", done);
+                span.record("known", known);
+                walking.progress.tell();
             }
             let order = Order::of(&walking.frontier, roots, static_roots, check);
             if walking.stopped.load(Ordering::Relaxed) {
@@ -2164,6 +2267,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                         // Deferred with its count: the check sends back no other.
                         let Some(counted) = entry.counted.get() else { continue };
                         let step = Step::place_past(entry.from.as_ref(), counted);
+                        walking.progress.known(1);
                         walking.work.push(Ask::Function(entry, step));
                     }
                 }
@@ -2201,7 +2305,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Some(made) => made,
                     None => {
                         let made = self
-                            .described(&entry.asked, walking.round, walking.counts)
+                            .described(&entry.asked, walking.counts)
                             .and_then(|it| self.node(&entry.asked.0, entry.asked.1, it));
                         match entry.made.set(made) {
                             Ok(made) => made,
@@ -2239,6 +2343,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
+        // Past everything that can give way: a visit run again is counted once, as it ends.
+        walking.progress.done();
     }
 
     /// Sends on what `refs`, the references of a function or static at `step` asked for by
@@ -2332,6 +2438,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             sent_statics.push(entry.value.clone());
             walking.work.push(Ask::Static(entry, Step::place_static(from)));
         }
+        // What a describe reached and sent; the roots (`from` is none) are counted whatever
+        // a control plants.
+        if from.is_none() || self.planted != Some(Planted::UncountedSends) {
+            walking.progress.known(sent.len() + sent_statics.len());
+        }
         (sent, sent_statics)
     }
 
@@ -2368,7 +2479,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut described_functions = Vec::new();
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
-            Some(kept) if kept.is_empty() => Some(kept.empty_because()),
+            Some(kept) if kept.is_empty() => Some(Fresh::Restart),
             Some(_) => None,
         };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =
@@ -2820,10 +2931,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
         }
         drop(resolving);
-        let (described, verified) = counts.get();
         let walk = Walk {
-            described,
-            verified,
+            described: counts.described_so_far(),
+            // A whole walk takes no describe from memory: each is a record's or a describe.
+            verified: 0,
+            found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,
             fresh,
@@ -2968,20 +3080,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         flown.into_iter().flatten().collect()
     }
 
-    /// Builds the IR of each of `keys`, on all cores, until the build is stopped.
-    fn prepare_all(
-        &self,
-        nodes: &Sorted<InstanceKey, Node<B>>,
-        keys: &[InstanceKey],
-        errors: &mut Vec<CodegenError>,
-    ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
-        self.until_stopped(keys, errors, |key| {
-            let node = &nodes[key];
-            let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
-            (*key, made)
-        })
-    }
-
     /// Compiles everything `roots` reach. Each root is an instance and whose code asks for it.
     /// The recursion limit's check walks from the roots in their order.
     pub fn run(
@@ -3044,8 +3142,35 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// A whole build, or with `later` a lazy one whose entry is the roots at those places
-    /// ([`Build::run_later`]).
+    /// ([`Build::run_later`]): [`Self::run_built`], then the records of the describes its walk
+    /// made, added to its puts ([`Build::recording`]). A build that is refused puts nothing,
+    /// its records with the rest.
     fn run_as(
+        &mut self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+        later: Option<&[usize]>,
+        store: &impl Lookup,
+    ) -> Result<Built, Vec<CodegenError>> {
+        let built = self.run_built(roots, static_roots, check, later, store);
+        // alloc: per build, the records its describes made
+        let made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        let mut built = built?;
+        if made.is_empty() {
+            return Ok(built);
+        }
+        // alloc: an error, once
+        let records = records::sorted(made).map_err(|why| vec![why])?;
+        // A record's key is of its own domain (the front end's schema of it), so none is a
+        // key of the build's other puts: the two sorted lists merge into one, by key.
+        built.puts.extend(records);
+        built.puts.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(built)
+    }
+
+    /// [`Self::run_as`], before the records of its describes are added to its puts.
+    fn run_built(
         &mut self,
         roots: &[(FrontInstance<B>, Origin)],
         static_roots: &[FrontStatic<B>],
@@ -3084,8 +3209,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // 2026-11-10 a 2 s walk's row said nothing of which walk it was.
                 function = tracing::field::Empty,
                 roots = roots.len(),
+                // How far the walk is, while it runs ([`progress`]): visits ended of items sent.
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
+                found = tracing::field::Empty,
                 reached = tracing::field::Empty,
                 visited = tracing::field::Empty,
                 fresh = tracing::field::Empty,
@@ -3177,6 +3306,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let walk = &walked.3;
             span.record("described", walk.described);
             span.record("verified", walk.verified);
+            span.record("found", walk.found);
             span.record("reached", walk.reached);
             span.record("visited", walk.visited);
             if let Some(fresh) = walk.fresh {
@@ -3187,8 +3317,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 span.record(
                     "function",
                     tracing::field::display(format_args!(
-                        "whole ({whole}): described {}, verified {}, reached {}",
-                        walk.described, walk.verified, walk.reached
+                        "whole ({whole}): described {}, found {}, verified {}, reached {}",
+                        walk.described, walk.found, walk.verified, walk.reached
                     )),
                 );
             }
@@ -3448,6 +3578,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut identities: Vec<(InstanceKey, ContentId)> =
             nodes.iter().map(|(key, node)| (*key, node.subject())).collect();
         identities.append(&mut out.folded);
+        // alloc: per build, what it gives a running program's slots
+        let abis = nodes.iter().map(|(key, node)| (*key, node.described.abi)).collect();
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
         let made = nodes
@@ -3519,6 +3651,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             digests: pieces,
             memo_used: used,
             identities,
+            abis,
             cold,
             made,
             kernel,
@@ -3719,24 +3852,43 @@ impl<'a, B: Prepare> Build<'a, B> {
         store: &impl Lookup,
         out: &mut Out,
     ) {
-        let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
+        // Each fold candidate's shape, as this build prepared it: what a landing under its
+        // flight key must be (`landed`, rule 21).
+        // alloc: per build, a key and a hash a fold candidate
+        let mut shapes: HashMap<InstanceKey, Shape> = HashMap::new();
 
         // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
         // known before preparing holds what a masked data object is told by (its positions'
         // anchors, its file names), so a mask kept from another build or unit could name
         // other data than the IR a group merges. Each form interned once in `self.masks`
-        // (hashed only when new).
+        // (hashed only when new). Its IR is let go the moment it is masked: a candidate's IR
+        // held while others are prepared and compiled was the build's top held site, every
+        // candidate's at once. One the store misses, or a group merges, is prepared again
+        // where it is compiled (`compile_missing`, `merge_group`), each at most the pool's
+        // width at once.
         // alloc: per build, sized by its units
         let candidates_of: Vec<InstanceKey> =
             dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
+        #[cfg(test)]
+        let held = plant::Held::<B>::new();
+        let made_masks = self.until_stopped(candidates_of.as_slice(), &mut out.errors, |key| {
+            let node = &nodes[key];
+            let made = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node);
+            let masked = made.map(|(shape, made)| {
+                let masked = self.backend.masked(&node.unit, &made, &node.refs);
+                #[cfg(test)]
+                held.keep(made);
+                (shape, masked)
+            });
+            (*key, masked)
+        });
         // alloc: per build, sized by its units
-        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
-        for (key, made) in self.prepare_all(nodes, &candidates_of, &mut out.errors) {
+        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(made_masks.len());
+        for (key, made) in made_masks {
             match made {
-                Ok((shape, made)) => {
-                    let node = &nodes[&key];
-                    masks.push((key, self.backend.masked(&node.unit, &made, &node.refs)));
-                    prepared.insert(key, (shape, made));
+                Ok((shape, masked)) => {
+                    masks.push((key, masked));
+                    shapes.insert(key, shape);
                 }
                 Err(why) => out.errors.push(why),
             }
@@ -3800,9 +3952,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                         key: at,
                         hit: true,
                     });
-                    let ir = prepared.remove(key);
                     if self.verify.sampled(&at.0) {
-                        sampled.push((*key, at, ir.map(|it| it.1)));
+                        sampled.push((*key, at));
                     }
                     out.made(&node.unit, &node.described.name, *key, Whence::Store(at), made);
                 }
@@ -3812,19 +3963,19 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     missing.push(*key);
                 }
-                Read::Failed => {
-                    prepared.remove(key);
-                }
+                // Its error is the build's already.
+                Read::Failed => {}
             }
         }
         self.verify_dev(nodes, sampled, store, out);
         // Each function the store missed is compiled by one build of the memo
         // ([`crate::flight`]), by its stored key: this one when it asks first, landed the
         // moment its compile ends; else the other's template, waited for, that function
-        // alone, once this build's own compiles ended.
+        // alone, once this build's own compiles ended. Each is prepared where it is compiled
+        // (`own` is `None`).
         let items: Vec<(InstanceKey, (InstanceKey, Option<(Shape, B::Prepared)>))> =
             // alloc: per build, sized by its store misses
-            missing.into_iter().map(|key| (nodes[&key].flight(), (key, prepared.remove(&key)))).collect();
+            missing.into_iter().map(|key| (nodes[&key].flight(), (key, None))).collect();
         let name = |(key, _): &(InstanceKey, Option<(Shape, B::Prepared)>)| {
             let node = &nodes[key];
             (*key, node.unit.item, node.described.name.as_str())
@@ -3838,8 +3989,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         for it in flown {
             match it {
                 Flown::Ran(piece) => out.absorb(piece),
-                Flown::Landed((key, own), shape) => {
-                    self.landed(nodes, key, shape, own.as_ref().map(|(own, _)| own), out)
+                Flown::Landed((key, _), shape) => {
+                    self.landed(nodes, key, shape, shapes.get(&key), out)
                 }
             }
         }
@@ -3848,43 +3999,29 @@ impl<'a, B: Prepare> Build<'a, B> {
             return;
         }
 
-        self.folded(nodes, &groups, prepared, store, out);
+        self.folded(nodes, &groups, store, out);
     }
 
     /// The store check of `sampled`, dev functions whose templates the store gave
-    /// ([`Build::verify_store`]): each compiled again from its IR (the one folding prepared,
-    /// else prepared here) with neither the store nor the memo, and its template's bytes
+    /// ([`Build::verify_store`]): each prepared again and compiled from that IR with neither
+    /// the store nor the memo, its IR let go as its compile ends, and its template's bytes
     /// compared with the stored.
     fn verify_dev(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
-        sampled: Vec<(InstanceKey, Key, Option<B::Prepared>)>,
+        sampled: Vec<(InstanceKey, Key)>,
         store: &impl Lookup,
         out: &mut Out,
     ) {
         if sampled.is_empty() {
             return;
         }
-        // alloc: per build, the store hits the store check samples
-        let unprepared: Vec<InstanceKey> =
-            sampled.iter().filter(|it| it.2.is_none()).map(|it| it.0).collect();
-        let mut made: HashMap<InstanceKey, B::Prepared> = HashMap::new();
-        for (key, it) in self.prepare_all(nodes, &unprepared, &mut out.errors) {
-            match it {
-                Ok((_, ir)) => {
-                    made.insert(key, ir);
-                }
-                Err(why) => out.errors.push(why),
-            }
-        }
-        let jobs: Vec<(InstanceKey, Key, B::Prepared)> = (sampled.into_iter())
-            .filter_map(|(key, at, ir)| Some((key, at, ir.or_else(|| made.remove(&key))?)))
-            // alloc: per build, the store hits the store check samples
-            .collect();
-        let emitted = self.until_stopped(jobs, &mut out.errors, |(key, at, ir)| {
+        let emitted = self.until_stopped(sampled, &mut out.errors, |(key, at)| {
             let node = &nodes[&key];
-            let emitted = self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None);
-            (key, at, emitted.map_err(|why| naming(why, &node.described.name)))
+            let emitted = prepare_node(self.backend, self.frontend, &node.unit, &node.spec, node)
+                .and_then(|(_, ir)| self.backend.emit(&node.unit, &node.spec, ir, &node.refs, None))
+                .map_err(|why| naming(why, &node.described.name));
+            (key, at, emitted)
         });
         for (key, at, emitted) in emitted {
             let node = &nodes[&key];
@@ -4107,7 +4244,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
         groups: &[Group],
-        mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
         store: &impl Lookup,
         out: &mut Out,
     ) {
@@ -4169,16 +4305,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         // Each group the store missed is merged by one build of the memo ([`crate::flight`]),
         // by its key and members; its body and thunks are kept in the memo under their store
-        // keys, so a build that waited for it or asks after takes them there.
+        // keys, so a build that waited for it or asks after takes them there. Its members are
+        // prepared as it is merged (each `own` is `None`): no group's IR is held while another
+        // group or function is compiled.
         let items: Vec<(InstanceKey, (&Group, Vec<Option<(Shape, B::Prepared)>>))> = merging
             .into_iter()
-            // alloc: per group the store missed, its members' IR
-            .map(|group| {
-                (
-                    group_flight(group),
-                    (group, group.members.iter().map(|it| prepared.remove(it)).collect()),
-                )
-            })
+            // alloc: per group the store missed, a `None` a member
+            .map(|group| (group_flight(group), (group, group.members.iter().map(|_| None).collect())))
             // alloc: per build, sized by its groups
             .collect();
         let name = |(group, _): &(&Group, Vec<Option<(Shape, B::Prepared)>>)| {
@@ -5185,9 +5318,16 @@ mod frontier;
 use frontier::{Frontier, Order};
 mod kept;
 pub use kept::{Kept, Walk, Work};
+mod records;
+pub use records::Records;
 mod later;
 mod lists;
+mod near;
+pub use near::{Callee, Near};
+mod start;
+pub use start::{One, OneStatic, Start};
 mod patch;
+mod progress;
 mod recursion;
 use recursion::Step;
 mod rows;

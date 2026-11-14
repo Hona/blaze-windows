@@ -62,14 +62,14 @@ pub use crate::llvm::pgo::Profile;
 pub use allocator::allocations_unobserved;
 pub use backend::Backends;
 pub use devirt::Checkpoint as DynCheckpoint;
-pub use frontend::{BodyChecks, Databases, HirFrontend, KeptProgram, let_go_kept_walks};
+pub use frontend::{BodyChecks, Databases, HirFrontend, KeptProgram, Walks, kept_walks};
 pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
 pub use linked::{Assumed, InputsWork, LinkInputs, Table, span_table_id, span_tables_of};
 pub use lowered::{Lowering, lowered};
 #[cfg(feature = "llvm")]
 pub use release::{give_profile, profile_id};
-pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE, kept_record};
 pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/design/item-hash.md): the

@@ -25,7 +25,6 @@ fn open(sim: &mut Sim) -> Store {
             tags: 1 << 40,
             load_tags: 2 << 40,
             loader: blaze_cas::Loader::Pumped,
-            sharing: blaze_core::Sharing::Blocks,
         },
         &mut effects,
     );
@@ -91,7 +90,8 @@ fn link(cache: &Cache, answers: &Answers, search: &[PathBuf]) -> (Vec<u8>, Vec<u
 
 #[test]
 fn restored_requests_resolve_current_paths_and_link_the_fresh_pe_and_pdb_bytes() {
-    let dir = temp("coff-restore");
+    let top = top();
+    let dir = temp(&top, "coff-restore");
     let earlier = dir.join("first");
     let search = [earlier.clone()];
     let lib = "entry.lib";
@@ -126,18 +126,20 @@ fn restored_requests_resolve_current_paths_and_link_the_fresh_pe_and_pdb_bytes()
     let fresh = link(&Cache::new(), &answers, &search);
     assert_ne!(first.0, fresh.0, "a different native function must change the PE");
     assert_eq!(restored, fresh);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A power cut before flush may lose the record, not change the requests of a given
 /// input. Only a changed input or producer, or a lost put, may call the COFF parser.
-#[hegel::test(test_cases = 24)]
-fn after_a_restart_a_record_only_answers_for_its_input_and_producer(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let mut sim = Sim::new(tc.draw(gs::integers::<u64>()), Faults::default());
-    let flushed = tc.draw(gs::booleans());
-    let edited = tc.draw(gs::booleans());
-    let upgraded = tc.draw(gs::booleans());
+#[test]
+fn after_a_restart_a_record_only_answers_for_its_input_and_producer() {
+    blaze_sim::check(blaze_sim::Config::cases(24), restored_record);
+}
+
+fn restored_record(tape: &blaze_sim::Tape) {
+    let mut sim = Sim::new(tape.next_u64("sim seed"), Faults::default());
+    let flushed = tape.bool("flushed");
+    let edited = tape.bool("edited");
+    let upgraded = tape.bool("upgraded");
     let input = coff("/DEFAULTLIB:one");
     {
         let mut store = open(&mut sim);

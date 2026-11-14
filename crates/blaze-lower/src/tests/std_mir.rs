@@ -78,7 +78,7 @@ fn fmaf128_for(target_tuple: &str) {
     ));
     units.graph.roots = vec![1];
     let lowered =
-        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let db = lowered.db();
     blaze_query::db::attach(db, || {

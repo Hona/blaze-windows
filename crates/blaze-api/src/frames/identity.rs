@@ -16,14 +16,14 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 35;
-const RESPONSES: usize = 44;
+const REQUESTS: usize = 38;
+const RESPONSES: usize = 47;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -103,11 +103,10 @@ impl Gen {
     }
 
     fn outcome(&mut self) -> TestOutcome {
-        match self.below(4) {
+        match self.below(3) {
             0 => TestOutcome::Passed,
             1 => TestOutcome::Failed,
-            2 => TestOutcome::Ignored,
-            _ => TestOutcome::Unreached,
+            _ => TestOutcome::Ignored,
         }
     }
 
@@ -223,6 +222,7 @@ impl Gen {
             command: self.text(),
             refused: self.maybe(Gen::u32),
             verbose: self.next() as u8,
+            prebuilt: self.yes(),
         }
     }
 
@@ -312,7 +312,7 @@ impl Gen {
                 top: self.u32(),
                 since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
             },
-            28 => Request::Gc { dry_run: self.yes() },
+            28 => Request::Gc { dry_run: self.yes(), unkept: self.yes() },
             29 => Request::Rebuilt {
                 all: self.yes(),
                 cwd: self.maybe_text(),
@@ -336,8 +336,31 @@ impl Gen {
                 spans: self.bytes(),
                 ended_ns: self.wide() as i64,
                 started_ns: self.wide() as i64,
+                pid: self.u32(),
+                timed: (0..self.below(3))
+                    .map(|_| crate::Timed {
+                        name: self.text(),
+                        start_ns: self.wide() as i64,
+                        end_ns: self.wide() as i64,
+                    })
+                    .collect(),
             },
             33 => Request::Lock { view: self.view(0), targets: self.targets() },
+            35 => Request::Store { words: self.texts(0) },
+            36 => Request::Diagnostics {
+                view: self.view(0),
+                since: self.maybe_id(),
+                client: self.text(),
+                targets: self.targets(),
+                wait_ms: self.wide(),
+            },
+            37 => Request::Prove {
+                emit: self.yes(),
+                lean: self.maybe_text(),
+                view: self.view(0),
+                subset: self.yes(),
+                targets: self.targets(),
+            },
             _ => Request::Stop,
         }
     }
@@ -448,6 +471,7 @@ impl Gen {
             target: self.unit_target(),
             package_id: self.text(),
             manifest_path: self.text(),
+            primary: self.yes(),
         }
     }
 
@@ -471,6 +495,24 @@ impl Gen {
             },
             rendered: self.text(),
             explanation: self.maybe(Gen::text),
+        }
+    }
+
+    fn found(&mut self) -> crate::Found {
+        crate::Found {
+            id: self.id(),
+            code: self.maybe(Gen::text),
+            help: self.texts(1),
+            span: self.maybe(Gen::span),
+            fixes: self.many(1, Gen::span),
+            level: match self.below(2) {
+                0 => Level::Error,
+                _ => Level::Warning,
+            },
+            message: self.text(),
+            package: self.maybe(Gen::text),
+            primary: self.yes(),
+            rendered: self.text(),
         }
     }
 
@@ -589,8 +631,25 @@ impl Gen {
                     optimized: g.wide(),
                     functions: g.wide(),
                 }),
+                storage: self.maybe(|g| crate::Storage {
+                    store_bytes: g.wide(),
+                    store_delta_bytes: g.wide() as i64,
+                    held_bytes: g.wide(),
+                    budget_bytes: g.wide(),
+                    collectable_bytes: g.wide(),
+                    volume_free_bytes: g.wide(),
+                    over_budget: g.yes(),
+                    warning: g.maybe_text(),
+                }),
             }),
             8 => Response::TestResult(TestResult {
+                ran: self.maybe(|g| RanWhy {
+                    ask: g.maybe_text(),
+                    now: g.maybe_text(),
+                    why: g.text(),
+                    said: g.text(),
+                    before: g.maybe_text(),
+                }),
                 name: self.text(),
                 binary: self.text(),
                 cached: self.maybe(|g| Cached {
@@ -606,6 +665,7 @@ impl Gen {
                 outcome: self.outcome(),
                 outside: self.yes(),
                 executable: self.u32(),
+                not_kept: self.maybe(|g| NotKept { no: g.text(), why: g.text() }),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),
@@ -623,6 +683,7 @@ impl Gen {
                 settings: self
                     .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
                 uptime_ms: self.wide(),
+                placed_by: self.maybe_text(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 builds: self.many(depth, |g| crate::Building {
@@ -805,6 +866,67 @@ impl Gen {
                 for_ms: self.wide(),
                 running: self.maybe_text(),
             }),
+            43 => Response::Diagnostics(crate::Seen {
+                new: self.many(depth, Gen::found),
+                base: match self.below(3) {
+                    0 => crate::Base::First,
+                    1 => crate::Base::Held,
+                    _ => crate::Base::Unknown,
+                },
+                root: self.id(),
+                build: if self.yes() { Some(self.wide()) } else { None },
+                ended: self.yes(),
+                fixed: self.many(depth, Gen::found),
+                token: self.maybe_id(),
+                failed: self.maybe(|g| ApiError::from(g.report(depth))),
+                unchanged: self.many(depth, Gen::found),
+            }),
+            44 => Response::Proven(crate::Proven {
+                failed: self.maybe(|g| g.text()),
+                subset: self.maybe(|g| crate::Subset {
+                    generic: g.u32(),
+                    refused: g.many(depth, |g| crate::SubsetRefusal { what: g.text(), count: g.u32() }),
+                    outcomes: g.many(depth, |g| crate::SubsetFunction {
+                        path: g.text(),
+                        outcome: match g.below(3) {
+                            0 => crate::SubsetOutcome::Translated,
+                            1 => crate::SubsetOutcome::Generic,
+                            _ => crate::SubsetOutcome::Refused { what: g.text() },
+                        },
+                    }),
+                    functions: g.u32(),
+                    translated: g.u32(),
+                }),
+                records: self.many(depth, |g| match g.below(4) {
+                    0 => crate::ProofRecord::Open {
+                        why: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                        proof_file: g.text(),
+                    },
+                    1 => crate::ProofRecord::Proved {
+                        key: g.id(),
+                        model: g.text(),
+                        axioms: g.texts(depth),
+                        theorem: g.text(),
+                        function: g.text(),
+                    },
+                    2 => crate::ProofRecord::Emitted {
+                        path: g.text(),
+                        module: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                    },
+                    _ => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
+                }),
+            }),
+            45 => Response::TestsOf(crate::TestsOf {
+                tests: self.u32(),
+                binary: self.text(),
+                nearest: self.many(depth, |g| crate::Near { name: g.text(), distance: g.u32() }),
+                executable: self.u32(),
+                filtered_out: self.u32(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -842,7 +964,7 @@ impl Gen {
     }
 
     fn report_text(&mut self) -> crate::Text {
-        crate::Text(self.many(1, |g| match g.below(9) {
+        crate::Text(self.many(1, |g| match g.below(11) {
             0 => crate::ReportSpan::Plain(g.text()),
             1 => crate::ReportSpan::Code(g.text()),
             2 => crate::ReportSpan::Path(g.text()),
@@ -851,7 +973,9 @@ impl Gen {
             5 => crate::ReportSpan::Hash(g.text()),
             6 => crate::ReportSpan::Var(g.text()),
             7 => crate::ReportSpan::Count(g.wide()),
-            _ => crate::ReportSpan::Took(g.wide()),
+            8 => crate::ReportSpan::Took(g.wide()),
+            9 => crate::ReportSpan::Command(g.text()),
+            _ => crate::ReportSpan::Strong(g.text()),
         }))
     }
 
@@ -1018,6 +1142,9 @@ fn request_index(request: &Request) -> usize {
         Request::ClientRows { .. } => 32,
         Request::Lock { .. } => 33,
         Request::Stop => 34,
+        Request::Store { .. } => 35,
+        Request::Diagnostics { .. } => 36,
+        Request::Prove { .. } => 37,
     }
 }
 
@@ -1067,7 +1194,10 @@ fn response_index(response: &Response) -> usize {
         Response::Stored { .. } => 40,
         Response::Report { .. } => 41,
         Response::Doing(_) => 42,
-        Response::Of { .. } => 43,
+        Response::Diagnostics(_) => 43,
+        Response::Proven(_) => 44,
+        Response::TestsOf(_) => 45,
+        Response::Of { .. } => 46,
     }
 }
 

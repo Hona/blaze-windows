@@ -715,7 +715,7 @@ pub fn refused_report(
 pub fn machine_link_dirs(
     env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<Vec<PathBuf>, String> {
-    let Some(home) = blaze_manifest::user_config::home() else { return Ok(Vec::new()) };
+    let home = blaze_manifest::user_config::home().map_err(|why| why.to_string())?;
     machine_link_dirs_in(&blaze_manifest::user_config::file(&home), env)
 }
 

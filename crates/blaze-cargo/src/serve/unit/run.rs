@@ -17,13 +17,16 @@ use blaze_units::schema::Mode;
 use std::alloc::Global;
 
 use super::{
-    Job, Real, UnitWriter, codegen,
+    Job, Real, codegen,
     error::{UnitError, manifest_dir},
     package_of,
 };
-use crate::serve::work::{RunPuts, Runs};
+use crate::serve::work::{Asks, RunPuts, Runs};
 
 pub(crate) mod inproc;
+pub(crate) mod launch;
+#[blaze::sans_io]
+pub(crate) mod needs;
 #[cfg(test)]
 mod tests;
 
@@ -82,6 +85,8 @@ pub(crate) fn launch_of(
     match allows_live(profile, policy) {
         Ok(()) => match (policy.mode, not_in_process) {
             (BuildMode::Live, _) => Ok(Launch::InProcess),
+            // A launcher's program starts as a file: the file is the launcher.
+            (BuildMode::Launched, _) => Ok(Launch::File),
             (_, Some(why)) => Err(format!(
                 "`{target}` runs under profile `{profile}`, so on the daemon's code memory, and can't: {why}. \
                  {NOT_IN_PROCESS}"
@@ -319,8 +324,8 @@ pub(crate) fn start(
 impl Runs<Real> for Program {
     fn start(
         &mut self,
-        _store: &Store,
-        _writer: Option<&mut UnitWriter>,
+        _store: &mut Store,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -339,7 +344,7 @@ impl Runs<Real> for Program {
         &mut self,
         completion: Completion,
         _store: &mut Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
