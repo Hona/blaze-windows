@@ -46,10 +46,8 @@ pub(crate) struct Finished {
 const RUN: u64 = 8 << 20;
 /// Ranges of an incremental link closer than this are one write, the bytes between included.
 const GAP: u64 = 4096;
-/// A changed symbol or fixup is a few words. Compare changed pages at cache-line
-/// granularity: rewriting a whole 4 KiB block per fixup makes a same-size body edit
-/// copy most of every small symbol table, even when only one entry changed.
-const BLOCK: usize = 64;
+/// The block a synthetic region is compared in.
+const BLOCK: usize = 4096;
 
 /// Where each byte of a state's file comes from: its regions in the file and the writer's
 /// parts, each sorted by offset, and the slots the writer encodes, laid over the regions.
@@ -602,9 +600,7 @@ impl<'a> Stage<'a> {
                 _ => ranges.push((offset, part.len() as u64)),
             }
         }
-        // Coalesce nearby fixups but don't put kilobytes of unchanged symbols between
-        // them back in the patch. Full-file writes still coalesce at the disk block size.
-        fill(&Layout::of(&self.new), &merge(ranges, BLOCK as u64))
+        fill(&Layout::of(&self.new), &merge(ranges, GAP))
     }
 }
 
