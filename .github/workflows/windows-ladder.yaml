@@ -23,11 +23,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # A change only to the ladder driver does not change either executable. Bump the
+      # cache schema below if this workflow changes compiler arguments or packaging.
+      - id: source
+        run: |
+          $rev = git log -1 --format=%H -- . ':(exclude).github/scripts/windows-ladder.ps1' ':(exclude).github/workflows/windows-ladder.yaml'
+          if ($LASTEXITCODE -or $rev -notmatch '^[0-9a-f]{40}$') { throw 'cannot identify the binary inputs' }
+          "revision=$rev" >> $env:GITHUB_OUTPUT
       - uses: actions/cache@v6
         id: cached
         with:
           path: bundle
-          key: windows-x64-msvc-v1-${{ matrix.bundle }}-${{ github.sha }}
+          key: windows-x64-msvc-v1-${{ matrix.bundle }}-${{ steps.source.outputs.revision }}
       - if: steps.cached.outputs.cache-hit != 'true'
         uses: ./.github/actions/toolchain
         with:
@@ -67,6 +75,7 @@ jobs:
           if-no-files-found: error
   units:
     needs: compile
+    if: "!contains(github.event.head_commit.message, '[ladder only]')"
     runs-on: windows-2025
     timeout-minutes: 75
     strategy:

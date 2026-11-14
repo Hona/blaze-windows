@@ -82,6 +82,10 @@ fn json() -> anyhow::Result<String> {
 '@)
 
 $serverLog = Join-Path $Out 'serve.stderr.log'
+# Auto-starting clients install the pinned sysroot first; a directly launched server requires
+# it to be whole already. Install with blaze's own verifier, not the runner's rustup default.
+& $Blaze toolchain *> (Join-Path $Out 'toolchain.log')
+if ($LASTEXITCODE) { throw "blaze toolchain failed: $LASTEXITCODE (see toolchain.log)" }
 $server = Start-Process -FilePath $Blaze -ArgumentList 'serve' -NoNewWindow -PassThru `
     -RedirectStandardError $serverLog -RedirectStandardOutput (Join-Path $Out 'serve.stdout.log')
 $ready = $false
