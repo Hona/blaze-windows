@@ -162,4 +162,12 @@ python -c "import duckdb,sys; duckdb.sql(sys.argv[1]).write_csv(sys.argv[2])" $q
 if ($LASTEXITCODE) { throw "the profile query failed (profile $profile)" }
 Get-Content $counts
 
+if ($Fixture -ne 'rune-cstr') {
+    # The three standalone `build` requests in execution order: cold, no-op, edit.
+    $builds = @(Import-Csv $counts | Where-Object { $_.command -eq 'build' -and $_.outcome -eq 'ok' })
+    if ($builds.Count -ne 3) { throw "expected three completed build profiles; got $($builds.Count)" }
+    Write-Host "build-script runs: build=$($builds[0].script_runs) noop=$($builds[1].script_runs) edit=$($builds[2].script_runs)"
+    if ([int]$builds[1].script_runs -ne 0) { throw 'the no-op ran a build script' }
+}
+
 Get-Content $timings
