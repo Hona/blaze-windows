@@ -651,7 +651,9 @@ fn body_edit_among(fillers: u8) -> (Patch, usize) {
     let mut kept = Kept::new();
     kept.link(&program, Plant::None).unwrap();
     program.funcs.get_mut(&1).unwrap().version = 9;
+    std::fs::write(format!("{fillers}-before.elf"), &kept.file).unwrap();
     let patch = kept.link(&program, Plant::None).unwrap();
+    std::fs::write(format!("{fillers}-after.elf"), &kept.file).unwrap();
     assert_eq!(as_fresh(&kept.file, &program), Ok(()));
     (patch, program.funcs[&1].len())
 }

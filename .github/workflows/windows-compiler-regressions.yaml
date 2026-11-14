@@ -24,6 +24,13 @@ jobs:
         with:
           arch: x64
           toolset: '14.5'
+      - name: Identify changed ELF records in the incremental patch
+        run: cargo test --locked --lib -p blaze-link a_same_size_body_edit_writes_the_function_and_a_constant
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elf-images
+          path: crates/blaze-link/*-*.elf
       - name: Verify row directory commit, derived impl publication and const backing storage
         run: |
           foreach ($case in @(
