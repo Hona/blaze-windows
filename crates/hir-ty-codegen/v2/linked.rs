@@ -603,6 +603,17 @@ impl Kept {
                 Some(Resolved::Item(ItemId::Function(func))) => {
                     let anchor = hashes.declaration(db, func)?.anchor;
                     self.sources.insert(anchor, Source::Declared(func));
+                    // The vtable shim of a method that tracks its caller where its trait's
+                    // declaration does not is of the method, and names the place of that
+                    // declaration (`vtable_shim`), which is no item of the build.
+                    let declared = crate::declared_method(db, func);
+                    if declared != func
+                        && crate::track_caller(db, func)
+                        && !crate::track_caller(db, declared)
+                    {
+                        let anchor = hashes.declaration(db, declared)?.anchor;
+                        self.sources.insert(anchor, Source::Declared(declared));
+                    }
                     DefWithBodyId::FunctionId(func)
                 }
                 Some(Resolved::Item(ItemId::Static(it))) => DefWithBodyId::StaticId(it),

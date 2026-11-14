@@ -301,10 +301,10 @@ fn a_wide_dispatch_proof_scales() {
             eprintln!("{arms} arms, {blocks} blocks: {visits} visits, {:?}", start.elapsed());
             assert_eq!(reach.refused, None);
             assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
-            // A wide dispatch can carry one exclusion per preceding arm. Inspecting these
-            // along the dispatch is quadratic; rejoining the shared exits for each partial
-            // set of predecessors instead took cubic or worse work. No clock threshold.
-            assert!(visits <= 2 * (blocks as u64).pow(2), "{blocks} blocks, {visits} visits");
+            // A path carries one exclusion per preceding arm. None is a transitive or
+            // linear premise; each question should inspect only a bounded number of facts.
+            // Counts fact inspections and endpoint lookups, not allocations or wall time.
+            assert!(visits <= 80 * blocks as u64, "{blocks} blocks, {visits} visits");
         });
     }
 }
@@ -360,5 +360,35 @@ fn a_body_with_no_loop_walks_each_block_once() {
         assert_eq!(reach::of_body(&db, def).refused, None);
         let walks = reach::WALKS.get();
         assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
+    let source = dispatch_source(32).replace("ran && !repeat", "let mut i = s.held; while i > 0 { i -= 1; } ran && !repeat");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).unwrap().basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks < blocks + 100, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn iterating_recursive_effects_proves_the_instance_sites_only_once() {
+    let source = format!("{MINICORE}//- /lib.rs crate:kernel\nfn probe(n: u32) -> u32 {{ if n > 0 {{ next(n - 1) }} else {{ 0 }} }}\nfn next(n: u32) -> u32 {{ probe(n) }}");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let probe = fn_named(&db, krate, "probe");
+        reach::COUNT_BODY.set(Some(probe.into()));
+        reach::COUNT_PROOFS.set(0);
+        crate::fn_purity_generic(&db, probe);
+        reach::COUNT_BODY.set(None);
+        assert_eq!(reach::COUNT_PROOFS.get(), 1);
     });
 }

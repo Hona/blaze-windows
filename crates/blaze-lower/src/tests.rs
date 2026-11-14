@@ -2573,6 +2573,27 @@ fn units_with_a_registry_lib() -> Units {
 /// What a store holds of library crates' narrowed identities, by key.
 type KeptNarrows = Vec<(ContentId, Vec<u8>)>;
 
+#[test]
+fn a_librarys_code_key_is_independent_of_its_file_parse_order() {
+    let extra: Vec<_> = (0..32).map(|n| (format!("a/src/file{n}.rs"), format!("pub fn f{n}() {{}}"))).collect();
+    let mut files = FILES.to_vec();
+    files.extend(extra.iter().map(|(name, text)| (name.as_str(), text.as_bytes())));
+    let key = |order| {
+        let tree = MemTree::default();
+        let root = tree.root(&files);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front = lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+        let previous = base_db::set_run_order(order);
+        front.library_narrows(LIB, &FRONT_END, |_| Ok(None)).unwrap();
+        base_db::set_run_order(previous);
+        let made = front.take_library_narrows();
+        assert_eq!(made.len(), 1);
+        made
+    };
+    assert_eq!(key(base_db::RunOrder::LeftToReaders), key(base_db::RunOrder::Reversed));
+}
+
 /// The lib, a registry crate with its root as `lib`, and the bin above it, lowered from
 /// nothing and given their library crates' narrowed identities from `store`, which is given
 /// what the store lacked: the lib's whole identity, its narrowed identity and the bin's, and

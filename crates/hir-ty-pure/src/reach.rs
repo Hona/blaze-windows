@@ -199,6 +199,18 @@ struct Imp {
     premise: Atom,
 }
 
+/// Scratch for the questions of one saturation, on one state's facts and implications.
+/// The solver is only borrowed during saturation (term ranges cannot change). Implications
+/// stay fixed. Adding a fact invalidates both successes and failures: even the bounded
+/// linear search may choose a different set of paths on the next question.
+#[derive(Default)]
+struct Questions {
+    facts: usize,
+    answers: HashMap<(Atom, u8), bool, Global>,
+    bounds: HashMap<TermId, (i128, i128), Global>,
+    known: Option<Vec<Form>>,
+}
+
 /// What is known at a point: each slot's value (the locals, then the epoch), the atoms that
 /// hold and the implications between atoms. Sorted, so equal states are equal values.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -231,6 +243,12 @@ impl Slots {
 }
 
 impl State {
+    /// A disequality can exclude a range endpoint, but cannot give a linear inequality,
+    /// an equality rewrite, or a step through a middle term. Rel::Ne sorts last.
+    fn comparisons(&self) -> &[Atom] {
+        &self.facts[..self.facts.partition_point(|fact| fact.rel != Rel::Ne)]
+    }
+
     fn has(&self, atom: Atom) -> bool {
         self.facts.binary_search(&atom).is_ok()
     }
@@ -487,6 +505,10 @@ pub fn prove<'db>(
     body: &MirBody<'db>,
     explain: &[u32],
 ) -> Reach {
+    #[cfg(test)]
+    if let hir_ty::InferBodyId::DefWithBodyId(def) = body.owner && COUNT_BODY.get() == Some(def) {
+        COUNT_PROOFS.set(COUNT_PROOFS.get() + 1);
+    }
     if body.coroutine.is_some() {
         return Reach::refused("it is a coroutine");
     }
@@ -591,6 +613,8 @@ struct Out {
 #[cfg(test)]
 thread_local! {
     pub(crate) static PROOF_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static COUNT_BODY: std::cell::Cell<Option<DefWithBodyId>> = const { std::cell::Cell::new(None) };
+    pub(crate) static COUNT_PROOFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct Solver<'a, 'db> {
@@ -617,8 +641,7 @@ struct Solver<'a, 'db> {
     addressed: Vec<bool>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
-    /// Forward priority in an acyclic body; otherwise the original FIFO, as loop bounds
-    /// widen against the previous visit and their precision depends on visit order.
+    /// Forward priority, including the acyclic arms of a body that also contains a loop.
     rank: Vec<usize>,
     predecessors: Vec<Vec<u32>>,
     /// Per block, the slots that are a join's unknown there: only grows.
@@ -677,9 +700,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         let mut rank = vec![0; count]; // alloc: the worklist rank of each block, once per proof
         let read = hir_ty_mir::mir::ReadOnEntry::in_order(body, |order| {
-            if !cyclic.contains(&true) {
-                for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
-            }
+            for (at, &block) in order.iter().enumerate() { rank[index(block)] = at; }
         });
         let mut solver = Solver {
             db,
@@ -877,8 +898,9 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// What the state's facts say as linear bounds: each `a < b`, `a <= b` and `a == b` as
     /// `form <= bound`, the form with no constant.
     fn known(&self, state: &State) -> Vec<(Vec<(TermId, i128)>, i128)> {
-        self.visit(state.facts.len());
-        let mut known = Vec::with_capacity(state.facts.len()); // alloc: one bound per fact, per proof
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        let mut known = Vec::with_capacity(comparisons.len()); // alloc: one bound per comparison
         let mut add = |left: &Form, right: &Form, slack: i128| {
             if let Some((parts, constant)) = form_add(left, right, -1)
                 && !parts.is_empty()
@@ -887,7 +909,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                 known.push((parts, bound));
             }
         };
-        for fact in &state.facts {
+        for fact in comparisons {
             let (a, b) = (self.form(fact.a), self.form(fact.b));
             match fact.rel {
                 Rel::Lt => add(&a, &b, -1),
@@ -952,13 +974,12 @@ impl<'a, 'db> Solver<'a, 'db> {
     }
 
     /// Whether the state entails `atom` by linear reasoning ([`Self::lin_le`]).
-    fn linear(&self, state: &State, atom: Atom) -> bool {
+    fn linear(&self, state: &State, atom: Atom, known: &[Form]) -> bool {
         let (a, b) = (self.form(atom.a), self.form(atom.b));
-        let known = self.known(state);
         let mut fuel = LINEAR_FUEL;
         let mut le = |left: &Form, right: &Form, limit: i128| {
             form_add(left, right, -1).is_some_and(|form| {
-                self.lin_le(state, &form, limit, &known, LINEAR_DEPTH, &mut fuel)
+                self.lin_le(state, &form, limit, known, LINEAR_DEPTH, &mut fuel)
             })
         };
         match atom.rel {
@@ -1037,8 +1058,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         if self.const_of(term).is_some() {
             return (low, high);
         }
-        self.visit(state.facts.len());
-        for fact in &state.facts {
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        for fact in comparisons {
             let (left, right) = (fact.a == term, fact.b == term);
             if left == right {
                 continue;
@@ -1084,8 +1106,9 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low.unwrap_or(i128::MIN), high.unwrap_or(i128::MAX));
         }
         let (mut low, mut high) = self.ranges[term as usize];
-        self.visit(state.facts.len());
-        for fact in &state.facts {
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len());
+        for fact in comparisons {
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
                 continue;
@@ -1106,6 +1129,26 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
         }
         // A value ruled out at an end moves the end: at most as many turns as such facts.
+        let excluded = |value| {
+            self.visit(0);
+            self.ids.get(&Term::Const(value)).is_some_and(|&id| state.has(Atom::new(Rel::Ne, term, id)))
+        };
+        // No exclusion can move either end without one naming its current value. This
+        // is the usual case, even on a dispatch path carrying hundreds of exclusions.
+        match (excluded(low), excluded(high)) {
+            (false, false) => return (low, high),
+            (true, false) => {
+                while low < high && excluded(low) { low += 1; }
+                return (low, high);
+            }
+            (false, true) => {
+                while low < high && excluded(high) { high -= 1; }
+                return (low, high);
+            }
+            // If both ends are excluded their meeting point can depend on fact order.
+            // Preserve that order, including the empty-range and saturating cases.
+            (true, true) => {}
+        }
         let mut turns = state.facts.len();
         loop {
             self.visit(state.facts.len());
@@ -1134,7 +1177,16 @@ impl<'a, 'db> Solver<'a, 'db> {
     }
 
     /// Whether `state` entails `atom`, following at most `depth` facts or implications.
-    fn holds(&self, state: &State, atom: Atom, depth: u8) -> bool {
+    fn holds(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
+        if let Some(result) = memo.as_ref().and_then(|q| q.answers.get(&(atom, depth))) {
+            return *result;
+        }
+        let result = self.search(state, atom, depth, memo);
+        if let Some(q) = memo { q.answers.insert((atom, depth), result); }
+        result
+    }
+
+    fn search(&self, state: &State, atom: Atom, depth: u8, memo: &mut Option<Questions>) -> bool {
         let Atom { rel, a, b } = atom;
         if a == b {
             return matches!(rel, Rel::Le | Rel::Eq);
@@ -1151,7 +1203,11 @@ impl<'a, 'db> Solver<'a, 'db> {
         if stated {
             return true;
         }
-        let ((low_a, high_a), (low_b, high_b)) = (self.bounds(state, a), self.bounds(state, b));
+        let mut bounds = |term| match memo {
+            Some(q) => *q.bounds.entry(term).or_insert_with(|| self.bounds(state, term)),
+            None => self.bounds(state, term),
+        };
+        let ((low_a, high_a), (low_b, high_b)) = (bounds(a), bounds(b));
         let bounded = match rel {
             Rel::Lt => high_a < low_b,
             Rel::Le => high_a <= low_b,
@@ -1173,14 +1229,14 @@ impl<'a, 'db> Solver<'a, 'db> {
                 match self.terms[term as usize] {
                     Term::Cmp(rel, x, y) => {
                         let inner = Atom { rel, a: x, b: y };
-                        if self.holds(state, if truth { inner } else { inner.not() }, depth) {
+                        if self.holds(state, if truth { inner } else { inner.not() }, depth, memo) {
                             return true;
                         }
                     }
                     Term::Not(inner) if depth > 0 => {
                         let want = self.ids.get(&Term::Const(i128::from(!truth)));
                         if let Some(&want) = want
-                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1)
+                            && self.holds(state, Atom::new(Rel::Eq, inner, want), depth - 1, memo)
                         {
                             return true;
                         }
@@ -1191,21 +1247,27 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // Adding facts up: `i + 1 < n` gives `i < n`, `k <= n` gives `0 <= n - k`. Once, at
         // the top: the steps below ask about single facts.
-        if depth >= 2 && self.linear(state, atom) {
-            return true;
+        if depth >= 2 {
+            let known;
+            let forms = match memo {
+                Some(q) => q.known.get_or_insert_with(|| self.known(state)),
+                None => { known = self.known(state); &known }
+            };
+            if self.linear(state, atom, forms) { return true; }
         }
         if depth == 0 {
             return false;
         }
         let concluding = state.concluding(atom);
-        self.visit(state.facts.len() + concluding.len());
+        let comparisons = state.comparisons();
+        self.visit(comparisons.len() + concluding.len());
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites.
-        for fact in &state.facts {
-            let through = |mid: TermId, strict: bool| -> bool {
+        for fact in comparisons {
+            let mut through = |mid: TermId, strict: bool| -> bool {
                 match rel {
-                    Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1),
-                    Rel::Lt => self.holds(state, Atom::new(Rel::Lt, mid, b), depth - 1),
-                    Rel::Le => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1),
+                    Rel::Lt if strict => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
+                    Rel::Lt => self.holds(state, Atom::new(Rel::Lt, mid, b), depth - 1, memo),
+                    Rel::Le => self.holds(state, Atom::new(Rel::Le, mid, b), depth - 1, memo),
                     Rel::Eq | Rel::Ne => false,
                 }
             };
@@ -1213,16 +1275,16 @@ impl<'a, 'db> Solver<'a, 'db> {
                 Rel::Lt if fact.a == a && fact.b != b => through(fact.b, true),
                 Rel::Le if fact.a == a && fact.b != b => through(fact.b, false),
                 Rel::Eq if fact.a == a && fact.b != b => {
-                    self.holds(state, Atom::new(rel, fact.b, b), depth - 1)
+                    self.holds(state, Atom::new(rel, fact.b, b), depth - 1, memo)
                 }
                 Rel::Eq if fact.b == a && fact.a != b => {
-                    self.holds(state, Atom::new(rel, fact.a, b), depth - 1)
+                    self.holds(state, Atom::new(rel, fact.a, b), depth - 1, memo)
                 }
                 Rel::Eq if fact.a == b && fact.b != a => {
-                    self.holds(state, Atom::new(rel, a, fact.b), depth - 1)
+                    self.holds(state, Atom::new(rel, a, fact.b), depth - 1, memo)
                 }
                 Rel::Eq if fact.b == b && fact.a != a => {
-                    self.holds(state, Atom::new(rel, a, fact.a), depth - 1)
+                    self.holds(state, Atom::new(rel, a, fact.a), depth - 1, memo)
                 }
                 _ => false,
             };
@@ -1230,11 +1292,11 @@ impl<'a, 'db> Solver<'a, 'db> {
                 return true;
             }
         }
-        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1))
+        concluding.iter().any(|imp| self.holds(state, imp.premise, depth - 1, memo))
     }
 
     fn entails(&self, state: &State, atom: Atom) -> bool {
-        self.holds(state, atom, 2)
+        self.holds(state, atom, 2, &mut None)
     }
 
     /// Adds `atom` to `state`: false when the state then has no run (the atom contradicts it).
@@ -1283,7 +1345,14 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// Writes down what the state's implications give: the conclusion of each whose premise
     /// holds. False when one contradicts the state. Each implication fires at most once.
     fn saturate(&self, state: &mut State) -> bool {
-        saturate(state, |state, atom| self.entails(state, atom))
+        let mut memo = (state.imps.len() >= 16).then(Questions::default);
+        saturate(state, |state, atom| {
+            if let Some(q) = &mut memo && q.facts != state.facts.len() {
+                q.answers.clear(); q.bounds.clear(); q.known = None;
+                q.facts = state.facts.len();
+            }
+            self.holds(state, atom, 2, &mut memo)
+        })
     }
 
     // The state.
@@ -1951,7 +2020,14 @@ impl<'a, 'db> Solver<'a, 'db> {
         incoming.first()?;
         // An unwritten slot is its entry unknown on every path. Only a slot present on an
         // incoming path, or previously joined here, can differ or mention this join.
-        let mut slots: Vec<usize> = incoming.iter().flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize)).collect();
+        // A local overwritten before any read needs no phi. Addresses and the epoch are
+        // implicit reads (notably RangeNext through MutRef). This drops no path facts:
+        // their operands are immutable term IDs, not references to local slots.
+        let live = |slot: usize| slot == self.epoch_slot() || self.addressed[slot]
+            || self.read.contains(block as usize, slot);
+        let mut slots: Vec<usize> = incoming.iter()
+            .flat_map(|s| s.vals.0.iter().map(|it| it.0 as usize))
+            .filter(|&slot| live(slot)).collect(); // alloc: written and live incoming slots
         slots.extend(self.joined[block as usize].iter().map(|&k| if k >= FIELD { ((k - FIELD) / 64) as usize } else { k as usize }));
         slots.sort_unstable();
         slots.dedup();

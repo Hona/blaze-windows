@@ -1549,6 +1549,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
+ "blaze-mem",
  "blaze-query",
  "blaze-units",
  "blaze-vfs",
