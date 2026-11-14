@@ -117,6 +117,14 @@ jobs:
         with:
           name: engine-${{ github.sha }}
           path: target/debug
+      - name: Provision the checkout change journal on the disposable scratch volume
+        run: |
+          $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
+          fsutil usn queryjournal $volume
+          if ($LASTEXITCODE) {
+            fsutil usn createjournal m=33554432 a=4194304 $volume
+            if ($LASTEXITCODE) { throw "could not provision USN journal on $volume" }
+          }
       - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/debug/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
       - if: always()
         uses: actions/upload-artifact@v4
