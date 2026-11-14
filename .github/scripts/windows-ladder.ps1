@@ -102,6 +102,7 @@ try {
     if (!$ready) { throw 'blaze serve did not announce its listener in four minutes' }
     foreach ($p in @(@('hello', $hello, 'hello from blaze'), @('withdeps', $withdeps, 'hello from blaze with deps'))) {
         $name, $dir, $said = $p
+        Step $name 'lock' $dir @('lock') ''
         Step $name 'check' $dir @('check') ''
         Step $name 'build' $dir @('build') ''
         Step $name 'run' $dir @('run', '-q') $said
