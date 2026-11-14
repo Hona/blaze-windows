@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Out | Out-Null
 $env:BLAZE_HOME = Join-Path $Out 'home'
-$env:BLAZE_CORES = 'all'
+$env:BLAZE_CORES = if ($Fixture -eq 'withdeps') { '1' } else { 'all' }
 $timings = Join-Path $Out 'timings.csv'
 'project,step,seconds,exit' | Set-Content $timings
 
@@ -138,7 +138,7 @@ with b as (select distinct build_id, started_unix_ns, command, workspace, outcom
            from read_parquet('$profile/*.builds.parquet', union_by_name=true)),
      m as (select distinct build_id, item from read_parquet('$profile/*.misses.parquet', union_by_name=true)
            where step = 'build script run')
-select b.build_id, b.command, b.workspace, b.outcome, round(b.dur_ns / 1e9, 3) as engine_s, count(m.item) as script_runs
+select b.build_id, b.started_unix_ns, b.command, b.workspace, b.outcome, round(b.dur_ns / 1e9, 3) as engine_s, count(m.item) as script_runs
 from b left join m using (build_id) group by all order by b.started_unix_ns
 "@
 python -m pip install --quiet duckdb
