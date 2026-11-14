@@ -2,6 +2,11 @@ name: Windows host
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      revisions:
+        description: 'Optional JSON list of fork commit SHAs to compare'
+        type: string
+        default: ''
   push:
     branches: [windows/host, windows/int]
 
@@ -14,11 +19,13 @@ concurrency:
 
 jobs:
   bootstrap:
-    # Compare the exact source trees, with the same compiler budget, before integrating host.
+    # The engine and unit graph build different sets of crate features. Give each a
+    # fresh disk instead of keeping two copies of LLVM-linked targets on a single VM.
     strategy:
       fail-fast: false
       matrix:
-        revision: ${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/windows/int' && '["df70baaf8d1b9754173fb0ab51e277f5c0d8f38d","c553ddba520c9d84244732ee3ddda34482cb06f4"]' || format('["{0}"]', github.sha)) }}
+        revision: ${{ fromJSON(inputs.revisions || (github.event_name == 'push' && endsWith(github.event.head_commit.message, '[compare host]') && '["df70baaf8d1b9754173fb0ab51e277f5c0d8f38d","c553ddba520c9d84244732ee3ddda34482cb06f4"]') || format('["{0}"]', github.sha)) }}
+        suite: [engine, units]
     runs-on: windows-2025
     timeout-minutes: 180
     env:
@@ -48,8 +55,10 @@ jobs:
           }
           cl 2>&1 | Select-Object -First 1
       - name: Bootstrap the engine
+        if: matrix.suite == 'engine'
         run: cargo build --locked -p blaze-engine --bin blaze
       - name: Check the bootstrap binary
+        if: matrix.suite == 'engine'
         run: |
           ./target/debug/blaze.exe --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -59,7 +68,15 @@ jobs:
             throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
           }
       - name: Host, store and linker units
-        run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link
+        if: matrix.suite == 'units'
+        run: |
+          Get-PSDrive C,D | Format-Table Name,Used,Free
+          $p = Start-Process cargo -ArgumentList 'test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru
+          while (-not $p.WaitForExit(30000)) {
+            $os = Get-CimInstance Win32_OperatingSystem
+            Write-Host "free MiB: RAM $([int]($os.FreePhysicalMemory/1024)), commit $([int]($os.FreeVirtualMemory/1024)), disk C $([int]((Get-PSDrive C).Free/1MB)), disk D $([int]((Get-PSDrive D).Free/1MB))"
+          }
+          exit $p.ExitCode
       - name: Portable tool call sites and planted regressions
-        if: '!cancelled()'
+        if: '!cancelled() && matrix.suite == ''engine'''
         run: cargo test --locked -p astlog-core --test rules
