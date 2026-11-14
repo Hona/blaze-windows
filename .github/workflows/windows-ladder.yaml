@@ -1,7 +1,7 @@
 name: Windows release ladder
 on:
   push:
-    branches: [windows/int, 'windows/ladder/*']
+    branches: [windows/int, windows/int-host-trial, windows/int-sync, 'windows/ladder/*']
   workflow_dispatch:
     inputs:
       revision:

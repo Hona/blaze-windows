@@ -237,6 +237,31 @@ impl Spans {
         Err(SpansFull { name })
     }
 
+    /// Each region registered now, as its name, the address of its first byte and its length,
+    /// in slot order: for a reading of where the process's memory is (`blaze-cargo`'s commit
+    /// map). Of a moment: a region given back as it is read is left out, never half read.
+    pub fn each(mut visit: impl FnMut(&'static str, usize, usize)) {
+        for slot in (0..CHUNKS).map_while(chunk).flatten() {
+            let state = slot.state.load(Ordering::Acquire);
+            if state & PHASE != LIVE {
+                continue;
+            }
+            let (base, len) = (slot.base.load(Ordering::Relaxed), slot.len.load(Ordering::Relaxed));
+            let (at, name_len) =
+                (slot.name.load(Ordering::Relaxed), slot.name_len.load(Ordering::Relaxed));
+            // The seqlock's second look, as `name_of` takes it.
+            std::sync::atomic::fence(Ordering::Acquire);
+            if slot.state.load(Ordering::Relaxed) != state {
+                continue;
+            }
+            // SAFETY: as in `name_of`: a `'static` string's address and length, published live.
+            let name = unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(at as *const u8, name_len))
+            };
+            visit(name, base, len);
+        }
+    }
+
     /// How many regions are registered now.
     pub fn registered() -> usize {
         (0..CHUNKS)

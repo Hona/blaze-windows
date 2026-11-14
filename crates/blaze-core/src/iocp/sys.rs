@@ -43,6 +43,9 @@ pub(super) const KEY_WARM: usize = 3;
 /// A journal's doorbell rang (`usn::Doorbell`): its `lpOverlapped` carries the journal's tag,
 /// not an address, and its byte count the doorbell's read's error, 0 for none.
 pub(super) const KEY_DOORBELL: usize = 4;
+/// A memory pressure watch said memory is short (`pressure::Watch`): its `lpOverlapped`
+/// carries the watch's tag, not an address, and its byte count 1 when critically.
+pub(super) const KEY_PRESSURE: usize = 5;
 /// Keys from here are a job's: the bits of its spawn's handle, which are at least 2^32 (a live
 /// handle's generation is odd), so above every key before. Its `lpOverlapped` is a process id
 /// and its byte count the message (`JOB_OBJECT_MSG_*`), neither of them an address.

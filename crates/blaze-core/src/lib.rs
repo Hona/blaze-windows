@@ -675,14 +675,18 @@ pub enum Effect {
     /// system says memory is short (docs/memory-budget.md section 7, "Pressure"), until an
     /// [`Effect::Unwatch`] of the same tag ends it with [`Done::Unwatched`]. In flight until it
     /// ends, as a watch is. Where the system has no such source (Linux without PSI, or one
-    /// this process may not arm; Windows and the other targets, not yet), it ends at once with
-    /// a [`Done::Failed`] naming why: the asker runs without it.
+    /// this process may not arm; the other targets), it ends at once with a [`Done::Failed`]
+    /// naming why: the asker runs without it.
     ///
     /// - macOS (kqueue): `EVFILT_MEMORYSTATUS` with `NOTE_MEMORYSTATUS_PRESSURE_WARN` and
     ///   `_CRITICAL`, the filter libdispatch's `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` is made of.
     /// - Linux (io_uring): a PSI trigger ([`PSI_TRIGGER`]) on the memory pressure of the
     ///   process's own cgroup where one is delegated to it, else of the whole system
     ///   (`/proc/pressure/memory`), polled through the ring for `POLLPRI`.
+    /// - Windows (IOCP): the machine's commit left under a sixteenth of its commit limit (a
+    ///   thirty-second: critical), or low physical memory as the memory manager says it, looked
+    ///   at by a thread of the watch's every 250 ms: Windows refuses memory by commit, which
+    ///   runs out before RAM does (`iocp/pressure.rs`).
     Pressure {
         tag: Tag,
     },

@@ -115,6 +115,8 @@ pub fn main() -> ExitCode {
             // daemon alike.
             #[cfg(feature = "native")]
             crate::heaps::purge_at_once();
+            #[cfg(feature = "native")]
+            crate::heaps::commit_pages_as_they_fill();
             // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
             // until it ends and its profile written to `<dir>`; with `<dir>` a target
             // directory's `layout`, the next build of blaze there lays its code out by it

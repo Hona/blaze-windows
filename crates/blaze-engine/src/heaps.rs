@@ -34,7 +34,7 @@ use blaze_mem::Tag;
 use libmimalloc_sys::{
     mi_collect, mi_free, mi_heap_delete, mi_heap_malloc_aligned, mi_heap_new,
     mi_heap_realloc_aligned, mi_heap_t, mi_heap_zalloc_aligned, mi_is_in_heap_region, mi_malloc,
-    mi_malloc_aligned, mi_process_info, mi_realloc_aligned, mi_theap_t, mi_usable_size, mi_zalloc,
+    mi_malloc_aligned, mi_realloc_aligned, mi_theap_t, mi_usable_size, mi_zalloc,
     mi_zalloc_aligned,
 };
 
@@ -160,6 +160,28 @@ pub(crate) fn purge_at_once() {
     // SAFETY: sets one option word, which mimalloc reads each time it frees a page to an
     // arena; mimalloc documents options as settable from any thread at any time.
     unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) };
+}
+
+/// `mi_option_page_commit_on_demand` of mimalloc 3's `mi_option_e`: the forty-first option, after
+/// `mi_option_pagemap_commit` and before `mi_option_page_max_reclaim`, which libmimalloc-sys
+/// 0.1.49 does not name; `the_page_commit_option_is_the_option_this_names` holds the number.
+const PAGE_COMMIT_ON_DEMAND: libmimalloc_sys::mi_option_t = 40;
+
+/// Has mimalloc commit a medium or large page (512 KiB, 4 MiB) as its blocks are first handed
+/// out, 64 KiB at a time (`page.c`, `mi_page_extend_free`), not whole as it takes the page. On
+/// Windows a committed page is charged to the footprint whether touched or not, and mimalloc
+/// takes pages whole by default (`page_commit_on_demand` 0): after a build of a crate with
+/// four dependencies its pages spanned 7.25 GiB of which 3.90 had ever held a block (3.09
+/// live), and a purge gave none of it back, since every one of those pages held a live block.
+/// Linux and macOS charge a page only once it is touched, so there this changes nothing and is
+/// not set. Called once, before the first allocation of a task (docs/memory-footprint.md).
+pub(crate) fn commit_pages_as_they_fill() {
+    #[cfg(windows)]
+    // SAFETY: sets one option word, which mimalloc reads as it takes a page; mimalloc documents
+    // options as settable from any thread at any time.
+    unsafe {
+        libmimalloc_sys::mi_option_set(PAGE_COMMIT_ON_DEMAND, 1)
+    };
 }
 
 /// mimalloc, a heap per tag ([`Holders`]).
@@ -386,27 +408,78 @@ fn holder(ptr: *mut u8) -> Option<Tag> {
 }
 
 /// What mimalloc has committed from the system now, over every heap: its live blocks and the free
-/// pages it keeps until it purges them (`mi_process_info`'s `current_commit`, its count of the
-/// pages it commits and decommits, kept in every build). What the memory line sets the global
-/// heap's live bytes against, and what a release's pressure counts of the heap
+/// pages it keeps until it purges them (its subprocess's `committed` count, the pages it commits
+/// and decommits, kept in every build). What the memory line sets the global heap's live bytes
+/// against, and what a release's pressure counts of the heap
 /// (`blaze_mem::tag::Snapshot::heap_footprint`). It allocates nothing.
+///
+/// Not `mi_process_info`'s `current_commit`: on Windows mimalloc overwrites that with the whole
+/// process's `PagefileUsage` (prim/windows/prim.c, `_mi_prim_process_info`), so the memory line
+/// said the process's commit charge was the heap's, and every page blaze-mem, the store's pool,
+/// LLVM and the stacks held read as "freed: kept" by mimalloc (2.02 of 2.24 GiB on a hello
+/// world).
 fn committed() -> u64 {
-    let mut current = 0usize;
-    // SAFETY: every out-pointer but `current_commit` is null, which `mi_process_info` skips;
-    // `current` is a live `usize` of ours.
-    unsafe {
-        mi_process_info(
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &raw mut current,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        );
+    let mut stats = MiStats::empty();
+    // SAFETY: `stats` is a live `mi_stats_t` of ours with its size and version set, as
+    // `mi_stats_header_init` sets them; the call writes only within it.
+    let ok = unsafe { mi_subproc_stats_get_exclusive(mi_subproc_main(), &raw mut stats) };
+    if !ok {
+        say(b"blaze: mimalloc refused its statistics record (crates/blaze-engine/src/heaps.rs MiStats): libmimalloc-sys's mi_stats_t changed size or version\n");
+        std::process::abort();
     }
-    current as u64
+    stats.committed.current.max(0) as u64
+}
+
+/// mimalloc 3's `mi_stat_count_t` (include/mimalloc-stats.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StatCount {
+    total: i64,
+    peak: i64,
+    current: i64,
+}
+
+/// mimalloc 3's `mi_stats_t` of `MI_STAT_VERSION` 5 (include/mimalloc-stats.h): its header and
+/// the counts before `committed` laid out as mimalloc does, the rest as bytes. mimalloc checks
+/// the size and version it is given against its own and refuses another
+/// (`the_heap_statistics_record_is_mimallocs`).
+#[repr(C, align(8))]
+struct MiStats {
+    size: usize,
+    version: usize,
+    pages: StatCount,
+    reserved: StatCount,
+    committed: StatCount,
+    rest: [u8; MI_STATS_SIZE - 16 - 3 * 24],
+}
+
+/// `sizeof(mi_stats_t)`: the header (16), 15 counts and 21 counters in `MI_STAT_FIELDS`, 4 and 4
+/// reserved, and the size bins (74 + 74 + 6 counts): 16 + 360 + 168 + 96 + 32 + 3696.
+const MI_STATS_SIZE: usize = 4368;
+const MI_STAT_VERSION: usize = 5;
+
+impl MiStats {
+    fn empty() -> MiStats {
+        let zero = StatCount { total: 0, peak: 0, current: 0 };
+        MiStats {
+            size: MI_STATS_SIZE,
+            version: MI_STAT_VERSION,
+            pages: zero,
+            reserved: zero,
+            committed: zero,
+            rest: [0; MI_STATS_SIZE - 16 - 3 * 24],
+        }
+    }
+}
+
+const _: () = assert!(size_of::<MiStats>() == MI_STATS_SIZE);
+
+unsafe extern "C" {
+    /// The main subprocess, whose statistics hold every heap's commits.
+    fn mi_subproc_main() -> *mut c_void;
+    /// The subprocess's own statistics, without aggregating its heaps' (the commit count is
+    /// the subprocess's alone); false where `stats`' size or version is not mimalloc's.
+    fn mi_subproc_stats_get_exclusive(subproc: *mut c_void, stats: *mut MiStats) -> bool;
 }
 
 /// mimalloc 3's `mi_heap_area_t` (include/mimalloc.h): one page of a heap, as
@@ -415,6 +488,7 @@ fn committed() -> u64 {
 #[repr(C)]
 struct Area {
     blocks: *mut c_void,
+    /// The page's reserved blocks times its block size: what it spans.
     reserved: usize,
     /// The page's capacity times its block size.
     committed: usize,
@@ -460,6 +534,7 @@ unsafe extern "C" fn count_page(
     // A header read mid-write may say more blocks than the page has: held to the page.
     let used = (area.used as u64).saturating_mul(area.full_block_size as u64).min(committed);
     into.pages += 1;
+    into.spanned += area.reserved as u64;
     into.committed += committed;
     into.used += used;
     if used == 0 {
@@ -788,6 +863,68 @@ mod tests {
         })
         .join()
         .expect("the walking thread");
+    }
+
+    /// The invariant: [`committed`] is mimalloc's own count of what it committed. A block
+    /// mimalloc makes moves it and the same block freed and purged takes it back; a block of
+    /// the system's allocator (on Windows its heap, `VirtualAlloc` for this size) does not
+    /// move it. The control: `mi_process_info`'s `current_commit`, which [`committed`] read
+    /// before, is the whole process's `PagefileUsage` on Windows and moves with the system
+    /// block too. Other tests of this binary allocate meanwhile: the bounds are far from what
+    /// they move.
+    #[test]
+    fn the_heap_statistics_record_is_mimallocs() {
+        const SIZE: usize = 256 << 20;
+        const SLACK: u64 = 96 << 20;
+        let before = committed();
+        // SAFETY: a fresh block, freed once below.
+        let block = unsafe { mi_malloc(SIZE) };
+        assert!(!block.is_null());
+        let made = committed();
+        assert!(
+            made + SLACK >= before + SIZE as u64,
+            "a block mimalloc made: {before} then {made}"
+        );
+        // SAFETY: the block made above; then collect the calling thread's heap, forced.
+        unsafe {
+            mi_free(block);
+            mi_collect(true);
+        }
+        let freed = committed();
+        assert!(
+            freed + SIZE as u64 <= made + SLACK,
+            "the block freed and purged: {made} then {freed}"
+        );
+        let layout = std::alloc::Layout::from_size_align(SIZE, 4096).unwrap();
+        // SAFETY: a layout of non-zero size; freed below with the same layout.
+        let system = unsafe { std::alloc::System.alloc(layout) };
+        assert!(!system.is_null());
+        let beside = committed();
+        // SAFETY: the block made above with this layout.
+        unsafe { std::alloc::System.dealloc(system, layout) };
+        assert!(
+            beside.abs_diff(freed) < SLACK,
+            "the system's block is not mimalloc's: {freed} then {beside}"
+        );
+    }
+
+    /// [`PAGE_COMMIT_ON_DEMAND`] is the option `commit_pages_as_they_fill` means: its default and
+    /// its neighbours' (`pagemap_commit` 0 off macOS, `page_max_reclaim` -1) are mimalloc's.
+    #[test]
+    fn the_page_commit_option_is_the_option_this_names() {
+        // SAFETY: reads option words; callable from any thread.
+        let (before, it, after) = unsafe {
+            (
+                libmimalloc_sys::mi_option_get(PAGE_COMMIT_ON_DEMAND - 1),
+                libmimalloc_sys::mi_option_get(PAGE_COMMIT_ON_DEMAND),
+                libmimalloc_sys::mi_option_get(PAGE_COMMIT_ON_DEMAND + 1),
+            )
+        };
+        assert_eq!(
+            (before, it, after),
+            (if cfg!(target_os = "macos") { 1 } else { 0 }, 0, -1),
+            "option 40 of libmimalloc-sys's mimalloc is not page_commit_on_demand at its default"
+        );
     }
 
     /// [`PURGE_DELAY`] is the option `purge_at_once` means: it reads mimalloc's default for

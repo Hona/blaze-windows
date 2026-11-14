@@ -1,6 +1,11 @@
 //! Memory: what a process holds (macOS, Linux, Windows) and the machine has (macOS), the kernel's
 //! fatal limit on this process's footprint (macOS), and the allocator's purge.
 
+#[cfg(windows)]
+mod commit;
+#[cfg(windows)]
+pub use commit::{CommitMap, commit_map};
+
 /// Bytes of memory a process of this user owns: its physical footprint, which is what
 /// Activity Monitor shows, and which still counts pages macOS has compressed.
 #[cfg(target_os = "macos")]
@@ -471,6 +476,7 @@ pub fn purge() -> Purged {
     .entered();
     // Read from the system both times: a purge measures what it gave back between them.
     let before = own_footprint_now();
+    let heap_before = blaze_mem::tag::snapshot().heap_committed;
     blaze_mem::tag::ask_heap_give_back();
     let settle = settle_heaps();
     #[cfg(feature = "native")]
@@ -480,6 +486,43 @@ pub fn purge() -> Purged {
     relieve_system_zones();
     let after = own_footprint_now();
     let purged = Purged { before, after, settle };
+    let gib = |bytes: Option<u64>| bytes.map_or(f64::NAN, |it| it as f64 / f64::from(1u32 << 30));
+    // alloc: one line a purge, which comes at most once a `PURGE_EVERY_NS` or between requests
+    let pages = blaze_mem::tag::heap_pages().map(|pages| {
+        pages.iter().fold(blaze_mem::tag::HeapPages::default(), |sum, it| {
+            blaze_mem::tag::HeapPages {
+                pages: sum.pages + it.pages,
+                spanned: sum.spanned + it.spanned,
+                committed: sum.committed + it.committed,
+                used: sum.used + it.used,
+                empty: sum.empty + it.empty,
+                sparse: sum.sparse + it.sparse,
+            }
+        })
+    });
+    let pages = pages.map_or(String::new(), |it| {
+        // alloc: as the line
+        format!(
+            "; its pages {}: {:.2} GiB spanned, {:.2} made, {:.2} in use, {:.2} in pages empty, {:.2} in pages under a quarter used",
+            it.pages,
+            gib(Some(it.spanned)),
+            gib(Some(it.committed)),
+            gib(Some(it.used)),
+            gib(Some(it.empty)),
+            gib(Some(it.sparse)),
+        )
+    });
+    let said = format!(
+        "memory purge: footprint {:.2} GiB then {:.2}; the global heap's allocator committed {:.2} then {:.2}, {:.2} live{pages}; workers {settle:?}",
+        gib(before),
+        gib(after),
+        gib(heap_before),
+        gib(blaze_mem::tag::snapshot().heap_committed),
+        gib(Some(blaze_graph::arena::held())),
+    );
+    // logged: the info event below
+    eprintln!("blaze serve: {said}");
+    tracing::info!(target: "blaze", "{said}");
     PURGED.fetch_add(purged.returned(), std::sync::atomic::Ordering::Relaxed);
     if let Some(before) = before {
         span.record("before", before);

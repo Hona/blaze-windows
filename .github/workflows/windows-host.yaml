@@ -3,7 +3,7 @@ on:
   pull_request:
   workflow_dispatch:
   push:
-    branches: [windows/host, windows/int]
+    branches: [windows/host, windows/int, windows/int-host-trial, windows/int-sync]
 
 permissions:
   contents: read

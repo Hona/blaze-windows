@@ -1079,6 +1079,15 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     // logged: the info event below
     eprintln!("blaze serve: {said}");
     tracing::info!(target: "blaze", "{said}");
+    // Windows charges every committed page to the footprint, touched or not, freed by its
+    // allocator or not: where the charge is, by holder.
+    #[cfg(windows)]
+    {
+        let map = crate::raw::memory::commit_map();
+        // logged: the info event below
+        eprintln!("blaze serve: {map}");
+        tracing::info!(target: "blaze", "{map}");
+    }
 }
 
 /// Why a start's database is empty.
@@ -2515,6 +2524,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     tracing::info_span!(target: "blaze", "memory pressure", critical, release)
                         .entered();
                 if release {
+                    crate::serve::said::logged!(INFO,
+                        "blaze serve: the system says memory is short{}: admission is held at what the daemon \
+                         holds until it stops saying so, and the front ends are asked to let go",
+                        if critical { ", critically" } else { "" }
+                    );
                     self.jobs.pressed();
                 }
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
