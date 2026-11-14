@@ -2,11 +2,6 @@ name: Windows host
 on:
   pull_request:
   workflow_dispatch:
-    inputs:
-      revisions:
-        description: 'Optional JSON list of fork commit SHAs to compare'
-        type: string
-        default: ''
   push:
     branches: [windows/host, windows/int]
 
@@ -24,7 +19,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        revision: ${{ fromJSON(inputs.revisions || (github.event_name == 'push' && endsWith(github.event.head_commit.message, '[compare host]') && '["df70baaf8d1b9754173fb0ab51e277f5c0d8f38d","c553ddba520c9d84244732ee3ddda34482cb06f4"]') || format('["{0}"]', github.sha)) }}
         suite: [engine, units]
     runs-on: windows-2025
     timeout-minutes: 180
@@ -38,7 +32,6 @@ jobs:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
-          ref: ${{ matrix.revision }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
         with:
@@ -65,8 +58,15 @@ jobs:
           $headers = dumpbin /nologo /headers target/debug/blaze.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if (-not ($headers -match '^\s*800000 size of stack reserve\s*$')) {
-            throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
-          }
+           throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
+           }
+      - if: matrix.suite == 'engine'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-engine-${{ github.sha }}
+          path: target/debug/blaze.exe
+          retention-days: 3
+          if-no-files-found: error
       - name: Compile unit executables without starting them
         if: matrix.suite == 'units'
         run: |
@@ -76,10 +76,48 @@ jobs:
             $os = Get-CimInstance Win32_OperatingSystem
             Write-Host "free MiB: RAM $([int]($os.FreePhysicalMemory/1024)), commit $([int]($os.FreeVirtualMemory/1024)), disk C $([int]((Get-PSDrive C).Free/1MB)), disk D $([int]((Get-PSDrive D).Free/1MB))"
           }
-          exit $p.ExitCode
-      - name: Run host, store and linker units
-        if: matrix.suite == 'units'
-        run: cargo test --locked --no-fail-fast --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link
+          if ($p.ExitCode) { exit $p.ExitCode }
+          New-Item -ItemType Directory bundle | Out-Null
+          foreach ($crate in 'blaze-cargo','blaze-cas','blaze-core','blaze-link','blaze-mem','blaze-usercode','blaze-vfs') {
+            $target = $crate.Replace('-','_')
+            $exe = @(Get-ChildItem "target/debug/deps/$target-*.exe")
+            if ($exe.Count -ne 1) { throw "expected one $crate test executable; found $($exe.Count)" }
+            Copy-Item $exe[0].FullName "bundle/$crate.exe"
+          }
+      - if: matrix.suite == 'units'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-units-${{ github.sha }}
+          path: bundle/*.exe
+          retention-days: 3
+          if-no-files-found: error
       - name: Portable tool call sites and planted regressions
         if: '!cancelled() && matrix.suite == ''engine'''
         run: cargo test --locked -p astlog-core --test rules
+
+  units:
+    needs: bootstrap
+    runs-on: windows-2025
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [blaze-cargo, blaze-cas, blaze-core, blaze-link, blaze-mem, blaze-usercode, blaze-vfs]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-units-${{ github.sha }}
+          path: target/debug/deps
+      - name: Run the suite with runner headroom
+        run: ./.github/scripts/windows-suite.ps1 '${{ matrix.crate }}'
