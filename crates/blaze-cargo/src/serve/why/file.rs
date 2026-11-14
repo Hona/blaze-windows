@@ -493,7 +493,9 @@ impl File {
             return Ok(len + magic + record.len() as u64);
         };
         // durable: a failed append cut back: the ledger on disk ends at a whole record
-        match file.set_len(len).and_then(|()| file.sync_data()) {
+        // An append-only handle cannot resize a file on Windows. Keep atomic append on
+        // the normal path and request write access only when undoing a failed append.
+        match fs::OpenOptions::new().write(true).open(path).and_then(|it| it.set_len(len).and_then(|()| it.sync_data())) {
             Ok(()) => Err(format!("{}; cut back to its {len} bytes", fail("appending to", error))), // alloc: error path
             Err(cut) => Err(format!(
                 "{}; and cutting it back to its {len} bytes: {cut}, so its next restore cuts the torn record",

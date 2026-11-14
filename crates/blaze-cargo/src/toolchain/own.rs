@@ -677,9 +677,11 @@ fn download(source: &Source, file: &str, part: &Path, pin: Pin, to: Option<&Feed
         _ => Ok(()),
     };
     let mut keep = Keep::new(pin.sha256, pin.bytes)?;
-    let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
+    // Resizing a partial file needs write access, not just append access on Windows.
+    let mut written = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(part)?;
     let have = keep.resume(written.metadata()?.len());
     written.set_len(have)?;
+    written.seek(io::SeekFrom::Start(have))?;
     let mut kept = BufReader::new(File::open(part)?).take(have);
     let mut piece = Vec::with_capacity_in(PIECE, Global);
     piece.resize(PIECE, 0);
@@ -1162,6 +1164,21 @@ mod tests {
             .path()
             .join("toolchains/.9.9.9-test-host.download/rustc-9.9.9-test-host.tar.xz.part");
         assert!(!part.exists(), "what was downloaded is not gone on with");
+    }
+
+    #[test]
+    fn the_download_replaces_an_oversized_part_and_appends_only_to_a_valid_prefix() {
+        let work = tempfile::tempdir().unwrap();
+        let bytes = b"published";
+        let pin = Pin { sha256: sha256(bytes), bytes: bytes.len() as u64 };
+        let source = Source::Dir(work.path().to_owned());
+        std::fs::write(work.path().join("release"), bytes).unwrap();
+        let part = work.path().join("release.part");
+        for before in [b"".as_slice(), b"pub", b"a longer stale file"] {
+            std::fs::write(&part, before).unwrap();
+            download(&source, "release", &part, pin, None).unwrap();
+            assert_eq!(std::fs::read(&part).unwrap(), bytes);
+        }
     }
 
     #[test]
