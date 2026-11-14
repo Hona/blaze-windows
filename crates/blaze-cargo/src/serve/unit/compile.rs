@@ -2244,7 +2244,8 @@ fn names(
             misses: Vec::new(),
         };
         lock(slot).kept = Some(served);
-        return Ok(());
+        // The purity proof supplied the result; names did not replay a compile record.
+        return Ok(PhaseDone::Continue);
     }
     let miss = missed(job, reader, unit);
     let unmounted =
