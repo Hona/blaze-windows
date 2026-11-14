@@ -234,6 +234,11 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 Proved means what formal-verification.md says: the kernel accepts it, no `sorry`, only
 Lean's three axioms.
 
+Every theorem's model is compiled, proof file or none, before anything is said of it: `Open`
+for want of a proof file means the model builds. A model Lean refuses is `ModelBroken`, never
+`Open`: blaze's translator's bug, which no proof can fix, with Lean's first error at its file
+and line; like `Open`, it makes the command fail.
+
 **How Lean is run.** The check has a sans-IO core and a driver, as everything does
 (`sans-io-cores`):
 
@@ -315,22 +320,64 @@ told from `SeqCst`, and the world checks that at every step and refuses the run 
   run over one cell is a sequentially consistent run. This covers a park, a once, a flag, a
   counter, a lock word.
 
-What is refused today is what needs the weak world: two or more cells with an ordering
-weaker than `SeqCst` on any (a ring's head and tail). That world is the same `World` with
-views: per cell the messages written, per thread the newest it has seen of each, the world's
-pick choosing which a load reads; release and acquire carry views, `SeqCst` a global one.
-Without promises it forbids load buffering, which ARM allows for plain loads and stores, so
-`Relaxed` on more than one cell stays refused until the world has promises.
+**The weak world** (`lean/Blaze/ThreadsWeak.lean`, built 2026-11-14) is what the sequentially
+consistent one refuses: two or more cells with an ordering weaker than `SeqCst` on any (a
+ring's head and tail). It runs the same programs and the same `two`. Per cell it keeps the
+messages written, oldest first; per thread a view (the newest message of each cell it has
+seen); the world's pick says which message a load reads, never older than the thread's view,
+and where a store's message goes. A release write carries its thread's view and an acquire
+read joins it, so what was written before a release is seen after the acquire that reads it.
+An update is glued to the message it read (nothing goes between) and continues its release
+sequence. A futex look sees at least what the caller of every completed wake had seen. A
+spawn gives a thread its parent's view and a join gives the parent its children's.
+`Prog.valueAny` runs a program in the sequentially consistent world where that world is its
+meaning and in this one where it refuses.
+
+- It has no promises, so it cannot show load buffering, which ARM allows of plain loads and
+  stores. A run that could show it is refused (rule R1: a write that does not release, after
+  the thread's relaxed read of another cell), not approximated.
+- `SeqCst` means `AcqRel` there, which is sound and loses what only `SeqCst` promises; a run
+  whose every operation is `SeqCst` is the sequentially consistent world's.
+- Its litmus tests are runs by evaluation (`lean/Blaze/Tests/ThreadsWeak.lean`): store
+  buffering shown with release and acquire and not with `SeqCst`; message passing kept by a
+  release and an acquire and lost without them; coherence; a weak compare-and-swap that fails
+  on a stale read.
+- The Rust `two` takes turns and makes the real operation, so it runs the sequentially
+  consistent world only and refuses the runs that world refuses; the weak world has no Rust
+  runner yet.
 
 **Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
-sleeper; that blaze compiles each atomic operation to one whose effect is its `Ordering`'s
-or stronger; that safe code shares nothing but atomics.
+sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait
+that looks after it; that blaze compiles each atomic operation to one whose effect is within
+what its `Ordering` allows in the world; that an `Acquire` load is ordered before its thread's
+later stores and a `Release` store after its earlier loads (aarch64's LDAR and STLR and every
+x86-64 load and store give both; Rust's own memory model promises neither); that safe code
+shares nothing but atomics.
 
-Built: the Lean library, on 2026-11-14. Next in order: the translator (a function that
-reaches an atomic operation is emitted as a `Prog`), the Rust `two`, then the first proof,
-the park (`wait/parking.rs`: one word and its futex), whose simulation test runs an unpark
-whole between two of the park's atomics and so never tried a park's step between the
-unpark's swap and its wake.
+**The method** (`lean/Blaze/ThreadsAuto.lean`): name each thread's program points (the
+continuation after each of its operations), list the reachable states (both threads' points,
+the cells, who sleeps), show each thread's step with any pick keeps the list (`two_ends`, by
+induction on the schedule), and read the theorem off the states with no step left. The first
+proof, of the park's order of atomics written by hand, has seven points for the park, three
+for the unpark and 21 reachable states (`lean/Blaze/Tests/ThreadsParkProof.lean`).
+
+Built 2026-11-14, all of it: both worlds; the method; the Rust `two` with scheduled atomics
+behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`); the
+translator (a function that reaches an atomic operation, `two`, `wait` or `wake`, or a
+function that does, is emitted as a `Threads.Prog`, and a shared theorem's statement is that
+its program's value is `ok true`); and the first proof of real lock-free code,
+`no_unpark_is_lost` (`wait/parking.rs`, `BlazeCore/Wait/Parking.lean`): the real `park` and
+`unpark` as two threads, every schedule, every choice of the kernel's, the retry's count and
+the error path of a clock that stands still: 8 kinds of park point, 3 of the unpark, 26
+reachable states. The park's simulation test ran an unpark whole between two of the park's
+atomics and so never tried a park's step between the unpark's swap and its wake; it stays
+for what the theorem does not state, that a park ends by its deadline and promptly after its
+wake on a clock that moves.
+
+Next: a clock in the threads world and that promptness theorem; models that name a thread's
+program points, so a proof does not copy the model's continuations
+(agents/annoyances/proofs-1113-11.json); a multi-cell structure against the weak world.
+How-to: `agents/howto/H-prove-two-threads.json`.
 
 ## Costs
 
