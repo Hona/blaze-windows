@@ -918,6 +918,7 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
             quiet: thin.quiet,
             ..blaze_screen::Options::of(match thin.command {
                 blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Check => blaze_screen::Command::Check,
                 blaze_thin::route::Command::Run => blaze_screen::Command::Run,
             })
         };
@@ -998,6 +999,7 @@ fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
         let shown = blaze_thin::answer::Shown::pipe(
             match thin.command {
                 blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Check => blaze_screen::Command::Check,
                 blaze_thin::route::Command::Run => blaze_screen::Command::Run,
             },
             false,
@@ -1010,14 +1012,14 @@ fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
         let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
         assert_eq!(out, "", "{typed:?}");
         match thin.command {
-            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Build | blaze_thin::route::Command::Check => assert_eq!(then, Then::Exit(0), "{typed:?}"),
             blaze_thin::route::Command::Run => {
                 let program = plain.program().expect("the one bin runs");
                 let exec = Exec::of(
                     program.executable.as_deref().unwrap(),
                     &program.env,
                     &thin.program,
-                    std::path::Path::new("/w"),
+                    std::path::Path::new(W),
                 );
                 let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
                 assert_eq!(

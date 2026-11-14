@@ -462,6 +462,13 @@ struct Outside {
     dir: tempfile::TempDir,
 }
 
+fn file_link(target: &str, at: &std::path::Path) {
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, at).expect("a file link made");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, at).expect("a file link made");
+}
+
 impl Outside {
     fn new() -> Outside {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -470,7 +477,7 @@ impl Outside {
         }
         std::fs::create_dir(dir.path().join("listed")).expect("a directory made");
         std::fs::write(dir.path().join("listed").join("a"), b"a").expect("a file written");
-        std::os::unix::fs::symlink("f0.h", dir.path().join("entry")).expect("a link made");
+        file_link("f0.h", &dir.path().join("entry"));
         Outside { dir }
     }
 
@@ -501,7 +508,7 @@ impl Outside {
             LookKind::Entry => {
                 let link = self.dir.path().join("entry");
                 std::fs::remove_file(&link).expect("the link removed");
-                std::os::unix::fs::symlink("f1.h", &link).expect("the link made again");
+                file_link("f1.h", &link);
             }
             LookKind::Listing => {
                 std::fs::write(self.dir.path().join("listed").join("b"), b"b").expect("a file written")
@@ -714,6 +721,9 @@ fn shared_layout_moved(plant: Plant) -> Result<[Looked; 2], String> {
     let fresh = || super::super::native_shared(laid.clone(), &Looks::none()).map(|it| it.looks().to_vec());
     let before = fresh()?;
     std::fs::remove_dir(&laid).expect("the layout removed");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(outside.path(), &laid).expect("a directory link made where the layout was");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), &laid).expect("a link made where the layout was");
     let after = fresh()?;
     assert_ne!(before, after, "the task's look sees the layout move");

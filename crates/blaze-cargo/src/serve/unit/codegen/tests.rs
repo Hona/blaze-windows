@@ -41,7 +41,7 @@ fn only_immutable_build_scripts_need_no_edit_space() {
 
 #[test]
 fn an_unchanged_compact_script_image_keeps_its_build_id() {
-    let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, blaze_link::Debug::Lines, false).unwrap();
+    let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, blaze_link::Debug::Lines, false, blaze_link::target::RunsOn::Here).unwrap();
     assert!(!output.incremental);
     let mut linked = kept("/w/build_script.exe", &output).kept;
     let inputs = ContentId([3; 32]);

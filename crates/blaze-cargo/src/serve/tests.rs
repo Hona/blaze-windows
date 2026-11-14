@@ -1516,7 +1516,10 @@ impl Front<Fake> for FakeFront {
         let stored = self.compile(stores, unit, Phase::Store, images);
         STANDING_TASK.set(false);
         STAND_ENDED.with_borrow_mut(|it| it.push((unit, record)));
-        stored
+        match stored? {
+            PhaseDone::Compiled(unit) => Ok(Some(unit)),
+            _ => unreachable!("the fake Store phase returns the compiled unit"),
+        }
     }
 
     fn sealed(&self) -> Result<Vec<bool>, ApiError> {
