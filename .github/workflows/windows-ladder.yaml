@@ -1,0 +1,119 @@
+name: Windows bounded verification
+on:
+  push:
+    branches: [windows/int29-ladder]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+jobs:
+  compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        bundle: [units, engine]
+    runs-on: windows-2025
+    timeout-minutes: 150
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v6
+        id: cached
+        with:
+          path: bundle
+          key: windows-x64-msvc-v1-${{ matrix.bundle }}-${{ github.sha }}
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - if: matrix.bundle == 'units' && steps.cached.outputs.cache-hit != 'true'
+        name: Package each unit executable from Cargo's artifact messages
+        run: |
+          New-Item -ItemType Directory bundle | Out-Null
+          $crates = 'blaze-cargo','blaze-cas','blaze-core','blaze-link','blaze-mem','blaze-usercode','blaze-vfs'
+          $packages = foreach ($c in $crates) { '-p'; $c }
+          cargo test --locked --no-run --lib @packages --message-format=json-render-diagnostics > artifacts.jsonl
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($item in (Get-Content artifacts.jsonl | ConvertFrom-Json)) {
+            if ($item.reason -eq 'compiler-artifact' -and $item.profile.test -and $item.executable) {
+              $name = $item.target.name.Replace('_','-')
+              if ($name -in $crates) { Copy-Item -LiteralPath $item.executable "bundle/$name.exe" }
+            }
+          }
+          foreach ($name in $crates) { Get-Item "bundle/$name.exe" }
+      - if: matrix.bundle == 'engine' && steps.cached.outputs.cache-hit != 'true'
+        name: Build the engine used by both ends of the ladder
+        run: |
+          cargo build --locked -p blaze-engine --bin blaze
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory bundle | Out-Null
+          Copy-Item target/debug/blaze.exe bundle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bundle }}-${{ github.sha }}
+          path: bundle/*.exe
+          retention-days: 3
+          if-no-files-found: error
+  units:
+    needs: compile
+    runs-on: windows-2025
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [blaze-cargo, blaze-cas, blaze-core, blaze-link, blaze-mem, blaze-usercode, blaze-vfs]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: run
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v4
+        with:
+          name: units-${{ github.sha }}
+          path: target/debug/deps
+      - name: Run the suite with runner headroom
+        run: ./.github/scripts/windows-suite.ps1 '${{ matrix.crate }}'
+  ladder:
+    needs: compile
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-${{ github.sha }}
+          path: target/debug
+      - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/debug/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ladder
+          path: |
+            ${{ runner.temp }}/ladder/*.log
+            ${{ runner.temp }}/ladder/*.csv
+            ${{ runner.temp }}/ladder/home/v2/serve.log
