@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bundle: [units, engine]
+        bundle: ${{ fromJSON(contains(github.event.head_commit.message, '[ladder only]') && '["release-engine"]' || '["units","release-engine"]') }}
     runs-on: windows-2025
     timeout-minutes: 150
     steps:
@@ -60,13 +60,13 @@ jobs:
             }
           }
           foreach ($name in $crates) { Get-Item "bundle/$name.exe" }
-      - if: matrix.bundle == 'engine' && steps.cached.outputs.cache-hit != 'true'
-        name: Build the engine used by both ends of the ladder
+      - if: matrix.bundle == 'release-engine' && steps.cached.outputs.cache-hit != 'true'
+        name: Build the release engine used by both ends of the ladder
         run: |
-          cargo build --locked -p blaze-engine --bin blaze
+          cargo build --locked --release -p blaze-engine --bin blaze
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory bundle | Out-Null
-          Copy-Item target/debug/blaze.exe bundle/
+          Copy-Item target/release/blaze.exe bundle/
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bundle }}-${{ github.sha }}
@@ -115,8 +115,8 @@ jobs:
           toolset: '14.5'
       - uses: actions/download-artifact@v4
         with:
-          name: engine-${{ github.sha }}
-          path: target/debug
+          name: release-engine-${{ github.sha }}
+          path: target/release
       - name: Provision the checkout change journal on the disposable scratch volume
         run: |
           $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
@@ -125,7 +125,9 @@ jobs:
             fsutil usn createjournal m=33554432 a=4194304 $volume
             if ($LASTEXITCODE) { throw "could not provision USN journal on $volume" }
           }
-      - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/debug/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
+      - run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/release/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
+        env:
+          RUST_BACKTRACE: '1'
       - if: always()
         uses: actions/upload-artifact@v4
         with:
