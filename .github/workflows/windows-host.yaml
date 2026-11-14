@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: '1'
+      CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -71,19 +71,21 @@ jobs:
         if: matrix.suite == 'units'
         run: |
           Get-PSDrive C,D | Format-Table Name,Used,Free
-          $p = Start-Process cargo -ArgumentList 'test --locked --no-run --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru
+          $p = Start-Process cargo -ArgumentList 'test --locked --no-run --message-format=json-render-diagnostics --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru -RedirectStandardOutput artifacts.jsonl
           while (-not $p.WaitForExit(30000)) {
             $os = Get-CimInstance Win32_OperatingSystem
             Write-Host "free MiB: RAM $([int]($os.FreePhysicalMemory/1024)), commit $([int]($os.FreeVirtualMemory/1024)), disk C $([int]((Get-PSDrive C).Free/1MB)), disk D $([int]((Get-PSDrive D).Free/1MB))"
           }
           if ($p.ExitCode) { exit $p.ExitCode }
           New-Item -ItemType Directory bundle | Out-Null
-          foreach ($crate in 'blaze-cargo','blaze-cas','blaze-core','blaze-link','blaze-mem','blaze-usercode','blaze-vfs') {
-            $target = $crate.Replace('-','_')
-            $exe = @(Get-ChildItem "target/debug/deps/$target-*.exe")
-            if ($exe.Count -ne 1) { throw "expected one $crate test executable; found $($exe.Count)" }
-            Copy-Item $exe[0].FullName "bundle/$crate.exe"
+          $crates = 'blaze-cargo','blaze-cas','blaze-core','blaze-link','blaze-mem','blaze-usercode','blaze-vfs'
+          foreach ($item in (Get-Content artifacts.jsonl | ConvertFrom-Json)) {
+            if ($item.reason -eq 'compiler-artifact' -and $item.profile.test -and $item.executable) {
+              $name = $item.target.name.Replace('_','-')
+              if ($name -in $crates) { Copy-Item -LiteralPath $item.executable "bundle/$name.exe" }
+            }
           }
+          foreach ($name in $crates) { Get-Item "bundle/$name.exe" }
       - if: matrix.suite == 'units'
         uses: actions/upload-artifact@v4
         with:
