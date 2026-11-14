@@ -3200,12 +3200,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             self.vfs.collect_if_due(&self.mounts.roots());
             self.heads.sweep();
-            // What the build and the collections freed goes back to the system now, on the
-            // purger's thread: each worker's heaps keep their pages, and the chunk cache its
-            // chunks, until asked, and an idle daemon is asked by nothing else. On Windows they
-            // are commit charged against every process on the machine (14.99 GiB of an idle
-            // daemon after a build of a crate with four dependencies, 4.61 of it freed blocks).
-            crate::raw::memory::purger().ask();
             // The requests that read a corrupt group failed with it; the image is not used
             // past it.
             let corrupt = self.db.take_corrupt().into_iter().next().or_else(|| self.vfs.corrupt());
@@ -3249,10 +3243,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         "between requests: settle the database on the image",
                     )
                     .entered();
-                    let settled = db.settle(image, &mut self.effects).map(|()| db.reclaim());
-                    // The values the image now holds were let go of: back to the system.
-                    crate::raw::memory::purger().ask();
-                    settled
+                    db.settle(image, &mut self.effects).map(|()| db.reclaim())
                 }
                 None => Ok(()),
             };
