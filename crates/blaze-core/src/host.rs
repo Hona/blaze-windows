@@ -25,8 +25,8 @@
 //! receives wait on a thread of its own, and a datagram's arrival costs that thread's wake and
 //! a wake of the driver.
 //!
-//! Windows' (the IOCP driver's) and WASI's are [`wall`] and [`random`] alone: their drivers
-//! refuse the sockets and the streams, naming why.
+//! Windows also uses the bounded system resolver on an IOCP worker. Datagram sockets and
+//! standard streams are refused there; WASI provides only [`wall`] and [`random`].
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,55 @@ use crate::{Done, IoError, RANDOM_MOST};
 
 #[cfg(unix)]
 pub(crate) use unix::{Host, Sink};
+
+/// Resolve on an OS thread: `getaddrinfo` cannot be cancelled, but no driver or caller
+/// waits beyond `RESOLVE_WAIT`. Used by both the Unix host and IOCP's worker pool.
+#[cfg(any(unix, windows))]
+pub(crate) fn resolve_by(name: String, port: u16) -> Done {
+    use std::{alloc::Global, io, net::{SocketAddr, ToSocketAddrs as _}, sync::Arc};
+    use crate::{dgram, lock::Lock, wait::{Clock as _, Deadline, Monotonic, Parker, Waited}};
+
+    let unresolved = |name, why| Done::Unresolved(dgram::Unresolved { name, port, why });
+    if name.len() > dgram::NAME_MOST || name.contains('\0') || name.is_empty() {
+        let why = format!("a name of {} bytes: one is 1 to NAME_MOST ({}) bytes with no NUL", name.len(), dgram::NAME_MOST);
+        return unresolved(name, why);
+    }
+    struct Answer {
+        got: Lock<Option<io::Result<Vec<SocketAddr>>>>,
+        parker: Parker,
+    }
+    let answer = Arc::new_in(Answer { got: Lock::new("core.host.resolve_answer", None), parker: Parker::new() }, Global);
+    // clone: the worker owns a count of the answer and the name for its system call.
+    let (theirs, asked) = (Arc::clone(&answer), name.clone());
+    let started = std::thread::Builder::new().name("blaze-host-getaddrinfo".into()).spawn(move || {
+        let got = (asked.as_str(), port).to_socket_addrs().map(|found| {
+            let mut addresses = Vec::new_in(Global);
+            addresses.extend(found);
+            addresses
+        });
+        *theirs.got.lock() = Some(got);
+        theirs.parker.unpark();
+    });
+    if let Err(error) = started {
+        return unresolved(name, format!("starting its thread: {error}"));
+    }
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), dgram::RESOLVE_WAIT);
+    loop {
+        if let Some(got) = answer.got.lock().take() {
+            return match got {
+                Ok(addresses) if addresses.is_empty() => unresolved(name, "the system resolver gave no address".to_owned()),
+                Ok(addresses) => Done::Resolved(addresses),
+                Err(error) => unresolved(name, error.to_string()),
+            };
+        }
+        match answer.parker.park("getaddrinfo's answer for an Effect::Resolve", Some(deadline), &clock) {
+            Ok(Waited::Ready(())) => {}
+            Ok(Waited::Deadline) => return unresolved(name, format!("the system resolver gave no answer in RESOLVE_WAIT, {:?}", dgram::RESOLVE_WAIT)),
+            Err(error) => return unresolved(name, error.to_string()),
+        }
+    }
+}
 
 /// [`Effect::Now`](crate::Effect::Now) of the system's wall clock.
 pub(crate) fn wall() -> Done {
@@ -125,7 +174,7 @@ mod unix {
     use std::{
         alloc::Global,
         io,
-        net::{SocketAddr, ToSocketAddrs as _, UdpSocket},
+        net::{SocketAddr, UdpSocket},
         os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
         sync::{
             Arc,
@@ -457,19 +506,11 @@ mod unix {
         /// one past its wait fails the resolve, naming the name, and its answer, when it
         /// comes, has no one to go to.
         fn resolve(&mut self, name: String, port: u16, tag: Tag) {
-            if name.len() > dgram::NAME_MOST || name.contains('\0') || name.is_empty() {
-                let why = format!(
-                    "a name of {} bytes: one is 1 to NAME_MOST ({}) bytes with no NUL",
-                    name.len(),
-                    dgram::NAME_MOST
-                );
-                return self.tell(tag, Done::Unresolved(dgram::Unresolved { name, port, why }));
-            }
             // clone: the name, for the error of a thread not started, which takes the other.
             let named = name.clone();
             let started = self.shared().and_then(|shared| {
                 spawn("blaze-host-resolve", move || {
-                    let done = resolve_by(name, port);
+                    let done = super::resolve_by(name, port);
                     shared.sink.tell(Completion { tag, done });
                 })
             });
@@ -737,72 +778,6 @@ mod unix {
                 }
                 Woke::Failed(error) => {
                     return bound.failed(into, true, None, Some(&error), error.to_string());
-                }
-            }
-        }
-    }
-
-    /// `name`'s addresses by `getaddrinfo`, on a thread of their own, waited for until
-    /// [`dgram::RESOLVE_WAIT`].
-    fn resolve_by(name: String, port: u16) -> Done {
-        struct Answer {
-            got: Lock<Option<io::Result<Vec<SocketAddr>>>>,
-            parker: Parker,
-        }
-        let answer = Arc::new_in(
-            Answer { got: Lock::new("core.host.resolve_answer", None), parker: Parker::new() },
-            Global,
-        );
-        // clone: a count, for the thread that calls getaddrinfo.
-        let theirs = Arc::clone(&answer);
-        // clone: the name, for that thread; this one names it in the answer.
-        let asked = name.clone();
-        let started = spawn("blaze-host-getaddrinfo", move || {
-            let got = (asked.as_str(), port).to_socket_addrs().map(|found| {
-                let mut addresses = Vec::new_in(Global);
-                addresses.extend(found);
-                addresses
-            });
-            *theirs.got.lock() = Some(got);
-            theirs.parker.unpark();
-        });
-        if let Err(error) = started {
-            let why = format!("starting its thread: {error}");
-            return Done::Unresolved(dgram::Unresolved { name, port, why });
-        }
-        let clock = Monotonic::new();
-        let deadline = Deadline::after(wait::Clock::now(&clock), dgram::RESOLVE_WAIT);
-        // Each park ends with the answer, a spurious wake (parked again) or the deadline, so
-        // this ends by the deadline.
-        loop {
-            if let Some(got) = answer.got.lock().take() {
-                return match got {
-                    Ok(addresses) if addresses.is_empty() => Done::Unresolved(dgram::Unresolved {
-                        name,
-                        port,
-                        why: "the system resolver gave no address".to_owned(),
-                    }),
-                    Ok(addresses) => Done::Resolved(addresses),
-                    Err(error) => Done::Unresolved(dgram::Unresolved {
-                        name,
-                        port,
-                        why: error.to_string(),
-                    }),
-                };
-            }
-            let what = "getaddrinfo's answer for an Effect::Resolve";
-            match answer.parker.park(what, Some(deadline), &clock) {
-                Ok(Waited::Ready(())) => {}
-                Ok(Waited::Deadline) => {
-                    let why = format!(
-                        "the system resolver gave no answer in RESOLVE_WAIT, {:?}",
-                        dgram::RESOLVE_WAIT
-                    );
-                    return Done::Unresolved(dgram::Unresolved { name, port, why });
-                }
-                Err(error) => {
-                    let why = error.to_string();
-                    return Done::Unresolved(dgram::Unresolved { name, port, why });
                 }
             }
         }

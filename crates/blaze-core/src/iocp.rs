@@ -420,6 +420,7 @@ enum Back {
 /// What the driver's threads are given.
 enum Work {
     File(Effect),
+    Resolve { name: String, port: u16, tag: Tag },
     Connect {
         tag: Tag,
         at: Address,
@@ -544,11 +545,28 @@ struct Connection {
     hung_up: bool,
 }
 
+/// Coalesce external wakeups separately from the worker mailbox: only an external
+/// wake ends an otherwise idle poll. The port lives as long as any handed-out waker.
+struct CallerWake {
+    port: Arc<Port>,
+    pending: Wake,
+}
+
+impl crate::Wake for CallerWake {
+    fn wake(&self) {
+        if self.pending.wake() {
+            self.port.post(sys::KEY_CALLER, 0, 0).expect("posting an external wake to the completion port");
+        }
+    }
+}
+
 pub struct Iocp {
     start: Instant,
     root: Arc<Path>,
     paths: sys::Paths,
     port: Arc<Port>,
+    caller: Arc<CallerWake>,
+    parks_idle: std::cell::Cell<bool>,
     back: Receiver<Back>,
     /// Whether a thread has posted a wake that the driver has not yet drained `back` after:
     /// so a batch of what the threads send costs one packet, not one each.
@@ -664,6 +682,8 @@ impl Iocp {
             start: Instant::now(),
             paths: sys::Paths::new(&root),
             root,
+            caller: Arc::new(CallerWake { port: Arc::clone(&port), pending: Wake::new() }),
+            parks_idle: std::cell::Cell::new(false),
             port,
             back,
             woken,
@@ -974,6 +994,10 @@ impl Iocp {
                 self.ready.push(Completion { tag, done: crate::host::random(len) });
                 Ok(())
             }
+            Effect::Resolve { name, port, tag } => {
+                self.to_threads(Work::Resolve { name, port, tag });
+                Ok(())
+            }
             // Not yet: a datagram socket or a standard stream waited on here needs its overlapped
             // form (`WSARecvFrom`, an overlapped console or pipe read) on the port. Until then each
             // ends at once, naming why ([`crate::host::refused`]).
@@ -981,7 +1005,6 @@ impl Iocp {
             | Effect::SendTo { .. }
             | Effect::RecvFrom { .. }
             | Effect::Unbind { .. }
-            | Effect::Resolve { .. }
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }) => {
                 let tag = effect.tag();
@@ -2061,12 +2084,13 @@ impl Iocp {
 
     /// Takes what the port has, waiting until `until` (forever for `None`) for the first,
     /// and acts on it.
-    fn wait(&mut self, until: Option<Deadline>) {
+    fn wait(&mut self, until: Option<Deadline>) -> bool {
         let clock = Monotonic::since(self.start);
         let got = match self.port.take(&mut self.entries, until, &clock) {
             Ok(got) => got,
             Err(error) => panic!("waiting on the completion port: {error}"),
         };
+        let mut asked = false;
         for at in 0..got {
             let entry = self.entries[at];
             match entry.lpCompletionKey {
@@ -2087,6 +2111,10 @@ impl Iocp {
                     self.ended(id, result);
                 }
                 KEY_WAKE => {}
+                sys::KEY_CALLER => {
+                    self.caller.pending.drain();
+                    asked = true;
+                }
                 KEY_DOORBELL => {
                     self.rang(Tag(entry.lpOverlapped as usize as u64), entry.dwNumberOfBytesTransferred)
                 }
@@ -2127,6 +2155,7 @@ impl Iocp {
                 _ => {}
             }
         }
+        asked
     }
 
     /// Every timer due fired, in the order they were due, and what the threads sent taken.
@@ -2491,7 +2520,7 @@ impl Driver for Iocp {
         let clock = Monotonic::since(self.start);
         loop {
             self.gather(out);
-            if out.len() > before || self.in_flight == 0 {
+            if out.len() > before || (self.in_flight == 0 && !self.parks_idle.get()) {
                 break;
             }
             // The caller's deadline or the next timer's, whichever is sooner.
@@ -2499,9 +2528,9 @@ impl Driver for Iocp {
                 .timers
                 .next_deadline()
                 .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
-            self.wait(wait.finite());
+            let asked = self.wait(wait.finite());
             self.gather(out);
-            if out.len() > before || until.passed(clock.now()) {
+            if asked || out.len() > before || until.passed(clock.now()) {
                 break;
             }
         }
@@ -2520,6 +2549,11 @@ impl Driver for Iocp {
 
     fn in_flight(&self) -> usize {
         self.in_flight
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        self.parks_idle.set(true);
+        Some(crate::Waker::new(self.caller.clone()))
     }
 
     fn now(&self) -> Duration {
@@ -2606,6 +2640,10 @@ fn work_on(
             Work::Connect { tag, at } => {
                 let made = guarded_work("connecting to a local socket", || net::connect_blocking(root, &at));
                 back.send(Back::Connected { tag, at, made })
+            }
+            Work::Resolve { tag, name, port } => {
+                let done = crate::host::resolve_by(name, port);
+                back.send(Back::Done(Completion { tag, done }))
             }
             Work::Open { tag, dir, since } => {
                 let opened = guarded_work("opening a USN journal", || usn::Journal::open(root, &dir, since).and_then(|(mut journal, first)| {
@@ -2777,6 +2815,48 @@ mod tests {
     /// long as a driver works in it.
     fn dir(what: &str) -> crate::temp::TempDir {
         crate::temp::TempDir::for_test(&format!("blaze-iocp-{what}-"))
+    }
+
+    #[test]
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        const BOUND: Duration = Duration::from_secs(10);
+        let root = dir("wake-parked");
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        let wake = driver.waker().unwrap();
+        let mut out = Vec::new();
+        for timer in [false, true] {
+            if timer {
+                driver.submit(&mut vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }]);
+            }
+            let start = driver.now();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    wake.wake();
+                });
+                assert_eq!(driver.poll(&mut out, Deadline::after(start, BOUND)), 0);
+                assert!((Duration::from_millis(90)..BOUND / 2).contains(&(driver.now() - start)));
+            });
+            // Calls before the next poll coalesce to one return, not two.
+            wake.wake();
+            wake.wake();
+            let start = driver.now();
+            assert_eq!(driver.poll(&mut out, Deadline::after(start, BOUND)), 0);
+            assert!(driver.now() - start < BOUND / 2);
+            let until = Deadline::after(driver.now(), Duration::from_millis(30));
+            assert_eq!(driver.poll(&mut out, until), 0);
+            assert!(until.passed(driver.now()));
+        }
+    }
+
+    #[test]
+    fn a_numeric_host_is_resolved_without_network_access() {
+        let root = dir("resolve");
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        driver.submit(&mut vec![Effect::Resolve { name: "127.0.0.1".into(), port: 443, tag: Tag(1) }]);
+        let mut out = Vec::new();
+        assert_eq!(driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_secs(10))), 1);
+        assert!(matches!(&out[0].done, Done::Resolved(at) if at == &["127.0.0.1:443".parse().unwrap()]), "{out:?}");
     }
 
     fn system() -> PathBuf {
