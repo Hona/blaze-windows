@@ -3,7 +3,7 @@ on:
   pull_request:
   workflow_dispatch:
   push:
-    branches: [windows/host, windows/int]
+    branches: [windows/host, windows/int, windows/host-wip2]
 
 permissions:
   contents: read
@@ -57,3 +57,42 @@ jobs:
       - name: Portable tool call sites and planted regressions
         if: '!cancelled()'
         run: cargo test --locked -p astlog-core --test rules
+
+  # The end-to-end ladder the integrator ran on a workstation until blaze's Windows memory
+  # pattern bugchecked it on process exit (notes: BSOD 0x1A/0x3453): from now on blaze runs on
+  # Windows only on these runners, which are VMs. A standard runner (4 vCPU, 16 GB) holds
+  # hello world and a crate with dependencies, not rune's `hello` (37 GB of daemon commit) or
+  # rune-desktop (84 GB).
+  ladder:
+    runs-on: windows-2025
+    timeout-minutes: 340
+    env:
+      CARGO_BUILD_JOBS: '4'
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '1'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - name: Build the release engine
+        run: cargo build --locked --release -p blaze-engine -p blaze-thin
+      - name: Hello world and a crate with dependencies
+        run: ./.github/scripts/windows-ladder.ps1 -Blaze "$PWD/target/release/blaze.exe" -Out "$env:RUNNER_TEMP/ladder"
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ladder
+          path: |
+            ${{ runner.temp }}/ladder/*.log
+            ${{ runner.temp }}/ladder/*.csv
+            ${{ runner.temp }}/ladder/home/v2/serve.log
+          if-no-files-found: warn
