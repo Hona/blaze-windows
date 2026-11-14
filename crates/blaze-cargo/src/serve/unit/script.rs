@@ -2145,7 +2145,7 @@ impl ScriptRun {
             // alloc: once a run applied, its variables, which `output` keeps beside: shared by
             // every crate the front end applies them to
             env: output.env.as_slice().into(),
-            out_dir: out_dir.clone(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {
