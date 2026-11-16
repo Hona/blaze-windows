@@ -34,7 +34,7 @@ mod tests;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Launch {
     /// From its executable as linked: a profile compiled whole (a release one, as
-    /// `blaze_lazy::allow` decides), or a run under `target.<triple>.runner`, which takes a file.
+    /// `blaze_lazy::allow` decides), a native Windows PE, or a run under `target.<triple>.runner`.
     File,
     /// On the daemon's code memory (docs/v2/plan/design/compile-time.md): a dev
     /// executable ([`inproc::runs_in_process`]), linked with the start hook's reservations and
@@ -52,7 +52,13 @@ pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on i
     (`blaze_inproc_start`, blaze's dev runtime) lays the daemon's code memory over its code before \
     `main`. blaze links that runtime into every binary and test of a dev build of this machine's \
     own target as it links std (library/blaze_inproc_rt), on Linux (x86_64, AArch64) and macOS \
-    (AArch64); a program of another platform has none, and does not run";
+    (AArch64). Native Windows x64 processes start from linked PE files instead";
+
+/// The Windows x64 host starts its native executable as a file in a job object. Select that
+/// ABI before choosing live code at link or launch time, never because a runtime is missing.
+fn native_pe(host: &str, target: &str) -> bool {
+    host == "x86_64-pc-windows-msvc" && target == host
+}
 
 /// How the process of unit `unit` starts; `runner` says it runs under a
 /// `target.<triple>.runner`. What a `run` and a test binary both start through.
@@ -62,6 +68,9 @@ pub(crate) fn launch(job: &Job, unit: usize, runner: bool) -> Result<Launch, Str
     }
     let u = job.unit(unit).map_err(|it| it.what)?;
     let policy = codegen::policy(job, unit, codegen::toolchain(job, unit)?)?;
+    if policy.mode == BuildMode::Output && native_pe(&job.input.config.host, &policy.toolchain.target) {
+        return Ok(Launch::File);
+    }
     // Only a build not made live asks why: a live one is a dev executable.
     let why = match policy.mode {
         BuildMode::Live => None,
