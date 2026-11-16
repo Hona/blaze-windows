@@ -307,7 +307,7 @@ fn a_wide_dispatch_proof_scales() {
             let start = std::time::Instant::now();
             let reach = reach::of_body(&db, def);
             let visits = reach::PROOF_VISITS.get();
-            eprintln!("{arms} arms, {blocks} blocks: {visits} visits, {:?}", start.elapsed());
+            eprintln!("{arms} arms, {blocks} blocks, {} locals, {} steps: {visits} visits, work {}/{}, stopped {:?}, {:?}", body.locals.len(), reach.steps, reach.work, reach.bound, reach.stopped, start.elapsed());
             assert_eq!(reach.refused, None);
             assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
             // A path carries one exclusion per preceding arm. None is a transitive or

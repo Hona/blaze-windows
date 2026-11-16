@@ -40,7 +40,7 @@ jobs:
               @('hir-ty-pure','iterating_recursive_effects_proves_the_instance_sites_only_once'),
               @('hir-ty-pure','work_grows_near_linearly_with_the_body'))) {
             $crate, $filter = $case
-            $result = cargo test --locked --lib -p $crate $filter -- --test-threads=1
+            $result = cargo test --locked --lib -p $crate $filter -- --show-output --test-threads=1
             $status = $LASTEXITCODE
             $result
             if ($status -or -not ($result -match 'test result: ok\. 1 passed;')) { throw "$crate $filter failed or selected no test" }
