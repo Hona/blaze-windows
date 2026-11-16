@@ -164,9 +164,6 @@ pub enum PlaneInput {
     /// in its own request at its own priority (skipped, of a request cancelled, or failed and
     /// not keeping going).
     Yielded { at_ns: u64, id: NodeId },
-    /// The executor holds this run behind a prerequisite and uses no thread for it. It
-    /// retains the task until `Yielded` makes it eligible again or `Done` refuses it.
-    Held { at_ns: u64, id: NodeId },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
@@ -189,6 +186,9 @@ pub enum PlaneInput {
         #[serde(default)]
         peak: u64,
     },
+    /// The executor holds this run behind a prerequisite and uses no thread for it. It
+    /// retains the task until `Yielded` makes it eligible again or `Done` refuses it.
+    Held { at_ns: u64, id: NodeId },
 }
 
 impl PlaneInput {

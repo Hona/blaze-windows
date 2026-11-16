@@ -1861,6 +1861,18 @@ fn a_held_reader_does_not_own_the_core_its_writer_needs() {
         }
         assert_eq!(finished(&close(&mut plane, 1)), [(1, !refuse)]);
     }
+
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open(&mut plane, 2, 1, true);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(47, &[], 1)])), [47]);
+    plane.step(PlaneInput::Held { at_ns: 1, id: NodeId(47) }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 2, vec![work(302, &[], 1)])), [302]);
+    plane.cancel(2, RequestId(1)).unwrap();
+    let released = plane.step(PlaneInput::Yielded { at_ns: 3, id: NodeId(47) }).unwrap();
+    assert_eq!(finished(&released), [(1, false)]);
+    assert!(runs(&released).is_empty(), "never post a cancelled held reader");
+    built(&mut plane, 302);
 }
 
 /// A task not idle that waits only for the thread of running idle tasks has the newest of
