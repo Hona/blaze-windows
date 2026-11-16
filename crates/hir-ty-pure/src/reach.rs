@@ -3921,12 +3921,20 @@ impl<'a, 'db> Solver<'a, 'db> {
         let epoch = self.epoch_slot();
         // alloc: the unknowns still reachable, once per join
         let mut live: blaze_hash::HashSet<TermId, Global> = blaze_hash::HashSet::new_in(Global);
-        if !self.charge((epoch + 1 + state.facts.len()) as u64) { return; }
-        for slot in 0..=epoch {
-            if self.live_at(block, slot) {
+        // Seed the same closure as `live_at`, without testing every temporary of every
+        // other arm. Padding bits are zero; the extra epoch slot is always live.
+        let start = block as usize * self.live_words;
+        if !self.charge((self.live_words + 1 + state.facts.len()) as u64) { return; }
+        for (at, &word) in self.live[start..start + self.live_words].iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let slot = at * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if !self.charge(1) { return; }
                 self.unknowns(state.vals[slot], &mut |it| { live.insert(it); });
             }
         }
+        self.unknowns(state.vals[epoch], &mut |it| { live.insert(it); });
         for fact in state.facts.iter() {
             self.unknowns(fact.a, &mut |it| { live.insert(it); });
             self.unknowns(fact.b, &mut |it| { live.insert(it); });

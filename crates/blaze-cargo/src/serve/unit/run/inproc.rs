@@ -71,7 +71,9 @@ fn is_runtime(name: &str) -> bool {
 /// daemon side, and never runs as one.
 pub(crate) fn runs_in_process(job: &Job, unit: usize, policy: &Policy) -> Result<bool, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
-    if super::allows_live(&u.profile.name, policy).is_err() {
+    if super::native_pe(&job.input.config.host, &policy.toolchain.target)
+        || super::allows_live(&u.profile.name, policy).is_err()
+    {
         return Ok(false);
     }
     Ok(not_in_process(job, unit)?.is_none())

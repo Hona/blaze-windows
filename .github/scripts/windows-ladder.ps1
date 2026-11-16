@@ -17,18 +17,41 @@ $timings = Join-Path $Out 'timings.csv'
 
 function Step([string] $project, [string] $step, [string] $dir, [string[]] $words, [string] $expect) {
     $log = Join-Path $Out "$project-$step.log"
+    $err = Join-Path $Out "$project-$step.stderr.log"
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    Push-Location $dir
-    try { & $Blaze @words *> $log; $code = $LASTEXITCODE } finally { Pop-Location }
+    $client = Start-Process $Blaze -WorkingDirectory $dir -ArgumentList $words -PassThru -NoNewWindow `
+        -RedirectStandardOutput $log -RedirectStandardError $err
+    try {
+        # Capture a live request, not just the empty queue after a stall error. Keep the
+        # client's own stall/task dump in stderr. Bound both clients independently.
+        while (!$client.WaitForExit(60000)) {
+            $sample = Join-Path $Out "$project-$step-status-$([int]$watch.Elapsed.TotalSeconds)"
+            $status = Start-Process $Blaze -WorkingDirectory $dir -ArgumentList @('status','--json') `
+                -PassThru -NoNewWindow -RedirectStandardOutput "$sample.log" -RedirectStandardError "$sample.stderr.log"
+            try {
+                if (!$status.WaitForExit(5000)) {
+                    $status.Kill($true)
+                    Write-Warning "status timed out ($sample)"
+                } elseif ($status.ExitCode) { Write-Warning "status exited $($status.ExitCode) ($sample)" }
+            } finally { $status.Dispose() }
+            if ($watch.Elapsed.TotalMinutes -ge 20) { throw "$project $step exceeded 20 minutes (see $err and status logs)" }
+        }
+        $code = $client.ExitCode
+    } finally {
+        if (!$client.HasExited) { $client.Kill($true) }
+        $client.Dispose()
+    }
     $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
     "$project,$step,$seconds,$code" | Add-Content $timings
     Write-Host "$project $step ($($words -join ' ')): exit $code in $seconds s"
     if ($code -ne 0) {
         Get-Content $log -Tail 60
+        Get-Content $err -Tail 60
         throw "$project $step failed with exit $code (log $log)"
     }
-    if ($expect -and -not (Select-String -Path $log -SimpleMatch $expect -Quiet)) {
+    if ($expect -and -not (Select-String -Path $log,$err -SimpleMatch $expect -Quiet)) {
         Get-Content $log -Tail 60
+        Get-Content $err -Tail 60
         throw "$project $step did not print '$expect' (log $log)"
     }
 }
@@ -168,6 +191,7 @@ if ($Fixture -ne 'rune-cstr') {
     if ($builds.Count -ne 3) { throw "expected three completed build profiles; got $($builds.Count)" }
     Write-Host "build-script runs: build=$($builds[0].script_runs) noop=$($builds[1].script_runs) edit=$($builds[2].script_runs)"
     if ([int]$builds[1].script_runs -ne 0) { throw 'the no-op ran a build script' }
+    if ([int]$builds[2].script_runs -ne 0) { throw 'the one-line edit ran a build script' }
 }
 
 Get-Content $timings

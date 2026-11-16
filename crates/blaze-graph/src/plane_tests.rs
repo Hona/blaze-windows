@@ -1835,6 +1835,46 @@ fn a_promoted_request_takes_its_share() {
     assert!(plane.step(over).unwrap().is_empty());
 }
 
+/// A reader admitted just as its front end asks for a write holds the node, not the only
+/// core. The write runs without raising the limit; releasing the read cannot oversubscribe.
+#[test]
+fn a_held_reader_does_not_own_the_core_its_writer_needs() {
+    for refuse in [false, true] {
+        let mut plane = Plane::new(config(1, 1)).unwrap();
+        open(&mut plane, 1, 1, true);
+        open(&mut plane, 2, 1, true);
+        assert_eq!(runs(&add(&mut plane, 1, vec![work(47, &[], 1)])), [47]);
+        assert!(runs(&add(&mut plane, 2, vec![work(302, &[], 1)])).is_empty());
+        let held = PlaneInput::Held { at_ns: 1, id: NodeId(47) };
+        assert_eq!(runs(&plane.step(held).unwrap()), [302]);
+        let release = match refuse {
+            true => done(47, Outcome::Failed { why: "write refused".into() }, Vec::new()),
+            false => PlaneInput::Yielded { at_ns: 2, id: NodeId(47) },
+        };
+        assert!(runs(&plane.step(release).unwrap()).is_empty());
+        let starts = runs(&built(&mut plane, 302));
+        if refuse {
+            assert!(starts.is_empty());
+        } else {
+            assert_eq!(starts, [47]);
+            built(&mut plane, 47);
+        }
+        assert_eq!(finished(&close(&mut plane, 1)), [(1, !refuse)]);
+    }
+
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open(&mut plane, 2, 1, true);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(47, &[], 1)])), [47]);
+    plane.step(PlaneInput::Held { at_ns: 1, id: NodeId(47) }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 2, vec![work(302, &[], 1)])), [302]);
+    plane.cancel(2, RequestId(1)).unwrap();
+    let released = plane.step(PlaneInput::Yielded { at_ns: 3, id: NodeId(47) }).unwrap();
+    assert_eq!(finished(&released), [(1, false)]);
+    assert!(runs(&released).is_empty(), "never post a cancelled held reader");
+    built(&mut plane, 302);
+}
+
 /// A task not idle that waits only for the thread of running idle tasks has the newest of
 /// them asked to give way, once, and as few as it takes; given way, the idle task's node is
 /// ready again and the thread is the other's. One that ends before it gives way frees its

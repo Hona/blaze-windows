@@ -1253,6 +1253,19 @@ impl<W: Work, P: Predict> Plane<W, P> {
             .unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
     }
 
+    /// The executor cannot yet post this reader. Return its unused core to admission.
+    pub fn hold(&mut self, at: Duration, id: NodeId) {
+        self.step(PlaneInput::Held { at_ns: ns(at), id })
+            .unwrap_or_else(|error| panic!("the plane refused to hold task {id}: {error}"));
+    }
+
+    /// The prerequisite is available: let normal admission start the held task, or skip it
+    /// when cancelled. Never post straight to a worker without first reacquiring its core.
+    pub fn release_held(&mut self, at: Duration, id: NodeId) {
+        self.step(PlaneInput::Yielded { at_ns: ns(at), id })
+            .unwrap_or_else(|error| panic!("the plane refused to release held task {id}: {error}"));
+    }
+
     /// A thread task of [`Happened::Post`] posted with the readers the loop made for it.
     pub fn post(&mut self, task: Posting, again: bool, readers: W::Readers) {
         let Some((batch, Task::Thread { .. })) = self.task(task.id) else {
@@ -1578,7 +1591,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     build: batch.request,
                 };
                 if batch.reads {
-                    self.happened.push(Happened::Post { task, again: false });
+                    let again = self.again.is_restarted(u64::from(id.0));
+                    self.happened.push(Happened::Post { task, again });
                 } else {
                     let work = batch.work.clone().expect("checked by add");
                     self.happened.push(Happened::Started { id });
