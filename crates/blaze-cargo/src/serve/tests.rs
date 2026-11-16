@@ -327,7 +327,7 @@ fn app_artifact() -> Artifact {
             src_path: "/w/src/main.rs".into(),
             crate_types: vec![CrateType::Bin],
         },
-        content: ContentId::of("blaze serve tests output", APP),
+        content: super::unit::output_key(APP).0,
         harness: true,
         package: "path+file:///w#0.1.0".into(),
         profile: UnitProfile {
@@ -1477,17 +1477,17 @@ impl Front<Fake> for FakeFront {
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if SCRIPT_OUTPUT.get() == Some(unit) {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SCRIPT));
+            let key = super::unit::output_key(SCRIPT);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
+            let key = super::unit::output_key(APP);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && SIDE_OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SIDE));
+            let key = super::unit::output_key(SIDE);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SIDE.to_vec() });
             outputs.push(Output { path: SIDE_AT.into(), key, executable: true, made: None });
         }

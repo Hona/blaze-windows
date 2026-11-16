@@ -526,7 +526,10 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
             LayerOp::Flush => writer.flush(&mut effects),
         }
         let [one, two] = &mut writers;
-        pump_all(&mut sim, &mut [one, two], &mut effects, Some(rng.below(3)))?;
+        // Cut the record-first control at the publication boundary. A later flush
+        // can publish the missing outputs and hide the violation from the reader.
+        let cut = plant == LayerPlant::RecordFirst && matches!(op, LayerOp::Flush);
+        pump_all(&mut sim, &mut [one, two], &mut effects, (!cut).then(|| rng.below(3)))?;
         for (home, writer) in writers.iter().enumerate() {
             waiting[home].retain(|(unit, ticket)| {
                 let durable = writer.durable(*ticket);
@@ -535,6 +538,11 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
                 }
                 !durable
             });
+        }
+        if cut {
+            sim.crash();
+            crashed = true;
+            break;
         }
     }
     if !crashed {

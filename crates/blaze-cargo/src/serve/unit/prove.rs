@@ -1506,7 +1506,9 @@ mod tests {
             [ProofRecord::Open { function, why, .. }, ProofRecord::ModelBroken { function: broken, module, at, error }] => {
                 assert_eq!((function.as_str(), broken.as_str(), module.as_str()), ("k::m::t0", "k::m::t1", bad));
                 assert!(why.starts_with("there is no proof file"), "{why}");
-                assert_eq!((at.as_str(), error.as_str()), ("/b/lean/lib/BlazeModel/k/m/t1.lean:1:0", "error: refused"));
+                let file = at.strip_suffix(":1:0").expect("Lean's line and column");
+                assert_eq!(Path::new(file), Path::new("/b/lean/lib/BlazeModel/k/m/t1.lean"));
+                assert_eq!(error, "error: refused");
             }
             other => panic!("{other:?}"),
         }

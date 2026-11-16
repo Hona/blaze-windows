@@ -232,12 +232,13 @@ fn the_settings_refuse_what_they_do_not_know() {
     .unwrap();
     assert_eq!(serving.serve.unwrap().readers, [[0xab; 32]]);
     assert_eq!((serving.peers[0].url.as_str(), serving.peers[0].key), ("http://10.0.0.5:7420", [0xab; 32]));
+    let directory_peer = serde_json::json!({ "key_file": "/k", "peers": [{ "url": std::env::temp_dir(), "key": "00" }] }).to_string();
     for (bad, names) in [
         (r#"{ "source": [] }"#, "`source` is not a setting"),
         (r#"{ "sources": ["relative/dir"] }"#, "neither an absolute directory"),
         (r#"{ "trusted": ["abc"] }"#, "is not a key"),
         (r#"{ "pins": ["../x"] }"#, "the pin"),
-        (r#"{ "key_file": "/k", "peers": [{ "url": "/dir", "key": "00" }] }"#, "not an http(s) address"),
+        (directory_peer.as_str(), "not an http(s) address"),
         (r#"{ "key_file": "/k", "serve": { "bind": "10.0.0.4:7420", "readers": [], "allow": ["10.0.0.0/8"] } }"#, "`serve.allow` is not a setting"),
         (r#"{ "key_file": "/k", "serve": { "bind": "10.0.0.4:7420" } }"#, "`serve` has no `readers`"),
         // A machine that asks or answers peers signs with its own key.
@@ -501,11 +502,7 @@ fn with_no_prebuilt_a_source_that_has_the_key_is_never_asked() {
     let mut again = empty(&dir.path().join("home-2"));
     // alloc: the second home's handle, as above.
     let second: &'static blaze_cas::Handle = Box::leak(Box::new(blaze_cas::Handle::new(again.store(), dir.path().join("home-2"))));
-    let config = Config::parse(&format!(
-        r#"{{ "sources": ["{}"], "trusted": ["{}"] }}"#,
-        out.display(),
-        blaze_pack::peer::hex(&public)
-    ))
+    let config = Config::parse(&serde_json::json!({"sources": [out], "trusted": [blaze_pack::peer::hex(&public)]}).to_string())
     .unwrap();
     let prebuilt = given(Some(Arc::new(Packs::new(config, "t1".to_owned(), None, second))), true);
     assert!(prebuilt.is_some());

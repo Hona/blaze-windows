@@ -317,6 +317,11 @@ impl World {
 
     /// The name in `placed/` of the whole file value `value` is placed from, if it has one.
     fn whole_name(&self, value: usize) -> Option<String> {
+        // Copy volumes place bytes directly. `forced` also checks the actual writes
+        // to ensure they never created a clone source under placed/.
+        if self.sharing == Sharing::Unshared {
+            return None;
+        }
         let Value { key, bytes, whole, base } = &self.values[value];
         match (whole, base) {
             (false, _) => None,

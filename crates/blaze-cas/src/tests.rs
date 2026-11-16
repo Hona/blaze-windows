@@ -1976,12 +1976,20 @@ fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
 
 #[test]
 fn a_flipped_byte_of_a_value_is_never_served() {
+    for legacy in [false, true] {
+        flipped_value_is_refused(legacy);
+    }
+}
+
+fn flipped_value_is_refused(legacy: bool) {
     let mut sim = Sim::new(4, quiet());
     let mut store = open(&mut sim, "store");
+    disk::WRITE_FORMAT_8.set(legacy);
     store.put(key(1), Kind::Query, &[b'a'; 1000]).unwrap();
     store.put(key(2), Kind::Query, &[b'b'; 1000]).unwrap();
     flush(&mut sim, &mut store);
     let loc = store.loc_of(&key(2));
+    disk::WRITE_FORMAT_8.set(false);
     drop(store);
     let pack = name("store/pack-000000");
     let mut bytes = sim.contents(&pack);
@@ -1994,7 +2002,8 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = store.get(&key(2)).unwrap_err();
     assert_eq!(corrupt.pack, pack);
-    assert!(corrupt.what.contains("hash"), "{corrupt}");
+    let why = if legacy { "hash" } else { "header and payload do not match its check" };
+    assert!(corrupt.what.contains(why), "{corrupt}");
     let found = store.verify(None);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].key, key(2));
@@ -2415,6 +2424,7 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
                 Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
             }
             Effect::RenameUnsynced { to: onto, .. } if *onto == to => Some("rename".to_owned()),
+            Effect::Mode { file, .. } if file.as_str().ends_with(".placing") => Some("mode".to_owned()),
             // The staged clone's look, whose stamp the place answers (`tests::place_copy`).
             Effect::Stamp { files, .. } if files.iter().any(|it| it.ends_with(".placing")) => {
                 Some("look".to_owned())
@@ -2441,16 +2451,17 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
     // No file at the path yet: prewarmed all the same (of nothing), and placed.
     store.starts(&name("target/app"), true);
     let first = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "look", "rename"]);
+    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "mode", "look", "rename"]);
     assert_eq!(sim.contents(&name("target/app")), big);
     // Over the file there: the prewarm is asked as the clone completed, the staged clone's
     // look as the prewarm did, and the rename as the look did (since 2026-11-12 a place
     // answers the stamp its clone has: `tests::place_copy`).
     let again = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "look", "rename"]);
+    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "mode", "look", "rename"]);
     assert_eq!(again[1].1.as_deref(), Some("Cloned"), "{again:?}");
     assert!(again[2].1.as_deref().is_some_and(|it| it.starts_with("Prewarmed")), "{again:?}");
-    assert!(again[3].1.as_deref().is_some_and(|it| it.starts_with("Stamped")), "{again:?}");
+    assert_eq!(again[3].1.as_deref(), Some("Moded"), "{again:?}");
+    assert!(again[4].1.as_deref().is_some_and(|it| it.starts_with("Stamped")), "{again:?}");
     // The control: a path nothing is started from, and the same path once it is said so.
     let other = placed_logged(&mut sim, &mut store, "target/app.debug");
     assert_eq!(asked(&other), ["clone", "look", "rename"]);
@@ -3101,15 +3112,16 @@ fn a_store_on_a_volume_that_shares_no_blocks_sweeps_the_whole_files_it_finds() {
 #[test]
 fn a_layer_is_read_after_the_store_and_never_written() {
     let mut sim = Sim::new(11, quiet());
-    let mut base = open(&mut sim, "base");
+    let mut base = open_shared(&mut sim, 1);
     base.put(key(1), Kind::Code, b"from the base").unwrap();
     base.put(key(2), Kind::Output, &noise(400 << 10, 2)).unwrap();
     flush(&mut sim, &mut base);
     drop(base);
-    let before = sim.contents(&name("base/head"));
+    let head = writer_file(1, "head");
+    let before = sim.contents(&head);
     let mut store = open_with(
         &mut sim,
-        Config { dir: name("mine"), layers: vec![name("base")], tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: crate::Loader::Pumped },
+        Config { layers: vec![name("shared")], ..config("mine") },
     );
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"from the base");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), noise(400 << 10, 2));
@@ -3118,7 +3130,7 @@ fn a_layer_is_read_after_the_store_and_never_written() {
     assert!(store.put(key(1), Kind::Code, b"other").is_err());
     store.put(key(3), Kind::Code, b"mine").unwrap();
     flush(&mut sim, &mut store);
-    assert_eq!(sim.contents(&name("base/head")), before);
+    assert_eq!(sim.contents(&head), before);
     assert!(sim.exists(&name("mine/head")));
     assert_eq!(store.verify(None), Vec::new());
 }
@@ -3132,7 +3144,7 @@ fn a_missing_layer_stops_the_store() {
         &mut effects,
     );
     drive(&mut sim, &mut store, &mut effects);
-    assert_eq!(store.broken().unwrap().file, name("nowhere/head"));
+    assert_eq!(store.broken().unwrap().file, name("nowhere"));
 }
 
 fn writer(n: u64) -> ContentId {
@@ -3255,12 +3267,20 @@ fn a_value_another_writer_committed_is_one_entry() {
 
 #[test]
 fn a_damaged_value_in_another_writers_store_is_never_served() {
+    for legacy in [false, true] {
+        damaged_peer_value_is_refused(legacy);
+    }
+}
+
+fn damaged_peer_value_is_refused(legacy: bool) {
     let mut sim = Sim::new(16, quiet());
     let mut a = open_shared(&mut sim, 1);
+    disk::WRITE_FORMAT_8.set(legacy);
     a.put(key(1), Kind::Query, &[b'a'; 1000]).unwrap();
     a.put(key(2), Kind::Query, &[b'b'; 1000]).unwrap();
     flush(&mut sim, &mut a);
     let loc = a.loc_of(&key(2));
+    disk::WRITE_FORMAT_8.set(false);
     drop(a);
     let pack = writer_file(1, "pack-000000");
     let mut bytes = sim.contents(&pack);
@@ -3272,7 +3292,8 @@ fn a_damaged_value_in_another_writers_store_is_never_served() {
     assert_eq!(bytes_of(&b, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = b.get(&key(2)).unwrap_err();
     assert_eq!(corrupt.pack, pack);
-    assert!(corrupt.what.contains("hash"), "{corrupt}");
+    let why = if legacy { "hash" } else { "header and payload do not match its check" };
+    assert!(corrupt.what.contains(why), "{corrupt}");
 }
 
 #[test]

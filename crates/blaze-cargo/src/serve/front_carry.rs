@@ -1750,6 +1750,10 @@ pub(crate) mod bodies {
         };
         let mut did = Did::default();
         for it in &claim.refused {
+            #[cfg(test)]
+            if did.refused == 0 {
+                eprintln!("first body record refused: {:?} {:?}: {}", it.def, it.step, it.why);
+            }
             did.refused += 1;
             tracing::debug!(target: "blaze", def = ?it.def, step = ?it.step, "a run the item store refused to trace, kept as no entry: {}", it.why);
         }

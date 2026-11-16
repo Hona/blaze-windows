@@ -670,7 +670,7 @@ pub fn untagged_check(root: &Path, dirs: &[(String, Measured, bool)]) -> Check {
         return check(Verdict::Ok, "no directory of a gigabyte or more without a CACHEDIR.TAG".to_owned());
     }
     let named: Vec<String> = large.iter().map(|(name, size, _)| format!("{name}/ ({})", size.said())).collect();
-    let tags: Vec<String> = large.iter().map(|(name, _, _)| format!("{}/CACHEDIR.TAG", quoted(&root.join(name)))).collect();
+    let tags: Vec<String> = large.iter().map(|(name, _, _)| quoted(&root.join(name).join("CACHEDIR.TAG"))).collect();
     check(Verdict::Warn, format!("{} with no CACHEDIR.TAG: the watcher walks it", named.join(", "))).fixed_by(format!(
         "printf 'Signature: 8a477f597d28d172789f06886806bc55\\n' | tee {} >/dev/null, if it is a cache",
         tags.join(" ")
@@ -942,7 +942,7 @@ mod tests {
         let check = untagged_check(root, &faulty);
         assert_eq!(check.verdict, Verdict::Warn);
         assert!(check.said.starts_with("node_modules/ (2048 MiB)"), "{check:?}");
-        assert!(check.fix.unwrap().contains("/w/node_modules/CACHEDIR.TAG"));
+        assert!(check.fix.unwrap().contains(&quoted(&root.join("node_modules").join("CACHEDIR.TAG"))));
     }
 
     #[test]
