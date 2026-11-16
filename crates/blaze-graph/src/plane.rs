@@ -164,6 +164,9 @@ pub enum PlaneInput {
     /// in its own request at its own priority (skipped, of a request cancelled, or failed and
     /// not keeping going).
     Yielded { at_ns: u64, id: NodeId },
+    /// The executor holds this run behind a prerequisite and uses no thread for it. It
+    /// retains the task until `Yielded` makes it eligible again or `Done` refuses it.
+    Held { at_ns: u64, id: NodeId },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
@@ -197,7 +200,8 @@ impl PlaneInput {
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Promote { at_ns, .. }
-            | PlaneInput::Yielded { at_ns, .. } => *at_ns,
+            | PlaneInput::Yielded { at_ns, .. }
+            | PlaneInput::Held { at_ns, .. } => *at_ns,
         }
     }
 }
@@ -613,6 +617,8 @@ const DONE: u8 = 2;
 const STARTED: u8 = 4;
 const GROUP: u8 = 8;
 const OPEN: u8 = 16;
+/// A dispatched runner waiting outside the pool: neither ready nor using a thread.
+const HELD: u8 = 32;
 
 /// What adding, readying, starting and settling a node read: 64 bytes, one cache line, found
 /// by its slot.
@@ -1220,6 +1226,21 @@ impl<M: Memo> Plane<M> {
             PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
                 self.yielded(at, task, out, touched);
+            }
+            PlaneInput::Held { id, .. } => {
+                let task = self.running_task(id)?;
+                let t = &mut self.tasks[row_of(task)];
+                let flags = &mut self.cold[t.runner as usize].flags;
+                if *flags & HELD == 0 {
+                    *flags |= HELD;
+                    let p = pool_at(t.pool);
+                    self.running[p] -= 1;
+                    if t.yielding {
+                        t.yielding = false;
+                        self.yielding[p] -= 1;
+                    }
+                    self.idle_running.retain(|&it| it != task);
+                }
             }
             PlaneInput::Add { request, nodes, .. } => {
                 let r = self.open_request(request)?;
@@ -2014,7 +2035,9 @@ impl<M: Memo> Plane<M> {
     ) {
         let t = self.tasks[row_of(task)];
         let p = pool_at(t.pool);
-        self.running[p] -= 1;
+        if self.cold[t.runner as usize].flags & HELD == 0 {
+            self.running[p] -= 1;
+        }
         if t.yielding {
             self.yielding[p] -= 1;
         }
@@ -2024,7 +2047,7 @@ impl<M: Memo> Plane<M> {
         row.yielding = false;
         let runner = t.runner as usize;
         self.requests[self.rows[runner].request as usize].stats.ran -= 1;
-        self.cold[runner].flags &= !STARTED;
+        self.cold[runner].flags &= !(STARTED | HELD);
         let mut member = t.first;
         while member != NONE {
             let next = self.rows[member as usize].next_member;
@@ -2065,7 +2088,9 @@ impl<M: Memo> Plane<M> {
         let t = self.tasks[row_of(task)];
         self.tasks[row_of(task)].running = false;
         let p = pool_at(t.pool);
-        self.running[p] -= 1;
+        if self.cold[t.runner as usize].flags & HELD == 0 {
+            self.running[p] -= 1;
+        }
         if t.yielding {
             self.tasks[row_of(task)].yielding = false;
             self.yielding[p] -= 1;

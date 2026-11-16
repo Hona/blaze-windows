@@ -168,6 +168,7 @@ if ($Fixture -ne 'rune-cstr') {
     if ($builds.Count -ne 3) { throw "expected three completed build profiles; got $($builds.Count)" }
     Write-Host "build-script runs: build=$($builds[0].script_runs) noop=$($builds[1].script_runs) edit=$($builds[2].script_runs)"
     if ([int]$builds[1].script_runs -ne 0) { throw 'the no-op ran a build script' }
+    if ([int]$builds[2].script_runs -ne 0) { throw 'the one-line edit ran a build script' }
 }
 
 Get-Content $timings

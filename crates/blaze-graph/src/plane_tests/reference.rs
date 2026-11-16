@@ -64,6 +64,7 @@ struct Task {
     /// own request.
     members: Vec<usize>,
     running: bool,
+    held: bool,
     /// Running, and asked to give way.
     yielding: bool,
 }
@@ -351,6 +352,20 @@ impl<M: Memo> Plane<M> {
                 let task = self.running_task(id)?;
                 self.yielded(at, task, &mut out, &mut touched);
             }
+            PlaneInput::Held { id, .. } => {
+                let task = self.running_task(id)?;
+                let t = &mut self.tasks[task];
+                if !t.held {
+                    t.held = true;
+                    let p = pool_at(t.pool);
+                    self.running[p] -= 1;
+                    if t.yielding {
+                        t.yielding = false;
+                        self.yielding[p] -= 1;
+                    }
+                    self.idle_running.retain(|&it| it != task);
+                }
+            }
         }
         self.after(at, out, touched)
     }
@@ -384,7 +399,9 @@ impl<M: Memo> Plane<M> {
         let (p, yielding, runner) = (pool_at(t.pool), t.yielding, t.runner);
         t.running = false;
         t.yielding = false;
-        self.running[p] -= 1;
+        if !std::mem::take(&mut t.held) {
+            self.running[p] -= 1;
+        }
         if yielding {
             self.yielding[p] -= 1;
         }
@@ -750,7 +767,7 @@ impl<M: Memo> Plane<M> {
         }
         let spec = &self.nodes[me].spec;
         let made =
-            Task { key, pool: spec.pool, runner: me, members: vec![me], running: false, yielding: false };
+            Task { key, pool: spec.pool, runner: me, members: vec![me], running: false, held: false, yielding: false };
         let task = match self.free_tasks.pop() {
             Some(task) => {
                 self.tasks[task] = made;
@@ -861,7 +878,9 @@ impl<M: Memo> Plane<M> {
         let (pool, key, yielding) = (pool_at(t.pool), t.key, t.yielding);
         t.yielding = false;
         let members = std::mem::take(&mut t.members);
-        self.running[pool] -= 1;
+        if !t.held {
+            self.running[pool] -= 1;
+        }
         if yielding {
             self.yielding[pool] -= 1;
         }

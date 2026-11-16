@@ -116,6 +116,12 @@ impl Again {
         Some(SameAgain { build: track.build, node, times: track.times, waited: now })
     }
 
+    /// Whether this node has already run and given way without ending.
+    #[must_use]
+    pub fn is_restarted(&self, node: u64) -> bool {
+        self.tracks.binary_search_by_key(&node, |it| it.node).is_ok()
+    }
+
     /// Node `node` ended, settled or was dropped: forgotten.
     pub fn forget(&mut self, node: u64) {
         if let Ok(k) = self.tracks.binary_search_by_key(&node, |it| it.node) {
