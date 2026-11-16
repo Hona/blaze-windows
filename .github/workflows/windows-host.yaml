@@ -123,3 +123,11 @@ jobs:
           path: target/debug/deps
       - name: Run the suite with runner headroom
         run: ./.github/scripts/windows-suite.ps1 '${{ matrix.crate }}'
+      - name: Preserve the full diagnostics for a failed suite
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.crate }}-logs-${{ github.sha }}
+          path: ${{ matrix.crate }}.*.log
+          retention-days: 3
+          if-no-files-found: warn
