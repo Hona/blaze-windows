@@ -1096,13 +1096,23 @@ impl Image {
     }
 
     /// Gives back what the image keeps only for its next stage to start warm: its stage
-    /// scratch's blocks, to the kernel. Nothing a stage made outlives it in the scratch (each
-    /// stage resets it as it begins, and what a stage returns borrows none of it), so this
-    /// changes nothing the next link reads; that link commits its scratch again as it goes.
-    /// For an image kept idle between builds, where many kept images' warm scratch adds up.
+    /// scratch's blocks, to the kernel, plus its key-hashing scratch and (for non-incremental
+    /// images that never roll back) its undo history. Nothing a stage made outlives it in the
+    /// scratch (each stage resets it as it begins, and what a stage returns borrows none of it),
+    /// so this changes nothing the next link reads; that link commits its scratch again as it
+    /// goes. For an image kept idle between builds, where many kept images' warm scratch adds up.
     pub fn rest(&mut self) {
         self.arena.reset();
         self.arena.trim(0);
+        self.scratch.clear();
+        self.scratch.shrink_to_fit();
+        if self.placed_pairs.is_empty() {
+            self.placed_pairs.shrink_to_fit();
+        }
+        if !self.output.incremental {
+            self.history.clear();
+            self.history.shrink_to_fit();
+        }
     }
 
     /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.

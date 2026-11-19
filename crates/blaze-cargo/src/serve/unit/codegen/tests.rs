@@ -587,3 +587,22 @@ fn a_link_out_of_room_names_the_image_and_whose_limit_it_is() {
     assert!(no_room.contains("the limit is the output's"), "{no_room}");
     assert!(!failed(None).contains("the limit is the output's"));
 }
+
+#[test]
+fn native_bytes_shares_one_allocation_across_links_and_releases_when_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("libcmt.lib");
+    let payload = vec![0xABu8; 64 * 1024];
+    std::fs::write(&file, &payload).unwrap();
+    let mut hasher = blaze_ids::b3::Hasher::new();
+    hasher.update(&payload);
+    let id = ContentId(hasher.finalize());
+    let pool = crate::serve::unit::NativeBytes::default();
+    let first = pool.get_or_read(id, &file).unwrap();
+    let second = pool.get_or_read(id, &file).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "same content must share one Arc<[u8]>");
+    let weak = std::sync::Arc::downgrade(&first);
+    drop(first);
+    drop(second);
+    assert!(weak.upgrade().is_none(), "weak pool must not pin bytes after last image drops");
+}

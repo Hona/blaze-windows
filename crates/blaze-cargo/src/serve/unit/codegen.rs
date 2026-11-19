@@ -1509,6 +1509,11 @@ impl Linked {
         self.loaded.as_ref().is_some_and(|it| it.running())
     }
 
+    /// Whether this image keeps patch room for incremental links.
+    pub(crate) fn incremental(&self) -> bool {
+        self.output.incremental
+    }
+
     /// Kept idle until its next link: the image's stage scratch given back ([`Image::rest`]).
     pub(crate) fn rest(&mut self) {
         self.image.rest();
@@ -2456,7 +2461,11 @@ fn link_at(
         };
         Ok((written, runs, read, table, laid, told))
     });
-    images.push(KeptImage { path: path.to_owned(), kept: linked });
+    // A wasm proc macro is linked whole with no patch room and `runs` is `None`: keeping its
+    // 448-region `blaze_link::Image` after a successful link serves no incremental relink.
+    if !wasm || made.is_err() {
+        images.push(KeptImage { path: path.to_owned(), kept: linked });
+    }
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
@@ -2845,15 +2854,12 @@ fn relink(
                 bytes_of.push((order, made.clone()));
                 continue;
             }
-            let bytes = std::fs::read(&it.path).map_err(|error| {
-                // alloc: error path
-                LinkCause::Native(blaze_usercode::inputs::Unreadable {
-                    path: it.path.clone(),
-                    error: error.to_string(),
-                })
-            })?;
-            // alloc: once per native input new to the image, which keeps it shared from here.
-            bytes_of.push((order, Arc::<[u8]>::from(bytes)));
+            let shared = job
+                .shared
+                .native_bytes
+                .get_or_read(native_ids[order], &it.path)
+                .map_err(LinkCause::Native)?;
+            bytes_of.push((order, shared));
         }
     }
 

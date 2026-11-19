@@ -523,6 +523,29 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     assert!(paths.take_images(&[a, b, c]).is_empty());
 }
 
+#[test]
+fn compact_images_are_capped_and_evict_images_drops_non_live_images() {
+    let mut paths = Paths::<Real>::new();
+    for i in 0..12 {
+        let path = format!("/w/target/debug/build/script-{i}");
+        let id = paths.intern(&path);
+        paths.keep(&[id], vec![crate::serve::unit::test_kept_image(&path, false)]);
+    }
+    let (count, _bytes) = paths.kept_summary();
+    assert_eq!(
+        count,
+        Paths::<Real>::MAX_COMPACT_KEPT,
+        "compact build-script images must be capped at MAX_COMPACT_KEPT"
+    );
+    let app = "/w/target/debug/app";
+    let app_id = paths.intern(app);
+    paths.keep(&[app_id], vec![crate::serve::unit::test_kept_image(app, true)]);
+    assert_eq!(paths.kept_summary().0, Paths::<Real>::MAX_COMPACT_KEPT + 1);
+    let (dropped, _bytes) = paths.evict_images();
+    assert_eq!(dropped, Paths::<Real>::MAX_COMPACT_KEPT + 1);
+    assert_eq!(paths.kept_summary().0, 0);
+}
+
 /// A job that ends while its request is open cancels it when not ok and closes it when ok
 /// (once); one that ends after the plane finished its request, before the job read so, does
 /// neither, where the plane would refuse ("request 1 is not open").

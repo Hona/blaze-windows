@@ -1045,6 +1045,11 @@ pub trait Kept: Send + 'static {
     /// Whether a run of user code maps it now (a dev executable's running program): such an
     /// image is never let go, or the next link could not patch what runs.
     fn live(&self) -> bool;
+    /// Whether this image keeps patch room for incremental edits (`false` for compact fetched
+    /// build scripts and wasm reactors, which may be capped aggressively).
+    fn incremental(&self) -> bool {
+        true
+    }
     /// Lets go of what it keeps only to start its next link warm, as it is kept idle.
     fn rest(&mut self);
 }

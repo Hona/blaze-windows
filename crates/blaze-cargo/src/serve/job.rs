@@ -2061,10 +2061,14 @@ struct Paths<S: Steps> {
     /// file is still so is not placed again.
     placed: Vec<Option<Placement>>,
     /// The image kept linked there: moved into the compile that relinks it and back once it
-    /// ends ([`Image`]). Nothing lets one go for memory: the kernel's limit is the ceiling.
+    /// ends ([`Image`]).
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
+    /// Non-incremental kept image path ids (fetched build scripts, compact links), oldest first,
+    /// capped at [`Self::MAX_COMPACT_KEPT`] so large workspaces with dozens of build scripts do
+    /// not hold dozens of 448-region linker images forever while small builds keep build-id reuse.
+    compact: std::collections::VecDeque<u32>,
     /// The images a unit links beside its planned outputs (a library's doctests, each its own
     /// program, under its runner's `.doctests` directory), by the unit's first output: taken
     /// with that output's, so an edit relinks the one example it changed.
@@ -2075,6 +2079,9 @@ struct Paths<S: Steps> {
 }
 
 impl<S: Steps> Paths<S> {
+    /// Most non-incremental (compact build-script) linker images kept at once.
+    const MAX_COMPACT_KEPT: usize = 8;
+
     fn new() -> Paths<S> {
         Paths {
             ids: HashMap::new_in(Global),
@@ -2083,6 +2090,7 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
+            compact: std::collections::VecDeque::new(), // alloc: none until a compact image is kept
             extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
@@ -2163,10 +2171,56 @@ impl<S: Steps> Paths<S> {
                 extras.push(id);
             }
         }
+        let slot_id = id;
+        let incremental = image.kept.incremental();
         let id = id as usize;
         if self.images[id].replace(image).is_none() {
             self.kept += 1;
         }
+        if !incremental {
+            self.compact.retain(|&it| it != slot_id);
+            self.compact.push_back(slot_id);
+            while self.compact.len() > Self::MAX_COMPACT_KEPT {
+                let Some(old) = self.compact.pop_front() else { break };
+                if let Some(existing) = self.images.get_mut(old as usize)
+                    && existing.as_ref().is_some_and(|it| !it.kept.live() && !it.kept.incremental())
+                {
+                    *existing = None;
+                    self.kept -= 1;
+                }
+            }
+        }
+    }
+
+    /// Number of kept linker images and their summed `Kept::held()` bytes.
+    fn kept_summary(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for image in self.images.iter().flatten() {
+            count += 1;
+            bytes = bytes.saturating_add(image.kept.held());
+        }
+        (count, bytes)
+    }
+
+    /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
+    /// Used under memory pressure: the next link lays the image out from scratch.
+    fn evict_images(&mut self) -> (usize, u64) {
+        while let Some(image) = self.back.pop() {
+            self.keep_one(&[], image);
+        }
+        let mut dropped = 0usize;
+        let mut bytes = 0u64;
+        for slot in &mut self.images {
+            if slot.as_ref().is_some_and(|it| !it.kept.live()) {
+                let gone = slot.take().expect("checked is_some_and");
+                self.kept = self.kept.saturating_sub(1);
+                dropped += 1;
+                bytes = bytes.saturating_add(gone.kept.held());
+            }
+        }
+        self.compact.retain(|&id| self.images.get(id as usize).is_some_and(Option::is_some));
+        (dropped, bytes)
     }
 }
 
@@ -6082,6 +6136,16 @@ impl<S: Steps> Jobs<S> {
             // alloc: a refused task, once
             None => w.plane.refuse(w.now, task, "its job has no front end to read now".to_owned()),
         }
+    }
+
+    /// Number of kept linker images and their summed held bytes.
+    pub fn kept_images_summary(&self) -> (usize, u64) {
+        self.paths.kept_summary()
+    }
+
+    /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
+    pub fn evict_kept_images(&mut self) -> (usize, u64) {
+        self.paths.evict_images()
     }
 
     /// What each kept front end's query storage holds, by ingredient, a line a front end in

@@ -143,6 +143,64 @@ pub(crate) struct Shared {
     /// The programs blaze's launcher runs, and the socket their launchers connect to
     /// (docs/v2/plan/design/launcher.md).
     pub(crate) launches: run::launch::Launches,
+    /// Native library bytes shared across every kept image by content hash (`Weak<[u8]>` so
+    /// bytes free automatically once the last image referencing them drops). Without this,
+    /// 72 build scripts and binaries each hold their own copy of MSVC CRT/SDK `.lib` archives.
+    pub(crate) native_bytes: NativeBytes,
+}
+
+/// Content-addressed weak pool of native object/archive bytes shared across linked images.
+pub(crate) struct NativeBytes {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "cold lock held only when a new native archive is added to a link image"
+    )]
+    by_id: blaze_core::lock::Lock<blaze_hash::HashMap<ContentId, std::sync::Weak<[u8]>, std::alloc::Global>>,
+}
+
+impl Default for NativeBytes {
+    fn default() -> NativeBytes {
+        NativeBytes {
+            by_id: blaze_core::lock::Lock::new(
+                "serve.unit.native_bytes",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+        }
+    }
+}
+
+impl NativeBytes {
+    /// Returns the shared bytes for native input `id` at `path`, reading from disk only when no
+    /// live image already holds the same content.
+    pub(crate) fn get_or_read(
+        &self,
+        id: ContentId,
+        path: &std::path::Path,
+    ) -> Result<Arc<[u8]>, blaze_usercode::inputs::Unreadable> {
+        if let Some(shared) = self.by_id.lock().get(&id).and_then(std::sync::Weak::upgrade) {
+            return Ok(shared);
+        }
+        let bytes = std::fs::read(path).map_err(|error| blaze_usercode::inputs::Unreadable {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        // Key by the actual BLAKE3 of the bytes just read so a concurrent file edit can never
+        // alias another content id.
+        let mut hasher = blaze_ids::b3::Hasher::new();
+        hasher.update(&bytes);
+        let actual = ContentId(hasher.finalize());
+        // alloc: once per unique native archive across all images that link it
+        let arc = Arc::<[u8]>::from(bytes);
+        let mut map = self.by_id.lock();
+        if let Some(existing) = map.get(&actual).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
+        }
+        if map.len() >= 128 {
+            map.retain(|_, weak| weak.strong_count() > 0);
+        }
+        map.insert(actual, Arc::downgrade(&arc));
+        Ok(arc)
+    }
 }
 
 impl Real {
@@ -167,6 +225,7 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
             launches: run::launch::Launches::new(paths.state.join("launch")),
+            native_bytes: NativeBytes::default(),
         };
         let native = blaze_manifest::user_config::home().ok().map(|it| it.join(crate::serve::native::NATIVE));
         Ok(Real {
@@ -2782,9 +2841,28 @@ impl Kept for codegen::Linked {
         codegen::Linked::live(self)
     }
 
+    fn incremental(&self) -> bool {
+        codegen::Linked::incremental(self)
+    }
+
     fn rest(&mut self) {
         codegen::Linked::rest(self);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_kept_image(path: &str, incremental: bool) -> crate::serve::work::Image<Real> {
+    let mut output = blaze_link::target::output(
+        "x86_64-unknown-linux-gnu",
+        None,
+        blaze_link::Debug::None,
+        incremental,
+        blaze_link::target::RunsOn::Here,
+    )
+    .unwrap();
+    output.incremental = incremental;
+    let kept = codegen::fresh_image(path, &output, None).unwrap();
+    crate::serve::work::Image { path: path.to_owned(), kept }
 }
 
 /// User code of a job, run on the loop: a build script's run, the build's tests, its
