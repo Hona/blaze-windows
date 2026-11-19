@@ -50,6 +50,8 @@ use hir_ty::check_cache::port;
 
 use super::*;
 
+pub(crate) mod traced;
+
 /// The domain of a describe record's inputs, and of its schema.
 const DOMAIN: &str = "blaze v2 describe record 1";
 const STAGE_DOMAIN: &str = "blaze v2 describe record stage 1";
@@ -190,7 +192,7 @@ pub(super) fn found_in(slot: &mut Option<(u64, Arc<Found>)>, db: &Db) -> Arc<Fou
 /// The crates an instance worked out in `home` may name: `home` and what it depends on,
 /// whose content `home`'s image key covers.
 #[derive(Clone, Copy)]
-struct Closure<'db> {
+pub(super) struct Closure<'db> {
     db: &'db Db,
     crates: &'db [Crate],
 }
@@ -529,19 +531,17 @@ fn ask_read(db: &Db, bytes: &[u8]) -> R<(HirInstance, Origin)> {
 }
 
 impl<'db> HirFrontend<'db> {
-    /// What a record key holds of this front end: its producer, and its [`Stage`] with
-    /// whether the build links an image and is build-time code. `None` for a front end whose
-    /// describes are no records: one made with no policy, one keyed by the tests' hashes
-    /// (ids of a database), and one whose bodies are walked against a program's dyn facts
-    /// (its describes are of that program, [`Facing::world`]).
-    fn record_stage(&self) -> Option<(ContentId, ContentId)> {
+    /// What a record key holds of this front end, regardless of whether a closed devirt world
+    /// is active: `describe_recorded_in` checks `Described::takes_world` on a hit so that
+    /// non-devirtualized functions reuse their `world = None` records across devirt round 2.
+    pub(super) fn record_stage_for_trace(&self) -> Option<(ContentId, ContentId)> {
         let stage = self.stage?;
         let by_content = match &self.hashes {
             HashSource::Items(_) => true,
             #[cfg(test)]
             HashSource::ById(_) => false,
         };
-        if !by_content || self.devirt.world().is_some() {
+        if !by_content {
             return None;
         }
         let mut hasher = Hasher::new(STAGE_DOMAIN);
@@ -549,16 +549,50 @@ impl<'db> HirFrontend<'db> {
         Some((stage.toolchain, hasher.finish()))
     }
 
+    /// What a record key holds of this front end: its producer, and its [`Stage`] with
+    /// whether the build links an image and is build-time code. `None` for a front end whose
+    /// describes are no records: one made with no policy, one keyed by the tests' hashes
+    /// (ids of a database), and one whose bodies are walked against a program's dyn facts
+    /// (its describes are of that program, [`Facing::world`]).
+    fn record_stage(&self) -> Option<(ContentId, ContentId)> {
+        if self.devirt.world().is_some() {
+            return None;
+        }
+        self.record_stage_for_trace()
+    }
+
     /// The image key of the home of `instance`, and the crates it may name; `None` for an
-    /// instance with no home read from an image, or worked out in an environment that is not
-    /// empty.
+    /// instance whose home crate is not sealed (`hir_def::deps::sealed`: workspace crates and
+    /// crates above them have image keys that hash dependency `surface`s, which exclude
+    /// `#[inline]` bodies, so they use traced describe records in [`traced`] instead), has no
+    /// image, or is worked out in an environment that is not empty.
     fn sealed(db: &'db Db, instance: &HirInstance) -> Option<(ContentId, Closure<'db>)> {
         let Kind::Code(_, env) = &instance.0 else { return None };
         if env.param_env(db) != ParamEnv::empty() {
             return None;
         }
+        if !hir_def::deps::sealed(db, env.krate) {
+            return None;
+        }
         let image = hir_def::deps::image_of(db, env.krate).as_ref()?.key();
         Some((image, Closure::of(db, env.krate)))
+    }
+
+    /// What a describe of `instance` for `requester` is read under ([`Under`]) and its
+    /// producer; `None` where it has no single-key sealed record.
+    fn under_with_stage(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        stage: Option<(ContentId, ContentId)>,
+    ) -> Option<(ContentId, Under, Closure<'db>)> {
+        let (producer, stage) = stage?;
+        let (image, closure) = Self::sealed(db, instance)?;
+        let mut asked = Hasher::new(STAGE_DOMAIN);
+        asked.id(&stage);
+        self.units.as_ref()?.asked_as(requester, &mut asked)?;
+        Some((producer, Under { image, asked: asked.finish() }, closure))
     }
 
     /// What a describe of `instance` for `requester` is read under ([`Under`]) and its
@@ -569,12 +603,25 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Option<(ContentId, Under, Closure<'db>)> {
-        let (producer, stage) = self.record_stage()?;
-        let (image, closure) = Self::sealed(db, instance)?;
-        let mut asked = Hasher::new(STAGE_DOMAIN);
-        asked.id(&stage);
-        self.units.as_ref()?.asked_as(requester, &mut asked)?;
-        Some((producer, Under { image, asked: asked.finish() }, closure))
+        self.under_with_stage(db, instance, requester, self.record_stage())
+    }
+
+    fn sealed_key_with_stage(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        stage: Option<(ContentId, ContentId)>,
+    ) -> Option<(Key, Under, Closure<'db>)> {
+        let (producer, under, closure) = self.under_with_stage(db, instance, requester, stage)?;
+        let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
+        // alloc: once per key, the instance's few words
+        let mut named = Vec::with_capacity(64);
+        put_instance(&closure, &mut writer, &mut named, instance)?;
+        let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
+        let mut inputs = Hasher::new(DOMAIN);
+        inputs.id(&under.asked).id(&under.image).part(&named).part(&ported);
+        Some((Key::of(SCHEMA, producer, &[inputs.finish()]), under, closure))
     }
 
     /// [`Frontend::record_key`], given the database.
@@ -584,15 +631,7 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Option<Key> {
-        let (producer, under, closure) = self.under(db, instance, requester)?;
-        let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
-        // alloc: once per key, the instance's few words
-        let mut named = Vec::with_capacity(64);
-        put_instance(&closure, &mut writer, &mut named, instance)?;
-        let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
-        let mut inputs = Hasher::new(DOMAIN);
-        inputs.id(&under.asked).id(&under.image).part(&named).part(&ported);
-        Some(Key::of(SCHEMA, producer, &[inputs.finish()]))
+        self.sealed_key_with_stage(db, instance, requester, self.record_stage()).map(|it| it.0)
     }
 
     /// What the build calls the files of `instance`'s home crate and of each crate it loads:
@@ -694,7 +733,227 @@ impl<'db> HirFrontend<'db> {
     pub fn static_naming_of(&self, value: &HirStatic) -> Option<ContentId> {
         self.with(|db| self.naming_over(db, value.0.krate(db).transitive_deps(db)))
     }
+}
 
+/// Encodes `described` into portable bytes naming every instance and static by content.
+/// Shared by sealed single-key records and unsealed traced records ([`traced`]).
+pub(super) fn encode_described<'db>(
+    db: &'db Db,
+    closure: &Closure<'db>,
+    own: Option<&Origin>,
+    described: &Described<HirInstance, HirStatic>,
+) -> Option<Vec<u8>> {
+    let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
+    // alloc: per record written, its bytes
+    let mut out = Vec::with_capacity(512);
+    let Described {
+        item,
+        code,
+        template_code,
+        anchors,
+        built_in_code,
+        args,
+        origin: _,
+        takes_world,
+        editable,
+        over_editable,
+        overflow_checks,
+        address,
+        symbol,
+        linkage,
+        refs,
+        built_in,
+        name,
+        owner,
+        identity,
+        abi,
+        bound,
+        cold,
+    } = described;
+    put_id(&mut out, &item.0);
+    put_id(&mut out, &code.0);
+    put_id(&mut out, &template_code.0);
+    put_id(&mut out, &built_in_code.0);
+    put_id(&mut out, args);
+    put_id(&mut out, identity);
+    put_id(&mut out, abi);
+    match anchors {
+        Some(anchors) => {
+            out.put_u8(1);
+            anchors.iter().for_each(|it| put_id(&mut out, it));
+        }
+        None => out.put_u8(0),
+    }
+    match own {
+        Some(own) => put_origin(&mut out, own),
+        None => out.put_u8(0),
+    }
+    let flags = u8::from(*editable)
+        | u8::from(*over_editable) << 1
+        | u8::from(*cold) << 2
+        | u8::from(matches!(address, Address::Significant)) << 3
+        | u8::from(matches!(linkage, blaze_codegen::Linkage::Weak)) << 4
+        | u8::from(matches!(owner, Owner::Workspace)) << 5
+        | u8::from(*takes_world) << 6;
+    out.put_u8(flags);
+    out.put_u8(match overflow_checks {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
+    put_text(&mut out, symbol.as_deref());
+    put_text(&mut out, Some(name.as_str()));
+    match bound {
+        Ok(bound) => {
+            out.put_u8(1);
+            put_id(&mut out, bound);
+        }
+        Err(why) => {
+            out.put_u8(0);
+            out.put_bytes_u32(why.as_bytes());
+        }
+    }
+    out.put_u32(u32::try_from(built_in.len()).ok()?);
+    built_in.iter().for_each(|it| out.put_u32(*it));
+    out.put_u32(u32::try_from(refs.len()).ok()?);
+    for it in refs {
+        match it {
+            FrontRef::Function(callee) => {
+                put_instance(closure, &mut writer, &mut out, callee)?;
+                put_counted(&mut out, &counted(db, &callee.0));
+            }
+            FrontRef::Static(value) => {
+                if !closure.holds(value.0.krate(db)) {
+                    return None;
+                }
+                out.put_u8(STATIC);
+                out.put_u32(writer.static_item(value.0));
+            }
+            FrontRef::Extern(name) => {
+                out.put_u8(EXTERN);
+                out.put_bytes_u32(name.as_bytes());
+            }
+            FrontRef::Weak(name) => {
+                out.put_u8(WEAK);
+                out.put_bytes_u32(name.as_bytes());
+            }
+        }
+    }
+    let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
+    // alloc: per record written, its bytes: the ported buffer, then the describe
+    let mut record = Vec::with_capacity(4 + ported.len() + out.len());
+    record.put_bytes_u32(&ported);
+    record.extend_from_slice(&out);
+    Some(record)
+}
+
+/// Decodes portable bytes written by [`encode_described`] in `db`, invoking `on_counted` for
+/// each callee's recursion-limit count.
+pub(super) fn decode_described<'db>(
+    db: &'db Db,
+    requester: &Origin,
+    record: &[u8],
+    mut on_counted: impl FnMut(&HirInstance, Counted),
+) -> R<Described<HirInstance, HirStatic>> {
+    let mut bytes = Reader::new(record);
+    // The ported buffer is read in place at its own alignment, which a store's bytes at
+    // an offset do not have.
+    let ported = Aligned::copy_from(bytes.bytes_u32()?);
+    let mut ported = port::Reader::open(
+        db,
+        DbInterner::new_no_crate(db),
+        &ported,
+        &mut |name| item_named(db, name),
+    )?;
+    let item = ItemKey(get_id(&mut bytes)?);
+    let code = CodeHash(get_id(&mut bytes)?);
+    let template_code = CodeHash(get_id(&mut bytes)?);
+    let built_in_code = CodeHash(get_id(&mut bytes)?);
+    let args = get_id(&mut bytes)?;
+    let identity = get_id(&mut bytes)?;
+    let abi = get_id(&mut bytes)?;
+    let anchors = match flag(bytes.u8()?)? {
+        true => {
+            let mut anchors = [ContentId::default(); blaze_codegen::template::OWN_TABLES];
+            for anchor in &mut anchors {
+                *anchor = get_id(&mut bytes)?;
+            }
+            Some(anchors)
+        }
+        false => None,
+    };
+    let origin = get_origin(&mut bytes, requester)?;
+    let flags = bytes.u8()?;
+    if flags >= 1 << 7 {
+        // alloc: the reason of a refusal
+        return Err(format!("a describe with flags {flags:#x}"));
+    }
+    let overflow_checks = match bytes.u8()? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        // alloc: the reason of a refusal
+        other => return Err(format!("overflow checks of no kind ({other})")),
+    };
+    let symbol = get_text(&mut bytes)?;
+    let name = get_text(&mut bytes)?.ok_or("a describe with no name")?;
+    let bound = match flag(bytes.u8()?)? {
+        true => Ok(get_id(&mut bytes)?),
+        false => Err(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
+    };
+    let count = bytes.count_u32(size_of::<u32>())?;
+    // alloc: the describe's own list
+    let mut built_in = Vec::with_capacity(count);
+    for _ in 0..count {
+        built_in.push(bytes.u32()?);
+    }
+    let count = bytes.count_u32(1)?;
+    // alloc: the describe's own list
+    let mut refs = Vec::with_capacity(count);
+    for _ in 0..count {
+        refs.push(match bytes.u8()? {
+            STATIC => FrontRef::Static(HirStatic(ported.static_item(bytes.u32()?)?)),
+            EXTERN => FrontRef::Extern(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
+            WEAK => FrontRef::Weak(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
+            tag => {
+                let callee = get_instance(db, &mut ported, &mut bytes, tag)?;
+                let counted = get_counted(&mut bytes)?;
+                on_counted(&callee, counted);
+                FrontRef::Function(callee)
+            }
+        });
+    }
+    bytes.finish()?;
+    Ok(Described {
+        item,
+        code,
+        template_code,
+        anchors,
+        built_in_code,
+        args,
+        origin,
+        editable: flags & 1 != 0,
+        takes_world: flags & 64 != 0,
+        over_editable: flags & 2 != 0,
+        overflow_checks,
+        address: if flags & 8 != 0 { Address::Significant } else { Address::Free },
+        symbol,
+        linkage: match flags & 16 != 0 {
+            true => blaze_codegen::Linkage::Weak,
+            false => blaze_codegen::Linkage::Strong,
+        },
+        refs,
+        built_in,
+        name,
+        owner: if flags & 32 != 0 { Owner::Workspace } else { Owner::Dependency },
+        identity,
+        abi,
+        bound,
+        cold: flags & 4 != 0,
+    })
+}
+
+impl<'db> HirFrontend<'db> {
     /// [`Frontend::to_record`], given the database.
     pub(super) fn to_record_in(
         &self,
@@ -718,108 +977,7 @@ impl<'db> HirFrontend<'db> {
         if described.origin != own.unwrap_or(*requester) {
             return None;
         }
-        let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
-        // alloc: per record written, its bytes
-        let mut out = Vec::with_capacity(512);
-        let Described {
-            item,
-            code,
-            template_code,
-            anchors,
-            built_in_code,
-            args,
-            origin: _,
-            takes_world,
-            editable,
-            over_editable,
-            overflow_checks,
-            address,
-            symbol,
-            linkage,
-            refs,
-            built_in,
-            name,
-            owner,
-            identity,
-            abi,
-            bound,
-            cold,
-        } = described;
-        put_id(&mut out, &item.0);
-        put_id(&mut out, &code.0);
-        put_id(&mut out, &template_code.0);
-        put_id(&mut out, &built_in_code.0);
-        put_id(&mut out, args);
-        put_id(&mut out, identity);
-        put_id(&mut out, abi);
-        match anchors {
-            Some(anchors) => {
-                out.put_u8(1);
-                anchors.iter().for_each(|it| put_id(&mut out, it));
-            }
-            None => out.put_u8(0),
-        }
-        match &own {
-            Some(own) => put_origin(&mut out, own),
-            None => out.put_u8(0),
-        }
-        let flags = u8::from(*editable)
-            | u8::from(*over_editable) << 1
-            | u8::from(*cold) << 2
-            | u8::from(matches!(address, Address::Significant)) << 3
-            | u8::from(matches!(linkage, blaze_codegen::Linkage::Weak)) << 4
-            | u8::from(matches!(owner, Owner::Workspace)) << 5
-            | u8::from(*takes_world) << 6;
-        out.put_u8(flags);
-        out.put_u8(match overflow_checks {
-            None => 0,
-            Some(false) => 1,
-            Some(true) => 2,
-        });
-        put_text(&mut out, symbol.as_deref());
-        put_text(&mut out, Some(name.as_str()));
-        match bound {
-            Ok(bound) => {
-                out.put_u8(1);
-                put_id(&mut out, bound);
-            }
-            Err(why) => {
-                out.put_u8(0);
-                out.put_bytes_u32(why.as_bytes());
-            }
-        }
-        out.put_u32(u32::try_from(built_in.len()).ok()?);
-        built_in.iter().for_each(|it| out.put_u32(*it));
-        out.put_u32(u32::try_from(refs.len()).ok()?);
-        for it in refs {
-            match it {
-                FrontRef::Function(callee) => {
-                    put_instance(&closure, &mut writer, &mut out, callee)?;
-                    put_counted(&mut out, &counted(db, &callee.0));
-                }
-                FrontRef::Static(value) => {
-                    if !closure.holds(value.0.krate(db)) {
-                        return None;
-                    }
-                    out.put_u8(STATIC);
-                    out.put_u32(writer.static_item(value.0));
-                }
-                FrontRef::Extern(name) => {
-                    out.put_u8(EXTERN);
-                    out.put_bytes_u32(name.as_bytes());
-                }
-                FrontRef::Weak(name) => {
-                    out.put_u8(WEAK);
-                    out.put_bytes_u32(name.as_bytes());
-                }
-            }
-        }
-        let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
-        // alloc: per record written, its bytes: the ported buffer, then the describe
-        let mut record = Vec::with_capacity(4 + ported.len() + out.len());
-        record.put_bytes_u32(&ported);
-        record.extend_from_slice(&out);
-        Some(record)
+        encode_described(db, &closure, own.as_ref(), described)
     }
 
     /// [`Frontend::from_record`], given the database: the describe, and into [`Found`] that
@@ -834,105 +992,86 @@ impl<'db> HirFrontend<'db> {
         let (_, under, _) = (self.under(db, instance, requester))
             .ok_or("this front end has no record key for it now")?;
         let found = self.found.as_ref().ok_or("this front end was made with no policy")?;
-        let mut bytes = Reader::new(record);
-        // The ported buffer is read in place at its own alignment, which a store's bytes at
-        // an offset do not have.
-        let ported = Aligned::copy_from(bytes.bytes_u32()?);
-        let mut ported = port::Reader::open(
-            db,
-            DbInterner::new_no_crate(db),
-            &ported,
-            &mut |name| item_named(db, name),
-        )?;
-        let item = ItemKey(get_id(&mut bytes)?);
-        let code = CodeHash(get_id(&mut bytes)?);
-        let template_code = CodeHash(get_id(&mut bytes)?);
-        let built_in_code = CodeHash(get_id(&mut bytes)?);
-        let args = get_id(&mut bytes)?;
-        let identity = get_id(&mut bytes)?;
-        let abi = get_id(&mut bytes)?;
-        let anchors = match flag(bytes.u8()?)? {
-            true => {
-                let mut anchors = [ContentId::default(); blaze_codegen::template::OWN_TABLES];
-                for anchor in &mut anchors {
-                    *anchor = get_id(&mut bytes)?;
-                }
-                Some(anchors)
-            }
-            false => None,
-        };
-        let origin = get_origin(&mut bytes, requester)?;
-        let flags = bytes.u8()?;
-        if flags >= 1 << 7 {
-            // alloc: the reason of a refusal
-            return Err(format!("a describe with flags {flags:#x}"));
-        }
-        let overflow_checks = match bytes.u8()? {
-            0 => None,
-            1 => Some(false),
-            2 => Some(true),
-            // alloc: the reason of a refusal
-            other => return Err(format!("overflow checks of no kind ({other})")),
-        };
-        let symbol = get_text(&mut bytes)?;
-        let name = get_text(&mut bytes)?.ok_or("a describe with no name")?;
-        let bound = match flag(bytes.u8()?)? {
-            true => Ok(get_id(&mut bytes)?),
-            false => Err(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
-        };
-        let count = bytes.count_u32(size_of::<u32>())?;
-        // alloc: the describe's own list
-        let mut built_in = Vec::with_capacity(count);
-        for _ in 0..count {
-            built_in.push(bytes.u32()?);
-        }
-        let count = bytes.count_u32(1)?;
-        // alloc: the describe's own list
-        let mut refs = Vec::with_capacity(count);
-        for _ in 0..count {
-            refs.push(match bytes.u8()? {
-                STATIC => FrontRef::Static(HirStatic(ported.static_item(bytes.u32()?)?)),
-                EXTERN => FrontRef::Extern(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
-                WEAK => FrontRef::Weak(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
-                tag => {
-                    let callee = get_instance(db, &mut ported, &mut bytes, tag)?;
-                    let counted = get_counted(&mut bytes)?;
-                    // clone: the map's key, once per reference of a record read
-                    found.counted.pin().insert(callee.clone(), counted);
-                    FrontRef::Function(callee)
-                }
-            });
-        }
-        bytes.finish()?;
+        let described = decode_described(db, requester, record, |callee, counted| {
+            // clone: the map's key, once per reference of a record read
+            found.counted.pin().insert(callee.clone(), counted);
+        })?;
         // clone: the map's key, once per record read
         found.records.pin().insert((instance.clone(), *requester), under);
-        Ok(Described {
-            item,
-            code,
-            template_code,
-            anchors,
-            built_in_code,
-            args,
-            origin,
-            editable: flags & 1 != 0,
-            takes_world: flags & 64 != 0,
-            over_editable: flags & 2 != 0,
-            overflow_checks,
-            address: if flags & 8 != 0 { Address::Significant } else { Address::Free },
-            symbol,
-            linkage: match flags & 16 != 0 {
-                true => blaze_codegen::Linkage::Weak,
-                false => blaze_codegen::Linkage::Strong,
-            },
-            refs,
-            built_in,
-            name,
-            owner: if flags & 32 != 0 { Owner::Workspace } else { Owner::Dependency },
-            identity,
-            abi,
-            bound,
-            cold: flags & 4 != 0,
-        })
+        Ok(described)
+    }
+
+    /// [`Frontend::describe_recorded`], given the database: sealed crates use the single-key
+    /// record path; unsealed crates use [`traced::describe_recorded`] which captures and
+    /// validates every dependency read by `code_walk` and `described`.
+    pub(super) fn describe_recorded_in(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        // dyn: the store's verified reader
+        records: &dyn blaze_codegen::driver::Records,
+        puts: &mut Vec<blaze_codegen::driver::Put>,
+    ) -> Result<(Described<HirInstance, HirStatic>, bool), CodegenError> {
+        let world_active = self.devirt.world().is_some();
+        if let Some((key, under, closure)) =
+            self.sealed_key_with_stage(db, instance, requester, self.record_stage_for_trace())
+        {
+            let unread = |why: String| {
+                undescribed(
+                    db,
+                    &crate::v2::Named(db, instance),
+                    None,
+                    // alloc: error path
+                    format!(
+                        "the record of the describe of `{}` under the store key {:x} does not read: \
+                         {why}",
+                        spelled(db, &instance.0),
+                        key.0
+                    ),
+                )
+            };
+            let found_table = self.found.as_ref();
+            let mut decoded = None;
+            let had = records
+                .read(&key, &mut |bytes| {
+                    decoded = Some(decode_described(db, requester, bytes, |callee, counted| {
+                        if let Some(found) = found_table {
+                            found.counted.pin().insert(callee.clone(), counted);
+                        }
+                    }));
+                })
+                .map_err(unread)?;
+            if let (true, Some(read)) = (had, decoded) {
+                let desc = read.map_err(unread)?;
+                if !(world_active && desc.takes_world) {
+                    if let Some(found) = found_table {
+                        found.records.pin().insert((instance.clone(), *requester), under);
+                    }
+                    return Ok((desc, true));
+                }
+                // `world_active && desc.takes_world`: must describe live against the closed world.
+                return self.described_now(db, instance, requester).map(|it| (it, false));
+            }
+            let now = self.described_now(db, instance, requester)?;
+            if !(world_active && now.takes_world) && !names_files(db, &instance.0) {
+                let own = match crate_of(db, &instance.0) {
+                    Some(krate) if !user_compiled(db, &instance.0) => Some(self.origin(db, krate)),
+                    _ => None,
+                };
+                if now.origin == own.unwrap_or(*requester)
+                    && let Some(bytes) = encode_described(db, &closure, own.as_ref(), &now)
+                {
+                    puts.push(blaze_codegen::driver::Put {
+                        key,
+                        kind: blaze_codegen::driver::RECORD_KIND,
+                        bytes,
+                    });
+                }
+            }
+            return Ok((now, false));
+        }
+        traced::describe_recorded(self, db, instance, requester, records, puts)
     }
 
     /// Whether the describe of `instance` for `requester` was read from a record in this

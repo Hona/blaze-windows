@@ -1333,6 +1333,16 @@ impl Frontend for HirFrontend<'_> {
         self.with(|db| self.to_record_in(db, instance, requester, described))
     }
 
+    fn describe_recorded(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        records: &dyn blaze_codegen::driver::Records,
+        puts: &mut Vec<blaze_codegen::driver::Put>,
+    ) -> Result<(Described<HirInstance, HirStatic>, bool), CodegenError> {
+        self.with(|db| self.describe_recorded_in(db, instance, requester, records, puts))
+    }
+
     fn describe_static(
         &self,
         value: &HirStatic,

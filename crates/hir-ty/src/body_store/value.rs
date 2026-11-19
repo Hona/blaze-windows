@@ -37,6 +37,31 @@ pub fn step_value(db: &Db, def: DefWithBodyId, step: Step) -> Option<ContentId> 
     }
 }
 
+/// [`step_value`], using `facts` directly when no item store is installed for `db` (a codegen
+/// describe trace in a test or standalone database). Uses the memoized [`step_value`] whenever a
+/// store is installed.
+pub fn step_value_with(
+    db: &Db,
+    // dyn: the facts encoder, called only when no item store is installed on `db`
+    facts: &dyn BodyFacts,
+    def: DefWithBodyId,
+    step: Step,
+) -> Option<ContentId> {
+    if let Some(value) = step_value(db, def, step) {
+        return Some(value);
+    }
+    match step {
+        Step::Infer => {
+            let result = InferenceResult::of(db, def);
+            let mut bytes = Vec::new();
+            infer::encode(db, facts, def, result, &mut bytes).ok()?;
+            Some(Hasher::new(INFER_DOMAIN).part(&bytes).finish())
+        }
+        Step::Mir => mir_hash(db, facts, def),
+        Step::Lower | Step::Borrowck | Step::Const => None,
+    }
+}
+
 /// [`step_value`] of [`Step::Infer`]. A store is installed for a database before any query of it
 /// runs and stays for its life, so which store answers is no input.
 #[blaze_query::tracked(returns(copy))]
