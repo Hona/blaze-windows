@@ -440,6 +440,16 @@ pub trait Frontend: Sync {
         let _ = shared;
     }
 
+    /// Whether `instance` is sealed code's (its sources and every crate's below them cannot
+    /// change): what a build that reads records puts of it (its templates, its side tables)
+    /// goes to the machine's sealed layer with its records ([`Self::walk_records`]), so a new
+    /// home on the machine, or one the layer is installed on, compiles none of it. The default
+    /// is `false`.
+    fn shares(&self, instance: &Self::Instance) -> bool {
+        let _ = instance;
+        false
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.

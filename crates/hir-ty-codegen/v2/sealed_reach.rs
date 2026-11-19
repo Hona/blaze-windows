@@ -125,9 +125,18 @@ fn imaged(text: &str, images: &Images) -> Db {
     db
 }
 
+/// What one build did beside its `Built`.
+struct Did {
+    /// The reads its walk made of the store.
+    reads: usize,
+    /// The functions it compiled.
+    compiled: usize,
+}
+
 /// One build of `text`'s `entry` in a fresh database over `store` (`None`: no store), with
-/// how many reads its walk made of the store; what it made is committed to the store.
-fn build(text: &str, images: &Images, store: Option<&MemoryStore>) -> (Built, usize) {
+/// what it did; what it made is committed to the store, the layer's puts with the home's (a
+/// home's store reads the layer below its own).
+fn build(text: &str, images: &Images, store: Option<&MemoryStore>) -> (Built, Did) {
     let db = imaged(text, images);
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| None)));
     let pol = policy(OptLevel::O3);
@@ -151,11 +160,23 @@ fn build(text: &str, images: &Images, store: Option<&MemoryStore>) -> (Built, us
         store.commit(&built.puts);
         store.commit(&built.shared);
     }
-    (built, counting.reads.load(Ordering::Relaxed))
+    let did = Did {
+        reads: counting.reads.load(Ordering::Relaxed),
+        compiled: machine.compiled.load(Ordering::Relaxed),
+    };
+    (built, did)
 }
 
 /// What the walk reached of the sealed crate: [`CHAIN`] functions and `print`.
 const SEALED: usize = CHAIN + 1;
+
+/// Of a build's puts for the machine's layer: its records (describe and reach) and its
+/// templates.
+fn layer(built: &Built) -> (usize, usize) {
+    let records = built.shared.iter().filter(|it| it.kind == blaze_codegen::driver::RECORD_KIND).count();
+    let code = built.shared.iter().filter(|it| it.kind == blaze_cas::Kind::Code).count();
+    (records, code)
+}
 
 /// The invariant: a second project on the same home (another workspace crate, the same sealed
 /// crate) describes only its own function, takes every sealed one from the records the first
@@ -170,11 +191,21 @@ fn a_second_project_and_a_restart_describe_no_sealed_function_and_read_its_reach
     let (cold, _) = build(&first, &images, Some(&store));
     assert!(cold.walk.described > SEALED, "premise: the cold build describes everything");
     // Each sealed function's describe record and one reach record, from where `entry` enters.
-    assert_eq!(cold.shared.len(), SEALED + 1, "the sealed layer's records: {}", cold.shared.len());
+    // And the sealed functions' templates: what a new home with the layer compiles none of.
+    let (records, code) = layer(&cold);
+    assert_eq!(records, SEALED + 1, "the sealed layer's records");
+    assert!(code >= SEALED, "the sealed functions' templates go to the layer: {code}");
+    assert!(
+        !cold.puts.iter().any(|it| cold.shared.iter().any(|shared| shared.key == it.key)),
+        "nothing the layer holds is the home's too"
+    );
 
     let second = source("hello2", 1);
-    let (other, reads) = build(&second, &images, Some(&store));
+    let (other, did) = build(&second, &images, Some(&store));
+    let reads = did.reads;
     let (fresh, _) = build(&second, &images, None);
+    // The sealed functions' templates are the layer's: only its own `entry` is compiled.
+    assert_eq!(did.compiled, 1, "a second project compiles its own `entry` alone");
     assert_eq!(
         other.walk.described, 1,
         "a second project describes its own `entry` alone (found {}, reached {})",
@@ -188,10 +219,11 @@ fn a_second_project_and_a_restart_describe_no_sealed_function_and_read_its_reach
     assert!(other.shared.is_empty(), "nothing sealed is made again: {}", other.shared.len());
     assert_eq!(function_signature_map(&other), function_signature_map(&fresh));
 
-    let (restart, reads) = build(&first, &images, Some(&store));
+    let (restart, did) = build(&first, &images, Some(&store));
     assert_eq!(restart.walk.described, 0, "a restart describes nothing (found {})", restart.walk.found);
     assert_eq!(restart.walk.found, restart.walk.reached);
-    assert!(reads <= 8, "a restart read the store {reads} times, not once a sealed function");
+    assert_eq!(did.compiled, 0, "a restart compiles nothing");
+    assert!(did.reads <= 8, "a restart read the store {} times, not once a sealed function", did.reads);
     assert_eq!(function_signature_map(&restart), function_signature_map(&cold));
 }
 
@@ -216,7 +248,7 @@ fn a_change_of_sealed_sources_misses_the_reach_record_and_builds_as_with_no_stor
         after.walk.described
     );
     assert_eq!(function_signature_map(&after), function_signature_map(&fresh));
-    assert_eq!(after.shared.len(), SEALED + 1, "the edited crate's records are made anew");
+    assert_eq!(layer(&after).0, SEALED + 1, "the edited crate's records are made anew");
 
     let (unedited, _) = build(&source("hello3", 1), &images, Some(&store));
     assert_eq!(unedited.walk.described, 1, "the control: the sources as they were describe none of it");
