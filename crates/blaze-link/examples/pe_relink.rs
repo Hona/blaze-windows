@@ -92,7 +92,7 @@ fn main() {
         // The image's PDB beside it, as a dev build's ("pdb" as the sixth argument).
         let pdb = args.get(6).is_some_and(|it| it == "pdb");
         let debug = if pdb { Debug::Beside } else { Debug::None };
-        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, debug, incremental)
+        let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, debug, incremental, blaze_link::target::RunsOn::Here)
             .expect("the output");
         // rustc names the static VC runtime (`/defaultlib:libcmt`) on a `+crt-static` line.
         output.link.pe.crt_static =

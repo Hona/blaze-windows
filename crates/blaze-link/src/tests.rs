@@ -2393,6 +2393,8 @@ mod tls_desc;
 
 mod pe_layout;
 
+mod first_link;
+
 #[cfg(windows)]
 mod pe_run;
 

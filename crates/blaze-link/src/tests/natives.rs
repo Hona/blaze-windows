@@ -197,7 +197,7 @@ fn glibcs_libc_script_is_checked_as_before() {
     );
 }
 
-fn windows() -> Output {
+pub(super) fn windows() -> Output {
     Output {
         format: Format::Pe,
         arch: Arch::X86_64,
