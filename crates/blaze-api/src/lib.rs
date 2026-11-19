@@ -488,9 +488,11 @@ pub enum Request {
         build: Option<u64>,
         unexplained: bool,
     },
-    /// `blaze run` of a built program, before it execs it as process `pid`: what that process
-    /// needs to run on the daemon's code memory when `program` (the path the build linked it
-    /// at) is a dev executable the daemon holds (docs/v2/plan/design/compile-time.md).
+    /// `blaze run` (process `pid`) of a built program, before it starts it (on Unix by exec, as
+    /// itself; on Windows as its child): what that process needs to run on the daemon's code
+    /// memory when `program` (the path the build linked it at) is a dev executable the daemon
+    /// holds (docs/v2/plan/design/compile-time.md). The process is matched to the launch by
+    /// the start hook's token, so `pid` names only who asked.
     /// Answered with [`Response::Launched`] by the daemon's loop, which holds the programs.
     Launch {
         pid: u32,
