@@ -131,6 +131,21 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
+/// Whether two section tables describe the same virtual layout: same count, names, virtual
+/// addresses, virtual sizes and protection bits (only `SizeOfRawData` / `PointerToRawData`
+/// and non-code `CNT_*_DATA` bits may differ when a compact PE image's sections grow on disk).
+fn same_virtual_sections(a: &[[u8; 40]], b: &[[u8; 40]]) -> bool {
+    const RWX: u32 = 0xe000_0000;
+    const EXEC: u32 = 0x2000_0000;
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            let (fx, fy) = (u32_at(x, 36), u32_at(y, 36));
+            x[..16] == y[..16]
+                && (fx & RWX) == (fy & RWX)
+                && (fx & EXEC == 0 || fx == fy)
+        })
+}
+
 /// The hash the PDB's tables are searched by (`hashStringV1`, Microsoft's `LHashPbCb`).
 pub(crate) fn hash_v1(name: &[u8]) -> u32 {
     let mut result = 0u32;
@@ -899,7 +914,9 @@ impl Model {
         count: usize,
         natives: Option<&[(&str, u64)]>,
     ) -> Result<Result<Vec<(u64, Vec<u8>)>, Whole>, String> {
-        if headers.sections != self.headers.sections || headers.base != self.headers.base {
+        if !same_virtual_sections(&self.headers.sections, &headers.sections)
+            || headers.base != self.headers.base
+        {
             return Ok(Err("the image's sections moved"));
         }
         if natives.is_some_and(|it| natives_hash(it) != self.natives) {
@@ -1061,8 +1078,16 @@ impl Model {
             dirty.push((usize::from(MODULE), self.files_at - 4..self.files_at + 8 * self.files_cap));
         }
         // The tables made of every function: the globals when the names changed; DBI when a
-        // contribution or a file did.
+        // contribution or a file did; the embedded PE section headers when a compact section's
+        // raw size or file offset grew in place.
         let mut whole_streams: Vec<usize> = Vec::new();
+        let sections_changed = headers.sections != self.headers.sections;
+        if sections_changed {
+            self.streams[usize::from(SECTION_HEADERS)] =
+                headers.sections.iter().flatten().copied().collect();
+            whole_streams.push(usize::from(SECTION_HEADERS));
+        }
+        self.headers = headers;
         if names_changed || refs_changed {
             self.streams[usize::from(GLOBALS)] = self.globals();
             whole_streams.push(usize::from(GLOBALS));
@@ -1084,10 +1109,9 @@ impl Model {
         }
         if id != self.id {
             self.id = id;
-            self.streams[usize::from(INFO)] = info(headers.stamp, &id);
+            self.streams[usize::from(INFO)] = info(self.headers.stamp, &id);
             whole_streams.push(usize::from(INFO));
         }
-        self.headers = headers;
         Ok(Ok(self.writes(dirty, whole_streams, resized, directory_before)))
     }
 
