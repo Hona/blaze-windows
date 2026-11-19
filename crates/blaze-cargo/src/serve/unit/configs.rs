@@ -61,7 +61,7 @@ pub(super) fn report(job: &Job, reader: impl FnOnce() -> Result<UnitReader, ApiE
         let mut crates = Vec::with_capacity(package.len()); // alloc: once per package
         for (_, label, unit) in package {
             let u = job.unit(*unit)?;
-            let krate = compile::crate_of(job, *unit, u)?;
+            let krate = compile::crate_of(db, job, *unit, u)?;
             if crates.contains(&krate) {
                 continue;
             }

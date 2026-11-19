@@ -86,6 +86,8 @@ thread_local! {
     /// How many of a writer's applies ran outside a write's task (`job::IN_WRITE_TASK`): on
     /// the loop, in its turn.
     static LOOP_APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// How many of a writer's applies with something to apply ran in no `blaze_mem` frame.
+    static FRAMELESS_APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The build script's run whose write fails with an error as it is applied, as a real
@@ -125,6 +127,14 @@ thread_local! {
     /// How many lowerings were given the head's last front end, and how many lowered anew.
     static INTO_KEPT: Cell<usize> = const { Cell::new(0) };
     static ANEW: Cell<usize> = const { Cell::new(0) };
+    /// Each lowering's view, the root it was asked for, in order.
+    static LOWERED_AT: RefCell<Vec<ContentId>> = const { RefCell::new(Vec::new()) };
+    /// Each query's view as its front end held it ([`FakeInputs::view`]), in order: what its
+    /// answer was read from.
+    static QUERIED_AT: RefCell<Vec<ContentId>> = const { RefCell::new(Vec::new()) };
+    /// The planted bug of the stale-front-end control: a lowering into the root's kept front end
+    /// leaves it at the view it was kept at, as a refresh that read nothing again would.
+    static STALE_INTO_KEPT: Cell<bool> = const { Cell::new(false) };
     /// How many kept front ends were stored ([`Steps::store_kept`]).
     static STORES: Cell<usize> = const { Cell::new(0) };
     /// How many kept front ends' members were stored, the second store of one
@@ -159,6 +169,17 @@ thread_local! {
     /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`], the file its
     /// artifact names ([`app_artifact`]): what the build's answer waits for.
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
+    /// Whether the fakes' tests are a launch of the program at [`APP_AT`] as the code memory's
+    /// host starts it ([`Launches`]), on a memory whose file is this key.
+    static TESTS_LAUNCH: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    /// Whether a run's compile of the program gives [`RUN_APP`] at [`APP_AT`] in place of
+    /// [`APP`] (another image of the same unit at the same path, as `blaze run`'s launcher's
+    /// program is beside `blaze build`'s live image on aarch64), and a run is a launch of it
+    /// ([`Launches`], on a memory whose file is [`RUN_APP`]'s).
+    static RUN_IMAGE: Cell<bool> = const { Cell::new(false) };
+    /// Each launch [`Launches`] made: the key the job's record held for [`APP_AT`], and the
+    /// refusal, if it was one.
+    static LAUNCHES: RefCell<Vec<(Option<[u8; 32]>, Option<String>)>> = const { RefCell::new(Vec::new()) };
     /// Whether the program's compile also gives [`SIDE`] at [`SIDE_AT`], a file its artifact
     /// does not name (as a program's hashed copy under `deps`): placed after the answer.
     static SIDE_OUTPUT: Cell<bool> = const { Cell::new(false) };
@@ -306,6 +327,18 @@ const SCRIPT_AT: &str = "/w/target/debug/build/app-b/build-script-build";
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
 
+/// The key the fakes' compile gives an output of `bytes`: the file hashed whole, as a real
+/// unit keys what it places (`serve::unit::output_key`) and as a request certificate's check
+/// hashes the file at an output's path (`certify`'s `content_of`). Under a key of their own
+/// the fakes' outputs never matched that hash, and no simulated certificate with an output
+/// answered.
+fn output_key(bytes: &[u8]) -> blaze_cas::Key {
+    crate::serve::unit::output_key(bytes)
+}
+/// The program as a run's compile gives it under [`RUN_IMAGE`]: another image of the same unit,
+/// at [`APP_AT`] too.
+const RUN_APP: &[u8] = b"\x7fELF the program as a run links it\n";
+
 const SIDE: &[u8] = b"\x7fELF the program, under the name with its hash\n";
 const SIDE_AT: &str = "/w/target/debug/deps/app-0123";
 
@@ -327,7 +360,7 @@ fn app_artifact() -> Artifact {
             src_path: "/w/src/main.rs".into(),
             crate_types: vec![CrateType::Bin],
         },
-        content: super::unit::output_key(APP).0,
+        content: output_key(APP).0,
         harness: true,
         package: "path+file:///w#0.1.0".into(),
         profile: UnitProfile {
@@ -825,9 +858,15 @@ impl Steps for Fake {
                 None,
             )));
         }
+        LOWERED_AT.with_borrow_mut(|it| it.push(job.root));
         let inputs = match kept {
-            Some(inputs) => {
+            Some(mut inputs) => {
                 INTO_KEPT.set(INTO_KEPT.get() + 1);
+                // A real lowering into a kept front end moves it to the job's view, reading
+                // again what changed (`Lowered::refresh`).
+                if !STALE_INTO_KEPT.get() {
+                    inputs.view = Some(job.root);
+                }
                 inputs
             }
             None => {
@@ -855,12 +894,16 @@ impl Steps for Fake {
                 // The home's look reads the machine's layer live (`Store::read_live`): a
                 // sealed crate's record another home put there is found through it.
                 SEALED_FOUND.set(holds(&sealed_key(), SEALED_RECORD));
-                FakeInputs { checkout, ..FakeInputs::default() }
+                FakeInputs { checkout, view: Some(job.root), ..FakeInputs::default() }
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
         Ok(FrontEnd {
-            front: Arc::new(FakeFront { kind: job.kind }),
+            front: Arc::new(FakeFront {
+                kind: job.kind,
+                runs: job.kind == JobKind::Run
+                    || job.config.invocation.command == blaze_units::query::Command::Run,
+            }),
             writer,
             puts: Vec::new(),
             misses: Vec::new(),
@@ -915,10 +958,64 @@ impl Steps for Fake {
     fn held_code(&self, holder: crate::serve::work::CodeHolder, program: &str) -> Option<crate::serve::work::HeldCode> {
         solo::held_code(holder, program)
     }
+
+    // What the fakes have and do not, each said here: the trait gives no default, so a fake
+    // never inherits an answer the real steps do not give (`blaze::default_refuses`).
+
+    /// The fakes' units name no pinned native input, and lay none out.
+    fn native(
+        &self,
+        input: &blaze_units::query::NativeInput,
+        _: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::path::PathBuf, ApiError> {
+        Err(ApiError::new(
+            format!("pinned native input `{}`: the fakes lay out none", input.name),
+            Some(input.pin.clone()), // clone: an error's place, once
+        ))
+    }
+
+    /// The fakes' store keeps every record a fake front end offers.
+    fn kept_refusal(&self, _: &mut FakeInputs) -> Option<String> {
+        None
+    }
+
+    /// A fake front end holds nothing a build's end lets go.
+    fn release_kept(&self, _: &mut FakeInputs, _: &std::sync::atomic::AtomicBool) {}
+
+    /// The fakes run no launched program's first call with a front end.
+    fn serve_needs(&self, _: &mut FakeInputs, _: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
+        Vec::new_in(std::alloc::Global)
+    }
+
+    /// No task of the fakes serves launched runs' first calls, so none is lost.
+    fn lose_needs(&self, _: &str, _: &str) {}
+
+    /// No task of the fakes serves launched runs' first calls, so none is woken.
+    fn wake_needs(&self) {}
+
+    /// No launcher connects to the fakes' launch host (`launched_restart` plays its marks,
+    /// not its connections).
+    fn launchers_connected(&self) -> usize {
+        0
+    }
+
+    /// The fakes build no dev executable on the daemon's code memory: a program the fakes
+    /// built runs its file.
+    fn launch(
+        &self,
+        _: &str,
+        _: u32,
+        _: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        Ok(None)
+    }
 }
 
 pub(super) struct FakeFront {
     kind: JobKind,
+    /// Its request runs the program: a `Run`, or a build asked as cargo's `run` (what the
+    /// client sends for `blaze run`, whose program it starts itself).
+    runs: bool,
 }
 
 /// A front end's inputs: the build scripts' runs applied to it, in the order applied, whether
@@ -930,6 +1027,8 @@ pub(super) struct FakeInputs {
     /// Whether its second store, of its members, was made since it was last kept.
     members: bool,
     checkout: String,
+    /// The view it was lowered at or last moved to: what a query of it reads.
+    view: Option<ContentId>,
 }
 
 /// The fakes' front end has no database: their images store no library trees.
@@ -1037,6 +1136,23 @@ impl Writer<Fake> for FakeWriter {
         Ok(Vec::new())
     }
 
+    /// The fakes lower no Rust source, so no key of theirs holds one by its code text: the
+    /// no-op lane's edit that changes no code is not theirs to vouch for.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        Err("the fakes lower no Rust source, so no key of theirs holds one by its code text".to_owned())
+    }
+
+    /// The fakes find nothing wrong only once a whole build ran.
+    fn finished(&mut self, _: bool, _: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
+        Ok(Vec::new_in(std::alloc::Global))
+    }
+
+    /// A fake front end makes nothing a build's end lets go, so a unit found kept is not
+    /// counted.
+    fn found_kept(&mut self, _: usize) {}
+
+    /// As [`FakeWriter::found_kept`]: a compile that ended is not counted.
+    fn compiled(&mut self, _: usize) {}
     fn apply(&mut self) -> Result<bool, ApiError> {
         if self.asked.is_empty() {
             return Ok(true);
@@ -1044,6 +1160,11 @@ impl Writer<Fake> for FakeWriter {
         // A write with something to apply, as `UnitWriter::apply` does only then.
         if !super::job::IN_WRITE_TASK.get() {
             LOOP_APPLIES.with(|it| it.set(it.get() + 1));
+        }
+        // A real apply serves dependencies from the store, which reads in the running task's
+        // frame (`blaze_mem::frame::current`) and panics outside one.
+        if !blaze_mem::frame::in_task() {
+            FRAMELESS_APPLIES.with(|it| it.set(it.get() + 1));
         }
         if FAILS_APPLY.get() {
             return Err(ApiError::new(
@@ -1114,6 +1235,7 @@ pub(super) enum FakeRuns {
     Over(Over),
     Lost(Lost),
     Keeps(Keeps),
+    Launches(Launches),
 }
 
 impl Runs<Fake> for FakeRuns {
@@ -1121,15 +1243,17 @@ impl Runs<Fake> for FakeRuns {
         &mut self,
         store: &mut Store,
         writer: Option<&mut dyn Asks>,
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         match self {
-            FakeRuns::Script(it) => it.start(store, writer, effects, out),
-            FakeRuns::Slow(it) => it.start(store, writer, effects, out),
-            FakeRuns::Over(it) => it.start(store, writer, effects, out),
-            FakeRuns::Lost(it) => it.start(store, writer, effects, out),
-            FakeRuns::Keeps(it) => it.start(store, writer, effects, out),
+            FakeRuns::Script(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Slow(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Over(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Lost(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Keeps(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Launches(it) => it.start(store, writer, placed, effects, out),
         }
     }
 
@@ -1140,6 +1264,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.owns(tag),
             FakeRuns::Lost(it) => it.owns(tag),
             FakeRuns::Keeps(it) => it.owns(tag),
+            FakeRuns::Launches(it) => it.owns(tag),
         }
     }
 
@@ -1157,6 +1282,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Lost(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Keeps(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Launches(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -1167,6 +1293,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.cancel(effects),
             FakeRuns::Lost(it) => it.cancel(effects),
             FakeRuns::Keeps(it) => it.cancel(effects),
+            FakeRuns::Launches(it) => it.cancel(effects),
         }
     }
 
@@ -1177,7 +1304,64 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.take_puts(),
             FakeRuns::Lost(it) => it.take_puts(),
             FakeRuns::Keeps(it) => it.take_puts(),
+            FakeRuns::Launches(it) => it.take_puts(),
         }
+    }
+}
+
+/// The tests' run as the code memory's host starts a test binary (`TestRun::start` through
+/// `blaze_usercode::test::queue`'s launch): from the file at [`APP_AT`], with the key the
+/// job's record holds there, on a memory whose file is `held`, by the host's own rule
+/// ([`blaze_inproc::host::StartError::check`]). A start is over at once, ok; a refusal ends
+/// it not ok with the refusal as its stderr. Each is kept in [`LAUNCHES`].
+pub(super) struct Launches {
+    held: [u8; 32],
+}
+
+impl Runs<Fake> for Launches {
+    fn start(
+        &mut self,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>,
+        _: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        let key = placed(APP_AT);
+        let refused = blaze_inproc::host::StartError::check(std::path::Path::new(APP_AT), key, self.held)
+            .err()
+            .map(|it| it.to_string());
+        LAUNCHES.with_borrow_mut(|it| it.push((key, refused.clone())));
+        match refused {
+            None => Some(true),
+            Some(why) => {
+                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: why.into_bytes() });
+                Some(false)
+            }
+        }
+    }
+
+    fn owns(&self, _: Tag) -> bool {
+        false
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        unreachable!("it asked for nothing")
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
     }
 }
 
@@ -1189,6 +1373,7 @@ impl Runs<Fake> for Script {
         &mut self,
         _: &mut Store,
         writer: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1233,6 +1418,7 @@ impl Runs<Fake> for Slow {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1276,6 +1462,7 @@ impl Runs<Fake> for Lost {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1337,6 +1524,7 @@ impl Runs<Fake> for Keeps {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1402,6 +1590,7 @@ impl Runs<Fake> for Over {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1477,17 +1666,21 @@ impl Front<Fake> for FakeFront {
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if SCRIPT_OUTPUT.get() == Some(unit) {
-            let key = super::unit::output_key(SCRIPT);
+            let key = output_key(SCRIPT);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
-            let key = super::unit::output_key(APP);
-            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
+            let app = match RUN_IMAGE.get() && self.runs {
+                true => RUN_APP,
+                false => APP,
+            };
+            let key = output_key(app);
+            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: app.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && SIDE_OUTPUT.get() {
-            let key = super::unit::output_key(SIDE);
+            let key = output_key(SIDE);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SIDE.to_vec() });
             outputs.push(Output { path: SIDE_AT.into(), key, executable: true, made: None });
         }
@@ -1519,6 +1712,7 @@ impl Front<Fake> for FakeFront {
             open: false,
             why: None,
             puts,
+            put_of: Vec::new(),
             record: None,
             body_sessions,
             share,
@@ -1569,6 +1763,12 @@ impl Front<Fake> for FakeFront {
         }
     }
 
+    /// The fakes' units have no crate or name a phase span gives: their tasks' spans name
+    /// none.
+    fn subject(&self, _: usize) -> Option<(String, String)> {
+        None
+    }
+
     fn script(&self, unit: usize, tags: u64) -> Result<FakeRuns, ApiError> {
         SCRIPTS.with_borrow_mut(|it| it.push(unit));
         Ok(match (LOSES_RUNS.get(), SLOW_SCRIPT.get()) {
@@ -1587,6 +1787,9 @@ impl Front<Fake> for FakeFront {
         tags: u64,
     ) -> Result<FakeRuns, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
+        if let Some(held) = TESTS_LAUNCH.get() {
+            return Ok(FakeRuns::Launches(Launches { held }));
+        }
         if TESTS_KEEP.get() {
             return Ok(FakeRuns::Keeps(Keeps {
                 tag: Tag(tags),
@@ -1645,6 +1848,9 @@ impl Front<Fake> for FakeFront {
         _: &[String],
         _: u64,
     ) -> Result<FakeRuns, ApiError> {
+        if RUN_IMAGE.get() {
+            return Ok(FakeRuns::Launches(Launches { held: run_app_key() }));
+        }
         Ok(FakeRuns::Over(Over(vec![Response::Ran {
             code: Some(0),
             stdout: b"hi\n".to_vec(),
@@ -1675,6 +1881,18 @@ impl Front<Fake> for FakeFront {
     ) -> Result<blaze_api::Edited, Failed> {
         EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
+    }
+
+    fn query(
+        &self,
+        FakeReader(read): FakeReader,
+        _: &str,
+    ) -> Result<blaze_api::query::Rows, Failed> {
+        EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
+        if let Some(view) = read.view {
+            QUERIED_AT.with_borrow_mut(|it| it.push(view));
+        }
+        Ok(blaze_api::query::Rows { findings: Vec::new(), relations: Vec::new() })
     }
 
     fn ahead(&self, FakeReader(read): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
@@ -1757,8 +1975,6 @@ fn options() -> Options {
         color: false,
         build: blaze_api::Build::default(),
         settings: Vec::new(),
-        // A table of its own: each daemon drives one, and tests run at once.
-        outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
         stall: blaze_profile::Watchdog::BOUND,
         #[cfg(unix)]
         activated: None,
@@ -2458,7 +2674,7 @@ fn an_edit_builds_its_views_proc_macros_and_build_scripts_before_it_reads_it() {
         panic!("the open said no root: {got:#?}")
     };
     let id = client
-        .send(&mut daemon, Request::Edit { base: root, head: "/w".into(), edits: Vec::new() });
+        .send(&mut daemon, Request::Edit { base: root, head: Some("/w".into()), edits: Vec::new() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert!(got.iter().any(|it| matches!(it, Response::Edited(_))), "{got:#?}");
@@ -4290,8 +4506,9 @@ fn a_build_answers_while_its_front_end_is_stored_and_the_next_waits_only_for_the
 }
 
 /// After a restart the front end the last build kept is gone from memory: the first build
-/// lowers anew, and reads from the store all the last build left for it, rather than working
-/// it out again (the fakes' lowering counts the reads).
+/// that is a job (a source was edited: the same request with nothing changed is its
+/// certificate's, and lowers nothing) lowers anew, and reads from the store all the last build
+/// left for it, rather than working it out again (the fakes' lowering counts the reads).
 #[test]
 fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
     for (seed, crash) in [(171, false), (172, true), (173, true)] {
@@ -4325,6 +4542,7 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
         };
         let mut client = dial(&mut daemon);
         let anew = ANEW.get();
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
         let id = client.send(
             &mut daemon,
             Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
@@ -4359,16 +4577,7 @@ fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) 
         client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     let after = crate::serve::direct::thread_counts();
-    let moved = blaze_cas::direct::Counts {
-        records: after.records - before.records,
-        bytes: after.bytes - before.bytes,
-        reads: after.reads - before.reads,
-        runs: after.runs - before.runs,
-        files_opened: after.files_opened - before.files_opened,
-        maps: after.maps - before.maps,
-        mapped_bytes: after.mapped_bytes - before.mapped_bytes,
-        leaked_bytes: after.leaked_bytes - before.leaked_bytes,
-    };
+    let moved = after.since(&before);
     (moved, KEPT_READS.get() == reads + 1)
 }
 
@@ -5321,7 +5530,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let front = Arc::new(FakeFront { kind: JobKind::Check });
+    let front = Arc::new(FakeFront { kind: JobKind::Check, runs: false });
     let inputs = Arc::new(FakeInputs { runs: vec![4, 7], ..FakeInputs::default() });
     let reading =
         || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
@@ -5392,7 +5601,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
         Step::of(
             &cancelled,
             Does::Compile {
-                front: Arc::new(FakeFront { kind: JobKind::Build }),
+                front: Arc::new(FakeFront { kind: JobKind::Build, runs: false }),
                 back: Default::default(),
                 hops: Arc::from(Vec::new()),
             },
@@ -5520,6 +5729,386 @@ fn the_loop_applies_no_front_end_write_over_many_seeds() {
     assert!(on_loop > 0, "the planted bug's applies on the loop went unseen");
 }
 
+/// One query of a checkout with a proc macro and a build script under `seed`: how many of the
+/// writer's applies ran on the loop and how many in no frame, and the runs the query read, or
+/// the stall it ended in.
+fn query_applies(seed: u64) -> (usize, usize, Result<Vec<Vec<usize>>, String>) {
+    EDITED.with(|it| it.borrow_mut().clear());
+    LOOP_APPLIES.set(0);
+    FRAMELESS_APPLIES.set(0);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client.send(
+        &mut daemon,
+        Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() },
+    );
+    let got = client.wait(&mut daemon, id);
+    let stall = got.iter().find_map(|it| match it {
+        // clone: a test's record
+        Response::Error(error) if error.what.starts_with("blaze stalled") => Some(error.what.clone()),
+        _ => None,
+    });
+    let read = EDITED.with(|it| it.take());
+    let ended = match stall {
+        Some(stall) => Err(stall),
+        None => {
+            assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+            Ok(read)
+        }
+    };
+    (LOOP_APPLIES.get(), FRAMELESS_APPLIES.get(), ended)
+}
+
+/// A job that reads its view's front end unbuilt (a query, an edit, a reach) first builds the
+/// proc macros and build scripts that front end applies, and their writes are applied on a
+/// write's task, in a frame, never on the loop. Until 2026-11-13 the last of them was applied
+/// on the loop as the build ended (`Jobs::applied`), where serving a dependency's record that
+/// is read, not mapped, asks for the running task's frame and the daemon panicked
+/// (`frame::current outside any frame::task`, deps.rs). The control is this test with
+/// `Jobs::units_applied`'s send of a waiting write removed: seeds 12, 21 and 26 then apply
+/// on the loop, in no frame.
+///
+/// Seeds 2 and 13 stall, with or without this fix, and are pinned here so the pin fails the
+/// day they stop: the job's reading tasks held while its write waits (`Build::held`) are
+/// Running to the plane, so they hold its threads (2 in these tests), and the write's own task
+/// is admitted by threads like any other, so it never starts (the stall's line `2 tasks held,
+/// applying on node 21`). `a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them`
+/// fails on the same stall at this commit's base. A stalled seed still applies nothing on the
+/// loop.
+#[test]
+fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds() {
+    let mut stalled = Vec::new(); // alloc: a test's record
+    for seed in 0..32 {
+        let (on_loop, frameless, ended) = query_applies(seed);
+        assert_eq!(on_loop, 0, "seed {seed}: an apply ran on the loop");
+        assert_eq!(frameless, 0, "seed {seed}: an apply ran in no frame");
+        match ended {
+            Ok(read) => assert_eq!(
+                read,
+                vec![vec![3]],
+                "seed {seed}: the query read the build script's run applied"
+            ),
+            Err(stall) => {
+                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
+                stalled.push(seed);
+            }
+        }
+    }
+    assert_eq!(stalled, vec![2, 13], "the seeds whose held tasks fill every thread");
+}
+
+/// A query of the head `/w`, its responses; it ended ok.
+fn query_ok(client: &mut Client, daemon: &mut SimDaemon) -> Vec<Response> {
+    let id = client
+        .send(daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+    let got = client.wait(daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    got
+}
+
+/// A check of the head `/w`, its responses; it ended ok.
+fn check_ok(client: &mut Client, daemon: &mut SimDaemon) -> Vec<Response> {
+    let id = client
+        .send(daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    got
+}
+
+/// The lowerings since `before`, as (anew, into the root's kept front end).
+fn lowerings_since(before: (usize, usize)) -> (usize, usize) {
+    (ANEW.get() - before.0, INTO_KEPT.get() - before.1)
+}
+
+fn lowerings_now() -> (usize, usize) {
+    (ANEW.get(), INTO_KEPT.get())
+}
+
+/// Two queries of one unchanged checkout under `seed`, the planted bug set or not: each
+/// query's lowerings, as (anew, into the kept front end).
+fn two_queries(seed: u64, plant: bool) -> ((usize, usize), (usize, usize)) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let first = lowerings_since(before);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let second = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (first, second)
+}
+
+/// The invariant: a query hands the front end it lowered back to its root
+/// (`Jobs::keep_queried`), so a second query of an unchanged view lowers nothing anew: it
+/// lowers into the first's front end, stored first, as a check after a check does. Sent at
+/// once after the first answered, so the second's lowering meets the first's store under way
+/// in some seeds and waits for it (`Jobs::lower_or_wait`). Until 2026-11-14 each query lowered
+/// the root anew (ripgrep: 2.1 million rows run as first again, 36.6 s a query). The control:
+/// [`the_oracle_catches_a_query_that_drops_its_front_end`].
+#[test]
+fn a_second_query_of_an_unchanged_view_lowers_nothing_anew_over_many_seeds() {
+    for seed in 0..16 {
+        let (first, second) = two_queries(seed, false);
+        assert_eq!(first, (1, 0), "seed {seed}: the first query of a fresh daemon lowers anew");
+        assert_eq!(second, (0, 1), "seed {seed}: the second lowers into the first's front end");
+    }
+}
+
+/// The control of [`a_second_query_of_an_unchanged_view_lowers_nothing_anew_over_many_seeds`]:
+/// a query that drops its front end (`job::PLANT_QUERY_DROPS_FRONT`, the code before
+/// 2026-11-14) leaves the second query to lower anew, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_query_that_drops_its_front_end() {
+    let (_, second) = two_queries(3, true);
+    assert_eq!(second, (1, 0), "the planted bug's second query lowered into a kept front end");
+}
+
+/// A query, an edit of the view's `src/main.rs`, and a query, under `seed`, the planted stale
+/// lowering set or not: the views the two queries' lowerings were asked for, and the views
+/// their front ends held as they answered.
+fn query_edit_query(seed: u64, stale: bool) -> (Vec<ContentId>, Vec<ContentId>, (usize, usize)) {
+    STALE_INTO_KEPT.set(stale);
+    LOWERED_AT.with(|it| it.borrow_mut().clear());
+    QUERIED_AT.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    query_ok(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let second = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    STALE_INTO_KEPT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (LOWERED_AT.with(|it| it.take()), QUERIED_AT.with(|it| it.take()), second)
+}
+
+/// The invariant: a front end handed back by a query is never read stale. A query after an
+/// edit of its view lowers again (into the first query's front end, which moves to the new
+/// view), and its answer is read from the edited view: each query reads the view its own
+/// lowering was asked for, and the second's is not the first's. The control:
+/// [`the_oracle_catches_a_stale_front_end_handed_back`].
+#[test]
+fn a_query_after_an_edit_lowers_again_and_reads_the_edited_view_over_many_seeds() {
+    for seed in 0..16 {
+        let (lowered, queried, second) = query_edit_query(seed, false);
+        assert_eq!(second, (0, 1), "seed {seed}: the second query lowers into the first's front end");
+        assert_eq!(lowered.len(), 2, "seed {seed}: one lowering a query");
+        assert_ne!(lowered[0], lowered[1], "seed {seed}: the edit moved the view");
+        assert_eq!(queried, lowered, "seed {seed}: each query read the view it was lowered for");
+    }
+}
+
+/// The control of [`a_query_after_an_edit_lowers_again_and_reads_the_edited_view_over_many_seeds`]:
+/// a lowering into the kept front end that leaves it at the view it was kept at
+/// ([`STALE_INTO_KEPT`]) answers the second query from the first's view, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_stale_front_end_handed_back() {
+    let (lowered, queried, _) = query_edit_query(5, true);
+    assert_ne!(queried, lowered, "the planted stale front end's answer went unseen");
+    assert_eq!(queried[1], lowered[0], "the planted bug read the first query's view");
+}
+
+/// A check, a check, a query and a check of one unchanged checkout under `seed`, the
+/// planted bug set or not: the query's lowerings and the last check's.
+fn check_query_check(seed: u64, plant: bool) -> ((usize, usize), (usize, usize)) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    // The first check writes the lock file into the checkout, so the second's view is another:
+    // the second is the one the last check repeats.
+    check_ok(&mut client, &mut daemon);
+    check_ok(&mut client, &mut daemon);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let query = lowerings_since(before);
+    let before = lowerings_now();
+    check_ok(&mut client, &mut daemon);
+    let check = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (query, check)
+}
+
+/// Four checks of one unchanged checkout under `seed`: the last one's lowerings, what a check
+/// after a check of an unchanged view costs.
+fn fourth_check(seed: u64) -> (usize, usize) {
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    for _ in 0..3 {
+        check_ok(&mut client, &mut daemon);
+    }
+    let before = lowerings_now();
+    check_ok(&mut client, &mut daemon);
+    let check = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    check
+}
+
+/// The invariant: a query between two checks of an unchanged view costs the second check
+/// nothing: it lowers exactly as a check after a check does (in the fakes, into the kept front
+/// end, or nothing at all where its certificate answers), never anew. The query itself lowers
+/// into the check's front end. Until 2026-11-14 the query took the check's front end and
+/// dropped it, so the check after it lowered the root anew. The control:
+/// [`the_oracle_catches_a_query_that_leaves_the_next_check_to_lower_anew`].
+#[test]
+fn a_check_after_a_query_of_an_unchanged_view_lowers_as_after_a_check_over_many_seeds() {
+    for seed in 0..16 {
+        let (query, check) = check_query_check(seed, false);
+        assert_eq!(query, (0, 1), "seed {seed}: the query lowers into the check's front end");
+        assert_eq!(check.0, 0, "seed {seed}: the check after the query lowers nothing anew");
+        assert_eq!(check, fourth_check(seed), "seed {seed}: the check lowers as one after a check");
+    }
+}
+
+/// The control of [`a_check_after_a_query_of_an_unchanged_view_lowers_as_after_a_check_over_many_seeds`]:
+/// a query that drops its front end (`job::PLANT_QUERY_DROPS_FRONT`) leaves the check after it
+/// to lower anew, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_query_that_leaves_the_next_check_to_lower_anew() {
+    let (_, check) = check_query_check(0, true);
+    assert_eq!(check, (1, 0), "the planted bug's check did not lower anew");
+}
+
+/// Two queries of a checkout with a proc macro and a build script under `seed`: the second
+/// query's lowerings and the runs each query read, or the stall the run ended in.
+fn two_applying_queries(seed: u64, plant: bool) -> Result<((usize, usize), Vec<Vec<usize>>), String> {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let ended = two_applying_queries_planted(seed);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    ended
+}
+
+fn two_applying_queries_planted(seed: u64) -> Result<((usize, usize), Vec<Vec<usize>>), String> {
+    EDITED.with(|it| it.borrow_mut().clear());
+    LOOP_APPLIES.set(0);
+    FRAMELESS_APPLIES.set(0);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let stalled = |got: &[Response]| {
+        got.iter().find_map(|it| match it {
+            // clone: a test's record
+            Response::Error(error) if error.what.starts_with("blaze stalled") => Some(error.what.clone()),
+            _ => None,
+        })
+    };
+    let mut second = (0, 0);
+    for at in 0..2 {
+        let before = lowerings_now();
+        let id = client
+            .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+        let got = client.wait(&mut daemon, id);
+        if let Some(stall) = stalled(&got) {
+            return Err(format!("query {at}: {stall}"));
+        }
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        if at == 1 {
+            second = lowerings_since(before);
+        }
+    }
+    settle(&mut daemon, &mut client);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    assert_eq!(LOOP_APPLIES.get(), 0, "seed {seed}: an apply ran on the loop");
+    assert_eq!(FRAMELESS_APPLIES.get(), 0, "seed {seed}: an apply ran in no frame");
+    Ok((second, EDITED.with(|it| it.take())))
+}
+
+/// The invariant: a query whose view's proc macros and build scripts are built and applied
+/// first (`Jobs::units_applied`, its last write on a write's task) still hands its front end
+/// back: the second query lowers into it, and reads the build script's run applied.
+///
+/// The seeds that stall are pinned as in
+/// [`a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`], so the pin
+/// fails the day they stop. It is the same stall, the job's write waiting on its held reading
+/// tasks, which hold the plane's two threads: seeds 2 and 13 in the first query, as there, and
+/// 1, 3, 24 and 27 in the second. It is not this change's: with the front end dropped
+/// (`job::PLANT_QUERY_DROPS_FRONT`, the code before) the second query stalls the same way, in
+/// seeds 7, 16, 22 and 24 (2026-11-14), a lowering anew giving another schedule.
+#[test]
+fn a_query_that_applies_its_views_units_still_hands_its_front_end_back_over_many_seeds() {
+    let mut stalled = Vec::new(); // alloc: a test's record
+    for seed in 0..32 {
+        match two_applying_queries(seed, false) {
+            Ok((second, read)) => {
+                assert_eq!(second, (0, 1), "seed {seed}: the second query lowers into the first's front end");
+                assert_eq!(read.len(), 2, "seed {seed}: two queries read the front end");
+                assert!(
+                    read.iter().all(|it| it.contains(&3)),
+                    "seed {seed}: each query read the build script's run applied: {read:?}"
+                );
+            }
+            Err(stall) => {
+                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
+                stalled.push(seed);
+            }
+        }
+    }
+    assert_eq!(stalled, vec![1, 2, 3, 13, 24, 27], "the seeds whose held tasks fill every thread");
+    // The control: with the front end dropped, the second query lowers anew.
+    let planted = two_applying_queries(0, true).map(|it| it.0);
+    assert_eq!(planted, Ok((1, 0)), "the planted bug's second query lowered into a kept front end");
+}
+
+/// A query, a stop as `blaze stop` makes, an edit, and a query, under `seed`, the planted bug
+/// set or not: whether the restarted daemon's query lowered anew, and whether that lowering
+/// found in the store what the first query's front end left there.
+fn query_restart_query(seed: u64, plant: bool) -> (usize, bool) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    query_ok(&mut client, &mut daemon);
+    let mut daemon = restart(daemon, &steps, seed + 1000);
+    let mut client = dial(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    let (before, reads) = (lowerings_now(), KEPT_READS.get());
+    query_ok(&mut client, &mut daemon);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    (lowerings_since(before).0, KEPT_READS.get() == reads + 1)
+}
+
+/// What a restart promises of a query's front end: the front end itself is memory and does not
+/// survive a stop (the restarted daemon's first query lowers anew), but what the query's front
+/// end left for the store does, as a build's does (`Steps::store_kept`, written before the stop
+/// ends): the restarted lowering reads it rather than working it out again. The control: a
+/// query that drops its front end stores nothing, and the restarted lowering finds nothing.
+#[test]
+fn after_a_restart_a_querys_lowering_reads_what_the_last_query_stored() {
+    for seed in [181, 182, 183] {
+        let (anew, found) = query_restart_query(seed, false);
+        assert_eq!(anew, 1, "seed {seed}: a restarted daemon lowers anew");
+        assert!(found, "seed {seed}: and reads what the last query's front end stored");
+    }
+    let (anew, found) = query_restart_query(181, true);
+    assert_eq!(anew, 1, "the planted bug's restarted daemon lowers anew too");
+    assert!(!found, "the planted bug stored nothing, and the oracle saw the lowering find it");
+}
+
 #[test]
 fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_end() {
     let mut sim = Sim::new(11, Faults::default());
@@ -5575,6 +6164,438 @@ fn an_output_is_placed_again_once_its_file_is_not_as_placed() {
     build(&mut daemon);
     daemon.driver().change(&app, b"a file longer than the one the build placed\n");
     build(&mut daemon);
+}
+
+/// The invariant: a job whose output's path already holds that output's value places nothing
+/// there (no write, no clone, no rename: the file keeps its inode and times).
+#[test]
+fn a_job_whose_outputs_path_holds_its_value_places_nothing() {
+    let placed = builds_place(false);
+    assert!(
+        !placed.iter().any(|it| it == APP_AT),
+        "a build after the one that placed {APP_AT} placed it again: {placed:?}"
+    );
+}
+
+/// The planted-bug control: an output placed again whatever its path holds, its file not
+/// looked at first, is seen placed by the builds after the first.
+#[test]
+fn the_oracle_catches_an_output_placed_over_its_own_value() {
+    let placed = builds_place(true);
+    assert!(
+        placed.iter().any(|it| it == APP_AT),
+        "the planted bug placed nothing the oracle saw: {placed:?}"
+    );
+}
+
+/// The key the fakes' compile files [`APP`] under: the program's file, as its code memory
+/// holds it.
+fn app_key() -> [u8; 32] {
+    output_key(APP).0.0
+}
+
+/// The key the fakes' compile files [`RUN_APP`] under.
+fn run_app_key() -> [u8; 32] {
+    output_key(RUN_APP).0.0
+}
+
+/// The invariant: two commands whose outputs share a path (a run's image of the program and a
+/// build's, both at [`APP_AT`]): after one placed its value there, the other's next request
+/// places its own again before it answers, and its launch starts that file with that key;
+/// nothing else is placed (one placement of one file each time the command changes). Over
+/// run, build, run, build, test, run, under several seeds.
+#[test]
+fn two_commands_sharing_an_output_path_each_place_their_own_before_answering() {
+    for seed in 320..326 {
+        let steps = alternate(seed, false);
+        for (at, (request, contents, placed, launched)) in steps.iter().enumerate() {
+            let own = image_of(request);
+            assert_eq!(&contents[..], own, "seed {seed}: step {at} ({request}) answered with another's file at {APP_AT}");
+            // The floor: one placement where the command before made the other image, none
+            // where it made this one.
+            if at > 0 {
+                let changed = image_of(steps[at - 1].0) != own;
+                assert_eq!(*placed, usize::from(changed), "seed {seed}: step {at} ({request}) placed {APP_AT} {placed} times");
+            }
+            let key = output_key(own).0.0;
+            for (with, refused) in launched {
+                assert_eq!((*with, refused.as_deref()), (Some(key), None), "seed {seed}: step {at} ({request})");
+            }
+        }
+    }
+}
+
+/// The planted-bug control: a path with any record taken to hold the job's value
+/// ([`super::job::PLANT_VOUCH_ANY_KEY`], a shortcut that vouches without the record's key) is
+/// seen by the oracle: a step answers with the other command's file there.
+#[test]
+fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
+    let steps = alternate(320, true);
+    let caught = steps.iter().any(|(request, contents, _, _)| &contents[..] != image_of(request));
+    assert!(caught, "the planted bug's steps went unseen: {:?}", steps.iter().map(|it| it.0).collect::<Vec<_>>());
+}
+
+/// The invariant (one writer, D45), at the request certificate: a request is answered with
+/// no job only where, for every output path its answer names, the jobs' record holds that
+/// answer's key. Two shapes of one checkout whose program shares [`APP_AT`] (cargo's `run`, a
+/// launcher's image; cargo's `build`, the program's own): after every answer the file there
+/// and its record are the answering command's. A switch places that one file once (its job:
+/// the certificate refuses it by the record, with no look at the file); a repeat after a
+/// settled one is the certificate's, placing nothing. The race the measurement hit
+/// (2026-11-14, run, build, run, build: the second build answered in 11 ms over the run's
+/// launcher) is forced: the build's certificate is written only after the next run placed.
+#[test]
+fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
+    for seed in 330..336 {
+        let steps = shared_path_certified(seed, false, false);
+        for (at, (command, certified, contents, recorded, placed, _, said)) in steps.iter().enumerate() {
+            let own = image_of(command);
+            let key = output_key(own).0.0;
+            assert_eq!(
+                &contents[..],
+                own,
+                "seed {seed}: step {at} ({command}) answered with another's file at {APP_AT}; the certificate's: \
+                 {certified}, placed {placed} times, the record {recorded:02x?}, and it said {said:?}; every step: {:?}",
+                steps.iter().map(|it| (it.0, it.1, it.4, &it.6)).collect::<Vec<_>>()
+            );
+            assert_eq!(*recorded, Some(key), "seed {seed}: step {at} ({command}): the record of {APP_AT} is not its key");
+            if at == 0 {
+                continue;
+            }
+            // The floor: one placement where the command before placed the other image, none
+            // where it placed this one.
+            let changed = image_of(steps[at - 1].0) != own;
+            assert_eq!(*placed, usize::from(changed), "seed {seed}: step {at} ({command}) placed {APP_AT} {placed} times");
+            assert!(!(changed && *certified), "seed {seed}: step {at} ({command}) was the certificate's over the other's file");
+        }
+        // The certificate is in play: each command's repeat after its own settled answer is
+        // its certificate's.
+        for at in [5, 7] {
+            let (command, certified, .., said) = &steps[at];
+            assert!(
+                *certified,
+                "seed {seed}: step {at} ({command}), a repeat, was not the certificate's; it said, with the step \
+                 before it: {:?} then {said:?}",
+                steps[at - 1].6
+            );
+        }
+    }
+}
+
+/// The planted-bug control: a certificate that names each output as the jobs' record holds it
+/// when it is written ([`super::job::PLANT_CERTIFY_SHARED_RECORD`], as until 2026-11-14) names
+/// the run's image as the build's, and the next build is answered over it with no job: the
+/// oracle sees the run's file after a build.
+#[test]
+fn the_oracle_catches_a_certificate_named_by_the_record_at_its_write() {
+    let steps = shared_path_certified(330, true, false);
+    let caught = steps.iter().any(|(command, _, contents, ..)| &contents[..] != image_of(command));
+    assert!(
+        caught,
+        "the planted bug's answers went unseen: {:?}",
+        steps.iter().map(|it| (it.0, it.1, &it.6)).collect::<Vec<_>>()
+    );
+}
+
+/// The invariant: the record's word costs no IO. The run asked after the build placed its
+/// image (step 3) is refused by the record with no read of the file; the control, the check
+/// with no word from the record ([`super::job::PLANT_HIT_UNRECORDED`]), reads and hashes it.
+#[test]
+fn a_certificate_whose_outputs_record_holds_another_key_misses_with_no_read_of_it() {
+    let real = shared_path_certified(331, false, false);
+    let planted = shared_path_certified(331, false, true);
+    assert_eq!(&planted[3].2[..], RUN_APP, "the planted check still ends with the run's own file");
+    // The premise: with the record's word the run's check missed by it, and without it the
+    // check went on to look at the file; each says so in its own words.
+    let placed_by_record = "holds another request's placement by the daemon's record";
+    assert!(
+        real[3].6.iter().any(|it| it.contains(placed_by_record)),
+        "step 3's check did not miss by the record: {:?}",
+        real[3].6
+    );
+    assert!(
+        !planted[3].6.iter().any(|it| it.contains(placed_by_record)),
+        "the planted check still missed by the record: {:?}",
+        planted[3].6
+    );
+    assert!(
+        planted[3].5 >= real[3].5 + APP.len() as u64,
+        "the record spared no read of {APP_AT}: {} bytes read with it ({:?}), {} without ({:?})",
+        real[3].5,
+        real[3].6,
+        planted[3].5,
+        planted[3].6
+    );
+}
+
+/// A build of `/w` asked as cargo asks `command` (`build`, or `run`, which the client sends for
+/// `blaze run` and whose program it starts itself): two request shapes of one checkout, each
+/// with its own certificate, whose program is at one path ([`APP_AT`]).
+fn cargo_asked(command: &str) -> Request {
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: command_env(),
+        args: Vec::new(),
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: command.into(),
+        refused: None,
+        verbose: 0,
+        prebuilt: true,
+    };
+    Request::Build { view: ViewRef::Head("/w".into()), targets: Targets { cargo: Some(cargo), ..agent() } }
+}
+
+/// One answer of [`shared_path_certified`]: the cargo command asked, whether its certificate
+/// answered it (no job began), the file at [`APP_AT`] once it answered, the key the jobs'
+/// record holds for that path then, how many times it placed that path, the bytes the driver
+/// read for it, and what the certificate said of it and of its settling, in its own words
+/// ([`super::job::CERTIFY_WORDS`]): why it became a job, why no certificate was written.
+type Certified = (&'static str, bool, Vec<u8>, Option<[u8; 32]>, usize, u64, Vec<String>);
+
+/// `run`, `run`, `build`, `run`, `build`, `build`, `run`, `run` of one checkout on one daemon,
+/// a run's image of the program another value than a build's ([`RUN_IMAGE`]). The first run
+/// writes the lock file, so the second's view is the one every later request reads and its
+/// certificate is the run's from then on. The store's syncs are held from the first `build`
+/// until the `run` after it answered, so that build's certificate is written only after the
+/// run placed its image at the shared path; every other answer is settled before the next
+/// request. `shared`:
+/// [`super::job::PLANT_CERTIFY_SHARED_RECORD`]; `unrecorded`: [`super::job::PLANT_HIT_UNRECORDED`].
+fn shared_path_certified(seed: u64, shared: bool, unrecorded: bool) -> Vec<Certified> {
+    use super::job::{CERTIFY_WORDS, PLACED_PATHS, PLANT_CERTIFY_SHARED_RECORD, PLANT_HIT_UNRECORDED};
+    OUTPUT.set(true);
+    RUN_IMAGE.set(true);
+    PLANT_CERTIFY_SHARED_RECORD.set(shared);
+    PLANT_HIT_UNRECORDED.set(unrecorded);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let mut out = Vec::new();
+    for (at, command) in ["run", "run", "build", "run", "build", "build", "run", "run"].into_iter().enumerate() {
+        if at == 2 {
+            daemon.driver().hold_syncs(store_dir());
+        }
+        PLACED_PATHS.with_borrow_mut(Vec::clear);
+        CERTIFY_WORDS.with_borrow_mut(Vec::clear);
+        let before = daemon.driver().bytes_read();
+        let id = client.send(&mut daemon, cargo_asked(command));
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: step {at} ({command}): {got:#?}");
+        let read = daemon.driver().bytes_read() - before;
+        // A request that became a job says so as its job begins (`job: ..`, with the
+        // certificate's word of why); a certificate's answer is no job.
+        let certified = !CERTIFY_WORDS.with_borrow(|it| it.iter().any(|it| it.starts_with("job: ")));
+        let placed = PLACED_PATHS.with_borrow(|it| it.iter().filter(|it| *it == APP_AT).count());
+        let mut said = CERTIFY_WORDS.with_borrow_mut(std::mem::take);
+        let (contents, recorded) = (daemon.driver().contents(&app), daemon.placed_key(APP_AT));
+        if at == 3 {
+            daemon.driver().release_held(Duration::ZERO);
+        }
+        // The first build's settling waits for the syncs held: it ends after the run after it.
+        if at != 2 {
+            settle(&mut daemon, &mut client);
+            turn_until(&mut daemon, |it| it.settled());
+        }
+        // What its settling said of its certificate (`not written: ..`) is this step's too.
+        said.extend(CERTIFY_WORDS.with_borrow_mut(std::mem::take));
+        out.push((command, certified, contents, recorded, placed, read, said));
+    }
+    PLANT_HIT_UNRECORDED.set(false);
+    PLANT_CERTIFY_SHARED_RECORD.set(false);
+    RUN_IMAGE.set(false);
+    OUTPUT.set(false);
+    out
+}
+
+/// The image a command's request makes of the program at [`APP_AT`] under [`RUN_IMAGE`].
+fn image_of(request: &str) -> &'static [u8] {
+    match request {
+        "run" => RUN_APP,
+        _ => APP,
+    }
+}
+
+/// One step of [`alternate`]: the request's command, the file at [`APP_AT`] once it answered,
+/// how many times it placed that path, and its launches.
+type Alternated = (&'static str, Vec<u8>, usize, Vec<(Option<[u8; 32]>, Option<String>)>);
+
+/// Run, build, run, build, test, run of one checkout on one daemon, a run's image of the
+/// program another value than a build's or a test's at the same path ([`RUN_IMAGE`]), a test
+/// a launch of the build's image. `plant`: [`super::job::PLANT_VOUCH_ANY_KEY`] after the
+/// first step.
+fn alternate(seed: u64, plant: bool) -> Vec<Alternated> {
+    use super::job::{PLACED_PATHS, PLANT_VOUCH_ANY_KEY};
+    OUTPUT.set(true);
+    RUN_IMAGE.set(true);
+    TESTS_LAUNCH.set(Some(app_key()));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let view = || ViewRef::Head("/w".into());
+    let mut out = Vec::new();
+    for (at, request) in ["run", "build", "run", "build", "test", "run"].into_iter().enumerate() {
+        PLACED_PATHS.with_borrow_mut(Vec::clear);
+        LAUNCHES.with_borrow_mut(Vec::clear);
+        PLANT_VOUCH_ANY_KEY.set(plant && at > 0);
+        let asked = match request {
+            "run" => Request::Run { view: view(), targets: agent(), bin: None, args: Vec::new() },
+            "build" => Request::Build { view: view(), targets: agent() },
+            _ => Request::Test { view: view(), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
+        };
+        let id = client.send(&mut daemon, asked);
+        let got = client.wait(&mut daemon, id);
+        let launched = LAUNCHES.with_borrow_mut(std::mem::take);
+        let started = launched.iter().all(|(_, refused)| refused.is_none());
+        if !plant {
+            assert_eq!(got.last(), Some(&Response::Done { ok: started }), "seed {seed}: {request}: {got:#?}");
+        }
+        let placed = PLACED_PATHS.with_borrow(|it| it.iter().filter(|it| *it == APP_AT).count());
+        out.push((request, daemon.driver().contents(&app), placed, launched));
+    }
+    PLANT_VOUCH_ANY_KEY.set(false);
+    TESTS_LAUNCH.set(None);
+    RUN_IMAGE.set(false);
+    OUTPUT.set(false);
+    out
+}
+
+/// The invariant: an output path has one writer, its job's placement. A job that runs tests
+/// whose executable's path holds its value places nothing there, and its launch starts that
+/// file, with the key the job's record holds for the path, which is the program's own: the
+/// code memory's host writes nothing, so nothing is placed again in the build after.
+#[test]
+fn a_test_run_whose_executable_holds_its_value_places_nothing_and_starts_that_file() {
+    for seed in 300..308 {
+        let (placed, launches) = tests_launch(seed, app_key(), false);
+        assert!(
+            !placed.iter().any(|it| it == APP_AT),
+            "seed {seed}: a test run after the one that placed {APP_AT} placed it again: {placed:?}"
+        );
+        assert_eq!(launches.len(), 3, "seed {seed}: one launch a run: {launches:?}");
+        for (key, refused) in &launches {
+            assert_eq!(*key, Some(app_key()), "seed {seed}: launched with the record's key");
+            assert_eq!(*refused, None, "seed {seed}: the placed file starts");
+        }
+    }
+}
+
+/// The planted-bug control: a launch given no record of its path ([`super::job::PLANT_LAUNCH_UNRECORDED`],
+/// as before launches read the job's record, when the host wrote the file in their stead) is
+/// seen by the oracle: refused, naming the path.
+#[test]
+fn the_oracle_catches_a_launch_given_no_record_of_its_path() {
+    let (_, launches) = tests_launch(300, app_key(), true);
+    assert!(
+        launches.iter().any(|(key, refused)| key.is_none() && refused.is_some()),
+        "the planted bug's launches went unseen: {launches:?}"
+    );
+}
+
+/// The invariant: a launch whose path holds another key than its program's, or no record, is
+/// refused, its run not ok, naming the path and both keys (the held one, and the placed one
+/// where there is one); nothing is written there in the build's stead.
+#[test]
+fn a_launch_whose_path_holds_another_key_or_no_record_is_refused_naming_both() {
+    let hex = |key: [u8; 32]| key.iter().map(|it| format!("{it:02x}")).collect::<String>();
+    let other = [0xab; 32];
+    let (placed, launches) = tests_launch(301, other, false);
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    for (key, refused) in &launches {
+        assert_eq!(*key, Some(app_key()));
+        let why = refused.as_deref().expect("a program whose file is another key is refused");
+        assert!(why.contains(APP_AT), "{why}");
+        assert!(why.contains(&hex(app_key())) && why.contains(&hex(other)), "{why}");
+    }
+    assert!(!placed.iter().any(|it| it == APP_AT), "nothing placed it again: {placed:?}");
+    let (_, launches) = tests_launch(302, app_key(), true);
+    for (key, refused) in &launches {
+        assert_eq!(*key, None);
+        let why = refused.as_deref().expect("a launch with no record is refused");
+        assert!(why.contains(APP_AT) && why.contains(&hex(app_key())), "{why}");
+    }
+}
+
+/// Three test runs of a checkout with an executable output at [`APP_AT`], nothing changed
+/// between them, its tests a launch of that file on a memory whose file is `held`
+/// ([`Launches`]): the paths the runs after the first placed a file at, and every launch.
+/// A run ends ok only where its launch started. `plant`: [`super::job::PLANT_LAUNCH_UNRECORDED`].
+fn tests_launch(seed: u64, held: [u8; 32], plant: bool) -> (Vec<String>, Vec<(Option<[u8; 32]>, Option<String>)>) {
+    use super::job::{PLACED_PATHS, PLANT_LAUNCH_UNRECORDED};
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    LAUNCHES.with_borrow_mut(Vec::clear);
+    OUTPUT.set(true);
+    TESTS_LAUNCH.set(Some(held));
+    PLANT_LAUNCH_UNRECORDED.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    for nth in 0..3 {
+        let request = Request::Test {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        };
+        let id = client.send(&mut daemon, request);
+        let got = client.wait(&mut daemon, id);
+        let started = LAUNCHES.with_borrow(|it| it.last().is_some_and(|(_, refused)| refused.is_none()));
+        assert_eq!(got.last(), Some(&Response::Done { ok: started }), "seed {seed}: {got:#?}");
+        assert_eq!(daemon.driver().contents(&app), APP, "seed {seed}: the build's file is there");
+        if nth == 0 {
+            PLACED_PATHS.with_borrow_mut(Vec::clear);
+        }
+    }
+    PLANT_LAUNCH_UNRECORDED.set(false);
+    TESTS_LAUNCH.set(None);
+    OUTPUT.set(false);
+    (PLACED_PATHS.with_borrow_mut(std::mem::take), LAUNCHES.with_borrow_mut(std::mem::take))
+}
+
+/// Three builds of a checkout with an executable output, a source edited before each of the
+/// later two: the paths those two placed a file at. The edit makes each a job, whose compile
+/// gives the same output (the fakes' program is the same bytes whatever its source): a request
+/// with nothing changed is its certificate's, which runs no job and so places nothing whatever
+/// is planted. `plant`: [`super::job::PLANT_PLACE_UNLOOKED`].
+fn builds_place(plant: bool) -> Vec<String> {
+    use super::job::{PLACED_PATHS, PLANT_PLACE_UNLOOKED};
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    let mut sim = Sim::new(13, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 13);
+    OUTPUT.set(true);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let mut build = |daemon: &mut SimDaemon| {
+        let id = client
+            .send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+        assert_eq!(daemon.driver().contents(&app), APP);
+    };
+    build(&mut daemon);
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    PLANT_PLACE_UNLOOKED.set(plant);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    build(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
+    build(&mut daemon);
+    PLANT_PLACE_UNLOOKED.set(false);
+    OUTPUT.set(false);
+    PLACED_PATHS.with_borrow_mut(std::mem::take)
 }
 
 /// What one client asked and how it ended.
@@ -5784,6 +6805,53 @@ fn status_says_the_daemons_pid() {
     assert_eq!(pid, Some(std::process::id()), "{got:#?}");
 }
 
+/// A loop stuck in a dispatch says which part of the daemon held it: the stuck line
+/// (`stop::stuck`), taken from inside the server's dispatch of a status request, names the
+/// loop's piece and the completion's part, read from the open span's own fields. Until
+/// 2026-11-14 the line said `loop turn: completions: a piece` and nothing more, so a 124 s
+/// stall in a dispatch named neither the piece nor whose completion it was. The control: drop
+/// `completion = handler.name()` from the dispatch's span, or `fields` from `SpanSaid`'s line,
+/// and the second assertion fails.
+///
+/// The invariant: a stuck line names, for each open span, its identifying fields, and the
+/// dispatch's span names its completion's part.
+#[test]
+fn a_stuck_line_inside_a_dispatch_names_the_piece_and_the_completions_part() {
+    use super::daemon::{Handler, STUCK_AT_DISPATCH};
+    const THREAD: &str = "daemon loop stuck line test";
+    blaze_profile::install();
+    let said = std::thread::Builder::new()
+        .name(THREAD.into())
+        .spawn(|| {
+            let mut sim = Sim::new(11, Faults::default());
+            checkout(&mut sim, "[package]\nname = \"app\"\n");
+            let steps = Arc::new(Fake::default());
+            let mut daemon = start(sim, &steps, 11);
+            STUCK_AT_DISPATCH.with_borrow_mut(|it| it.at = Some(Handler::Server));
+            let mut client = dial(&mut daemon);
+            let id = client.send(&mut daemon, Request::Status);
+            let got = client.wait(&mut daemon, id);
+            assert!(got.iter().any(|it| matches!(it, Response::Status(_))), "{got:#?}");
+            STUCK_AT_DISPATCH.with_borrow_mut(|it| it.said.take())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let Some(said) = said else { panic!("no dispatch to the server took the stuck line") };
+    let line = said
+        .lines()
+        .find(|it| it.trim_start().starts_with(THREAD))
+        .unwrap_or_else(|| panic!("the stuck line names no thread `{THREAD}`: {said}"));
+    assert!(
+        line.contains("loop turn: completions: a piece") && line.contains("piece=dispatch of one completion"),
+        "the stuck line names the loop's piece: {line}"
+    );
+    assert!(
+        line.contains(&format!("completion={}", Handler::Server.name())),
+        "the stuck line names whose completion the dispatch was in: {line}"
+    );
+}
+
 /// The loop's time between its turns is a `wait` span naming what ends it (rule 15). Before
 /// 2026-11-03 it was in no span, and 108.9 s of a self-build check's critical path read as
 /// unrecorded on the daemon's thread.
@@ -5881,42 +6949,53 @@ fn the_loop_runs_no_front_end_step_of_the_carry() {
 }
 
 /// The session survives a restart (rule 26): seeded, carried over an edit, the daemon stopped
-/// (its journal marks the session), started again, the edit undone and built. The restarted
-/// daemon opens the marked session and carries it from that root, with the counts an edit of
-/// that shape carries, rather than seeding; and none of it runs on the loop.
+/// (its journal marks the session), started again, the file edited again and built. The
+/// restarted daemon opens the marked session and carries it from that root, as a daemon that
+/// never stopped carries the same edit, rather than seeding; and none of it runs on the loop.
+/// The edit after the start is to a text no check answered yet: the edit undone is the first
+/// check's view, which that check's certificate answers with no job and so no pass.
 #[test]
 fn a_restarted_daemon_carries_from_its_mark() {
-    CARRY_CRATES.set(carry_crates());
-    let mut sim = Sim::new(34, Faults::default());
-    checkout(&mut sim, "[package]\n");
-    let steps = Arc::new(Fake::default());
-    let mut daemon = start(sim, &steps, 34);
-    let mut client = dial(&mut daemon);
-    check_settled(&mut client, &mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
-    check_settled(&mut client, &mut daemon);
-    let before = crate::serve::front_carry::sim::take_built();
-    assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
-    assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
-
-    let mut daemon = restart(daemon, &steps, 35);
-    assert_eq!(daemon.started().carries, None, "the marked sessions were used");
-    let mut client = dial(&mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
-    check_settled(&mut client, &mut daemon);
-    let after = crate::serve::front_carry::sim::take_built();
-    assert_eq!(after.len(), 1, "one pass: {after:?}");
+    // The passes of `/w`'s carry: the seed's and the first edit's, then the second edit's,
+    // the daemon stopped and started before the second edit or not.
+    let passes = |restarts: bool| {
+        CARRY_CRATES.set(carry_crates());
+        let mut sim = Sim::new(34, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, 34);
+        let mut client = dial(&mut daemon);
+        check_settled(&mut client, &mut daemon);
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+        check_settled(&mut client, &mut daemon);
+        let before = crate::serve::front_carry::sim::take_built();
+        assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
+        assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
+        if restarts {
+            daemon = restart(daemon, &steps, 35);
+            assert_eq!(daemon.started().carries, None, "the marked sessions were used");
+            client = dial(&mut daemon);
+        }
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
+        check_settled(&mut client, &mut daemon);
+        let after = crate::serve::front_carry::sim::take_built();
+        assert_eq!(after.len(), 1, "one pass (restarted: {restarts}): {after:?}");
+        after
+    };
+    let unstopped = passes(false);
+    let after = passes(true);
     assert!(!after[0].first, "the restarted daemon opened the marked session, not a seed");
     assert_eq!(after[0].paths, 1, "carried from the root the marked session is pinned at");
-    assert_eq!(after[0].carried, before[1].carried, "an edit of the same shape carries the same");
-    assert_eq!(after[0].files, before[1].files, "and holds the same roots");
+    assert_eq!(after[0].carried, unstopped[0].carried, "the edit carries what it carries in a daemon that never stopped");
+    assert_eq!(after[0].files, unstopped[0].files, "and holds the same roots");
     assert_eq!(crate::serve::front_carry::sim::reads().0, 0, "no read of the carry's world on the loop");
 }
 
 /// Whether the first pass of `/w`'s carry after a crash opened a session: seeded and carried
 /// over an edit, a snapshot (the journal and the store durable, the journal rewritten onto
-/// the image with its marks), a crash, a start and the edit undone. `drops_marks` plants the
-/// bug the control catches: the start keeps no mark.
+/// the image with its marks), a crash, a start and the file edited again (to a text no check
+/// answered yet: the edit undone is the first check's view, its certificate's to answer with
+/// no pass). `drops_marks` plants the bug the control catches: the start keeps no mark.
 fn carries_after_a_crash(seed: u64, drops_marks: bool) -> (bool, Option<String>) {
     CARRY_CRATES.set(carry_crates());
     let mut sim = Sim::new(seed, Faults::default());
@@ -5940,7 +7019,7 @@ fn carries_after_a_crash(seed: u64, drops_marks: bool) -> (bool, Option<String>)
     super::daemon::DROPS_MARKS.set(false);
     let said = daemon.started().carries.clone();
     let mut client = dial(&mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
     check_settled(&mut client, &mut daemon);
     let after = crate::serve::front_carry::sim::take_built();
     assert_eq!(after.len(), 1, "one pass: {after:?}");

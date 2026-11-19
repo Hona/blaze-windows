@@ -229,7 +229,7 @@ fn members_of(job: &Job, db: &Db) -> Result<Vec<Member>, Failed> {
         {
             continue;
         }
-        let Some(krate) = job.crates.krate(at) else { continue };
+        let Some(krate) = job.crates.krate(db, at) else { continue };
         if members.iter().any(|it| it.krate == krate) {
             continue;
         }
@@ -1007,6 +1007,7 @@ impl Runs<Real> for Checking {
         &mut self,
         _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        _placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s; Lean is no placed output
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1126,7 +1127,14 @@ mod tests {
             name,
             text,
             clauses: Vec::new(),
-            shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+            shape: Shape {
+                fuel: false,
+                monadic: false,
+                shared: false,
+                worlds: hir_ty_lean::translate::Worlds::default(),
+                mut_params: Vec::new(),
+                returns_unit: false,
+            },
             imports,
         }
     }
@@ -1352,7 +1360,18 @@ mod tests {
                 }
                 let module = last.trim_end_matches(".lean").replace('/', ".");
                 if given.contains(&module) {
-                    return Err(oracle(format!("`{module}` was given to Lean twice in one check")));
+                    // What Lean does with each module that it does not accept, and what was
+                    // given before: a failing case says its cause.
+                    let odd: Vec<String> = world
+                        .does
+                        .iter()
+                        .filter(|(_, does)| !matches!(does, Does::Accept))
+                        .map(|(module, does)| format!("{module}: {does:?}"))
+                        .collect();
+                    return Err(oracle(format!(
+                        "`{module}` was given to Lean twice in one check (given before: {given:?}; what Lean \
+                         does other than accept: {odd:?})"
+                    )));
                 }
                 for need in needs.get(&module).into_iter().flatten() {
                     if !accepted.contains(need) && !earlier.contains(need) {

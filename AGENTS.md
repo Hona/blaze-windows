@@ -57,7 +57,7 @@ Not now:
 - Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
 - Nothing merges until a release blaze of the exact merge commit has passed the smoke run (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
-- Facts come from tool output in this session (61); verdicts come from blaze on real projects (7).
+- Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
 
 ## Rules
@@ -114,7 +114,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **64. simulate-first**: Test stateful, incremental, concurrent or durable code in the deterministic simulation first.
 
 ### Speed and tracing (skill `perf-and-tracing`)
-- **16. slow-is-p0-traced**: Anything slow is a P0 until a span names it; the fix quotes before and after from the spans.
+- **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
 - **60. incremental-first**: Judge by the edit loop first; trade in the order incremental, memory, cold, disk cleanup, disk.
 
 ### Evidence and debugging (skill `debugging`)
@@ -122,7 +122,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **61. claims-from-evidence**: State as fact only what a tool call here showed; a pass counts only with proof the check ran.
 
 ### Design and changing code (skill `changing-code`)
-- **13. fix-through-blaze-lints**: Move an API with a `.clippy.toml` ban and `blaze check --fix`: by name, never by text.
+- **13. fix-through-blaze-lints**: Change many sites with astlog rules (`blaze check --rules`) or a ban and `--fix`: never by text.
 - **24. whole-ports**: A shared signature changes with all its callers in one batch; the tree compiles at every save.
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
@@ -134,7 +134,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **63. agents-json**: Read every how-to in `agents/`, search its annoyances for your area, add a row as things happen.
 - **66. end-state-not-hill-climb**: A second fix to one mechanism stops it until an outsider says rebuild or delete.
 - **67. within-ten-percent-of-the-floor**: Aim every design at the floor from the start; state it and report the ratio.
-- **72. edit-rust-by-syntax**: Only the edit tools, `ast-grep` or `blaze check --fix`; never a heredoc, `sed` or script.
+- **72. edit-rust-by-syntax**: Only the edit tools, astlog rules, `blaze check --fix` or `ast-grep`; never a heredoc or `sed`.
 - **73. type-then-lint-then-rule**: Prevent a mistake by a type, then a lint with a fix; a rule here comes last.
 - **76. correct-by-construction**: A value with an obligation or meaning is a type saying so: linear, proof, typed id, checked length.
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
@@ -145,7 +145,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
 - **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
-- **34. work-in-ix-vms**: Linux work runs on the one VM, `blaze-vm`, through its queue; the Mac for macOS; no AWS, no x86 VM.
+- **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
 - **35. fan-out-write-only**: Lanes only write; the main agent compiles each piece within minutes, then admits it alone.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
@@ -154,6 +154,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **48. agents-are-a-cost**: Start each independent large piece now in its own lane; four at most share files; nothing small.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
+- **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.
 
 ### Landing (skill `landing`)
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.

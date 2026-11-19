@@ -74,11 +74,8 @@ pub trait Work: Send + Sync + 'static {
     fn run(&self, arg: u32, readers: Self::Readers) -> Option<Did<Self::Value>>;
 
     /// Task `arg`'s crate and unit, for its `task` span: a unit phase's, `None` for a task of
-    /// no unit.
-    fn subject(&self, arg: u32) -> Option<(String, String)> {
-        let _ = arg;
-        None
-    }
+    /// no unit, said by the batch: no default, so a batch of units never inherits "no unit".
+    fn subject(&self, arg: u32) -> Option<(String, String)>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -516,13 +513,13 @@ fn alloc_failed(layout: std::alloc::Layout) {
 }
 
 /// The panic `payload` caught, with where the hook saw the newest one of its message raised.
-/// An unwind the query engine raised with a typed payload (a query past its bound, out of
-/// fuel) is named by its own text: it reaches no hook, and has no `panic!` text.
+/// An unwind the memo raised with a typed payload (its one, [`blaze_memo::Cancelled`]) is
+/// named by its own text: it reaches no hook, and has no `panic!` text.
 // dyn: a panic payload, read once per panicked task
 pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     let message = stdx::panic_text(payload)
         .map(str::to_owned) // alloc: a panic, once
-        .or_else(|| blaze_query::db::unwind_text(payload));
+        .or_else(|| payload.downcast_ref::<blaze_memo::Cancelled>().map(ToString::to_string));
     let at = blaze_profile::panics::claim(message.as_deref());
     Panic { message, at }
 }
@@ -1648,6 +1645,11 @@ mod tests {
 
         fn run(&self, arg: u32, (): ()) -> Option<Did<u32>> {
             (self.0)(arg)
+        }
+
+        /// A test's tasks are of no unit.
+        fn subject(&self, _: u32) -> Option<(String, String)> {
+            None
         }
     }
 

@@ -104,7 +104,7 @@ fn check(program: &Program) -> Result<Verdict, String> {
     let source = program.source();
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (probe, run) = (fn_named(&db, krate, "probe"), fn_named(&db, krate, "run"));
         let proved = proved(&db, probe);
         let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate }.store();
@@ -299,7 +299,7 @@ fn a_wide_dispatch_proof_scales() {
         let source = dispatch_source(arms);
         let db = fixture::db(&source).into_db();
         let krate = crate_named(&db, "kernel");
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             let probe = fn_named(&db, krate, "probe");
             let def = DefWithBodyId::FunctionId(probe);
             let body = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers");
@@ -337,7 +337,7 @@ fn most_implications(joins: u32) -> usize {
     );
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
         reach::MOST_IMPLICATIONS.set(0);
         let reach = reach::of_body(&db, def);
@@ -362,7 +362,7 @@ fn a_body_with_no_loop_walks_each_block_once() {
     let source = dispatch_source(24);
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
         let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers").basic_blocks.len();
         reach::WALKS.set(0);
@@ -377,7 +377,7 @@ fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
     let source = dispatch_source(32).replace("ran && !repeat", "let mut i = s.held; while i > 0 { i -= 1; } ran && !repeat");
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
         let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).unwrap().basic_blocks.len();
         reach::WALKS.set(0);
@@ -392,7 +392,7 @@ fn iterating_recursive_effects_proves_the_instance_sites_only_once() {
     let source = format!("{MINICORE}//- /lib.rs crate:kernel\nfn probe(n: u32) -> u32 {{ if n > 0 {{ next(n - 1) }} else {{ 0 }} }}\nfn next(n: u32) -> u32 {{ probe(n) }}");
     let db = fixture::db(&source).into_db();
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let probe = fn_named(&db, krate, "probe");
         reach::COUNT_BODY.set(Some(probe.into()));
         reach::COUNT_PROOFS.set(0);
@@ -437,7 +437,7 @@ impl Arith {
 fn fits_everywhere(source: &str) -> (bool, Option<(Db, FunctionId)>) {
     let db = fixture::db(source).into_db();
     let krate = crate_named(&db, "kernel");
-    let (fits, probe) = blaze_query::db::attach(&db, || {
+    let (fits, probe) = blaze_memo::attach(&db, || {
         let probe = fn_named(&db, krate, "probe");
         let found = reach::overflow_of_body(&db, DefWithBodyId::FunctionId(probe));
         (found.refused.is_empty() && found.sites.iter().all(|it| it.2.is_none()), probe)
@@ -458,7 +458,7 @@ fn check_overflow(program: &Arith) -> Result<bool, String> {
     }
     let Some((db, _)) = made else { return Err("no database".to_owned()) };
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let run = fn_named(&db, krate, "run");
         let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate }.store();
         let body = db

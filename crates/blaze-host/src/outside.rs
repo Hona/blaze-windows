@@ -3,7 +3,7 @@
 //! reads, settled before its certificate is filed) need, with no daemon. A fact's answer
 //! ([`Effect::Answer`]) is not here: it is a lookup in mapped tables
 //! ([`blaze_keyed::front::Universe::answer`]), and the late reads it answers from are the
-//! request's own ([`crate::Request::late`]).
+//! asking unit's own ([`crate::Request::late`], one table per unit).
 //!
 //! [`Effect::Outside`]: blaze_keyed::driver::Effect::Outside
 //! [`Effect::Answer`]: blaze_keyed::driver::Effect::Answer
@@ -224,29 +224,9 @@ impl fmt::Display for OutsideError {
     }
 }
 
-/// One remembered look: a file's path, its stamp, and the id of the bytes read under it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Leaf<'l> {
-    pub path: &'l [u8],
-    pub stamp: Stamp,
-    pub id: ContentId,
-}
-
-/// The command's leaf memory: rows sorted by path, each once, looked at no earlier than
-/// `instant_ns` (the wall clock before that look's first stat, a lower bound of every look).
-#[derive(Clone, Copy, Debug)]
-pub struct Leaves<'l> {
-    pub instant_ns: u64,
-    pub rows: &'l [Leaf<'l>],
-}
-
-impl Leaves<'_> {
-    pub const NONE: Leaves<'static> = Leaves { instant_ns: 0, rows: &[] };
-
-    fn find(&self, path: &[u8]) -> Option<&Leaf<'_>> {
-        self.rows.binary_search_by(|row| row.path.cmp(path)).ok().map(|at| &self.rows[at])
-    }
-}
+/// The leaf memory and its rule are blaze-vfs's, the one home of "this path outside every view
+/// is as it was" ([`blaze_vfs::outside::holds`]).
+pub use blaze_vfs::outside::{Leaf, Leaves};
 
 /// A file hashed by this request, to remember: its path, the stamp it was read under, its id.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -291,9 +271,7 @@ impl<'f, 'l, F: Files> Answerer<'f, 'l, F> {
                 }
                 // A link's stamp does not move when its target does: never vouched for.
                 if !stamp.is_link()
-                    && let Some(leaf) = self.leaves.find(path)
-                    && leaf.stamp == stamp
-                    && !blaze_vfs::racy(&stamp, self.leaves.instant_ns)
+                    && let Some(leaf) = self.leaves.held(path, &stamp)
                 {
                     return Ok(leaf.id);
                 }

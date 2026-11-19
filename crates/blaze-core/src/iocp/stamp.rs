@@ -39,6 +39,9 @@ use crate::{FileName, Names, S_IFDIR, S_IFLNK, S_IFREG, Stamp};
 /// How a stamp opens a name: its attributes, a link or junction itself.
 const LOOK: Open = Open { access: FILE_READ_ATTRIBUTES, link_itself: true };
 
+/// How a following stamp opens a name: its attributes, links and junctions followed.
+const FOLLOW: Open = Open { access: FILE_READ_ATTRIBUTES, link_itself: false };
+
 /// How many names one thread of a sweep stamps.
 const CHUNK: usize = 2048;
 
@@ -193,6 +196,13 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
 pub(crate) fn stamp_path(path: &Path) -> io::Result<Stamp> {
     let wide = sys::path(path)?;
     stamp_of(observe::open(At::Path(&wide), LOOK)?.raw())
+}
+
+/// The stamp of what `path` leads to, links and junctions followed:
+/// [`crate::fs::stamp_follow`].
+pub(crate) fn stamp_path_following(path: &Path) -> io::Result<Stamp> {
+    let wide = sys::path(path)?;
+    stamp_of(observe::open(At::Path(&wide), FOLLOW)?.raw())
 }
 
 /// How many threads stamp `names` names: one per [`CHUNK`] of them, at most one per core. A

@@ -2366,6 +2366,8 @@ mod thunks;
 
 mod patch;
 
+mod keep;
+
 mod beside;
 
 mod eh_frame_reach;

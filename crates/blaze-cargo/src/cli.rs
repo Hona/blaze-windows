@@ -706,6 +706,27 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     if let Some(what) = args::refused(asked) {
         return refused(&what, color);
     }
+    // Asked for by name, never taken because no daemon answers.
+    if asked.flags.no_daemon {
+        // What only the daemon's path does yet is refused by name, never dropped (rule 3).
+        let only_daemon = [
+            (asked.flags.query.is_some(), "--query"),
+            (asked.flags.rules.is_some(), "--rules"),
+            (!asked.flags.replace.is_empty(), "--replace"),
+            (asked.flags.fix, "--fix"),
+            (asked.flags.dry_run, "--dry-run"),
+        ];
+        if let Some((_, flag)) = only_daemon.iter().find(|(asked, _)| *asked) {
+            return refused(
+                &format!("`--no-daemon` with `{flag}`: the path with no daemon does not do `{flag}` yet; run it without `--no-daemon`"),
+                color,
+            );
+        }
+        return match no_daemon(asked, color) {
+            Ok(code) => code,
+            Err(what) => refused(&what, color),
+        };
+    }
     // Each stretch of the client's own time is a span (slow-is-p0-traced): they reach the
     // history with the client's rows (`client_rows`), under the build the daemon names.
     let preparing = tracing::info_span!(
@@ -726,8 +747,13 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     if let Err(what) = found {
         return refused(&what, color);
     }
-    if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
-        return replaced(&place, &asked.flags.replace, color);
+    if asked.command() == Command::Check && let Some(file) = &asked.flags.query {
+        return queried(&place, file, format.json(), color);
+    }
+    if asked.command() == Command::Check
+        && (!asked.flags.replace.is_empty() || asked.flags.rules.is_some())
+    {
+        return replaced(&place, &asked.flags, color);
     }
     let pinned = match asked.command() == Command::Check && asked.flags.fix {
         true => match fix::pin(&mut request) {
@@ -909,11 +935,180 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     }
 }
 
-/// `check --replace`'s edits made in the checkout: its exit code.
-fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
-    let done = replace::edits(pairs).and_then(|edits| replace::replace(&place.root, edits));
+/// `check`, `build` and `run` with `--no-daemon` (`blaze_command`): this process resolves the
+/// checkout into its unit graph, runs the keyed driver's host with the front end, files the
+/// records under `<home>/v2/keyed` and prints what it did; its exit code. `build` and `run`
+/// link the one program into the workspace's build dir (`<builds>/<workspace>/debug`), and
+/// `run` then becomes it (exec). Every step that cannot be done is an error naming it: no
+/// daemon is started or asked, and nothing is done another way.
+fn no_daemon(asked: &Invocation, color: bool) -> Result<i32, String> {
+    use std::alloc::Global;
+
+    use blaze_command::{front, graph, print as said, run as keyed};
+
+    let command = match asked.command() {
+        Command::Check => blaze_units::query::Command::Check,
+        Command::Build => blaze_units::query::Command::Build,
+        Command::Run => blaze_units::query::Command::Run,
+        other => {
+            return Err(format!(
+                "`--no-daemon` is `check`'s, `build`'s and `run`'s: `{}` with no daemon is not built yet",
+                other.name()
+            ));
+        }
+    };
+    if asked.flags.goal == Some(blaze_api::Goal::Max) {
+        return Err("`--goal max` with `--no-daemon`: the release tier is not made yet (rule: blaze_command::program::NO_RELEASE_TIER)".to_owned());
+    }
+    if command != blaze_units::query::Command::Check && std::env::var_os("CARGO_TARGET_DIR").is_some() {
+        return Err("`--no-daemon` builds into blaze's build dir for the workspace; `CARGO_TARGET_DIR` is not read by it yet".to_owned());
+    }
+    let began = Instant::now();
+    let (place, cargo) = prepared_cargo(asked, color)?;
+    // The workspace's directory, as the build dir is named by it (`blaze_manifest::home::build_dir`).
+    let workspace_root = place.manifest.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| place.root.clone());
+    crate::toolchain::ensure()?;
+    let library = crate::toolchain::library::fetch()?;
+    let home = crate::serve::root().map_err(|error| format!("{error:#}"))?;
+    let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
+    let builds = crate::serve::builds().map_err(|error| format!("{error:#}"))?;
+    let builds_dir = builds.clone();
+    let sources = crate::serve::sources().map_err(|error| format!("{error:#}"))?;
+    let makers = crate::serve::record_makers()?;
+    let std_dir = crate::serve::machine().map_err(|error| format!("{error:#}"))?.join("std").join(format!("{:x}", makers.id()));
+    let front_end = crate::serve::front_end_code()?.0;
+    let host = crate::toolchain::host().ok_or("blaze has no target triple for this machine's architecture and system")?;
+    let utf8 = |path: &std::path::Path| path.to_str().map(str::to_owned).ok_or_else(|| format!("{} is not named in UTF-8", path.display()));
+    let (std_dir, builds, sources) = (utf8(&std_dir)?, utf8(&builds)?, utf8(&sources)?);
+    let store = keyed::store_settings(&home.join("v2").join("keyed")).map_err(|error| error.to_string())?;
+    let tools = state.join("tools");
+    let inputs = graph::Inputs {
+        invocation: blaze_units::query::Invocation {
+            command,
+            args: crate::serve::undrawn(&cargo.args),
+            root: cargo.root,
+            cwd: cargo.cwd,
+            env: cargo.env,
+            files: cargo.files,
+        },
+        host,
+        library: graph::Library { dir: &library.dir, digest: &library.digest, commit: &library.commit },
+        std: &std_dir,
+        builds: &builds,
+        sources: &sources,
+        blaze: crate::release::get().version,
+        front_end,
+        tools: &tools,
+        org: store.org.as_deref().map(blaze_keyed::kind::Namespace::named),
+        trusted_writer: store.trusted_writer,
+    };
+    let prepare = began.elapsed();
+
+    let began = Instant::now();
+    let graph = graph::load(&inputs, Global).map_err(|error| error.to_string())?;
+    let load = began.elapsed();
+    let began = Instant::now();
+    let shown = |error: &blaze_command::CommandError| {
+        let mut text = String::new();
+        let _ = said::error(&graph, error, &mut text);
+        text.trim_end().to_owned()
+    };
+    let mut command_front = front::Command::new(&graph, Global).map_err(|error| shown(&error))?;
+    let made = began.elapsed();
+    let cores = blaze_core::cores::get().map_err(|error| format!("the cores this process may use: {error}"))?.budget.get();
+    let topology = blaze_graph::topology::Topology::detect().map_err(|error| format!("this machine's cores: {error}"))?;
+    let fast = topology.cpus.iter().filter(|cpu| cpu.fast).count();
+    let machine = blaze_keyed::machine::Machine {
+        cores: u32::try_from(cores).unwrap_or(u32::MAX),
+        fast_cores: u32::try_from(fast.clamp(1, cores)).unwrap_or(u32::MAX),
+        page_bytes: crate::raw::memory::page_bytes()
+            .and_then(|it| u32::try_from(it).ok())
+            .ok_or("this machine's page size: sysconf(_SC_PAGESIZE) said none")?,
+        memory_bytes: crate::raw::memory::machine_bytes().ok_or("the memory this machine has: the kernel said none")?,
+        qos: cfg!(target_os = "macos"),
+        huge_pages: false,
+    };
+    let summary = match command {
+        blaze_units::query::Command::Check => keyed::check(&graph, &mut command_front, &home, machine, Global).map_err(|error| shown(&error))?,
+        _ => {
+            let out_dir = blaze_manifest::home::build_dir(&builds_dir, &workspace_root).join("debug");
+            let built = keyed::build(&graph, &mut command_front, &home, &out_dir, machine, Global).map_err(|error| shown(&error))?;
+            for note in built.notes.iter() {
+                blaze_report::err!("{note}");
+            }
+            if asked.command() == Command::Run && said::succeeded(&built.summary.outcome) {
+                let Some(path) = built.program else {
+                    return Err("`run`: the build placed no program".to_owned());
+                };
+                let mut text = String::new();
+                let _ = said::summary(&graph, &built.summary, &[("prepare", prepare), ("load", load), ("front", made)], &mut text);
+                blaze_report::err!("{}", text.trim_end());
+                command_front.exit();
+                // Returns only when the exec failed.
+                return Err(shown(&keyed::start(&path, &asked.program)));
+            }
+            built.summary
+        }
+    };
+    let mut text = String::new();
+    let _ = said::summary(&graph, &summary, &[("prepare", prepare), ("load", load), ("front", made)], &mut text);
+    blaze_report::err!("{}", text.trim_end());
+    let code = match said::succeeded(&summary.outcome) {
+        true => 0,
+        false => Exit::Failed.code(),
+    };
+    command_front.exit();
+    Ok(code)
+}
+
+/// `check --query FILE`: what the rules derive and find, on stdout (one JSON line of
+/// [`blaze_api::Response::Rows`] with `--message-format json`); its exit code, failed when a
+/// lint of severity `error` found anything.
+fn queried(place: &Place, file: &str, json: bool, color: bool) -> i32 {
+    let done = replace::rules(&place.cwd, file).and_then(|rules| replace::query(&place.root, rules));
+    let rows = match done {
+        Ok(rows) => rows,
+        Err(what) => {
+            blaze_report::err!("{}", say::error(&what, color));
+            return Exit::Failed.code();
+        }
+    };
+    let failed = rows.findings.iter().any(|it| it.severity == blaze_api::query::Severity::Error);
+    let response = blaze_api::Response::Rows(rows);
+    let shown = match json {
+        true => serde_json::to_string(&response).map(|mut it| {
+            it.push('\n');
+            it
+        }),
+        false => Ok(blaze_ui::api::lines(&response, color && io::stdout().is_terminal())),
+    };
+    let written = shown
+        .map_err(io::Error::other)
+        .and_then(|it| io::stdout().lock().write_all(it.as_bytes()));
+    match (written, failed) {
+        (Ok(()), false) => 0,
+        // stdout closed under it, or an error-severity finding.
+        (Ok(()), true) | (Err(_), _) => Exit::Failed.code(),
+    }
+}
+
+/// `check --replace` and `--rules`' edits made in the checkout, or with `--dry-run` their
+/// diff on stdout: its exit code.
+fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
+    let done = replace::edits(&flags.replace).and_then(|mut edits| {
+        if let Some(file) = &flags.rules {
+            edits.push(blaze_api::Edit::Rules { rules: replace::rules(&place.cwd, file)? });
+        }
+        replace::replace(&place.root, edits, flags.dry_run)
+    });
     match done {
-        Ok(edited) => {
+        Ok(replace::Made { diff: Some(diff), edited }) => {
+            let written = io::stdout().lock().write_all(diff.as_bytes());
+            let rest = format!("{} item(s), nothing written", edited.items.len());
+            blaze_report::err!("{}", say::status("Would edit", &rest, color));
+            if written.is_ok() { 0 } else { Exit::Failed.code() }
+        }
+        Ok(replace::Made { edited, diff: None }) => {
             let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
             files.sort_unstable();
             files.dedup();
@@ -993,6 +1188,16 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
             }
             if let Some(found) = &mut found {
                 found.add(diagnostic);
+            }
+        }
+        // What a failed run did not check: the baselines' crates it left unmeasured.
+        if let Some(counted) = &mut counted {
+            match &response {
+                ResponseRef::Unchecked(unchecked) => counted.unchecked(unchecked),
+                ResponseRef::Report { unit: Some(unit), report } => {
+                    counted.report(unit, &report.headline.flat());
+                }
+                _ => {}
             }
         }
         if let ResponseRef::Work(worked) = &response {
@@ -1103,6 +1308,37 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     // (each failure was said, naming its unit), and the run then fails.
     let tests_past_failure =
         !asked.flags.fail_fast && matches!(asked.command(), Command::Test | Command::Bench);
+    // `check --baselines`: the run's counts held to the baselines. A failed run is still
+    // measured in part under `--bless-baselines` (`baselines::Counted`): the crates whose check
+    // completed are recorded, the rest named, and the command fails. Without a bless a failed
+    // run fails as it is; a run whose numbering the client refused measured nothing.
+    if asked.command() == Command::Check
+        && let Some(dir) = &asked.flags.baselines
+        && (ok || (asked.flags.bless_baselines && !printer.refused()))
+        && let Some(counted) = counted.take()
+    {
+        // args.rs refuses `--baselines` without exactly one `--target`.
+        let target = asked.flags.targets.first().map_or("", String::as_str);
+        let finished = counted.finish(
+            &place.root,
+            dir,
+            target,
+            asked.flags.bless_baselines,
+            &asked.flags.new_baselines,
+        );
+        return match finished {
+            Ok(said) => {
+                for line in said {
+                    printer.err().write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
+                }
+                Ok(Then::Exit(if ok { 0 } else { Exit::Failed.code() }))
+            }
+            Err(what) => {
+                printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+                Ok(Then::Exit(Exit::Failed.code()))
+            }
+        };
+    }
     if !ok && !tests_past_failure {
         return Ok(Then::Exit(Exit::Failed.code()));
     }
@@ -1118,33 +1354,8 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     let members = printer.members();
     match asked.command() {
         Command::Build => Ok(Then::Exit(0)),
-        Command::Check => {
-            let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else {
-                return Ok(Then::Exit(0));
-            };
-            // args.rs refuses `--baselines` without exactly one `--target`.
-            let target = asked.flags.targets.first().map_or("", String::as_str);
-            match counted.finish(
-                &place.root,
-                dir,
-                target,
-                asked.flags.bless_baselines,
-                &asked.flags.new_baselines,
-            ) {
-                Ok(said) => {
-                    for line in said {
-                        printer
-                            .err()
-                            .write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
-                    }
-                    Ok(Then::Exit(0))
-                }
-                Err(what) => {
-                    printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-                    Ok(Then::Exit(Exit::Failed.code()))
-                }
-            }
-        }
+        // Its baselines were held above.
+        Command::Check => Ok(Then::Exit(0)),
         Command::Doc => {
             if let Some(documented) = &documented {
                 doc::done(documented, asked.flags.open, shown.quiet, shown.color, &mut printer.err())?;

@@ -2,7 +2,6 @@
 //! walk lists of what the IR builder asks for.
 
 mod db;
-mod witnessed;
 
 use base_db::Db;
 use blaze_codegen::{
@@ -31,6 +30,44 @@ use super::{
 use crate::InstanceDef;
 use db::TestDB;
 
+/// Sets `file`'s text in a new snapshot: one edit and its commit (a text equal to the one held
+/// moves nothing and keeps the snapshot). A file's id is the same across it; every other id
+/// (an item's, a `Crate`, an interned `EditionedFileId`) is of the snapshot it was taken in,
+/// taken again after. A test that writes several files in one step opens one edit for them.
+pub(super) fn write_file(db: &mut TestDB, file: base_db::FileId, text: &str) {
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
+}
+
+/// What `work` gives, and the queries it ran on `db`, from the database's run log (a
+/// fixture's database keeps one): the runs before it are taken off first, so none of them is
+/// counted as its. A run is told by its query's kind (`Ran::is::<q>(&(key,))`).
+pub(super) fn runs_of<T>(db: &TestDB, work: impl FnOnce() -> T) -> (T, Vec<blaze_memo::testing::Ran, std::alloc::Global>) {
+    let log = db.runs().expect("a fixture's database keeps a run log");
+    _ = log.take();
+    let value = work();
+    (value, log.take())
+}
+
+/// Has `db`'s snapshots from its next on expand builtin derives, as a build's do: an input of
+/// the session arena, made each time that arena is, set in one commit. Every id taken of `db`
+/// before it is of the snapshot the commit replaced: take it again after.
+pub(super) fn expand_builtin_derives(db: &mut TestDB) {
+    let mut edit = db.edit();
+    edit.set_given(
+        None,
+        hir_def::nameres::builtin_derives_fact(true),
+        Box::new_in(
+            |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+                hir_def::nameres::set_expand_builtin_derives(inputs, true);
+            },
+            std::alloc::Global,
+        ),
+    );
+    _ = edit.commit();
+}
+
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     held(fixture::db(text).into_db())
@@ -56,7 +93,7 @@ fn stencils() -> Option<String> {
 }
 
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
-pub(super) fn policy(level: OptLevel) -> Policy {
+pub(crate) fn policy(level: OptLevel) -> Policy {
     let toolchain =
         Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {
@@ -299,7 +336,7 @@ fn instances_with_one_share_key_are_one() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = frontend(SHARED);
     // A failure's message formats instances, whose types are the database's.
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -443,7 +480,7 @@ fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
     // A failure's message formats instances, whose types are the database's.
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
@@ -492,7 +529,7 @@ fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
 fn overflow_checks_reach_an_inheriting_body_through_inline_bodies_without_checks() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let by_ref = frontend.with(|hir| called(hir, &root, function(db, "by_ref")));
@@ -528,7 +565,7 @@ fn an_instance_its_users_compile_is_walked_alike_for_every_asker() {
     use blaze_codegen::{backend::Frontend as _, plan::Origin};
     let policy = checks_policy(true);
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &policy);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
@@ -601,7 +638,7 @@ fn equal_share_keys_compile_to_one_shape() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let keyed = |instance: &HirInstance| {
@@ -691,7 +728,7 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let func = function(db, "id");
@@ -739,7 +776,7 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
             let mut policy = policy(OptLevel::O0);
             policy.profile.debuginfo = debuginfo;
             let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-            blaze_query::db::attach(db, || {
+            blaze_memo::attach(db, || {
                 let root = frontend.root(function(db, "roots"));
                 let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
                 let mut all = Vec::new(); // alloc: a test's list
@@ -829,7 +866,7 @@ fn described_in(
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let main = named("main");
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let root = frontend.root(hir_def::test_items::function(db, main, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, main));
         let func = hir_def::test_items::function(db, named(krate), name);
@@ -937,7 +974,7 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     use blaze_codegen::backend::Frontend as _;
     let code = |deep: &str| {
         let (db, frontend) = frontend(&cached_fixture(deep));
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let root = frontend.root(function(db, "cached"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let described = (frontend.describe(&root, &origin))
@@ -1004,7 +1041,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     };
     let refused = cached_reading(deep, "deep()");
     let (db, front) = frontend(&refused);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let cached = function(db, "cached");
         let compiled =
             crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
@@ -1022,7 +1059,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     for read in ["unsafe { M }", "(unsafe { M }, deep())"] {
         let impure = cached_reading(deep, read);
         let (db, _) = frontend(&impure);
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let compiled = crate::compiled_root(db, function(db, "cached"));
             if let Err(e) = compiled {
                 panic!("an impure cached function reading `{read}` compiles, uncached: {e}");
@@ -1036,7 +1073,7 @@ fn a_root_takes_function_items_for_its_type_parameters() {
     use blaze_codegen::backend::Frontend as _;
     let src = "pub fn expand<'a, F>(_: &'a u8) {}\npub fn two<F, G>() {}\npub fn sized<const N: usize, F>() {}\npub fn mac() {}\npub fn other() {}\n";
     let (db, frontend) = frontend(src);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let [expand, two, sized, mac, other] =
             ["expand", "two", "sized", "mac", "other"].map(|name| function(db, name));
         let root = |func, items: &[_]| frontend.root_with_fn_items(func, items);
@@ -1445,7 +1482,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_imaged(fixture::db(OVER_A_PATH_CRATE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend
                 .describe(instance, &origin)
@@ -1507,7 +1544,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_as(fixture::db(OVER_A_PATH_CRATE).into_db(), &policy(OptLevel::O0));
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let rooted =
             frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
         for it in &rooted.refs {
@@ -1534,7 +1571,7 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     let (db, frontend) = held_imaged(fixture::db(ASKED_BY_THE_IMAGE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend
                 .describe(instance, &origin)
@@ -2611,7 +2648,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
     let (distance, twice) = (method("distance"), method("twice"));
     let (concrete, bounded) = (function(db, "concrete"), function(db, "bounded"));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let interner = DbInterner::new_with(db, krate);
         let env = |def: FunctionId| ParamEnvAndCrate {
             param_env: db.trait_environment(def.into()),
@@ -2627,7 +2664,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         .expect_err("no impl of `P` is for `S`");
         assert!(why.starts_with("trait P method distance for [S"), "{why}");
         assert!(why.ends_with(": no impl holds"), "{why}");
-
+    
         let param = GenericArgs::identity_for_item(interner, bounded.into()).type_at(0);
         let (found, _) = crate::impl_method(
             db,
@@ -2637,7 +2674,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         )
         .expect("a where clause proves `T: P`");
         assert_eq!(found, either::Either::Left(distance));
-
+    
         let inherits = Ty::new_adt(interner, AdtId::StructId(inherits), GenericArgs::empty());
         let (found, _) = crate::impl_method(
             db,
@@ -2669,7 +2706,7 @@ pub fn roots(x: u32) {
 "#,
     );
     // A failure's message formats instances, whose types are the database's.
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -2739,7 +2776,7 @@ pub fn roots(a: A, b: B) {
 "#,
     );
     // A failure's message formats instances, whose types are the database's.
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -2768,7 +2805,7 @@ pub fn roots(a: A, b: B) {
         };
         let one = function(db, "one");
         let ones = |instance: &HirInstance| frontend.with(|hir| called(hir, instance, one)).len();
-
+    
         let twos = of("two");
         let [ab, aa, bb] = &twos[..] else { panic!("{twos:?}") };
         // The precondition: one code and one shared identity, so only the placement tells
@@ -2780,14 +2817,14 @@ pub fn roots(a: A, b: B) {
         assert_ne!(key(ab).0, key(aa).0, "{ab:?} and {aa:?}");
         assert_ne!(key(ab).0, key(bb).0, "{ab:?} and {bb:?}");
         assert_eq!(key(aa).0, key(bb).0, "{aa:?} and {bb:?}");
-
+    
         let threes = of("three");
         let [aba, abb] = &threes[..] else { panic!("{threes:?}") };
         assert_eq!((key(aba).1, shared(aba)), (key(abb).1, shared(abb)), "{aba:?} and {abb:?}");
         // Two places each: only which one the third call is given differs.
         assert_eq!((ones(aba), ones(abb)), (2, 2));
         assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
-
+    
         let reifieds = of("reified");
         let [aba, abb] = &reifieds[..] else { panic!("{reifieds:?}") };
         assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
@@ -2841,7 +2878,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
     use crate::fragment::DataRequest;
     let (db, frontend) = frontend(POINTERS_TO_DYN);
     let word = crate::Target::for_fixtures().word() as u32;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let cases =
             [("raw", "A"), ("aliased", "B"), ("behind", "C"), ("wrap", "D"), ("raw_slice", "E")];
         for (name, of) in cases {
@@ -3075,7 +3112,7 @@ pub fn id_num() -> (&'static dyn Tr, P) { ID_NUM }
 /// description (a vtable's type), or the error building it stops with.
 fn constant_datas(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
     let (db, frontend) = frontend(CONSTANT_MEMORY);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let root = frontend.root(function(db, name));
         frontend.with(|db| {
             let code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec()));
@@ -3868,7 +3905,7 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let (k, dep, main) = (named("k"), named("dep"), named("main"));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         assert!(
             !loaded_crates(db, k).contains(&dep),
             "the fixture's premise: `k` names `dep` only through a macro"
@@ -3963,7 +4000,7 @@ fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
             hir_def::test_items::function(db, dep, "always"),
         );
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else {
                 panic!("one `generic::<u8>`")
             };
@@ -4049,7 +4086,7 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
     let resize = hir_def::test_items::function(db, dep, "resize");
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let described = |it: &HirInstance, by: &Origin| {
             frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
         };
@@ -4124,7 +4161,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
     let executable = super::RootKind::Executable;
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         assert_eq!(frontend.devirt.world(), None, "no world before the first walk ends");
         frontend
             .with(|hir| frontend.devirt.makes(hir, executable, main))
@@ -4145,7 +4182,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
         }
         assert!(frontend.closed(&reached, &[]).expect("the program's dyn facts"));
         let world = frontend.devirt.world().expect("the world the first walk closed");
-
+    
         std::thread::scope(|scope| {
             for _ in 0..16 {
                 scope.spawn(|| {
@@ -4159,7 +4196,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
                 });
             }
         });
-
+    
         // The same facts again: the world held, and no new one.
         assert!(!frontend.closed(&reached, &[]).expect("the facts the bodies were built against"));
         // Another program of the same front end: refused, naming both.
@@ -4176,52 +4213,67 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
     });
 }
 
-/// The invariant: after a literal edit the plain and closed walk still support the same
-/// world. Changing the graph to reach another closure does not validate that checkpoint.
+/// The invariant: under the session memo (no changed set), resuming a world checkpoint is
+/// refused; a fresh walk after a literal edit closes to the same world, while adding another
+/// closure closes to a different world.
 #[test]
 fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
     use blaze_codegen::backend::Frontend as _;
     let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
-    let fixture = fixture::db(DYN_FN_BUILT_IN);
-    let file = fixture.file_at("/main.rs");
-    let mut db = fixture.into_db();
-    let file = file.file_id(&db);
-    let krate = fixture::test_crate(&db);
+    let mut fixture = fixture::db(DYN_FN_BUILT_IN);
+    let file = fixture.file_at("/main.rs").file_id(fixture.db());
     let policy = policy(OptLevel::O3);
-    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
-        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default()).with_policy(policy);
+    let walk = |db: &TestDB| {
+        let krate = fixture::test_crate(db);
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(&policy);
         f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
-        f
-    }
-    let (kept, view) = {
-        let f = front(&db, &policy, krate);
-        let view = f.view().unwrap();
+        assert_eq!(f.view(), None);
         for closed in [true, false] {
-            let root = f.root(function(&db, "roots"));
+            let root = f.root(function(db, "roots"));
             let origin = f.with(|db| f.origin(db, krate));
             let mut reached = Vec::new();
-            let mut queue = vec![(root,origin)];
-            while let Some((i,o)) = queue.pop() {
-                if reached.contains(&(i.clone(),o)) { continue; }
-                let d = f.describe(&i,&o).unwrap();
-                for r in d.refs { if let FrontRef::Function(callee) = r { queue.push((callee,d.origin)); } }
-                reached.push((i,o));
+            let mut queue = vec![(root, origin)];
+            while let Some((i, o)) = queue.pop() {
+                if reached.contains(&(i.clone(), o)) {
+                    continue;
+                }
+                let d = f.describe(&i, &o).unwrap();
+                for r in d.refs {
+                    if let FrontRef::Function(callee) = r {
+                        queue.push((callee, d.origin));
+                    }
+                }
+                reached.push((i, o));
             }
-            assert_eq!(f.closed(&reached,&[]).unwrap(),closed);
+            assert_eq!(f.closed(&reached, &[]).unwrap(), closed);
         }
-        (f.kept_world().unwrap(),view)
+        (f.kept_world().unwrap(), f.devirt.world().unwrap())
     };
-    db.set_file_text(file,&source.replace("y * 3", "y * 4"));
-    let since = {
-        let f = front(&db,&policy,krate);
-        f.resume_world(&kept,view).unwrap();
-        assert!(f.devirt.world().is_some());
-        f.abandon_resumed_world();
+    let (kept, initial) = walk(fixture.db());
+    _ = fixture.edit(|edit| _ = edit.set_file_text(file, &source.replace("y * 3", "y * 4")));
+    {
+        let db = fixture.db();
+        let krate = fixture::test_crate(db);
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(&policy);
+        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
+        assert!(f.resume_world(&kept, 0).is_err());
         assert!(f.devirt.world().is_none());
-        f.view().unwrap()
-    };
-    db.set_file_text(file, &source.replace("dep::resize::<K>(x, &|y| y * 3)", "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)"));
-    assert!(front(&db,&policy,krate).resume_world(&kept,since).is_err());
+    }
+    let (_, after_literal) = walk(fixture.db());
+    assert_eq!(initial, after_literal);
+    _ = fixture.edit(|edit| {
+        _ = edit.set_file_text(
+            file,
+            &source.replace(
+                "dep::resize::<K>(x, &|y| y * 3)",
+                "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)",
+            ),
+        );
+    });
+    let (_, after_new_closure) = walk(fixture.db());
+    assert_ne!(initial, after_new_closure);
 }
 
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at
@@ -4354,7 +4406,7 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
     let program = |derived: bool| {
         let mut db = fixture::db(&downstream_debug(derived)).into_db();
         // As a build's database: builtin derives expanded, so `D`'s derived `Debug::fmt` has a body.
-        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+        expand_builtin_derives(&mut db);
         let db: &'static TestDB = Box::leak(Box::new(db));
         let lib = (all_crates(db).iter().copied())
             .find(|it: &Crate| {
@@ -4371,7 +4423,7 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
         let root = frontend.root(function(db, "roots"));
         let g = hir_def::test_items::function(db, lib, "g");
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else {
                 panic!("one `g::<D>`")
             };
@@ -4546,8 +4598,20 @@ fn built_after_a_release() {
     assert!(!before.is_empty());
     let released = hir::evict::release_process_tables();
     assert!(released.tables > 0, "{released:?}");
-    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
+    let shapes = shapes_let_go(AFTER_RELEASE);
+    use std::sync::atomic::Ordering::Relaxed;
+    // Printed before the shapes' line, which `child` reads to its end.
+    println!(
+        "{STALE_AFTER}{} read, {} wrong",
+        crate::plant::STALE_READS.load(Relaxed),
+        crate::plant::STALE_WRONG.load(Relaxed)
+    );
+    println!("{SHAPES_AFTER}{shapes:?}");
 }
+
+/// What the planted child prints of its map's keys from before the release
+/// ([`crate::plant::STALE_READS`]), for the control's message.
+const STALE_AFTER: &str = "stale erased rows: ";
 
 #[test]
 #[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
@@ -4610,11 +4674,33 @@ fn a_build_after_a_release_equals_a_fresh_build() {
     assert!(after_passed, "the build after a release failed");
     assert_eq!(after, fresh, "the build after a release differs from a fresh build");
     let (kept_passed, kept) = child("child_builds_after_a_release_keeping_erased");
+    // Where the control fails, what the planted map gave: no read of a key it held at the
+    // release (the fixture no longer reaches the map across it: the fixture is to change), reads
+    // all right (the rows were renumbered in step, so the stale map is right by coincidence:
+    // the fixtures are to intern apart), or reads wrong with the shapes equal (the shapes miss a
+    // wrong row: the oracle is to change).
     assert!(
         !kept_passed || kept != fresh,
         "the control: with `erase_regions`' map kept across the release the build is still \
-         the fresh one's, so the test does not see a stale row"
+         the fresh one's, so the test does not see a stale row ({})",
+        child_stale("child_builds_after_a_release_keeping_erased")
     );
+}
+
+/// The [`STALE_AFTER`] line the child `name` prints, run again alone: only for a failing
+/// control's message.
+fn child_stale(name: &str) -> String {
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let path = format!("v2::tests::{name}");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", &path, "--ignored", "--nocapture", "--test-threads=1"])
+        .output()
+        .unwrap_or_else(|e| panic!("running {path}: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.find(STALE_AFTER).map(|at| line[at..].to_owned()))
+        .unwrap_or_else(|| format!("{path} printed no `{STALE_AFTER}` line"))
 }
 
 /// The invariant: what the builds over a database keep for the next walk (its kept walks,

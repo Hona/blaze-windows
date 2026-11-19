@@ -1368,6 +1368,26 @@ pub fn stamp(path: &Path) -> io::Result<crate::Stamp> {
     return std::fs::symlink_metadata(path).map(|it| wasi::stamp_of(&it));
 }
 
+/// The [`Stamp`] of what `path` leads to, links followed.
+pub fn stamp_follow(path: &Path) -> io::Result<crate::Stamp> {
+    #[cfg(windows)]
+    return crate::iocp::stamp_path_following(path);
+    #[cfg(unix)]
+    return std::fs::metadata(path).map(|it| {
+        use std::os::unix::fs::MetadataExt as _;
+        let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+        crate::Stamp {
+            ino: it.ino(),
+            size: it.size(),
+            mtime_ns: ns(it.mtime(), it.mtime_nsec()),
+            ctime_ns: ns(it.ctime(), it.ctime_nsec()),
+            mode: it.mode(),
+        }
+    });
+    #[cfg(target_os = "wasi")]
+    return std::fs::metadata(path).map(|it| wasi::stamp_of(&it));
+}
+
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
 #[cfg(unix)]
 pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {

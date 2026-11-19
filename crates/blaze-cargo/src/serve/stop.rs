@@ -62,7 +62,6 @@ use super::pulse::{Look, LoopWatch, Pulse, StallWatch};
 const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long the guard waits for the scheduler's lock to read its waits: a deadlock may hold it.
-#[cfg(unix)]
 const WAITS_READ: Duration = Duration::from_secs(2);
 
 /// What a stop that ended so says first: `blaze serve: pid 7 stop stalled: ...`.
@@ -130,7 +129,7 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
         stalls.look(pid, pulse);
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_query::db::completed(),
+            queries: blaze_memo::completed() + blaze_query::db::completed(),
             steps: pulse.moved(),
             working: 0,
         };
@@ -218,7 +217,7 @@ fn watch_turns(
         }
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_query::db::completed(),
+            queries: blaze_memo::completed() + blaze_query::db::completed(),
             steps: turns,
             working: 0,
         };
@@ -406,8 +405,7 @@ fn unread(error: &std::io::Error) -> bool {
 }
 
 /// The report of a turn that has lasted `for_ns`, the loop having finished `turns` turns.
-#[cfg(unix)]
-fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
+pub(super) fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
     // alloc: once a stuck turn
     let why = format!(
         "the loop has not finished a turn for {} s (after {turns} turns), so nothing reaps its children or hands on what completed",
@@ -417,7 +415,6 @@ fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
 }
 
 /// `blaze serve: pid 7 loop stuck: why; inside`.
-#[cfg(unix)]
 fn stuck_line(pid: u32, why: &str) -> String {
     format!("blaze serve: pid {pid}{STUCK}{why}; {}", inside()) // alloc: once a stuck turn
 }
@@ -436,7 +433,6 @@ fn stalled(pid: u32, why: &str) -> String {
 
 /// What a stuck daemon is inside: what each thread is inside, what each of the scheduler's
 /// waits waits on, and each child not reaped with what waits for it ([`children`]).
-#[cfg(unix)]
 fn inside() -> String {
     inside_within(WAITS_READ)
 }

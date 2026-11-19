@@ -163,7 +163,7 @@ pub(crate) fn takes_world(
 
 /// Whether the body of `instance` as any of [`Build::WALKS_INLINED`] builds it calls a trait
 /// method through a `dyn`: what `Devirtualize` looks at.
-#[blaze_query::tracked]
+#[blaze_memo::tracked(owns)]
 pub(crate) fn has_sites(
     db: &Db,
     instance: Instance,
@@ -265,71 +265,13 @@ impl State {
 
     pub(super) fn resume(
         &self,
-        front: &HirFrontend<'_>,
-        kept: &Checkpoint,
-        view: u64,
+        _front: &HirFrontend<'_>,
+        _kept: &Checkpoint,
+        _view: u64,
     ) -> Result<(), &'static str> {
-        use blaze_query::db::{Changed, View};
-        front.with(|db| {
-            if self.makes.get() != Some(&kept.makes)
-                || program_name(db, kept.makes.0, kept.makes.1) != kept.program
-            {
-                return Err("another program made the world checkpoint");
-            }
-            let since = View::from_u64(view);
-            let Changed::Keys(changed) = contribution::changed_since(db, since) else {
-                return Err("the changed set of world contributions is unknown");
-            };
-            for id in changed {
-                let Some((i, o, facing)) = contribution::arguments(db, id) else {
-                    return Err("a changed world contribution has no arguments");
-                };
-                if facing == front.facing(None) {
-                    let asked = (i, o);
-                    if let Some(was) = kept
-                        .plain
-                        .functions
-                        .get(&asked)
-                        .or_else(|| kept.closed.functions.get(&asked))
-                    {
-                        let now = contribution(db, asked.0, o, facing)
-                            .as_ref()
-                            .map_err(|_| "a function's world contribution failed")?;
-                        if !Arc::ptr_eq(now, was) && now != was {
-                            return Err(
-                                "a reached function changed its world contribution or plain edges",
-                            );
-                        }
-                    }
-                }
-            }
-            let Changed::Keys(changed) = static_contribution::changed_since(db, since) else {
-                return Err("the changed set of static world contributions is unknown");
-            };
-            for id in changed {
-                let Some((s, facing)) = static_contribution::arguments(db, id) else {
-                    return Err("a changed static world contribution has no arguments");
-                };
-                if facing == front.facing(None) {
-                    if let Some(was) =
-                        kept.plain.statics.get(&s).or_else(|| kept.closed.statics.get(&s))
-                    {
-                        let now = static_contribution(db, s, facing)
-                            .as_ref()
-                            .map_err(|_| "a static's world contribution failed")?;
-                        if !Arc::ptr_eq(now, was) && now != was {
-                            return Err(
-                                "a reached static changed its world contribution or plain edges",
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        self.resumed.set(kept.clone()).map_err(|_| "the front end already resumed a world")?;
-        self.using_resumed.store(true, Ordering::Release);
-        Ok(())
+        // Under blaze-memo, `HirFrontend::view` is `None` and the session memo names no
+        // changed set (`frontend.rs:1270`), so closed worlds are recomputed rather than resumed.
+        Err("the session memo names no changed set for world contributions")
     }
 }
 
@@ -536,7 +478,6 @@ fn object_inputs(
     Ok(ids)
 }
 
-#[blaze_query::tracked(returns(ref))]
 fn contribution(
     db: &Db,
     i: HirInstance,
@@ -587,7 +528,6 @@ struct StaticContribution {
     objects: Vec<ContentId>,
 }
 
-#[blaze_query::tracked(returns(ref))]
 fn static_contribution(
     db: &Db,
     value: HirStatic,
@@ -655,9 +595,7 @@ fn world_of(
     }
     let mut seen = blaze_hash::HashSet::new_in(Global);
     for (instance, requester) in functions {
-        let c = contribution(db, instance.clone(), *requester, frontend.facing(None))
-            .as_ref()
-            .map_err(Clone::clone)?;
+        let c = contribution(db, instance.clone(), *requester, frontend.facing(None))?;
         if !seen.insert(instance) {
             continue;
         }
@@ -684,9 +622,7 @@ fn world_of(
     }
     for value in statics {
         // An `extern_weak` static holds a foreign symbol's address: no vtable of its value.
-        let c = static_contribution(db, *value, frontend.facing(None))
-            .as_ref()
-            .map_err(Clone::clone)?;
+        let c = static_contribution(db, *value, frontend.facing(None))?;
         for (ty, key) in &c.facts.vtables {
             objects.entry(*key).or_default().tys.push(ty.clone());
         }
@@ -788,7 +724,7 @@ fn object(
             Some(last) if last.id == target.id && last.ty == target.ty => {}
             Some(last) if last.id == target.id => {
                 // alloc: the error's message
-                return Err(blaze_query::db::attach(db, || {
+                return Err(blaze_memo::attach(db, || {
                     format!("{:?} and {:?} have one content ID {:?}", last.ty, target.ty, target.id)
                 }));
             }
@@ -797,7 +733,7 @@ fn object(
     }
     let open = found.open.as_deref().or(everything);
     let digest = devirt::object_digest(&trait_id, &args_id, &kept, open);
-    let name = blaze_query::db::attach(db, || {
+    let name = blaze_memo::attach(db, || {
         let trait_name = TraitSignature::of(db, key.trait_).name.as_str().to_owned();
         match after_self.is_empty() {
             true => format!("dyn {trait_name}"),
