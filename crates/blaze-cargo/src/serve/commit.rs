@@ -116,7 +116,9 @@ pub(super) fn value_budget(physical: u64) -> u64 {
 pub(super) fn set_value_budgets() -> anyhow::Result<()> {
     let physical = blaze_mem::address_capacity()?.physical;
     let each = value_budget(physical);
-    for tag in VALUE_TAGS {
+    // `mir`'s values are let go only when asked: its cap is read by a write mid-build
+    // (`unit::release_mir_past_cap`), never by the storage's passes.
+    for tag in VALUE_TAGS.into_iter().chain([blaze_mem::Tag::Mir]) {
         if blaze_mem::tag::budget(tag) == u64::MAX {
             blaze_mem::tag::set_budget(tag, each);
         }

@@ -1522,6 +1522,16 @@ fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
     assert_eq!(compile::module_at(path, module.clone()), Ok(module));
 }
 
+/// MIR is let go on a write only past the `mir` cap, and never where no cap is set (Linux,
+/// macOS): 1 GiB holds about 175,000 values at 6 KiB each.
+#[test]
+fn mir_goes_on_a_write_only_past_its_cap() {
+    assert!(!super::mir_past_cap(10_000_000, u64::MAX), "no cap: never");
+    assert!(!super::mir_past_cap(170_000, 1 << 30));
+    assert!(super::mir_past_cap(180_000, 1 << 30));
+    assert!(!super::mir_past_cap(0, 0), "nothing held is never past");
+}
+
 /// Mid-build, a write lets go of each finished dependency crate once and never of a workspace
 /// member's: the member's inference is the next edit's. Control: a selection that ignores
 /// `released` lets one crate go twice.

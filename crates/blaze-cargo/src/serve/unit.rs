@@ -1486,6 +1486,41 @@ impl BuildEnd {
     }
 }
 
+/// What one MIR value holds, about: the withdeps ladder's memory lines held 0.24 GiB of `mir`
+/// heap for 45,344 bodies (5.6 KiB each), rounded up. MIR values are let go only when asked
+/// (`lru = 0`) and weigh nothing to the storage, so their count stands in for their bytes.
+const MIR_VALUE_BYTES: u64 = 6 << 10;
+
+/// Whether `values` MIR values, at [`MIR_VALUE_BYTES`] each, are past the `mir` tag's cap
+/// (`blaze_mem::tag::budget`, set on Windows by `serve::commit::set_value_budgets`; none
+/// elsewhere, so never).
+fn mir_past_cap(values: usize, cap: u64) -> bool {
+    cap != u64::MAX && (values as u64).saturating_mul(MIR_VALUE_BYTES) > cap
+}
+
+/// On a write a build asked anyway: where the MIR the front end holds is past its cap, every
+/// MIR value goes (each keeps its memo, so a body a later unit's codegen reads is made again
+/// and backdated). A cold build of a large workspace otherwise holds the MIR of every body it
+/// compiled until its end (I51: 7 GiB of `mir` heap on rune-desktop). Not in a check.
+fn release_mir_past_cap(lowered: &mut Lowered, end: &BuildEnd) {
+    if !end.compiles {
+        return;
+    }
+    let db = lowered.served_db();
+    let held = hir::evict::mir_held(db);
+    if !mir_past_cap(held, blaze_mem::tag::budget(blaze_mem::Tag::Mir)) {
+        return;
+    }
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end release of MIR past its cap, on a write",
+        held,
+        dropped = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    span.record("dropped", hir::evict::drop_mir(db));
+}
+
 /// Of `finished`, the crates that are not `local` and not in `released` (sorted), each added to
 /// it: each dependency crate is let go once, a workspace member's never mid-build.
 fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, released: &mut Vec<C>) -> Vec<C> {
@@ -1507,6 +1542,7 @@ fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, releas
 /// is made again from its memo and backdated, so nothing read can differ; what a later crate's
 /// codegen still reads of a finished one (a generic's body) is made again on demand.
 fn release_finished(lowered: &mut Lowered, end: &mut BuildEnd) {
+    release_mir_past_cap(lowered, end);
     let crates = {
         let db: &base_db::Db = &*lowered.served_db();
         end.newly_finished(db)
