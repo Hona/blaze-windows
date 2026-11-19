@@ -10,38 +10,23 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, PoisonError};
-use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+use super::ffi::{
+    ACL, ACL_REVISION, AddAccessAllowedAce, AddMandatoryAce, BOOL, CancelIoEx, ConnectNamedPipe,
+    CopySid, CreateEventW, CreateFileW, CreateNamedPipeW, CreateWellKnownSid, ERROR_BROKEN_PIPE,
+    ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, EqualSid, FILE_ALL_ACCESS,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_WRITE_DATA, GetCurrentProcess, GetNamedPipeClientProcessId, GetOverlappedResult,
+    GetTokenInformation, HANDLE, INFINITE, INVALID_HANDLE_VALUE, InitializeAcl,
+    InitializeSecurityDescriptor, OPEN_EXISTING, OVERLAPPED, OpenProcess, OpenProcessToken,
+    PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PROCESS_QUERY_LIMITED_INFORMATION, PSID, PeekNamedPipe,
+    ReadFile, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_REVISION,
+    SECURITY_IDENTIFICATION, SECURITY_MAX_SID_SIZE, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, SetSecurityDescriptorDacl, SetSecurityDescriptorSacl,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WAIT_OBJECT_0, WAIT_TIMEOUT, WELL_KNOWN_SID_TYPE,
+    WaitForSingleObject, WaitNamedPipeW, WinBuiltinAnyPackageSid, WinLowLabelSid, WriteFile,
 };
-use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, AddAccessAllowedAce, AddMandatoryAce, CopySid, CreateWellKnownSid, EqualSid,
-    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES,
-    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorSacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
-    WinBuiltinAnyPackageSid, WinLowLabelSid,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-    ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
-};
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
-    WaitNamedPipeW,
-};
-use windows_sys::Win32::System::SystemServices::{
-    SECURITY_DESCRIPTOR_REVISION, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
-};
-use windows_sys::core::BOOL;
-
 use super::os;
 use crate::Error;
 

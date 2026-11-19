@@ -11,6 +11,7 @@
 //! overlay's view over its placeholder (`MEM_REPLACE_PLACEHOLDER`), and puts back the pages it
 //! read as private memory with their protection. Every byte at every address is as before.
 
+mod ffi;
 mod pipe;
 #[cfg(test)]
 mod tests;
@@ -22,32 +23,22 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError,
-    HANDLE, HMODULE, INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::Security::Cryptography::ProcessPrng;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, FlushInstructionCache, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, UNW_FLAG_NHANDLER, WriteProcessMemory,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
-    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, UnmapViewOfFile,
-    UnmapViewOfFile2, VirtualAlloc2, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx,
-};
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentThreadId, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
-    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE, SetEvent, TerminateProcess, WaitForMultipleObjects,
-    WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
+use ffi::{
+    CONTEXT, CreateEventW, CreateFileMappingW, CreateToolhelp32Snapshot, DUPLICATE_SAME_ACCESS,
+    DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, FlushInstructionCache, GetCurrentProcess,
+    GetCurrentThreadId, GetLastError, GetModuleHandleW, GetProcAddress, GetSystemInfo, HANDLE,
+    HMODULE, INFINITE, INVALID_HANDLE_VALUE, K32EnumProcessModules, MEM_COMMIT, MEM_IMAGE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+    OpenProcess, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, PAGE_WRITECOPY, PROCESS_DUP_HANDLE, PROCESS_QUERY_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    PROCESS_VM_WRITE, ProcessPrng, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry,
+    RtlVirtualUnwind, SEC_COMMIT, SYSTEM_INFO, SetEvent, SetLastError, TH32CS_SNAPTHREAD,
+    THREADENTRY32, TerminateProcess, Thread32First, Thread32Next, UNW_FLAG_NHANDLER,
+    UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFreeEx, VirtualProtectEx,
+    VirtualQueryEx, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitForMultipleObjects, WaitForSingleObject,
+    WaitOnAddress, WakeByAddressAll, WriteProcessMemory,
 };
 
 pub use pipe::{Listener, Stream, connect};
@@ -1048,18 +1039,6 @@ pub fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> R
     Ok(())
 }
 
-#[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
-unsafe extern "system" {
-    /// psapi's `EnumProcessModules`, which kernel32 exports under this name: the process's
-    /// modules in load order, read from its loader's list without taking the loader lock.
-    fn K32EnumProcessModules(
-        process: HANDLE,
-        modules: *mut HMODULE,
-        bytes: u32,
-        needed: *mut u32,
-    ) -> windows_sys::core::BOOL;
-}
-
 /// What the process's global scope is on Windows: every module the system loader loaded, the
 /// executable first, each export found by `GetProcAddress` (forwarders followed), the first
 /// module that exports a name winning.
@@ -1120,8 +1099,9 @@ impl Scope {
             // SAFETY: `module` is a module of this process the loader listed, loaded for as
             // long as the start hook runs (it runs under the loader lock, so nothing unloads
             // one); `self.name` is NUL-terminated with no NUL before its end (checked above).
-            if let Some(found) = unsafe { GetProcAddress(module, self.name.as_ptr()) } {
-                return Ok(Some(found as usize as u64));
+            let found = unsafe { GetProcAddress(module, self.name.as_ptr()) };
+            if !found.is_null() {
+                return Ok(Some(found as u64));
             }
         }
         Ok(None)
@@ -1211,24 +1191,18 @@ pub fn serialize() {
     }
 }
 
-/// `RtlCaptureContext` stores the vector registers with aligned stores; windows-sys's `CONTEXT`
-/// is aligned to 8 only.
-#[repr(C, align(16))]
-struct Context(CONTEXT);
-
 /// The return addresses of the calling thread's frames, unwound one by one with the tables the
 /// system keeps (the loaded images' and those added with `RtlAddFunctionTable`). A frame
 /// below the first with no unwind information can't be stepped over, since only a leaf may
 /// lack it, so the walk did not finish: `None`. The outermost frame returns to 0.
 #[inline(never)]
 pub fn backtrace(out: &mut [u64]) -> Option<usize> {
-    // SAFETY: CONTEXT is plain integers: all zero is a value.
-    let mut context = Context(unsafe { std::mem::zeroed() });
+    let mut context = CONTEXT::zeroed();
     // SAFETY: fills the 16-byte aligned CONTEXT it is given with this thread's registers.
-    unsafe { RtlCaptureContext(&mut context.0) };
+    unsafe { RtlCaptureContext(&mut context) };
     let mut len = 0;
     loop {
-        let pc = context.0.Rip;
+        let pc = context.Rip();
         let mut image = 0u64;
         // SAFETY: looks `pc` up in the function tables the system keeps; writes only `image`.
         let function = unsafe { RtlLookupFunctionEntry(pc, &mut image, std::ptr::null_mut()) };
@@ -1246,16 +1220,16 @@ pub fn backtrace(out: &mut [u64]) -> Option<usize> {
                 image,
                 pc,
                 function,
-                &mut context.0,
+                &mut context,
                 &mut data,
                 &mut frame,
                 std::ptr::null_mut(),
             )
         };
-        if context.0.Rip == 0 {
+        if context.Rip() == 0 {
             return Some(len);
         }
-        *out.get_mut(len)? = context.0.Rip;
+        *out.get_mut(len)? = context.Rip();
         len += 1;
     }
 }

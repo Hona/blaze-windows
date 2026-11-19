@@ -24,8 +24,8 @@
 //!   profile (`blaze_units::stdlib::DEV_RUNTIME`). So a dev executable has its start hook
 //!   whatever it depends on, and blaze runs it on its code memory, never from its file.
 //!
-//! So it depends on std and libc alone (windows-sys on Windows, built only in blaze's
-//! workspace): the standard library's workspace has nothing else. Its locks and channels are
+//! So it depends on std and libc alone, and on Windows on its own `raw-dylib` declarations
+//! (`sys/windows/ffi.rs`): the standard library's workspace has nothing else. Its locks and channels are
 //! std's and its spin its own ([`ask`]'s `Relax`), not `parking_lot`, crossbeam or `blaze-spin`.
 //!
 //! What the daemon's side (`blaze-inproc`) builds on is `pub`; the modules a program never

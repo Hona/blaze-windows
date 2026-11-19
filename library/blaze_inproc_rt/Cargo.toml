@@ -7,8 +7,9 @@ edition = "2024"
 
 # One source, two builds: this manifest is the standard library's (blaze attaches the crate as
 # one of std's roots, `blaze_units::stdlib::DEV_RUNTIME`); crates/blaze-inproc-rt builds the same
-# files in blaze's workspace, for the daemon's side and the tests. Only std and libc here, and
-# no Windows (the library's windows-sys is a stub): blaze attaches it on Linux and macOS.
+# files in blaze's workspace, for the daemon's side and the tests. Only std and libc here; on
+# Windows the system's functions are declared in the crate with `raw-dylib` (the library's
+# windows-sys is a stub), so blaze attaches it on Linux, macOS and Windows on x86-64.
 
 [lib]
 test = false
