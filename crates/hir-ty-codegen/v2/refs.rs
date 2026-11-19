@@ -37,7 +37,7 @@ use hir_ty::{
 use hir_ty_mir::mir::{
     AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
     OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind,
-    devirt::DevirtWorld,
+    devirt::{DevirtWorld, ObjectKey},
     dispatch, interpret_mir, is_by_move_coroutine,
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
@@ -211,6 +211,19 @@ pub(crate) fn read<'db>(
     }
 }
 
+/// The trait-object keys `Devirtualize` looked up when walking `instance` against a world
+/// (`MirBody::inlined.devirt_objects`, including `ABSENT` lookups), each once, in order.
+pub(crate) fn read_objects<'db>(
+    db: &'db Db,
+    instance: &HirInstance,
+    walking: Walking,
+) -> Result<&'db [ObjectKey], String> {
+    match &instance.0 {
+        Kind::Allocator(_) => Ok(&[]),
+        _ => memo(db, instance, walking).map(|it| it.map_or(&[][..], |it| &it.read_objects)),
+    }
+}
+
 /// What the IR of an instance asks for, and which of its callees it builds in.
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Walked {
@@ -218,6 +231,7 @@ pub(crate) struct Walked {
     built_in: Vec<u32>,
     facts: Facts,
     read: Vec<[u8; 32]>,
+    read_objects: Vec<ObjectKey>,
     /// [`placement`].
     placement: ContentId,
 }
@@ -339,6 +353,11 @@ fn code_refs(
     for (at, (build, body)) in bodies.iter().enumerate() {
         let body = &**body;
         found.read.extend_from_slice(&body.inlined.devirtualized);
+        for &key in &body.inlined.devirt_objects {
+            if !found.read_objects.contains(&key) {
+                found.read_objects.push(key);
+            }
+        }
         // The facts of other items the body's passes relied on (`SpendFacts`,
         // docs/v2/plan/design/facts.md): its code is the code they changed, so they key it
         // beside the dyn facts, whatever else names the instance.
@@ -460,6 +479,7 @@ struct Found<'db> {
     built_in: Vec<u32>,
     facts: Facts,
     read: Vec<[u8; 32]>,
+    read_objects: Vec<ObjectKey>,
 }
 
 impl<'db> Found<'db> {
@@ -475,6 +495,7 @@ impl<'db> Found<'db> {
             facts: Facts::default(),
             // alloc: the memoized output, empty but for a devirtualized body
             read: Vec::new(),
+            read_objects: Vec::new(),
         }
     }
 
@@ -489,7 +510,14 @@ impl<'db> Found<'db> {
             placement.update(&at.to_le_bytes());
         }
         let placement = placement.finish();
-        Walked { refs, built_in: self.built_in, facts: self.facts, read: self.read, placement }
+        Walked {
+            refs,
+            built_in: self.built_in,
+            facts: self.facts,
+            read: self.read,
+            read_objects: self.read_objects,
+            placement,
+        }
     }
 }
 

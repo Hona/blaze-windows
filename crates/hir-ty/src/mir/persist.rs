@@ -781,6 +781,7 @@ impl<'db> Encode<'_, 'db> {
             bindings,
             promoted,
             devirtualized,
+            devirt_objects,
             specialized,
             moved_to_frame,
             relied,
@@ -795,7 +796,7 @@ impl<'db> Encode<'_, 'db> {
             "a body with inlined bindings, which only optimized MIR has"
         } else if !promoted.is_empty() {
             "a body with inlined promoted locals, which only optimized MIR has"
-        } else if !devirtualized.is_empty() {
+        } else if !devirtualized.is_empty() || !devirt_objects.is_empty() {
             "a body with devirtualized calls, which only optimized MIR has"
         } else if !specialized.is_empty() {
             "a body with specialized calls, which only optimized MIR has"

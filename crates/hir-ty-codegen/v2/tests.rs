@@ -4177,10 +4177,11 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
 }
 
 /// The invariant: after a literal edit the plain and closed walk still support the same
-/// world. Changing the graph to reach another closure does not validate that checkpoint.
+/// world (`WorldChange::Unchanged`). Changing the graph to reach another closure updates the
+/// world incrementally (`WorldChange::Updated`) and names only the consumer (`dep::resize`).
 #[test]
 fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
-    use blaze_codegen::backend::Frontend as _;
+    use blaze_codegen::backend::{Frontend as _, WorldChange};
     let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
     let fixture = fixture::db(DYN_FN_BUILT_IN);
     let file = fixture.file_at("/main.rs");
@@ -4189,39 +4190,316 @@ fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
     let krate = fixture::test_crate(&db);
     let policy = policy(OptLevel::O3);
     fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
-        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default()).with_policy(policy);
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(policy);
         f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
         f
     }
-    let (kept, view) = {
+    let (kept, view, world_before, fn_roots) = {
         let f = front(&db, &policy, krate);
         let view = f.view().unwrap();
+        let root = f.root(function(&db, "roots"));
+        let origin = f.with(|db| f.origin(db, krate));
         for closed in [true, false] {
-            let root = f.root(function(&db, "roots"));
-            let origin = f.with(|db| f.origin(db, krate));
             let mut reached = Vec::new();
-            let mut queue = vec![(root,origin)];
-            while let Some((i,o)) = queue.pop() {
-                if reached.contains(&(i.clone(),o)) { continue; }
-                let d = f.describe(&i,&o).unwrap();
-                for r in d.refs { if let FrontRef::Function(callee) = r { queue.push((callee,d.origin)); } }
-                reached.push((i,o));
+            let mut queue = vec![(root.clone(), origin)];
+            while let Some((i, o)) = queue.pop() {
+                if reached.contains(&(i.clone(), o)) {
+                    continue;
+                }
+                let d = f.describe(&i, &o).unwrap();
+                for r in d.refs {
+                    if let FrontRef::Function(callee) = r {
+                        queue.push((callee, d.origin));
+                    }
+                }
+                reached.push((i, o));
             }
-            assert_eq!(f.closed(&reached,&[]).unwrap(),closed);
+            assert_eq!(f.closed(&reached, &[]).unwrap(), closed);
         }
-        (f.kept_world().unwrap(),view)
+        (f.kept_world().unwrap(), view, f.devirt.world().unwrap(), vec![(root, origin)])
     };
-    db.set_file_text(file,&source.replace("y * 3", "y * 4"));
+    db.set_file_text(file, &source.replace("y * 3", "y * 4"));
     let since = {
-        let f = front(&db,&policy,krate);
-        f.resume_world(&kept,view).unwrap();
-        assert!(f.devirt.world().is_some());
+        let f = front(&db, &policy, krate);
+        assert_eq!(f.resume_world(&kept, view, &fn_roots, &[]).unwrap(), WorldChange::Unchanged);
+        assert_eq!(f.devirt.world(), Some(world_before));
         f.abandon_resumed_world();
         assert!(f.devirt.world().is_none());
         f.view().unwrap()
     };
-    db.set_file_text(file, &source.replace("dep::resize::<K>(x, &|y| y * 3)", "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)"));
-    assert!(front(&db,&policy,krate).resume_world(&kept,since).is_err());
+    db.set_file_text(
+        file,
+        &source.replace(
+            "dep::resize::<K>(x, &|y| y * 3)",
+            "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)",
+        ),
+    );
+    let f = front(&db, &policy, krate);
+    let change = f.resume_world(&kept, since, &fn_roots, &[]).unwrap();
+    let WorldChange::Updated { consumers } = change else {
+        panic!("adding a new closure vtable must update the world: {change:?}");
+    };
+    assert_ne!(f.devirt.world().unwrap(), world_before);
+    assert!(
+        consumers.iter().any(|(i, _)| f.spell(i).contains("resize")),
+        "consumers should name dep::resize: {:?}",
+        consumers.iter().map(|(i, _)| f.spell(i)).collect::<Vec<_>>()
+    );
+}
+
+/// The invariant (B10):
+/// 1. A structural body edit that adds/removes helper calls with no impl or trait-object
+///    coercion keeps the closed world unchanged (`WorldChange::Unchanged`).
+/// 2. Adding a duplicate coercion to an already-present concrete type keeps the world
+///    unchanged.
+/// 3. Adding or removing a concrete type for `dyn A` (including `PRESENT <-> ABSENT`) updates
+///    the world incrementally to the exact world a fresh whole walk builds and asks to
+///    re-verify ONLY consumers of `dyn A` (`use_a`), never consumers of unrelated `dyn B`
+///    (`use_b`).
+#[test]
+fn a_body_edit_without_dyn_changes_keeps_the_world_and_a_dyn_edit_re_verifies_only_its_consumers() {
+    use blaze_codegen::{
+        backend::{Frontend as _, WorldChange, WorldPatch},
+        plan::Origin,
+    };
+    const TWO_TRAITS: &str = r#"
+//- minicore: sized, copy, option, coerce_unsized, dispatch_from_dyn
+//- /main.rs crate:main
+pub trait A { fn a(&self) -> u32; }
+pub trait B { fn b(&self) -> u32; }
+pub struct A1;
+impl A for A1 { fn a(&self) -> u32 { 1 } }
+pub struct A2;
+impl A for A2 { fn a(&self) -> u32 { 2 } }
+pub struct B1;
+impl B for B1 { fn b(&self) -> u32 { 10 } }
+#[inline(never)]
+pub fn use_a(x: &dyn A) -> u32 { x.a() }
+#[inline(never)]
+pub fn use_b(x: &dyn B) -> u32 { x.b() }
+#[inline(never)]
+pub fn helper1(x: u32) -> u32 { x + 1 }
+#[inline(never)]
+pub fn helper2(x: u32) -> u32 { x + 2 }
+pub fn roots(x: u32, opt: Option<&dyn A>) -> u32 {
+    let extra = match opt { Some(a) => use_a(a), None => 0 };
+    let base = use_a(&A1) + use_b(&B1);
+    base + extra + helper1(x)
+}
+"#;
+    let fixture = fixture::db(TWO_TRAITS);
+    let file = fixture.file_at("/main.rs");
+    let mut db = fixture.into_db();
+    let file = file.file_id(&db);
+    let krate = fixture::test_crate(&db);
+    let policy = policy(OptLevel::O3);
+    let base_text = db.file_text(file).text(&db).to_string();
+
+    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(policy);
+        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
+        f
+    }
+
+    fn whole_walk(
+        db: &TestDB,
+        policy: &Policy,
+        krate: base_db::Crate,
+    ) -> (super::DynCheckpoint, u64, hir_ty_mir::mir::devirt::DevirtWorld, Vec<(HirInstance, Origin)>) {
+        let f = front(db, policy, krate);
+        let view = f.view().unwrap();
+        let root = f.root(function(db, "roots"));
+        let origin = f.with(|db| f.origin(db, krate));
+        let mut last_reached = Vec::new();
+        for closed in [true, false] {
+            let mut reached = Vec::new();
+            let mut queue = vec![(root.clone(), origin)];
+            while let Some((i, o)) = queue.pop() {
+                if reached.contains(&(i.clone(), o)) {
+                    continue;
+                }
+                let d = f.describe(&i, &o).unwrap();
+                for r in d.refs {
+                    if let FrontRef::Function(callee) = r {
+                        queue.push((callee, d.origin));
+                    }
+                }
+                reached.push((i, o));
+            }
+            assert_eq!(f.closed(&reached, &[]).unwrap(), closed);
+            last_reached = reached;
+        }
+        let _ = last_reached;
+        (f.kept_world().unwrap(), view, f.devirt.world().unwrap(), vec![(root, origin)])
+    }
+
+    let (mut kept, mut view, w1, fn_roots) = whole_walk(&db, &policy, krate);
+
+    // Edit 1: structural body edit swapping non-dyn helpers (helper1 -> helper2).
+    let text_e1 = base_text.replace("base + extra + helper1(x)", "base + extra + helper2(x)");
+    db.set_file_text(file, &text_e1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        assert_eq!(change, WorldChange::Unchanged, "non-dyn helper swap must keep the world");
+        assert_eq!(f.devirt.world(), Some(w1));
+        let root = fn_roots[0].clone();
+        let h1 = (f.root(function(&db, "helper1")), fn_roots[0].1);
+        let h2 = (f.root(function(&db, "helper2")), fn_roots[0].1);
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        let _ = f.describe(&h2.0, &h2.1).unwrap();
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &[root],
+            entered_functions: &[h2],
+            left_functions: &[h1],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 2: duplicate coercion to an already-present concrete type (`&A1`).
+    let text_e2 = text_e1.replace("use_a(&A1) + use_b(&B1)", "use_a(&A1) + use_a(&A1) + use_b(&B1)");
+    db.set_file_text(file, &text_e2);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        assert_eq!(change, WorldChange::Unchanged, "duplicate coercion must keep the world");
+        assert_eq!(f.devirt.world(), Some(w1));
+        let root = fn_roots[0].clone();
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &[root],
+            entered_functions: &[],
+            left_functions: &[],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 3: add a new coercion `&A2 as &dyn A` -> ONLY `use_a` is invalidated, NOT `use_b`.
+    let text_e3 =
+        text_e2.replace("use_a(&A1) + use_a(&A1) + use_b(&B1)", "use_a(&A1) + use_a(&A2) + use_b(&B1)");
+    db.set_file_text(file, &text_e3);
+    let (_, _, w2_fresh, _) = whole_walk(&db, &policy, krate);
+    assert_ne!(w2_fresh, w1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("adding &A2 as &dyn A must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w2_fresh), "incremental world must match fresh whole walk");
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must be re-verified: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must NOT be re-verified: {names:?}");
+        // Re-describe roots + consumers under W2 and finish the patch (discovering newly
+        // reachable A2::a and its vtable shim).
+        let root = fn_roots[0].clone();
+        let mut entered = Vec::new();
+        let mut queue = vec![root.clone()];
+        queue.extend(consumers.iter().cloned());
+        let mut described_here = Vec::new();
+        while let Some((i, o)) = queue.pop() {
+            if described_here.contains(&(i.clone(), o)) {
+                continue;
+            }
+            let d = f.describe(&i, &o).unwrap();
+            for r in d.refs {
+                if let FrontRef::Function(callee) = r {
+                    let next = (callee, d.origin);
+                    if f.spell(&next.0).contains("A2") && !entered.contains(&next) {
+                        entered.push(next.clone());
+                        queue.push(next);
+                    }
+                }
+            }
+            described_here.push((i, o));
+        }
+        let mut changed_fns = vec![root];
+        changed_fns.extend(consumers.iter().cloned());
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &changed_fns,
+            entered_functions: &entered,
+            left_functions: &[],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 4: remove ALL coercions to `dyn A` (`use_a` stays reachable via `opt`, so `dyn A`
+    // transitions from `[A1, A2]` to `ABSENT` while `dyn B` stays `[B1]`).
+    let text_e4 = text_e3.replace(
+        "let base = use_a(&A1) + use_a(&A2) + use_b(&B1);",
+        "let base = use_b(&B1);",
+    );
+    db.set_file_text(file, &text_e4);
+    let (_, _, w_absent_fresh, _) = whole_walk(&db, &policy, krate);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("removing all dyn A coercions must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w_absent_fresh));
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must see ABSENT: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must stay untouched: {names:?}");
+        // Finish the patch so `kept` records `use_a` reading `ABSENT` for `ObjectKey(A)`.
+        let root = fn_roots[0].clone();
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        for (i, o) in &consumers {
+            let _ = f.describe(i, o).unwrap();
+        }
+        // Any A1/A2 method and drop_glue that left the closed walk.
+        let mut left = Vec::new();
+        for (i, o) in kept.closed_functions_for_test() {
+            let sp = f.spell(&i);
+            if sp.contains("A1") || sp.contains("A2") {
+                left.push((i, o));
+            }
+        }
+        let mut changed_fns = vec![root];
+        changed_fns.extend(consumers.iter().cloned());
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &changed_fns,
+            entered_functions: &[],
+            left_functions: &left,
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 5: re-add `&A1 as &dyn A` (`ABSENT -> [A1]`): `use_a` must still be notified!
+    db.set_file_text(file, &text_e1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("re-adding &A1 after ABSENT must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w1));
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must wake from ABSENT: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must stay untouched: {names:?}");
+    }
 }
 
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at

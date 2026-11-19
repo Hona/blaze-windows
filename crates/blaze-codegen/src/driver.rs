@@ -5307,7 +5307,7 @@ mod progress;
 mod recursion;
 use recursion::Step;
 mod rows;
-mod support;
+pub mod support;
 mod worklist;
 pub use later::{Later, Walked, runs_at_start};
 use worklist::Worklist;

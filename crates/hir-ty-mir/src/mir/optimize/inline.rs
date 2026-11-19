@@ -367,6 +367,9 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
         for &digest in &callee.inlined.devirtualized {
             body.inlined.read_devirt(digest);
         }
+        for &key in &callee.inlined.devirt_objects {
+            body.inlined.read_devirt_object(key);
+        }
         // The same of the facts the callee's body relied on (`SpendFacts`): its copy here is
         // the code they changed.
         for &digest in &callee.inlined.relied {

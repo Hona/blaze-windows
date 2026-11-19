@@ -173,19 +173,25 @@ never devirtualized.
 
 ## Tests and benchmark
 
-A kept walk needs two proofs before it can reuse a closed world. The roots must still
-reach the same inputs to the first closure, **without** devirtualization, and the closure
-over the second walk must still agree with the first. The checkpoint names both ordered
-sets in this database only. A tracked query projects each reached item's outgoing edges
-separately from its code bytes; equal edges backdate. The query closing the world reads
-the vtables, upcasts, foreign signatures, loader symbols, target identities and consumer
-sites. On an edit preserving both proofs, install the verified world before patching the
-walk. An edit removing the only call to a vtable producer invalidates the first proof even
-if the edited body contains no cast. No query key or interned handle goes to disk.
+A kept walk needs two proofs before it can reuse or incrementally update a closed world. The
+roots must still yield a valid first closure **without** devirtualization, and the closure over
+the patched second walk must still agree with it. The checkpoint holds both rounds' item sets
+with an index of only the items that contribute trait-object facts (vtables, upcasts, foreign
+signatures, loaders) or consume the world, a lazy DRed incremental reachability graph for the
+plain walk (`blaze_codegen::driver::support::Graph`), and a per-object consumer index populated
+from `Inlined::devirt_objects` (including `ABSENT` lookups).
 
-The ordinary edit costs the changed projections and the walk's changed describes, not one
-verification per reached function. Changing the reached set still costs a walk to collect
-its new members; the floor for this case is the change in reachability and its readers.
+- On a body edit that adds or removes no impl and no coercion to a trait object (including
+  structural edits that add or remove non-dyn helper calls, or duplicate an already-present
+  coercion), the plain graph updates in `O(edit)`, finds the same world (`WorldChange::Unchanged`),
+  and patches the walk with zero unchanged consumers re-verified.
+- When an edit changes one trait object's facts, the new world is built from only the
+  contributing items and diffed per `ObjectKey` (`WorldChange::Updated { consumers }`): only
+  consumers that read a changed object key are re-described against the new world, while
+  consumers of unchanged trait objects keep their describes untouched. `finish_world_patch`
+  updates the closed set and verifies that the patched closed walk agrees with the plain walk's
+  world, falling back to a whole walk if they disagree or if multiple open-reason strings could
+  depend on BFS order. No query key or interned handle goes to disk.
 
 - `crates/hir-ty-mir/src/mir/optimize/devirt/fixtures.rs` covers: one type becomes direct;
   three types are compared with the `dyn` call last; an open object stays virtual with its

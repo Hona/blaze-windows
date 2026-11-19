@@ -11,7 +11,7 @@ use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
     backend::{
         Address, Changed, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates,
-        Limit,
+        Limit, WorldChange, WorldPatch,
     },
     driver::Kept,
     plan::{Mode, Origin, Package, PlanError, Policy},
@@ -1260,13 +1260,30 @@ impl<'db> HirFrontend<'db> {
 impl Frontend for HirFrontend<'_> {
     type World = super::DynCheckpoint;
 
-    fn kept_world(&self) -> Option<Self::World> { self.devirt.checkpoint() }
-
-    fn resume_world(&self, world: &Self::World, since: u64) -> Result<(), &'static str> {
-        self.devirt.resume(self, world, since)
+    fn kept_world(&self) -> Option<Self::World> {
+        self.devirt.checkpoint()
     }
 
-    fn abandon_resumed_world(&self) { self.devirt.abandon(); }
+    fn resume_world(
+        &self,
+        world: &Self::World,
+        since: u64,
+        fn_roots: &[(HirInstance, Origin)],
+        static_roots: &[HirStatic],
+    ) -> Result<WorldChange<HirInstance>, &'static str> {
+        self.devirt.resume(self, world, since, fn_roots, static_roots)
+    }
+
+    fn finish_world_patch(
+        &self,
+        patch: WorldPatch<'_, HirInstance, HirStatic>,
+    ) -> Result<(), &'static str> {
+        self.devirt.finish_patch(self, patch)
+    }
+
+    fn abandon_resumed_world(&self) {
+        self.devirt.abandon();
+    }
     type Instance = HirInstance;
     type Static = HirStatic;
 

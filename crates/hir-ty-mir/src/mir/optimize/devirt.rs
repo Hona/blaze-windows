@@ -115,6 +115,7 @@ pub(super) fn devirtualize<'db>(
     for at in 0..blocks {
         let block = BasicBlockId::from_raw(la_arena::RawIdx::from_u32(at as u32));
         let Some(site) = site(ctx, body, block, behind) else { continue };
+        body.inlined.read_devirt_object(site.key);
         let Some(object) = world.object(&site.key) else {
             body.inlined.read_devirt(ABSENT.0);
             tracing::info!(

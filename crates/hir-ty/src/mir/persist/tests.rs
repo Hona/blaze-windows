@@ -1401,6 +1401,7 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         bindings,
         promoted,
         devirtualized,
+        devirt_objects,
         specialized,
         moved_to_frame: _,
         relied,
@@ -1422,6 +1423,7 @@ fn owned_blocks(body: &MirBody<'_>) -> u64 {
         + vec(bindings)
         + vec(promoted)
         + vec(devirtualized)
+        + vec(devirt_objects)
         + vec(specialized)
         + vec(relied);
     blocks
