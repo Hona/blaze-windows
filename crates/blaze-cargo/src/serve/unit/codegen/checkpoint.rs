@@ -29,9 +29,16 @@ use hir_ty_codegen::v2::GlobalAsmObject;
 
 use super::{Job, Linked, kept};
 
-/// The record's first bytes, and the layout they name.
-const MAGIC: &[u8; 8] = b"BLKLNK01";
+/// The record's first bytes, and the layout they name. 02: the record ends with its own hash
+/// ([`RECORD_DOMAIN`]).
+const MAGIC: &[u8; 8] = b"BLKLNK02";
 const NAME_DOMAIN: &str = "blaze v2 link checkpoint name 1";
+/// The hash a record ends with, of every byte before it. The image's own digest checks only
+/// the image ([`Image::restore`]); the rows, natives and names beside it are what the next
+/// link's change is made against, and a record is written and renamed with no sync between,
+/// so a power cut can leave its name over bytes the disk never had. A torn record is refused
+/// as a whole, never restored with rows the image is not of.
+const RECORD_DOMAIN: &str = "blaze v2 link checkpoint record 1";
 
 /// Where checkpoints are written and the code identity of the blaze that writes them: set once
 /// by the daemon ([`keep`]); without it nothing is written or restored (a test's daemons).
@@ -92,6 +99,8 @@ pub(crate) fn put(linked: &mut Linked, path: &str) -> bool {
     put_id(linked.layout, &mut out);
     put_id(linked.given, &mut out);
     out.put_bytes_u64(&image);
+    let sum = blaze_ids::Hasher::new(RECORD_DOMAIN).update(&out).finish();
+    out.put_bytes(&sum.0);
     span.record("bytes", out.len());
     let file = file_of(dir, *producer, path, &linked.output, linked.layout);
     let next = file.with_extension("blaze-link-next");
@@ -146,10 +155,12 @@ fn restore_from(
     located: &[blaze_link::target::Located],
     bytes: &[u8],
 ) -> Result<Linked, String> {
-    let mut r = Reader::new(bytes);
-    if r.array::<8>().ok() != Some(MAGIC) {
-        return Err("not a link checkpoint of this layout (BLKLNK01)".into());
+    if bytes.get(..8) != Some(MAGIC.as_slice()) {
+        return Err("not a link checkpoint of this layout (BLKLNK02)".into());
     }
+    let body = whole(bytes)?;
+    let mut r = Reader::new(body);
+    r.array::<8>().map_err(String::from)?;
     let rows = take_rows(&mut r)?;
     let natives = (0..count(&mut r, 32)?)
         .map(|_| Ok(ContentId(*r.array::<32>().map_err(String::from)?)))
@@ -207,6 +218,18 @@ fn restore_from(
         assumed: Vec::new(),
         given,
     })
+}
+
+/// The record's bytes before its hash, when the hash is of them ([`RECORD_DOMAIN`]).
+fn whole(bytes: &[u8]) -> Result<&[u8], String> {
+    let Some(at) = bytes.len().checked_sub(32) else {
+        return Err(format!("{} bytes, shorter than a record's hash", bytes.len()));
+    };
+    let (body, sum) = bytes.split_at(at);
+    match blaze_ids::Hasher::new(RECORD_DOMAIN).update(body).finish().0 == *sum {
+        true => Ok(body),
+        false => Err("its bytes are not those it was written with (torn or changed)".into()),
+    }
 }
 
 /// A file of the link line, for a restore to hand the image its bytes.
@@ -277,4 +300,29 @@ fn take_rows(r: &mut Reader<'_>) -> Result<kept::Rows, String> {
         spans.insert(anchor, id(r)?);
     }
     Ok(kept::Rows::restored(functions, statics, spans))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record whose rows were torn (a byte the disk never had, the image's own bytes
+    /// intact) is refused whole, where before only the image's digest was checked and the
+    /// torn rows would have been the next link's change base. Remove the check and the torn
+    /// record passes.
+    #[test]
+    fn a_torn_record_is_refused_and_a_whole_one_passes() {
+        let mut out = Vec::new();
+        out.put_bytes(MAGIC);
+        out.put_u64(3);
+        out.put_bytes(&[7; 64]);
+        let sum = blaze_ids::Hasher::new(RECORD_DOMAIN).update(&out).finish();
+        out.put_bytes(&sum.0);
+        assert_eq!(whole(&out).unwrap(), &out[..out.len() - 32]);
+        let mut torn = out.clone();
+        torn[12] ^= 1;
+        assert!(whole(&torn).unwrap_err().contains("torn"));
+        assert!(whole(&out[..20]).is_err(), "a record cut short");
+        assert!(whole(&[0; 8]).is_err(), "shorter than a hash");
+    }
 }
