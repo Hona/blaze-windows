@@ -831,3 +831,26 @@ fn what_the_target_cannot_do_is_refused() {
     let none = StdKey { crates: Vec::new(), ..key(root) };
     assert!(failed(&none).contains("no crate"));
 }
+
+/// The platforms whose standard library carries the dev runtime: those the runtime maps code
+/// memory on. The controls: other architectures and environments of the same systems.
+#[test]
+fn the_dev_runtime_is_in_the_standard_library_of_each_platform_it_runs_on() {
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ] {
+        assert!(has_dev_runtime(triple), "{triple}");
+    }
+    for triple in [
+        "x86_64-apple-darwin",
+        "aarch64-pc-windows-msvc",
+        "x86_64-pc-windows-gnu",
+        "wasm32-wasip1",
+        "riscv64gc-unknown-linux-gnu",
+    ] {
+        assert!(!has_dev_runtime(triple), "{triple}");
+    }
+}

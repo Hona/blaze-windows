@@ -103,12 +103,12 @@ pub const DEV_RUNTIME: &str = "blaze_inproc_rt";
 
 /// Whether a program built for `triple` can run on the daemon's code memory, so its standard
 /// library has [`DEV_RUNTIME`]: the platforms the runtime maps code memory on, Linux on x86_64
-/// and AArch64 and macOS on AArch64. Its Windows side builds only in blaze's workspace
-/// (crates/blaze-inproc-rt): the library's windows-sys is a stub.
+/// and AArch64, macOS on AArch64 and Windows on x86_64 (MSVC), whose side declares the system's
+/// functions itself with `raw-dylib` (library/blaze_inproc_rt/src/sys/windows/ffi.rs).
 pub fn has_dev_runtime(triple: &str) -> bool {
     let arch = triple.split('-').next().unwrap_or_default();
     (matches!(arch, "x86_64" | "aarch64") && triple.split('-').any(|it| it == "linux"))
-        || triple == "aarch64-apple-darwin"
+        || matches!(triple, "aarch64-apple-darwin" | "x86_64-pc-windows-msvc")
 }
 
 /// The crates built, from those asked: `std` brings `core`, `alloc`, `proc_macro`,

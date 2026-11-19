@@ -9,17 +9,7 @@ use blaze_codegen::{
 };
 use blaze_ids::ContentId;
 
-use super::{Launch, NOT_IN_PROCESS, launch_of, native_pe};
-
-#[test]
-fn only_the_native_pe_uses_the_job_object_launch_abi() {
-    let pe = "x86_64-pc-windows-msvc";
-    let elf = "x86_64-unknown-linux-gnu";
-    assert!(native_pe(pe, pe));
-    assert!(!native_pe(elf, pe));
-    assert!(!native_pe(pe, elf));
-    assert!(!native_pe(elf, elf));
-}
+use super::{Launch, NOT_IN_PROCESS, launch_of};
 
 fn policy(level: OptLevel) -> Policy {
     Policy {
