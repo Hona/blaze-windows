@@ -2,9 +2,9 @@
 # Triggered ONLY by a deliberate push to `windows/batch` (never on pushes to `windows/int` or pull
 # requests; `workflow_dispatch` is not usable while workflow files are off the default branch).
 # Builds the 15 test executables (7 unit suites + 8 compiler regression crates) once and the
-# release engine once in parallel, fans out to isolated test and ladder VMs, continues past every
-# failure, and emits one complete Markdown + JSON summary (both in the GitHub step summary and as
-# the `windows-batch-summary` artifact).
+# release engine once in parallel, fans out to isolated unit, regression, ladder and real-project
+# corpus VMs, continues past every failure, and emits one complete Markdown + JSON summary (both
+# in the GitHub step summary and as the `windows-batch-summary` artifact).
 name: Windows batch gate
 
 on:
@@ -196,6 +196,9 @@ jobs:
           $ok = if ($code -eq 0) { 'true' } else { 'false' }
           "astlog_ok=$ok" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "astlog_seconds=$([math]::Round($watch.Elapsed.TotalSeconds, 2))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Validate Windows corpus manifest and inline fixtures
+        if: success()
+        run: ./.github/scripts/windows-corpus.ps1 -SelfTest
       - if: steps.compile.outputs.units_ready == 'true'
         uses: ./.github/actions/windows-cargo-cache-save
         with:
@@ -532,9 +535,73 @@ jobs:
         if: steps.run_ladder.outcome == 'failure'
         run: exit 1
 
+  corpus:
+    name: corpus (${{ matrix.project }})
+    needs: build-release
+    if: always() && !cancelled() && needs.build-release.outputs.engine_ready == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [ripgrep, fd, bat, hyperfine, just, axum, tokio-service, cc-native]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v8
+        with:
+          name: bin-release-engine
+          path: target/release
+      - name: Provision the scratch volume change journal
+        run: |
+          $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
+          fsutil usn queryjournal $volume
+          if ($LASTEXITCODE) { fsutil usn createjournal m=33554432 a=4194304 $volume }
+      - name: Run corpus project with runner memory telemetry
+        id: run_corpus
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          . ./.github/scripts/windows-memory.ps1
+          $outDir = Join-Path $env:RUNNER_TEMP 'corpus'
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          $p = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList @(
+            '-NoProfile', '-File', '.github/scripts/windows-corpus.ps1',
+            '-Blaze', "$PWD/target/release/blaze.exe",
+            '-Out', $outDir,
+            '-Project', $env:PROJECT,
+            '-ContinueOnFailure'
+          )
+          $metrics = Wait-WithHeadroom -Process $p -MetricsPath (Join-Path $outDir 'metrics.json') -NoThrow
+          $code = if ($p.HasExited) { $p.ExitCode } else { 137 }
+          if ($metrics.guard_tripped -and $code -eq 0) { $code = 137 }
+          $p.Dispose()
+          exit $code
+      - name: Upload corpus logs, timings and telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-corpus-${{ matrix.project }}
+          path: |
+            ${{ runner.temp }}/corpus/*.log
+            ${{ runner.temp }}/corpus/*.csv
+            ${{ runner.temp }}/corpus/*.json
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Reflect corpus project status
+        if: steps.run_corpus.outcome == 'failure'
+        run: exit 1
+
   summary:
     name: batch summary
-    needs: [build-units, build-release, units, regressions, ladder]
+    needs: [build-units, build-release, units, regressions, ladder, corpus]
     if: >-
       always() && !cancelled() &&
       !contains(github.event.head_commit.message, '[skip ci]') &&
@@ -547,7 +614,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            harness/windows-corpus.json
+          sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/download-artifact@v8
         continue-on-error: true
@@ -564,6 +634,7 @@ jobs:
           UNITS_RES: ${{ needs.units.result }}
           REGRESSIONS_RES: ${{ needs.regressions.result }}
           LADDER_RES: ${{ needs.ladder.result }}
+          CORPUS_RES: ${{ needs.corpus.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $jobs = [ordered]@{
@@ -572,10 +643,12 @@ jobs:
             units = $env:UNITS_RES
             regressions = $env:REGRESSIONS_RES
             ladder = $env:LADDER_RES
+            corpus = $env:CORPUS_RES
           } | ConvertTo-Json -Compress
           ./.github/scripts/windows-batch-summary.ps1 `
             -ArtifactsDir "$env:RUNNER_TEMP/batch-results" `
             -OutDir 'summary-out' `
+            -CorpusManifest 'harness/windows-corpus.json' `
             -Commit '${{ github.sha }}' `
             -RefName '${{ github.ref_name }}' `
             -RunUrl $env:RUN_URL `
