@@ -111,7 +111,7 @@ pub(crate) fn placed(
 
 /// File, line and column of where the anchor of the body begins: the one thing of a body's
 /// places that a line added or removed above it moves.
-#[blaze_memo::tracked]
+#[blaze_query::tracked]
 pub(crate) fn anchor_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -122,7 +122,7 @@ pub(crate) fn anchor_location(
 }
 
 /// Where the rows of the anchor of the body are.
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 fn anchor_rows(db: &Db, owner: DefWithBodyId) -> Option<span::LineIndex> {
     Some(span::LineIndex::new(body_syntax(db, owner).as_ref()?.text()))
 }
@@ -252,11 +252,10 @@ fn row_place(
     let within = match source_map.expr_syntax(code) {
         Ok(body) => {
             let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
-            let ctx = match body.file_id == syntax.file_id {
+            match body.file_id == syntax.file_id {
                 true => syntax.span_map.span_for_range(start).ctx,
                 false => body.file_id.span_map(db).span_for_range(start).ctx,
-            };
-            (body.file_id.context_arena(), ctx)
+            }
         }
         Err(_) => return source_place(db, owner, span),
     };
@@ -264,29 +263,26 @@ fn row_place(
 }
 
 /// [`super::written_place`], of a macro file, in the anchor of the body where it can be.
-/// `within` and the walk name the table each context is a word of, as there.
 fn written_place(
     db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,
     range: TextRange,
-    within: Option<(blaze_memo::ArenaId, span::SyntaxContext)>,
+    within: Option<span::SyntaxContext>,
 ) -> Option<Place> {
     let mut at = file_id.span_map(db).span_for_range(TextRange::empty(range.start()));
-    let mut table = file_id.context_arena();
     let mut kept = at;
-    while !at.ctx.is_root() && Some((table, at.ctx)) != within {
-        let Some(call) = at.ctx.outer_expn(db, table) else { break };
+    while !at.ctx.is_root() && Some(at.ctx) != within {
+        let Some(call) = at.ctx.outer_expn(db) else { break };
         let call = MacroCallId::from(call);
-        (at, table) = match call_node(db, syntax, call) {
-            CallNode::Anchored(range) => (
-                syntax.span_map.span_for_range(TextRange::empty(range.start())),
-                syntax.file_id.context_arena(),
-            ),
+        at = match call_node(db, syntax, call) {
+            CallNode::Anchored(range) => {
+                syntax.span_map.span_for_range(TextRange::empty(range.start()))
+            }
             CallNode::Other(node) => {
                 let range = TextRange::empty(written_range(node.value).start());
-                (node.file_id.span_map(db).span_for_range(range), node.file_id.context_arena())
+                node.file_id.span_map(db).span_for_range(range)
             }
         };
         let loc = call.loc(db);

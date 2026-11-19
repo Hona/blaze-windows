@@ -4,10 +4,7 @@ use std::{
 };
 
 use blaze_core::{Conn, FileName};
-use blaze_ids::{
-    ContentId,
-    rng::{SplitMix64, choose},
-};
+use blaze_ids::{ContentId, rng::SplitMix64};
 use blaze_mem::{
     Tag,
     tag::{Counters, Snapshot},
@@ -1251,10 +1248,10 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                     let next = ids.entry(conn).or_insert(0);
                     let id = *next;
                     *next += 1;
-                    let request = choose!(rng;
-                        Request::Check { view: head("main"), targets: targets() },
-                        Request::Snapshot,
-                        Request::BestOf {
+                    let request = match rng.index(7) {
+                        0 => Request::Check { view: head("main"), targets: targets() },
+                        1 => Request::Snapshot,
+                        2 => Request::BestOf {
                             base: head("main"),
                             candidates: vec![
                                 vec![write("x.rs", "x")],
@@ -1265,16 +1262,16 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                             test: rng.index(2) == 0,
                             filter: Vec::new(),
                         },
-                        {
+                        3 => {
                             written += 1;
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             let ops = vec![write(&format!("f{written}.rs"), "")];
                             Request::Commit { head: "main".to_owned(), base, ops }
-                        },
-                        if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
-                        Request::Open { view: head("main") },
-                        Request::Status,
-                    );
+                        }
+                        4 if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
+                        5 => Request::Open { view: head("main") },
+                        _ => Request::Status,
+                    };
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);
@@ -1357,7 +1354,7 @@ fn body_edited() -> Edited {
 }
 
 fn edit_request(base: ContentId) -> Request {
-    Request::Edit { base, head: Some("main".to_owned()), edits: body_edit() }
+    Request::Edit { base, head: "main".to_owned(), edits: body_edit() }
 }
 
 #[test]
@@ -1382,27 +1379,6 @@ fn an_edit_reports_what_it_changed_then_commits_its_ops_once_durable() {
     );
     let replies = world.request(1, 2, Request::Cancel { id: 1 });
     assert_eq!(error_at(&replies), Some("request 1".to_owned()), "it is over");
-}
-
-#[test]
-fn a_dry_run_edit_reports_what_it_would_change_and_commits_nothing() {
-    let mut world = World::new();
-    let base = world.commit(&[("src/lib.rs", "fn a() {}\n")]);
-    let dry = Request::Edit { base, head: None, edits: body_edit() };
-    assert_eq!(world.request(1, 1, dry), []);
-    let job = world.last_job();
-    let edited = Response::Edited(body_edited());
-    assert_eq!(world.report(job, edited.clone()), [reply(1, 1, edited)]);
-    assert_eq!(world.finish(job, true, None), [done(1, 1, true)], "over with no commit");
-    assert_eq!(world.vfs.head("main"), Some(base), "the head did not move");
-    assert!(world.session.tickets.is_empty());
-    assert_eq!(world.session.views(), 0);
-    // The control: the same edit with its head commits.
-    world.request(1, 2, edit_request(base));
-    let job = world.last_job();
-    world.report(job, Response::Edited(body_edited()));
-    world.finish(job, true, None);
-    assert_ne!(world.vfs.head("main"), Some(base));
 }
 
 #[test]
@@ -1642,30 +1618,30 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     *next += 1;
                     let text = texts[rng.index(texts.len())];
                     let wait_ms = rng.index(40) as u64;
-                    let request = choose!(rng;
-                        Request::WillSave {
+                    let request = match rng.index(5) {
+                        0 => Request::WillSave {
                             ops: vec![write("a.rs", text)],
                             head: "main".to_owned(),
                             test: rng.index(2) == 0,
                             targets: targets(),
                             wait_ms,
                         },
-                        Request::WillTest {
+                        1 => Request::WillTest {
                             view: head("main"),
                             filter: Vec::new(),
                             targets: targets(),
                             wait_ms,
                         },
-                        {
+                        2 => {
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             Request::Commit {
                                 head: "main".to_owned(),
                                 base,
                                 ops: vec![write("a.rs", text)],
                             }
-                        },
-                        Request::Check { view: head("main"), targets: targets() },
-                    );
+                        }
+                        _ => Request::Check { view: head("main"), targets: targets() },
+                    };
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);

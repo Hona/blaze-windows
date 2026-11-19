@@ -12,7 +12,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use blaze_memo::Id as _;
+use blaze_query::db::{AsId, FromId};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, BuiltinDeriveImplId, CallableDefId, FunctionId, GenericParamId,
@@ -54,15 +54,15 @@ pub fn within_longest(args: GenericArgs<'_>) -> bool {
 }
 
 /// The body an instance runs: the code generator's `InstanceDef` of those with MIR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Body {
     Fn(FunctionId),
     /// An `InternedClosureId`, without its database lifetime.
-    Closure(blaze_memo::Gid),
+    Closure(blaze_query::db::Id),
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block.
-    Coroutine(blaze_memo::Gid),
+    Coroutine(blaze_query::db::Id),
     /// The same of the future an `async` closure gives when called by value.
-    CoroutineByMove(blaze_memo::Gid),
+    CoroutineByMove(blaze_query::db::Id),
 }
 
 /// The monomorphized runtime MIR of `body` with `args` (a closure's or coroutine's are its
@@ -76,15 +76,15 @@ pub fn body_of<'db>(
     match body {
         Body::Fn(func) => db.monomorphized_runtime_mir_body(InferBodyId::from(func), args, env),
         Body::Closure(id) => {
-            db.monomorphized_runtime_mir_body_for_closure(InternedClosureId::from_gid(id), args, env)
+            db.monomorphized_runtime_mir_body_for_closure(InternedClosureId::from_id(id), args, env)
         }
         Body::Coroutine(id) => db.monomorphized_runtime_mir_body_for_coroutine(
-            InternedCoroutineId::from_gid(id),
+            InternedCoroutineId::from_id(id),
             args,
             env,
         ),
         Body::CoroutineByMove(id) => db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-            InternedCoroutineId::from_gid(id),
+            InternedCoroutineId::from_id(id),
             args,
             env,
         ),
@@ -111,9 +111,9 @@ pub fn body_once<'db>(
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let owner = match body {
         Body::Fn(func) => MirOwner::Body(InferBodyId::from(func)),
-        Body::Closure(id) => MirOwner::Closure(InternedClosureId::from_gid(id)),
-        Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_gid(id)),
-        Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_gid(id)),
+        Body::Closure(id) => MirOwner::Closure(InternedClosureId::from_id(id)),
+        Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),
+        Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)),
     };
     hir_ty::providers::monomorphized_once(db, owner, MirStage::Runtime, args, env)
 }
@@ -124,8 +124,8 @@ pub fn coroutine_poll<'db>(db: &'db Db, ty: Ty<'db>) -> Option<(Body, GenericArg
     let TyKind::Coroutine(id, args) = ty.kind() else { return None };
     let args = args.as_coroutine();
     let body = match is_by_move_coroutine(db, id.0, args) {
-        true => Body::CoroutineByMove(id.0.gid()),
-        false => Body::Coroutine(id.0.gid()),
+        true => Body::CoroutineByMove(id.0.as_id()),
+        false => Body::Coroutine(id.0.as_id()),
     };
     Some((body, GenericArgs::new_from_slice(args.parent_args())))
 }
@@ -282,7 +282,7 @@ fn fn_trait<'db>(
         TyKind::Ref(_, inner, _) => fn_trait(infcx, env, func, args, inner),
         TyKind::Closure(id, closure_args) => {
             let parent = GenericArgs::new_from_slice(closure_args.as_closure().parent_args());
-            Call::Closure(Body::Closure(id.0.gid()), parent)
+            Call::Closure(Body::Closure(id.0.as_id()), parent)
         }
         TyKind::FnDef(def, fn_args) => Call::FnItem(def.0, fn_args.skip_binder()),
         TyKind::FnPtr(..) | TyKind::Dynamic(..) => Call::Indirect,

@@ -10,6 +10,7 @@ use base_db::{
     AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId,
     Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath,
 };
+use blaze_query::db::Durability;
 use cfg::CfgOptions;
 use expect_test::expect_file;
 use span::{Edition, SyntaxContext};
@@ -76,10 +77,14 @@ struct Fixture {
 
 /// A database of one crate whose root is `FIXTURE`.
 fn fixture() -> Fixture {
-    let mut db = Db::for_tests(|_| {});
+    let mut db = Db::for_tests();
     let id = FileId::from_raw(0);
+    db.set_file_text_with_durability(id, FIXTURE, Durability::LOW);
+    db.set_file_source_root_with_durability(id, SourceRootId(0), Durability::MEDIUM);
     let mut set = FileSet::default();
     set.insert(id, VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
+    let root = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
     let mut graph = CrateGraphBuilder::default();
     let builder = graph.add_crate_root(
         id,
@@ -101,16 +106,7 @@ fn fixture() -> Fixture {
             trusted: Box::default(),
         }),
     );
-    // The file, its root and the graph, one commit.
-    let committed = {
-        let mut edit = db.edit();
-        edit.set_file_text(id, FIXTURE)
-            .set_file_source_root(id, SourceRootId(0))
-            .set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)))
-            .set_crate_graph(graph);
-        edit.commit()
-    };
-    let krate = db.krate(committed.crates[&builder]);
+    let krate = graph.set_in_db(&mut db)[&builder];
     let file = EditionedFileId::new(&db, id, Edition::CURRENT);
     Fixture { db, file, krate }
 }
@@ -423,8 +419,7 @@ fn paths_lower_to_mod_paths() {
         .filter_map(view::Path::cast)
         .filter(|it| it.syntax().parent().and_then(view::Path::cast).is_none())
         .map(|it| {
-            let table = HirFileId::from(f.file).context_arena();
-            let path = ModPath::from_src_view(db, table, it, &mut root_ctxt);
+            let path = ModPath::from_src_view(db, it, &mut root_ctxt);
             let path = path.map(|it| (it.kind, it.display_verbatim(db).to_string()));
             (it.syntax().text().to_string(), path)
         })
@@ -522,7 +517,7 @@ fn an_eager_expansion_replaces_its_nested_calls() {
         let result = expand_eager_macro_input_view(
             db,
             f.krate,
-            ExpandTo::of_call_site_view(call),
+            call,
             ast_id,
             concat,
             ctxt,

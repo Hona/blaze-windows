@@ -45,7 +45,6 @@
 //!   out borrows the task it was read in: a query's [`Cx`], or a [`Pinned`] from outside one.
 
 pub mod db;
-pub mod edit_work;
 mod inputs;
 mod kind_counts;
 mod memo;
@@ -94,7 +93,6 @@ use crate::{
 };
 pub use crate::{
     inputs::Inputs,
-    kind_counts::KindCounts,
     subtree::TreeHash,
     tree::{MemTree, Names, Tree},
 };
@@ -484,7 +482,7 @@ struct KindInfo {
     /// Set for a [`Query::SHARE`] kind.
     share: Option<Shared>,
     /// What its memos did ([`Database::take_counts`]).
-    counts: kind_counts::KindCounters,
+    counts: kind_counts::KindCounts,
 }
 
 /// The registered queries by kind number: a kind's row is at its number in one reserved
@@ -1631,7 +1629,7 @@ impl Database {
                 decode: decode_key::<Q>,
                 tag: Q::TAG,
                 share: Q::SHARE.then_some(Shared { name: Q::NAME, schema: Q::Value::SCHEMA }),
-                counts: kind_counts::KindCounters::new(),
+                counts: kind_counts::KindCounts::new(),
             },
         );
     }

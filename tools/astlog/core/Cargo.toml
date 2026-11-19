@@ -12,7 +12,6 @@ repository.workspace = true
 
 [dependencies]
 ast-merge-langs.workspace = true
-astlog-engine.workspace = true
 blaze-hash.workspace = true
 edit-applier.workspace = true
 ignore.workspace = true

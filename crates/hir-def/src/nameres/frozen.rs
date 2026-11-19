@@ -22,7 +22,6 @@ use base_db::{Crate, Db};
 use base_db::{FileId, VfsPath};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::{HashMap, HashSet};
-use blaze_ids::ContentId;
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
@@ -86,9 +85,7 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-///
-/// 24: every crate root of the closure is named [`ROOT`] in a files table, not only an alias.
-pub const ENCODING: &str = "blaze frozen def map 24";
+pub const ENCODING: &str = "blaze frozen def map 23";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,62 +105,40 @@ pub struct Frozen {
     pub mode: Mode,
 }
 
-/// The fact a crate's frozen slot of `kind` (`"def map"`, `"lang items"`) is read by: the
-/// slot's id, of the crate's own stable id and the kind, and the digest of the bytes and the
-/// mode.
-pub fn frozen_fact(krate_id: ContentId, kind: &str, frozen: &Frozen) -> blaze_memo::Fact {
-    let id = blaze_ids::Hasher::new("hir-def frozen slot")
-        .id(&krate_id)
-        .part(kind.as_bytes())
-        .finish();
-    let digest = blaze_ids::Hasher::new("hir-def frozen bytes")
-        .part(&frozen.bytes)
-        .part(&[frozen.mode as u8])
-        .finish();
-    blaze_memo::Fact { id, digest }
+/// The crates whose `DefMap` is frozen, set by whoever has the bytes: read outside queries
+/// alone. A query reads its crate's own ([`DefMapSlot`], `crate::deps::given`).
+#[blaze_query::input(singleton, debug)]
+pub struct FrozenDefMaps {
+    #[returns(ref)]
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
 }
 
-/// Has name resolution use each crate's frozen `DefMap` of `entries` from the commit of `edit`
-/// on, given in the crate's own slot ([`DefMapSlot`]) with the fact it is read by
-/// ([`frozen_fact`]). Called by the driver in an edit of the world; how many crates' slots
-/// moved.
-pub fn give(
-    edit: &mut base_db::Edit<'_>,
-    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Frozen)>,
-) -> usize {
-    crate::deps::given::give_each::<DefMapSlot, Frozen>(edit, entries)
+/// Has name resolution use `maps`.
+pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
+    use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<DefMapSlot, Frozen>(db, was.as_deref(), &maps);
+    // alloc: Check/Verify only, which record differences; never when serving
+    let maps = Arc::new(maps);
+    match FrozenDefMaps::try_get(db) {
+        Some(it) => {
+            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
+        }
+        None => {
+            _ = FrozenDefMaps::new(db, Durability::HIGH, maps);
+        }
+    }
 }
 
-/// The kind of a crate's slot holding its frozen `DefMap` whole: given only under
-/// [`Mode::Check`] and [`Mode::Verify`] (`deps::give_image` takes it under [`Mode::Serve`], and
-/// an image read in place refuses the other two), so it costs the serving build nothing. A
-/// slot, not located ([`base_db::Located`]), though no value read depends on it: its readers
-/// are the comparisons of [`check`] and [`served`] inside `crate_local_def_map`, which compare
-/// only when that query runs; a first gift that marked nothing would leave a crate resolved
-/// before it uncompared, and say nothing. Marking makes the query run, so every crate given a
-/// record is compared.
+/// The kind of a crate's slot holding its entry of [`FrozenDefMaps`].
 pub struct DefMapSlot;
 
-/// The kind of a crate's gift of its frozen lang items: located ([`base_db::Located`]). The
-/// promise: the lang items served from it ([`served_lang_items`]) are the ones the crate's
-/// def map collects, since the image they are read from is filed under a key that covers
-/// every input of that collection; so a reader computes the same value with the gift as
-/// without it, and its first gift to a sealed crate whose arena holds evaluated queries marks
-/// nothing (round 27: given to 23 sealed crates in the first body edit, 28 arenas dropped).
-/// Withdrawn with the image ([`crate::deps::withdraw_image`]), which marks the crate.
+/// The kind of a crate's slot holding its entry of [`FrozenLangItems`].
 pub struct LangItemsSlot;
 
-impl base_db::Located for LangItemsSlot {}
-
-/// The kind of a crate's gift of its frozen diagnostic items: located ([`base_db::Located`]).
-/// The promise: the table served from it ([`served_diagnostic_items`]) is the one the walk of
-/// the crate's modules finds, as the image it is read from is filed under a key that covers
-/// every input of that walk; under [`Mode::Check`] it is not served, and the comparison
-/// ([`check_diagnostic_items`]) is called by its caller outside any query, so no comparison
-/// waits on a query running again. Withdrawn with the image, which marks the crate.
+/// The kind of a crate's slot holding its entry of [`FrozenDiagnosticItems`].
 pub struct DiagnosticItemsSlot;
-
-impl base_db::Located for DiagnosticItemsSlot {}
 
 /// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
 /// is resolved again when an `include!` loads a file, and only the last one is the crate's.
@@ -200,27 +175,6 @@ static DIFFERENCES: Differences =
 pub fn differences() -> Vec<String> {
     // alloc: Check/Verify only, which record differences; never when serving
     DIFFERENCES.take().into_iter().map(|(_, _, it)| it).collect()
-}
-
-/// What [`Mode::Check`] did not compare, by crate and kind, each with why: a check that
-/// leaves something out says so here by name, never by finding no difference in it. Held as
-/// [`DIFFERENCES`] is, for the same reader.
-// alloc: Check only, which records what it left out; never when serving
-static UNCOMPARED: Differences = Differences(Lock::new("def.frozen.uncompared", Vec::new()));
-
-/// What [`Mode::Check`] left out of its comparison since this was last called, each naming
-/// the crate, the kind and why. Whoever reads [`differences`] reads this beside it: an empty
-/// [`differences`] says nothing of a kind listed here.
-pub fn uncompared() -> Vec<String> {
-    // alloc: Check only, which records what it left out; never when serving
-    UNCOMPARED.take().into_iter().map(|(_, _, it)| it).collect()
-}
-
-/// Records that [`Mode::Check`] did not compare the frozen `kind` of `krate`, and `why`.
-pub fn record_uncompared(db: &Db, krate: Crate, kind: &'static str, why: &str) {
-    // alloc: Check only, which records what it left out; never when serving
-    let said = format!("the frozen {kind} of `{}` was not compared: {why}", krate.named(db));
-    UNCOMPARED.record(krate, kind, Some(said));
 }
 
 /// Forgets a difference found before in the frozen `kind` of `krate`, which agrees now.
@@ -277,15 +231,18 @@ pub fn check_frozen(
     }
 }
 
-/// The frozen `DefMap` of `krate`, a read of its own slot (the getter notes the slot's fact).
-fn frozen_def_map(db: &Db, krate: Crate) -> Option<&Frozen> {
-    krate.given::<DefMapSlot, Frozen>(db)
+/// The frozen `DefMap` of `krate`, by value: a [`set`] that leaves it as it was is backdated
+/// here, so it runs none of the queries of `krate` again.
+#[blaze_query::tracked(returns(as_ref))]
+fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
+    krate.given::<DefMapSlot, Frozen>(db).cloned()
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it: the
-/// crate's def map read from its pages ([`pages::give`]), a name at a time; nothing decodes a
+/// crate's def map read from its pages ([`pages::set`]), a name at a time; nothing decodes a
 /// crate's def map whole. Under [`Mode::Verify`] what was read is written again as pages and
-/// compared with the record (its [`DefMapSlot`] holds it whole, for that alone); under
+/// compared with the record ([`FrozenDefMaps`] holds it whole, for that alone); under
 /// [`Mode::Check`] the crate is given no pages and is resolved, and [`check`] compares. Pages
 /// that do not read stop the query with [`Unreadable`], failing the job that asked: never a
 /// panic of the daemon, and never a crate resolved instead.
@@ -293,7 +250,8 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     if !pages::is_paged(db, krate) {
         return None;
     }
-    // The value is the record's: the read of the crate's pages slot notes its fact.
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let (def_map, local) = pages::served(db, krate);
     if let Some(frozen) = frozen_def_map(db, krate)
         && frozen.mode == Mode::Verify
@@ -301,13 +259,15 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
         match pages::encode_of(db, krate, &def_map, &local) {
             Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
             Ok(written) => differs(db, krate, "what was read of it", &written, &frozen.bytes),
+            // alloc: error path
             Err(why) => differs(db, krate, &format!("what was read of it ({why})"), &[], &[]),
         }
     }
     Some((def_map, local))
 }
 
-/// Whether [`served`] gives `krate`'s `DefMap` from its pages.
+/// Whether [`served`] gives `krate`'s `DefMap` from its pages: the name resolution maintainer
+/// never maintains such a crate.
 pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
     pages::is_paged(db, krate)
 }
@@ -315,34 +275,28 @@ pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
 /// A test's serve of `records` (each crate's def map pages, as [`pages::encode`] writes them)
 /// in `mode`, held whole in memory, as `crate::deps::serve` gives a crate's records: its pages
 /// under [`Mode::Serve`] and [`Mode::Verify`], the record whole under [`Mode::Check`] and
-/// [`Mode::Verify`]. Given in the next commit of `db`.
+/// [`Mode::Verify`].
 #[cfg(test)]
 pub(crate) fn serve_pages(db: &mut Db, records: &[(Crate, Vec<u8>)], mode: Mode) {
-    let slot_id = |bytes: &[u8]| ContentId::of("blaze test crate", bytes);
-    let mut edit = db.edit();
     if mode != Mode::Serve {
-        give(
-            &mut edit,
-            records.iter().map(|(krate, bytes)| {
-                let frozen = Frozen { bytes: bytes.as_slice().into(), mode };
-                (*krate, frozen_fact(slot_id(bytes), "def map", &frozen), frozen)
-            }),
-        );
+        let maps = (records.iter())
+            .map(|(krate, bytes)| (*krate, Frozen { bytes: bytes.as_slice().into(), mode }))
+            .collect();
+        set(db, maps);
     }
     if mode != Mode::Check {
-        pages::give(
-            &mut edit,
-            records.iter().map(|(krate, bytes)| {
-                let held: crate::deps::ImageBuf = Arc::new(blaze_format::Aligned::copy_from(bytes));
-                let key = ContentId::of("blaze test def map pages", bytes);
+        let maps = (records.iter())
+            .map(|(krate, bytes)| {
+                let held: crate::deps::ImageBuf =
+                    Arc::new(blaze_format::Aligned::copy_from(bytes));
+                let key = blaze_ids::ContentId::of("blaze test def map pages", bytes);
                 // dyn: a test's holder of one record, one a crate
                 let source: Arc<dyn pages::PageSource> = Arc::new(pages::Whole(held));
-                let paged = pages::Paged { key, source };
-                (*krate, pages::pages_fact(slot_id(bytes), &paged), paged)
-            }),
-        );
+                (*krate, pages::Paged { key, source })
+            })
+            .collect();
+        pages::set(db, maps);
     }
-    _ = edit.commit();
 }
 
 /// Records a difference between the `DefMap` resolving found, written as pages, and the
@@ -370,28 +324,45 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
     dec.files().err()
 }
 
-/// Has finding the lang items of each crate of `entries` use its frozen ones from the commit
-/// of `edit` on, given as the crate's located gift ([`LangItemsSlot`]) with the fact it is
-/// read by ([`frozen_fact`] of `"lang items"`). Called by the driver in an edit of the world;
-/// how many crates' gifts moved.
-pub fn give_lang_items(
-    edit: &mut base_db::Edit<'_>,
-    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Frozen)>,
-) -> usize {
-    crate::deps::given::give_each_located::<LangItemsSlot, Frozen>(edit, entries)
+/// The crates whose lang items are frozen, set by whoever has the bytes: read outside
+/// queries alone. A query reads its crate's own ([`LangItemsSlot`]).
+#[blaze_query::input(singleton, debug)]
+pub struct FrozenLangItems {
+    #[returns(ref)]
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
 }
 
-/// The frozen lang items of `krate`, a read of its located gift (no input of any arena: the
-/// gift's fact is listed as read).
-fn frozen_lang_items(db: &Db, krate: Crate) -> Option<&Frozen> {
-    krate.located::<LangItemsSlot, Frozen>(db)
+/// Has finding the lang items of a crate use `maps`.
+pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
+    use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<LangItemsSlot, Frozen>(db, was.as_deref(), &maps);
+    // alloc: once per load of the frozen bytes
+    let maps = Arc::new(maps);
+    match FrozenLangItems::try_get(db) {
+        Some(it) => {
+            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
+        }
+        None => {
+            _ = FrozenLangItems::new(db, Durability::HIGH, maps);
+        }
+    }
+}
+
+/// The frozen lang items of `krate`, by value, as [`frozen_def_map`] is.
+#[blaze_query::tracked(returns(as_ref))]
+fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
+    krate.given::<LangItemsSlot, Frozen>(db).cloned()
 }
 
 /// What [`crate_lang_items`](crate::lang_item::crate_lang_items) reads for `krate` instead of
 /// finding them, when they are frozen.
 pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<LangItems>>> {
     let frozen = frozen_lang_items(db, krate).filter(|it| it.mode != Mode::Check)?;
-    // The value is the record's: the read of the crate's lang items slot notes its fact.
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let read = || {
         let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
         let items = dec.option(|dec| {
@@ -426,7 +397,7 @@ pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<Lang
 /// input, and the write that moves one withdraws the image in the same write (`deps`'
 /// implied write), so this is a bug in the key or in that withdrawal. Nothing is resolved in
 /// its place. It unwinds out of the query that asked, with this as its payload, as
-/// [`super::FixpointLimit`] does, and the driver that catches it fails that one job with it as
+/// [`super::Unmaintained`] does, and the driver that catches it fails that one job with it as
 /// the error (rule 20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
@@ -446,7 +417,7 @@ impl Unreadable {
         Unreadable { krate, name, kind, why }
     }
 
-    /// Unwinds with `self` as the payload, logged first, as [`super::FixpointLimit::throw`] is.
+    /// Unwinds with `self` as the payload, logged first, as [`super::Unmaintained::throw`] is.
     pub fn throw(self) -> ! {
         tracing::error!(target: "blaze", "{self}");
         std::panic::panic_any(self)
@@ -493,22 +464,37 @@ pub fn check_lang_items(db: &Db, krate: Crate) {
 /// What [`Unreadable`] and a difference call a crate's frozen diagnostic items.
 const DIAGNOSTIC_ITEMS: &str = "diagnostic items";
 
-/// Has finding the diagnostic items of each crate of `entries` use its frozen ones (the
-/// image's [`Part::DiagnosticItems`](crate::deps::Part::DiagnosticItems)) from the commit of
-/// `edit` on, given as the crate's located gift ([`DiagnosticItemsSlot`]) with the fact it is
-/// read by ([`frozen_fact`] of `"diagnostic items"`). Called by the driver in an edit of the
-/// world, in the same edit as the crate's other parts; how many crates' gifts moved.
-pub fn give_diagnostic_items(
-    edit: &mut base_db::Edit<'_>,
-    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Frozen)>,
-) -> usize {
-    crate::deps::given::give_each_located::<DiagnosticItemsSlot, Frozen>(edit, entries)
+/// The crates whose diagnostic items are frozen (the image's
+/// [`Part::DiagnosticItems`](crate::deps::Part::DiagnosticItems)), set by whoever has the
+/// bytes: read outside queries alone. A query reads its crate's own ([`DiagnosticItemsSlot`]).
+#[blaze_query::input(singleton, debug)]
+pub struct FrozenDiagnosticItems {
+    #[returns(ref)]
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
 }
 
-/// The frozen diagnostic items of `krate`, a read of its located gift (the gift's fact is
-/// listed as read).
-fn frozen_diagnostic_items(db: &Db, krate: Crate) -> Option<&Frozen> {
-    krate.located::<DiagnosticItemsSlot, Frozen>(db)
+/// Has finding the diagnostic items of a crate use `maps`.
+pub fn set_diagnostic_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
+    use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenDiagnosticItems::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<DiagnosticItemsSlot, Frozen>(db, was.as_deref(), &maps);
+    let maps = Arc::new_in(maps, Global);
+    match FrozenDiagnosticItems::try_get(db) {
+        Some(it) => {
+            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
+        }
+        None => {
+            _ = FrozenDiagnosticItems::new(db, Durability::HIGH, maps);
+        }
+    }
+}
+
+/// The frozen diagnostic items of `krate`, by value, as [`frozen_def_map`] is.
+#[blaze_query::tracked(returns(as_ref))]
+fn frozen_diagnostic_items(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
+    krate.given::<DiagnosticItemsSlot, Frozen>(db).cloned()
 }
 
 /// What [`crate_diagnostic_items`](crate::diagnostic_item::crate_diagnostic_items) reads for
@@ -520,7 +506,8 @@ fn frozen_diagnostic_items(db: &Db, krate: Crate) -> Option<&Frozen> {
 /// [`Unreadable`], naming the crate and the part: never a walk of the crate in their place.
 pub(crate) fn served_diagnostic_items(db: &Db, krate: Crate) -> Option<DiagnosticItems> {
     let frozen = frozen_diagnostic_items(db, krate).filter(|it| it.mode != Mode::Check)?;
-    // The value is the record's: the read of the crate's diagnostic items slot notes its fact.
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let read = || {
         let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
         let items = dec.diagnostic_items()?;
@@ -576,7 +563,20 @@ pub fn encode_diagnostic_items(db: &Db, krate: Crate) -> R<Vec<u8>> {
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
 pub fn check_diagnostic_items(db: &Db, krate: Crate) {
     let Some(frozen) = frozen_diagnostic_items(db, krate) else { return };
-    check_frozen(db, krate, DIAGNOSTIC_ITEMS, frozen, || encode_diagnostic_items(db, krate));
+    check_frozen(db, krate, DIAGNOSTIC_ITEMS, &frozen, || encode_diagnostic_items(db, krate));
+}
+
+/// A test's frozen diagnostic items of `krate` given or taken away (`None`) outside a serve.
+#[cfg(test)]
+pub(crate) fn give_diagnostic_items(db: &mut Db, krate: Crate, frozen: Option<Frozen>) {
+    let mut maps = FrozenDiagnosticItems::try_get(&*db)
+        .map(|it| (**it.maps(&*db)).clone())
+        .unwrap_or_default();
+    match frozen {
+        Some(frozen) => maps.insert(krate, frozen),
+        None => maps.remove(&krate),
+    };
+    set_diagnostic_items(db, maps);
 }
 
 /// The bytes of the `DefMap` of `krate` as name resolution computes it, or why it cannot be
@@ -657,16 +657,11 @@ fn vfs_path(real: bool, text: String) -> VfsPath {
 /// the same in every checkout. No path or literal holds a NUL.
 const OUT: &str = "\0OUT_DIR";
 
-/// What stands for the root file of a crate of the closure in the name of a file, after the
-/// index of the first crate of the closure it is the root of: every crate root, an ordinary one
-/// and an alias ([`base_db::Files::alias_of`]: its file's path and text with a module appended,
-/// as `Lowered::append_roots` makes for a test harness or a proc macro's wasm glue, whose path
-/// reads back as that file, lacking the appended module's items). Read back, it is that
-/// crate's root file id (`root_file_id` of its crate data), which the crate graph names: by
-/// [`Dec::files`] looked up nowhere and compared, and given by its address
-/// (`pages::make_keyed_files`) as the crate's own root file, with no path to match. No path
-/// holds a NUL. Until `ENCODING` 24 only an alias root was so marked, an ordinary root
-/// written by its path, so a crate given by its address made its root a new file id.
+/// What stands for a crate root that is an alias ([`base_db::Files::alias_of`]: its file's path
+/// and text with a module appended, as `Lowered::append_roots` makes for a test harness or a
+/// proc macro's wasm glue) in the name of a file, after the index of the crate it is the root
+/// of. Its path is its file's and reads back as that file, whose syntax lacks the appended
+/// module's items. No path holds a NUL.
 const ROOT: &str = "\0ROOT";
 
 /// What starts the name of a file outside the VFS (`base_db::Files::included_source`: the
@@ -680,18 +675,6 @@ const ROOT: &str = "\0ROOT";
 /// holds a NUL, and no mark of the port is this text (a mark is a NUL and a lower-case
 /// letter).
 const INCLUDED: &str = "\0INCLUDED";
-
-/// One entry of a files table as [`Enc::finish`] writes it: the index in the closure of the
-/// crate the file is of, its name ([`ROOT`], [`OUT`] or [`INCLUDED`] marked, or its path from
-/// that crate's root directory) and the content ID the bytes were made from. The one reader of
-/// the entry's layout: [`Dec::files`] and `pages::named_files` both read through it.
-fn file_entry<'b>(r: &mut Reader<'b>) -> R<(u32, &'b str, blaze_ids::ContentId)> {
-    let owner = r.uleb32()?;
-    let len = r.uleb32()? as usize;
-    let path = std::str::from_utf8(r.take(len)?).map_err(|_| "a string that is not UTF-8")?;
-    let content = blaze_ids::ContentId(r.take(32)?.try_into().map_err(|_| "a content ID")?);
-    Ok((owner, path, content))
-}
 
 fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
@@ -767,13 +750,9 @@ pub struct Enc<'a> {
     /// The files named, in the order of their index.
     file_order: Vec<FileId>,
     calls: HashMap<MacroCallId, u32, Global>,
-    /// Each context written whole, by the table it is of: a context's word is crate-local.
-    contexts: HashMap<(blaze_memo::ArenaId, SyntaxContext), u32, Global>,
+    contexts: HashMap<SyntaxContext, u32, Global>,
     call_hashes: HashMap<MacroCallId, u128, Global>,
-    context_hashes: HashMap<(blaze_memo::ArenaId, SyntaxContext), u128, Global>,
-    /// The table the contexts being written are of: the crate's own, or while a macro call's
-    /// loc is written, the calling crate's (`MacroCallId::arena`).
-    ctx_arena: blaze_memo::ArenaId,
+    context_hashes: HashMap<SyntaxContext, u128, Global>,
     modules: HashMap<ModuleId, (u32, u32), Global>,
     indexed: HashSet<Crate, Global>,
     /// The body each block that was looked for is in.
@@ -838,7 +817,6 @@ impl<'a> Enc<'a> {
             contexts: HashMap::new_in(Global),
             call_hashes: HashMap::new_in(Global),
             context_hashes: HashMap::new_in(Global),
-            ctx_arena: blaze_memo::Id::gid(krate).arena(),
             modules: HashMap::new_in(Global),
             indexed: HashSet::new_in(Global),
             block_owners: HashMap::new_in(Global),
@@ -1059,8 +1037,7 @@ impl Enc<'_> {
             // A file outside the VFS ([`INCLUDED`]): of the first crate of the closure that
             // read it, by its ported path.
             let read_by = |&krate: &Crate| {
-                let key = krate.key(db);
-                db.files().included_by(db, key).iter().any(|it| it.0.as_path() == outside)
+                db.files().included_by(db, krate).iter().any(|it| it.0.as_path() == outside)
             };
             let owner = self.closure.iter().position(read_by).ok_or_else(|| {
                 // alloc: error path
@@ -1085,10 +1062,8 @@ impl Enc<'_> {
                 self.dirs.insert(index as u32, dir);
             }
         }
-        // Every crate root of the closure by its mark ([`ROOT`]), never by its path: read back
-        // it is its crate's root file id, the one the crate graph names.
-        let root = self.closure.iter().position(|&it| it.data(db).root_file_id == file);
-        if root.is_some() || db.files().alias_of(file).is_some() {
+        if db.files().alias_of(file).is_some() {
+            let root = self.closure.iter().position(|&it| it.data(db).root_file_id == file);
             let owner = root.ok_or_else(|| {
                 let krate = self.closure[0].named(db);
                 // alloc: error path
@@ -1223,11 +1198,8 @@ impl Enc<'_> {
         let MacroCallLoc { def, krate, kind, ctxt, macro_depth } = loc;
         self.def_id(def)?;
         self.krate(krate)?;
-        // The loc's contexts (its spans' and its own) are of the calling crate's table.
-        let outer = std::mem::replace(&mut self.ctx_arena, blaze_memo::Id::gid(call).arena());
-        let written = self.call_kind(kind).and_then(|()| self.context(ctxt));
-        self.ctx_arena = outer;
-        written?;
+        self.call_kind(kind)?;
+        self.context(ctxt)?;
         self.u32(macro_depth);
         // What `include!` expands to is the file it reads, which the header must name: one a
         // build script writes may not be there yet, or may have other text, where it is read.
@@ -1353,23 +1325,19 @@ impl Enc<'_> {
         Ok(())
     }
 
-    /// Writes `ctx`, a context of the table [`Enc::ctx_arena`] names, by its structure (root
-    /// and edition, or its expansion, transparency, edition, parent and opaque forms), never
-    /// its word, which is crate-local and follows interning order (port decision 3).
     pub(crate) fn context(&mut self, ctx: SyntaxContext) -> R {
         if ctx.is_root() {
             self.u8(0);
-            self.edition(ctx.edition());
+            self.edition(ctx.edition(self.db));
             return Ok(());
         }
-        let key = (self.ctx_arena, ctx);
         if self.fingerprinting {
             self.u8(1);
             let print = self.context_hash(ctx)?;
             self.out.put_u128(print);
             return Ok(());
         }
-        if let Some(&index) = self.contexts.get(&key) {
+        if let Some(&index) = self.contexts.get(&ctx) {
             self.u8(2);
             self.u32(index);
             return Ok(());
@@ -1377,33 +1345,31 @@ impl Enc<'_> {
         self.u8(1);
         self.context_data(ctx)?;
         let index = self.contexts.len() as u32;
-        self.contexts.insert(key, index);
+        self.contexts.insert(ctx, index);
         Ok(())
     }
 
     fn context_hash(&mut self, ctx: SyntaxContext) -> R<u128> {
-        let key = (self.ctx_arena, ctx);
-        if let Some(&it) = self.context_hashes.get(&key) {
+        if let Some(&it) = self.context_hashes.get(&ctx) {
             return Ok(it);
         }
         let print = hash128(&self.fingerprint(|enc| enc.context_data(ctx))?);
-        self.context_hashes.insert(key, print);
+        self.context_hashes.insert(ctx, print);
         Ok(print)
     }
 
     fn context_data(&mut self, ctx: SyntaxContext) -> R {
-        let (db, arena) = (self.db, self.ctx_arena);
-        let outer = ctx.outer_expn(db, arena).ok_or("a syntax context with no expansion")?;
+        let db = self.db;
+        let outer = ctx.outer_expn(db).ok_or("a syntax context with no expansion")?;
         self.call(MacroCallId::from(outer))?;
-        self.u8(match ctx.outer_transparency(db, arena) {
+        self.u8(match ctx.outer_transparency(db) {
             Transparency::Transparent => 0,
             Transparency::SemiOpaque => 1,
             Transparency::Opaque => 2,
         });
-        self.edition(ctx.edition());
-        // Its parent and opaque forms are of the same table.
-        self.context(ctx.parent(db, arena))?;
-        for other in [ctx.opaque(db, arena), ctx.opaque_and_semiopaque(db, arena)] {
+        self.edition(ctx.edition(db));
+        self.context(ctx.parent(db))?;
+        for other in [ctx.opaque(db), ctx.opaque_and_semiopaque(db)] {
             if other == ctx {
                 self.u8(0);
             } else {
@@ -2665,11 +2631,7 @@ pub struct Dec<'a> {
     /// As `closure`: read from the header, or the pages' files as their head read them.
     files: std::borrow::Cow<'a, [FileId]>,
     calls: Vec<MacroCallId>,
-    /// Each context read whole, with the table it was interned in.
-    contexts: Vec<(blaze_memo::ArenaId, SyntaxContext)>,
-    /// While a macro call's loc is read, the calling crate's table, which its contexts are
-    /// interned in; `None`: the crate being read's own ([`Dec::ctx_arena`]).
-    ctx_arena: Option<blaze_memo::ArenaId>,
+    contexts: Vec<SyntaxContext>,
     /// The modules of the crate being read, in its `DefMap`'s order. As `closure`.
     own: std::borrow::Cow<'a, [ModuleId]>,
     /// Reading the crate's own `DefMap`, whose modules are `own`.
@@ -2691,7 +2653,6 @@ impl<'a> Dec<'a> {
             calls: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
             contexts: Vec::new(),
-            ctx_arena: None,
             // alloc: the decoded map's own storage, once per crate served
             own: std::borrow::Cow::Owned(Vec::new()),
             in_def_map: false,
@@ -2816,31 +2777,25 @@ impl Dec<'_> {
     /// covers every file's text, so that is a key that left an input out, and the image is
     /// refused rather than read against syntax it was not made from. Each that is not loaded
     /// is noted as an `include!` that found nothing is, for whoever owns the VFS to load.
-    ///
-    /// A crate given by its address (`deps::give_keyed`: its pages trusted as read at the
-    /// address that made them) reads its files from what it was given instead
-    /// ([`pages::keyed_files`]): each file by its owner's own list, looked up nowhere and
-    /// compared with no file. What is compared is two records: the content this one names a
-    /// file with and the content its owner's own pages name it with, which differ only where
-    /// two records of one snapshot disagree. A file of a crate not given by its address is an
-    /// error naming it: every crate below a crate given so is given so.
     fn files(&mut self) -> R {
-        let keyed = pages::keyed_files(self.db, self.krate).is_some();
         let n = self.len()?;
         let mut not_loaded = None;
         for _ in 0..n {
-            let (owner, path, content) = file_entry(&mut self.r)?;
-            let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
-            if keyed {
-                let found = self.keyed_file(krate, path, content)?;
-                self.files.to_mut().push(found);
-                continue;
-            }
+            let owner = self.u32()?;
             // alloc: the decoded map's own storage, once per crate served
-            let path = path.to_owned();
+            let path = self.str()?.to_owned();
+            let content =
+                blaze_ids::ContentId(self.r.take(32)?.try_into().map_err(|_| "a content ID")?);
+            let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
             if path == ROOT {
-                // The crate's root file, alias or not ([`ROOT`]): compared by its content.
                 let root = krate.data(self.db).root_file_id;
+                if self.db.files().alias_of(root).is_none() {
+                    // alloc: error path
+                    return Err(format!(
+                        "the root of {} is no alias, as the image's was",
+                        krate.named(self.db)
+                    ));
+                }
                 self.checked(krate, root, &path, content)?;
                 self.files.to_mut().push(root);
                 continue;
@@ -2914,18 +2869,8 @@ impl Dec<'_> {
     }
 
     /// `file`, of `krate`, as named `name`, has the content ID the image was made from.
-    ///
-    /// The file's content is read unrecorded: what is decoded depends on the file's path
-    /// alone (the source root's set, which stays read), and the check either holds or is a
-    /// corrupt image. Recorded, every file of a served crate's closure would be in the read
-    /// list of each value read from its image (a served signature's, through
-    /// `module_indexes -> crate_def_map`), keying it by text it does not depend on. The
-    /// arena the file is in is still borrowed ([`blaze_memo::unrecorded`]), so an edit of the
-    /// file still drops what was decoded here, and the serve checks the same contents before
-    /// it gives the image ([`pages::unreadable`]).
     fn checked(&self, krate: Crate, file: FileId, name: &str, made: blaze_ids::ContentId) -> R {
-        let memo = blaze_memo::Database::memo(self.db);
-        let now = blaze_memo::unrecorded(memo, || self.db.file_content(file));
+        let now = self.db.file_content(file);
         if now == made {
             return Ok(());
         }
@@ -2933,38 +2878,6 @@ impl Dec<'_> {
         let krate = krate.named(self.db);
         // alloc: error path
         Err(format!("{name} of {krate} has content {now:?}, the image was made from {made:?}"))
-    }
-
-    /// The file `krate`, given by its address, has at `path` (as a files table names it), from
-    /// the files its own pages name ([`pages::keyed_files`]): no file looked up, no file's
-    /// content read. `made` is the content these bytes name it with, which must be the one its
-    /// owner's pages name it with: two records of one snapshot that disagree on a file are an
-    /// error naming it, never read against each other.
-    fn keyed_file(&self, krate: Crate, path: &str, made: blaze_ids::ContentId) -> R<FileId> {
-        let shown = || if path == ROOT { "its root" } else { path };
-        let Some(keyed) = pages::keyed_files(self.db, krate) else {
-            // alloc: error path
-            return Err(format!(
-                "{} of {}, a crate not given by its address, named by bytes of a crate that was: every crate below one given so is given so",
-                shown(),
-                krate.named(self.db)
-            ));
-        };
-        let Some(found) = keyed.find(path) else {
-            // alloc: error path
-            return Err(format!(
-                "{} of {}, which its own pages (given at {:?}) do not name",
-                shown(),
-                krate.named(self.db),
-                keyed.address()
-            ));
-        };
-        // The file is its owner's by name: its owner's own pages say what it was given with.
-        // The content these bytes name is not compared: a body or comment edit moves it and
-        // neither crate's key, so two records found by their keys may name two contents of
-        // one file (the key is the proof, rule 74).
-        _ = made;
-        Ok(found.file)
     }
 
     pub(crate) fn file(&mut self) -> R<base_db::EditionedFileId> {
@@ -3009,42 +2922,12 @@ impl Dec<'_> {
             NEW => {
                 let loc = self.call_loc()?;
                 let include = includes(&loc);
-                let table = blaze_memo::Id::gid(loc.krate).arena();
                 let call = MacroCallId::new(self.db, loc);
-                if blaze_memo::Id::gid(call).arena() != table {
-                    // alloc: error path
-                    return Err(format!(
-                        "{call:?} is interned in {:?}, not its calling crate's {table:?}, whose \
-                         table its contexts were read into",
-                        blaze_memo::Id::gid(call).arena()
-                    ));
-                }
                 if include {
                     let written = self.file()?;
-                    let found = call.loc(self.db).include_file_id(self.db, call);
-                    if found != Some(written) {
-                        // Both files by their names here: the one the bytes name, and the one
-                        // the call resolves to in this database (or that it resolves to none).
-                        let named = |file: base_db::EditionedFileId| {
-                            let file = file.file_id(self.db);
-                            let source_root = self.db.file_source_root(file).source_root_id(self.db);
-                            let path = self.db.source_root(source_root).source_root_ref(self.db).path_for_file(&file).cloned();
-                            // alloc: error path
-                            match path {
-                                Some(path) => format!("{path} ({file:?})"),
-                                None => format!("{file:?}, which has no path in its source root"),
-                            }
-                        };
-                        let found = match found {
-                            Some(found) => named(found),
-                            // alloc: error path
-                            None => "no file (the path names no file of the snapshot, and none was read from disk)".to_owned(),
-                        };
+                    if call.loc(self.db).include_file_id(self.db, call) != Some(written) {
                         // alloc: error path
-                        return Err(format!(
-                            "an include! of another file than was written: the bytes name {}, and the call resolves to {found}",
-                            named(written)
-                        ));
+                        return Err("an include! of another file than was written".to_owned());
                     }
                 }
                 self.calls.push(call);
@@ -3058,19 +2941,10 @@ impl Dec<'_> {
     fn call_loc(&mut self) -> R<MacroCallLoc> {
         let def = self.def_id()?;
         let krate = self.krate()?;
-        // The loc's contexts are interned in the calling crate's table, as [`Enc::call_loc`]
-        // wrote them of it; [`Dec::call`] checks the call is interned there too.
-        let outer = self.ctx_arena.replace(blaze_memo::Id::gid(krate).arena());
-        let read = self.call_kind().and_then(|kind| Ok((kind, self.context()?)));
-        self.ctx_arena = outer;
-        let (kind, ctxt) = read?;
+        let kind = self.call_kind()?;
+        let ctxt = self.context()?;
         let macro_depth = self.u32()?;
         Ok(MacroCallLoc { def, krate, kind, ctxt, macro_depth })
-    }
-
-    /// The table the contexts being read are interned in ([`Dec::ctx_arena`]'s field).
-    fn ctx_arena(&self) -> blaze_memo::ArenaId {
-        self.ctx_arena.unwrap_or_else(|| blaze_memo::Id::gid(self.krate).arena())
     }
 
     fn call_kind(&mut self) -> R<MacroCallKind> {
@@ -3171,10 +3045,8 @@ impl Dec<'_> {
                         *it = Some(self.context()?);
                     }
                 }
-                let arena = self.ctx_arena();
                 let ctx = SyntaxContext::new(
                     self.db,
-                    arena,
                     outer.into(),
                     transparency,
                     edition,
@@ -3182,22 +3054,13 @@ impl Dec<'_> {
                     other[0],
                     other[1],
                 );
-                self.contexts.push((arena, ctx));
+                self.contexts.push(ctx);
                 Ok(ctx)
             }
             2 => {
                 let index = self.len()?;
-                let arena = self.ctx_arena();
-                match self.contexts.get(index) {
-                    Some(&(table, ctx)) if table == arena => Ok(ctx),
-                    // alloc: error path
-                    Some(&(table, _)) => Err(format!(
-                        "context {index} was read into {table:?}'s table and named again in \
-                         {arena:?}'s"
-                    )),
-                    // alloc: error path
-                    None => Err("a context not read".to_owned()),
-                }
+                // alloc: error path
+                self.contexts.get(index).copied().ok_or_else(|| "a context not read".to_owned())
             }
             // alloc: error path
             it => Err(format!("context tag {it}")),
@@ -4248,44 +4111,28 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         let map = super::super::crate_def_map(&db, krate);
         let name = Name::new_symbol_root(Symbol::intern("string"));
         let Some(ModuleDefId::ModuleId(child)) = map.module(&db, map.root).name_in_scope(&db, &name).take_types() else { panic!("no string module"); };
-        let bytes = pages::encode(&db, krate).unwrap();
-        serve_pages(&mut db, &[(krate, bytes)], Mode::Serve);
-        let krate = crate_named(&db, "kernel");
+        let bytes = encode(&db, krate).unwrap();
+        set(&mut db, [(krate, Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve })].into_iter().collect());
         let served = super::super::crate_def_map(&db, krate);
         let f = Name::new_symbol_root(Symbol::intern("f"));
         assert!(served.module(&db, child).name_in_scope(&db, &f).take_values().is_some());
     }
 
-    /// The names `script`'s encoder gives its own root, its dependency's root and its
-    /// dependency's module file `/dep/inner.rs`, two crates of one source root, with `script`
-    /// at `at`.
-    fn names_with_script_at(at: &str) -> [(u32, String); 3] {
-        let text = format!(
-            "//- {at} crate:script deps:dep\n//- /dep/lib.rs crate:dep\npub mod inner;\n\
-             //- /dep/inner.rs\npub fn f() {{}}\n"
-        );
-        let fixture = fixture::db(&text);
-        let inner = fixture.file_at("/dep/inner.rs").file_id(fixture.db());
-        let db = fixture.into_db();
+    /// The names `script`'s encoder gives its own root and its dependency's, two crates of one
+    /// source root, with `script` at `at`.
+    fn names_with_script_at(at: &str) -> [(u32, String); 2] {
+        let text =
+            format!("//- {at} crate:script deps:dep\n//- /dep.rs crate:dep\npub fn f() {{}}\n");
+        let db = fixture::db(&text).into_db();
         let (script, dep) = (crate_named(&db, "script"), crate_named(&db, "dep"));
         let mut enc = Enc::new(&db, script);
-        let mut name = |file| enc.file_name(file).unwrap();
-        [name(script.data(&db).root_file_id), name(dep.data(&db).root_file_id), name(inner)]
+        [script, dep].map(|it| enc.file_name(it.data(&db).root_file_id).unwrap())
     }
 
-    /// A crate root is named by its mark ([`ROOT`]) and its crate's place in the closure,
-    /// whatever its path (read back, it is its crate's root file id); any other file from the
-    /// crate whose root's directory is the deepest above it: `/dep/inner.rs` is `dep`'s even
-    /// with `script`'s root at `/build.rs`, whose directory is above it too. Moving `script`
-    /// renames none. Roots short-cut the nearest-crate choice, so the module file is what
-    /// tests it.
     #[test]
     fn a_file_is_named_from_the_nearest_crate_of_its_source_root() {
         let names = names_with_script_at("/build.rs");
-        assert_eq!(
-            names,
-            [(0, ROOT.to_owned()), (1, ROOT.to_owned()), (1, "inner.rs".to_owned())]
-        );
+        assert_eq!(names, [(0, "build.rs".to_owned()), (1, "dep.rs".to_owned())]);
         assert_eq!(
             names_with_script_at("/tools/gen/build.rs"),
             names,

@@ -1,11 +1,9 @@
 //! Allocation budgets of what every query reads first and of setting a view
 //! (docs/v2/plan.md, "base-db: inputs and views"): a read allocates
 //! nothing, a view's unchanged file allocates nothing, and a changed file costs a constant.
-//! Each measures the setter alone, inside its edit; the commit after it is not counted.
-
-use std::alloc::Global;
 
 use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
+use blaze_query::db::Durability;
 use span::Edition;
 use triomphe::Arc;
 
@@ -13,33 +11,25 @@ use crate::{
     ContentId, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
     DependencyBuilder, EditionedFileId, Env, FileText, SourceRoot, SourceRootId, TargetKind,
     ViewChange, ViewFile, ViewRoot, relevant_crates,
-    tests::{EditDb, set_graph, test_db},
 };
 
 const FILES: u32 = 64;
 
-/// One local source root of `n` files, each `text` at `/{dir}/f{i}.rs`, committed.
-fn root_of(db: &mut Db, n: u32, dir: &str, text: &str) -> Vec<FileId, Global> {
-    let mut files = Vec::new_in(Global);
-    files.extend((0..n).map(FileId::from_raw));
-    let mut set = FileSet::default();
-    let mut edit = db.edit();
-    for &file in &files {
-        edit.set_file_text(file, text).set_file_source_root(file, SourceRootId(0));
-        set.insert(file, VfsPath::new_virtual_path(format!("/{dir}/f{}.rs", file.index())));
-    }
-    edit.set_source_root(SourceRootId(0), Arc::new(SourceRoot::new_local(set)));
-    _ = edit.commit();
-    files
-}
-
 /// One local source root of [`FILES`] files and a crate rooted at the first.
-fn loaded() -> (Db, Vec<FileId, Global>) {
-    let mut db = test_db();
-    let files = root_of(&mut db, FILES, "budget", "fn f() { 1 }\n");
+fn loaded() -> (Db, Vec<FileId>) {
+    let mut db = Db::for_tests();
+    let files: Vec<FileId> = (0..FILES).map(FileId::from_raw).collect();
+    let mut set = FileSet::default();
+    for &file in &files {
+        db.set_file_text_with_durability(file, "fn f() { 1 }\n", Durability::LOW);
+        db.set_file_source_root_with_durability(file, SourceRootId(0), Durability::MEDIUM);
+        set.insert(file, VfsPath::new_virtual_path(format!("/budget/f{}.rs", file.index())));
+    }
+    let root = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
     let mut graph = CrateGraphBuilder::default();
     lib_root(&mut graph, files[0]);
-    set_graph(&mut db, graph);
+    graph.set_in_db(&mut db);
     (db, files)
 }
 
@@ -71,18 +61,11 @@ fn lib_root(graph: &mut CrateGraphBuilder, root: FileId) -> CrateBuilderId {
 fn a_keystroke_allocates_only_its_text_and_slot() {
     let (mut db, files) = loaded();
     for _ in 0..4 {
-        for text in ["fn f() { 2 }\n", "fn f() { 1 }\n"] {
-            db.commit_with(|edit| {
-                edit.set_file_text(files[1], text);
-            });
-        }
+        db.set_file_text(files[1], "fn f() { 2 }\n");
+        db.set_file_text(files[1], "fn f() { 1 }\n");
     }
     let content = db.source_root(SourceRootId(0)).content(&db);
-    let mut edit = db.edit();
-    let ((), used) = blaze_alloc_count::measure(|| {
-        edit.set_file_text(files[1], "fn f() { 2 }\n");
-    });
-    _ = edit.commit();
+    let ((), used) = blaze_alloc_count::measure(|| db.set_file_text(files[1], "fn f() { 2 }\n"));
     // The file's text and its reparse slot; the setter's batches are in its frame.
     assert!(used.allocations <= 2, "a keystroke in a root of {FILES} files: {used:?}");
     assert_ne!(db.source_root(SourceRootId(0)).content(&db), content);
@@ -96,32 +79,34 @@ fn crate_deps_are_memo_hits() {
     let a = lib_root(&mut graph, files[0]);
     let c = lib_root(&mut graph, files[2]);
     graph.add_dep(a, DependencyBuilder::new(CrateName::new("c").unwrap(), c)).unwrap();
-    let keys = set_graph(&mut db, graph);
-    let (a, c) = (db.krate(keys[&a]), db.krate(keys[&c]));
+    let ids = graph.set_in_db(&mut db);
+    let (a, c) = (ids[&a], ids[&c]);
     assert_eq!(a.transitive_deps(&db), &[a, c]);
-    // The reverse walk is not a query (a crate's arena reads no dependent): it writes the
-    // caller's buffer, warm after the first call.
-    let mut dependents = Vec::new_in(Global);
-    c.transitive_rev_deps(&db, &mut dependents);
-    assert_eq!(dependents, [c, a]);
+    assert_eq!(c.transitive_rev_deps(&db), &[c, a]);
     let (_, used) = blaze_alloc_count::measure(|| {
-        c.transitive_rev_deps(&db, &mut dependents);
-        a.transitive_deps(&db).len() + dependents.len()
+        a.transitive_deps(&db).len() + c.transitive_rev_deps(&db).len()
     });
     assert_eq!(used.allocations, 0, "crate deps, warm: {used:?}");
-    assert_eq!(dependents, [c, a], "the warm walk's answer");
 }
 
-/// Setting a graph equal to the one set allocates the call's own tables and nothing per
-/// crate: no crate's data is built and none is hashed.
+/// Setting a graph equal to the one set allocates the call's maps and nothing per crate: no
+/// crate's data is built and none is hashed.
 #[test]
 fn an_unchanged_crate_graph_allocates_a_constant() {
-    // The walk's tables (its ids, its done list, its order, its root files, its map) and the
-    // set of the crates it walked, each at the graph's size.
-    const PER_CALL: u64 = 8;
+    // `set_in_db`'s returned map, the crate list's two tables and the root files' set, each at
+    // the graph's size.
+    const PER_CALL: u64 = 4;
     let cost = |n: u32| {
-        let mut db = test_db();
-        let files = root_of(&mut db, n, "graph", "fn f() {}\n");
+        let mut db = Db::for_tests();
+        let files: Vec<FileId> = (0..n).map(FileId::from_raw).collect();
+        let mut set = FileSet::default();
+        for &file in &files {
+            db.set_file_text_with_durability(file, "fn f() {}\n", Durability::LOW);
+            db.set_file_source_root_with_durability(file, SourceRootId(0), Durability::MEDIUM);
+            set.insert(file, VfsPath::new_virtual_path(format!("/graph/c{}/lib.rs", file.index())));
+        }
+        let root = Arc::new(SourceRoot::new_local(set));
+        db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
         // Each crate depends on the one before it.
         let graph = || {
             let mut graph = CrateGraphBuilder::default();
@@ -136,16 +121,11 @@ fn an_unchanged_crate_graph_allocates_a_constant() {
             }
             graph
         };
-        set_graph(&mut db, graph());
-        set_graph(&mut db, graph());
+        graph().set_in_db(&mut db);
+        graph().set_in_db(&mut db);
         let equal = graph();
-        let mut edit = db.edit();
-        let ((), used) = blaze_alloc_count::measure(|| {
-            edit.set_crate_graph(equal);
-        });
-        let committed = edit.commit();
-        assert_eq!(committed.crates.len(), n as usize);
-        assert!(committed.dropped.is_empty(), "an equal graph dropped {:?}", committed.dropped);
+        let (ids, used) = blaze_alloc_count::measure(|| equal.set_in_db(&mut db));
+        assert_eq!(ids.len(), n as usize);
         used.allocations
     };
     let few = cost(8);
@@ -183,45 +163,44 @@ fn reads_allocate_nothing() {
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
 fn checkout() -> (Db, AbsPathBuf, FileSetConfig) {
-    let mut db = test_db();
+    let mut db = Db::for_tests();
     // A view is held in memory and its base is never read from disk: a path that is not there.
     let base =
         AbsPathBuf::assert_utf8(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("blaze-base-db-budgets"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
-    db.commit_with(|edit| {
-        for root in [0, 1] {
-            edit.set_source_root(SourceRootId(root), Arc::new(SourceRoot::new_local(FileSet::default())));
-        }
-    });
+    for root in [0, 1] {
+        let empty = Arc::new(SourceRoot::new_local(FileSet::default()));
+        db.set_source_root_with_durability(SourceRootId(root), empty, Durability::MEDIUM);
+    }
     (db, base, partition.build())
 }
 
 /// `n` files under `src/`, the first `edited` of them with another body than the rest have,
 /// each in an allocation of its own as blaze-vfs holds a heap file.
-fn texts(n: usize, edited: usize) -> Vec<(String, blaze_vfs::Bytes), Global> {
-    let mut texts = Vec::with_capacity_in(n, Global);
-    texts.extend((0..n).map(|at| {
-        let body = if at < edited { 2 } else { 1 };
-        let text = format!("fn f{at}() {{ {body} }}\n");
-        let bytes = std::sync::Arc::<[u8]>::from(text.as_bytes());
-        (format!("src/m{at}.rs"), blaze_vfs::Bytes::from(bytes))
-    }));
-    texts
+fn texts(n: usize, edited: usize) -> Vec<(String, blaze_vfs::Bytes)> {
+    (0..n)
+        .map(|at| {
+            let body = if at < edited { 2 } else { 1 };
+            let text = format!("fn f{at}() {{ {body} }}\n");
+            let bytes = std::sync::Arc::<[u8]>::from(text.as_bytes());
+            (format!("src/m{at}.rs"), blaze_vfs::Bytes::from(bytes))
+        })
+        .collect()
 }
 
-fn view_files(files: &[(String, blaze_vfs::Bytes)]) -> Vec<ViewFile<'_>, Global> {
-    let mut views = Vec::with_capacity_in(files.len(), Global);
-    views.extend(files.iter().map(|(path, bytes)| ViewFile {
-        path: path.as_str(),
-        id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
-        bytes,
-    }));
-    views
+fn view_files(files: &[(String, blaze_vfs::Bytes)]) -> Vec<ViewFile<'_>> {
+    files
+        .iter()
+        .map(|(path, bytes)| ViewFile {
+            path: path.as_str(),
+            id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
+            bytes,
+        })
+        .collect()
 }
 
-/// Sets the view and counts what that alone allocated (the view's list is made before, the
-/// commit after), and commits.
+/// Sets the view and counts what that alone allocated: the view's list is made before.
 fn set_view(
     db: &mut Db,
     base: &AbsPathBuf,
@@ -229,13 +208,10 @@ fn set_view(
     partition: &FileSetConfig,
     files: &[ViewFile<'_>],
 ) -> (ViewChange, blaze_alloc_count::Used) {
-    let mut edit = db.edit();
-    let measured = blaze_alloc_count::measure(|| {
-        edit.set_view_root(ViewRoot { base, built, partition, other: SourceRootId(1), files })
+    blaze_alloc_count::measure(|| {
+        db.set_view_root(ViewRoot { base, built, partition, other: SourceRootId(1), files })
             .expect("a view of good paths and matching IDs")
-    });
-    _ = edit.commit();
-    measured
+    })
 }
 
 #[test]

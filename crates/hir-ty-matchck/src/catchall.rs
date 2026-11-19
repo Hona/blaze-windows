@@ -12,10 +12,7 @@
 //! Used by `blaze::wildcard_arm`, which lists the variants in place of the catch-all; nothing
 //! in compilation reads it.
 
-use std::alloc::Global;
-
 use base_db::Db;
-use blaze_memo::Database as _;
 use hir_def::{
     AdtId, DefWithBodyId, EnumId, EnumVariantId, HasModule,
     expr_store::Body,
@@ -45,8 +42,8 @@ use crate::{
 const DEPTH: u32 = 64;
 
 /// One catch-all of a `match` arm whose place is an enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CatchAll<'db> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CatchAll {
     pub match_expr: ExprId,
     /// The pattern of the arm the catch-all is in.
     pub arm_pat: PatId,
@@ -58,14 +55,14 @@ pub struct CatchAll<'db> {
     pub enum_: EnumId,
     /// The variants of `enum_` the catch-all stands for, in declaration order; empty when the
     /// arms above cover every value it can match.
-    pub variants: &'db [EnumVariantId],
+    pub variants: Box<[EnumVariantId]>,
 }
 
 /// The catch-alls of a body's `match`es, desugared ones (`for`, `?`) included, in the order
 /// the body's expressions and each arm's patterns are walked.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct CatchAlls<'db> {
-    pub arms: &'db [CatchAll<'db>],
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+pub struct CatchAlls {
+    pub arms: Box<[CatchAll]>,
     /// A `match` of the body was left out: a pattern that does not lower, or an analysis that
     /// stopped (an error rustc reports, or the complexity limit).
     pub incomplete: bool,
@@ -95,7 +92,7 @@ pub(crate) fn catch_alls<'db>(
     db: &'db Db,
     def: DefWithBodyId,
     infer: &'db InferenceResult<'db>,
-) -> CatchAlls<'db> {
+) -> CatchAlls {
     let body = Body::of(db, def);
     // alloc: the catch-alls of one body, a lint's query only
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -143,7 +140,8 @@ pub(crate) fn catch_alls<'db>(
     };
     let lower = Lowerer::new(&cx, &body, infer, def);
 
-    let mut found: Vec<CatchAll<'db>> = Vec::new_in(Global);
+    // alloc: the answer
+    let mut found: Vec<CatchAll> = Vec::new();
     let mut incomplete = false;
     let mut at = 0;
     while at < candidates.len() {
@@ -160,7 +158,7 @@ pub(crate) fn catch_alls<'db>(
             None => incomplete = true,
         }
     }
-    CatchAlls { arms: blaze_memo::keep_slice(db.memo(), &found), incomplete }
+    CatchAlls { arms: found.into_boxed_slice(), incomplete }
 }
 
 /// The catch-alls of one `match`, `group` all of it; `None` when the match can't be analyzed.
@@ -171,7 +169,7 @@ fn check_match<'a, 'db>(
     infer: &'db InferenceResult<'db>,
     group: &[Candidate],
     arms: &[MatchArm],
-    found: &mut Vec<CatchAll<'db>>,
+    found: &mut Vec<CatchAll>,
 ) -> Option<()> {
     let first = group.first()?;
     lower.scope.set(first.match_expr);
@@ -214,10 +212,8 @@ fn check_match<'a, 'db>(
         }
         covered.sort_unstable();
         covered.dedup();
-        let variants = blaze_memo::keep_iter(
-            cx.db.memo(),
-            covered.into_iter().map(|idx| VariantIdx(idx).id(cx.db, candidate.enum_)),
-        );
+        let variants =
+            covered.into_iter().map(|idx| VariantIdx(idx).id(cx.db, candidate.enum_)).collect(); // alloc: the answer's variants
         found.push(CatchAll {
             match_expr: candidate.match_expr,
             arm_pat: arms[i].pat,

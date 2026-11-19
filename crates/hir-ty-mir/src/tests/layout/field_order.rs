@@ -9,8 +9,7 @@ use hir_def::{
     AdtId, HasModule, ModuleDefId, VariantId,
     signatures::{EnumSignature, FunctionSignature, StructSignature, TypeAliasSignature},
 };
-use hir_expand::{fixture, name::Name};
-use span::FileId;
+use hir_expand::{EditionedFileId, fixture, name::Name};
 use rustc_type_ir::inherent::GenericArgs as _;
 
 use crate::{
@@ -30,9 +29,7 @@ use super::current_machine_data_layout;
 
 struct Fx {
     db: TestDB,
-    /// The fixture's files by id, which a commit keeps (an interned `EditionedFileId` is of
-    /// the snapshot it was taken in).
-    files: Vec<FileId, Global>,
+    files: Vec<EditionedFileId>,
 }
 
 fn fx(#[rust_analyzer::rust_fixture] source: &str, minicore: &str) -> Fx {
@@ -42,27 +39,7 @@ fn fx(#[rust_analyzer::rust_fixture] source: &str, minicore: &str) -> Fx {
         format!("//- target_data_layout: {layout}\n{minicore}//- /main.rs crate:test\n{source}");
     let fx = fixture::db(&fixture);
     let files = fx.files().to_vec();
-    let db = fx.into_db();
-    let files = files.iter().map(|it| it.file_id(&db)).collect();
-    Fx { db, files }
-}
-
-/// Installs `plan` in the session arena from the next commit on, as the driver gives it (the
-/// pattern of blaze-item-hash's `the_field_order_fact_changes_with_the_plan_and_only_then`).
-fn install(db: &mut TestDB, plan: Option<Arc<FieldOrderPlan>>) {
-    let mut edit = db.edit();
-    edit.set_given(
-        None,
-        field_order::plan_fact(plan.as_deref()),
-        // clone: the plan's `Arc`, once per making of the session arena
-        Box::new_in(
-            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
-                field_order::install(builder, plan.clone());
-            },
-            Global,
-        ),
-    );
-    _ = edit.commit();
+    Fx { db: fx.into_db(), files }
 }
 
 impl Fx {
@@ -71,7 +48,7 @@ impl Fx {
         self.files
             .iter()
             .flat_map(|file| {
-                let module = db.module_for_file(*file);
+                let module = db.module_for_file(file.file_id(db));
                 let def_map = module.def_map(db);
                 def_map.module(db, module).scope(db).declarations().collect::<Vec<_>>()
             })
@@ -113,27 +90,23 @@ impl Fx {
             .unwrap_or_else(|| panic!("no fn `{name}`"))
     }
 
-    /// Installs the plan that ranks, for each named ADT, its fields `hot` (per variant) first,
-    /// each named by its stable key (`blaze_items::field_order::adt_key`), as a decoded plan
-    /// file names it: the plan holds across the commit that installs it, where an `AdtId` dies.
+    /// Installs the plan that ranks, for each named ADT, its fields `hot` (per variant) first.
     fn plan(&mut self, ranks: &[(&str, &[&[&str]])]) {
-        let mut by_key = HashMap::new_in(Global);
+        let mut by_adt = HashMap::new_in(Global);
         for &(adt, hot) in ranks {
             let variants = hot
                 .iter()
                 .map(|it| it.iter().map(|&name| Name::new_root(name)).collect::<Box<[Name]>>());
-            let key = blaze_items::field_order::adt_key(&self.db, self.adt(adt));
-            by_key.insert(key, AdtPlan { variants: variants.collect() });
+            by_adt.insert(self.adt(adt), AdtPlan { variants: variants.collect() });
         }
         let id = ContentId::of("test field order", format!("{ranks:?}").as_bytes());
-        let plan = FieldOrderPlan::new(id, blaze_items::field_order::adt_key, by_key);
-        install(&mut self.db, Some(Arc::new(plan)));
+        field_order::install(&mut self.db, Some(Arc::new(FieldOrderPlan::new(id, by_adt))));
     }
 
     /// The layout of the struct, enum or type alias `name`.
     fn layout(&self, name: &str) -> Layout {
         let db = &self.db;
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let interner = DbInterner::new_no_crate(db);
             let (ty, def, krate) = match self.declarations().into_iter().find_map(|it| match it {
                 ModuleDefId::TypeAliasId(t)
@@ -172,7 +145,7 @@ impl Fx {
     fn stdout(&self) -> String {
         let db = &self.db;
         let main = self.function("main");
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let env = ParamEnvAndCrate {
                 param_env: db.trait_environment(main.into()),
                 krate: main.krate(db),
@@ -203,7 +176,7 @@ struct Goal {
 fn without_a_plan_the_layout_is_rustcs() {
     let fresh = fx(HOT_LAST, "").layout("Goal");
     let mut none = fx(HOT_LAST, "");
-    install(&mut none.db, None);
+    field_order::install(&mut none.db, None);
     assert_eq!(none.layout("Goal"), fresh);
     // A plan that ranks only other types leaves this one alone.
     let other = format!("{HOT_LAST}\nstruct Other {{ x: [u64; 9], y: u8 }}");
@@ -303,7 +276,7 @@ fn once(g: &Goal) -> u64 {{
     // `CannotIndexInto` and its MIR does not build.
     let f = fx(&source, "//- minicore: slice, index\n");
     let db = &f.db;
-    let ranked = blaze_memo::attach(db, || {
+    let ranked = blaze_query::db::attach(db, || {
         let mut heat = Heat::new();
         heat.add_body(db, f.function("sum").into(), 1_000_000);
         heat.add_body(db, f.function("once").into(), 1_000);

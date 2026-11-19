@@ -1168,8 +1168,7 @@ impl<'db> Check<'_, '_, 'db> {
         if let Some(it) = self.call.nested {
             return it;
         }
-        let arena = crate::cx::context_arena(file);
-        let it = self.ctxt(file, node).outer_expn(self.cx.db, arena).is_some_and(|call| {
+        let it = self.ctxt(file, node).outer_expn(self.cx.db).is_some_and(|call| {
             let call = hir_expand::MacroCallId::from(call).loc(self.cx.db).to_node_view(self.cx.db);
             super::from_expansion(self.cx, call)
         });

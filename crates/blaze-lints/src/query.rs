@@ -4,9 +4,6 @@
 //! that moves a body without changing it backdates its value, and the driver
 //! ([`crate::check`]) moves and names what it found.
 //!
-//! A value owns nothing to drop (it is freed with its arena, [`crate::kept`]), but for
-//! [`Lints`], a tree of diagnostics, whose queries are `owns`.
-//!
 //! [`body_syntax`]: hir_def::expr_store::body::body_syntax
 
 #[cfg(test)]
@@ -19,7 +16,6 @@ use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, ImplId, ItemContainerId, Lookup as _, ModuleDefId,
     nameres::crate_def_map, visibility::Visibility,
 };
-use intern::Interned;
 use std::alloc::Global;
 use syntax::{TextRange, TextSize};
 
@@ -28,40 +24,20 @@ use crate::{
     conf::Conf,
     diag::Diag,
     famous::{self, Famous},
-    kept,
     lints, profile,
 };
 
 /// The lints a query runs, which may be above `allow` where it looks, and the configuration
-/// they read: a key of the lint queries, homed in the session's arena (it names no crate).
-/// The configuration is interned for the process ([`Interned`]): a key owns nothing to drop,
-/// and a workspace has a few configurations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+/// they read.
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct LintSet {
-    #[home(skip)]
-    on: lints::On,
-    #[home(skip)]
-    conf: Interned<Conf>,
+    #[returns(copy)]
+    pub(crate) on: lints::On,
+    #[returns(ref)]
+    pub(crate) conf: Conf,
 }
 
-impl LintSet {
-    pub(crate) fn new(_db: &Db, on: lints::On, conf: Conf) -> LintSet {
-        LintSet { on, conf: Interned::new(conf) }
-    }
-
-    pub(crate) fn on(self, _db: &Db) -> lints::On {
-        self.on
-    }
-
-    pub(crate) fn conf(&self, _db: &Db) -> &Conf {
-        &self.conf
-    }
-}
-
-intern::impl_internable!(Conf, profile::Loaded);
-
-/// What one query found: a tree of diagnostics, so its queries are `owns` (its destructor
-/// runs when its arena is dropped).
+/// What one query found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Lints {
     pub(crate) findings: Vec<Finding>,
@@ -125,16 +101,16 @@ pub(crate) struct Expect {
 
 /// The lints of `set` over the body of `def`, from the tree of its anchor, or of the macro
 /// expansion that writes it. Typed lints infer the body the first time they ask.
-#[blaze_memo::tracked(returns(ref), owns)]
-pub(crate) fn body_lints<'db>(db: &'db Db, def: DefWithBodyId, set: LintSet) -> BodyLints {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn body_lints(db: &Db, def: DefWithBodyId, set: LintSet) -> BodyLints {
     check::lint_body(db, def, set.on(db), set.conf(db))
 }
 
 /// The lints of `set` over what of `file` is in no body, as `krate` reads it: its items and
 /// what attribute macros and macro calls make of them. A body is never walked into.
-#[blaze_memo::tracked(returns(ref), owns)]
-pub(crate) fn item_lints<'db>(
-    db: &'db Db,
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn item_lints(
+    db: &Db,
     file: EditionedFileId,
     krate: base_db::Crate,
     set: LintSet,
@@ -152,16 +128,16 @@ pub(crate) struct Named {
 }
 
 /// The lint names a file's text writes, with every lint they name.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileNames<'db> {
-    pub(crate) names: &'db [Named],
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FileNames {
+    pub(crate) names: Box<[Named]>,
     /// The union of the names' lints.
     pub(crate) on: lints::On,
 }
 
 /// The lint names `file` writes: one scan of its text, again only when the text changes.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn lint_names<'db>(db: &'db Db, file: EditionedFileId) -> FileNames<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn lint_names(db: &Db, file: EditionedFileId) -> FileNames {
     check::names_of(db, file)
 }
 
@@ -186,66 +162,53 @@ pub(crate) struct BodyAt {
 
 /// What the driver walks of a crate: the files of its modules, each once, in the order of its
 /// modules, and its bodies in the order they are linted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Plan<'db> {
-    pub(crate) files: &'db [ModuleFile],
-    pub(crate) bodies: &'db [BodyAt],
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub(crate) files: Box<[ModuleFile]>,
+    pub(crate) bodies: Box<[BodyAt]>,
 }
 
 /// The [`Plan`] of `krate`: from its def map, the bodies' blocks and their anchors, so a run
 /// with nothing changed is one hit here, not several per body.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn lint_plan<'db>(db: &'db Db, krate: base_db::Crate) -> Plan<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn lint_plan(db: &Db, krate: base_db::Crate) -> Plan {
     check::plan_of(db, krate)
 }
 
 /// The profile a crate's profile lints read ([`crate::profile`]), keyed by its settings and
-/// its content ID: interned for the process ([`Interned`]), as a key owns nothing to drop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+/// its content ID.
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct ProfileKey {
-    #[home(skip)]
-    loaded: Interned<profile::Loaded>,
-}
-
-impl ProfileKey {
-    pub(crate) fn new(_db: &Db, loaded: profile::Loaded) -> ProfileKey {
-        ProfileKey { loaded: Interned::new(loaded) }
-    }
-
-    pub(crate) fn loaded(&self, _db: &Db) -> &profile::Loaded {
-        &self.loaded
-    }
+    #[returns(ref)]
+    pub(crate) loaded: profile::Loaded,
 }
 
 /// The functions of `krate` as `key`'s profile has them: once per crate, edit and profile, so
 /// each body's lints look a function up in a map.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn profile_hits<'db>(
-    db: &'db Db,
-    krate: base_db::Crate,
-    key: ProfileKey,
-) -> profile::Hits<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn profile_hits(db: &Db, krate: base_db::Crate, key: ProfileKey) -> profile::Hits {
     profile::hits_of(db, krate, key.loaded(db))
 }
 
 /// What `krate` resolves each path of [`famous::KNOWN`] to, by index: once per crate, so a
 /// lint's lookup is a hash of its path and one load, not a walk of `std`'s scopes.
-#[blaze_memo::tracked(returns(copy))]
-pub(crate) fn famous_defs<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [Option<hir::ModuleDef>] {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn famous_defs(db: &Db, krate: base_db::Crate) -> Box<[Option<hir::ModuleDef>]> {
     let famous = Famous::new(db, hir::Crate::from(krate));
-    kept::slice(db, famous::KNOWN.iter().map(|path| famous.find(path)))
+    // alloc: the query's value, once per crate
+    famous::KNOWN.iter().map(|path| famous.find(path)).collect()
 }
 
 /// What of a crate another crate can name: rustc's `effective_visibilities.is_exported`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Exported<'db> {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Exported {
     /// The definitions named by a public path from the crate's root, through public modules,
     /// enums and traits and `pub use`s; impls and their items are read off their self type and
     /// trait ([`Exported::has_impl`]).
-    defs: kept::Set<'db, ModuleDefId>,
+    defs: HashSet<ModuleDefId, Global>,
 }
 
-impl Exported<'_> {
+impl Exported {
     /// Whether another crate can name `def`, a definition of the crate.
     pub(crate) fn has(&self, db: &Db, def: ModuleDefId) -> bool {
         if self.defs.contains(&def) {
@@ -288,12 +251,11 @@ fn is_of(db: &Db, def: ModuleDefId, krate: base_db::Crate) -> bool {
 /// What of `krate` another crate can name: resolve's pass of rustc's effective visibilities at
 /// the `Reexported` level, from the crate's root over each name public in a scope another crate
 /// can name. It reads the crate's def map and no body, so an edit inside a body keeps it.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn exported<'db>(db: &'db Db, krate: base_db::Crate) -> Exported<'db> {
-    // alloc: the defs found, on the global heap until they are kept, once per crate
-    let mut defs: HashSet<ModuleDefId, Global> = HashSet::new_in(Global);
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn exported(db: &Db, krate: base_db::Crate) -> Exported {
+    let mut exported = Exported::default();
     let root = crate_def_map(db, krate).root_module_id();
-    defs.insert(ModuleDefId::ModuleId(root));
+    exported.defs.insert(ModuleDefId::ModuleId(root));
     // alloc: the query's value and its worklist, once per crate
     let mut modules = vec![root];
     while let Some(module) = modules.pop() {
@@ -305,7 +267,7 @@ pub(crate) fn exported<'db>(db: &'db Db, krate: base_db::Crate) -> Exported<'db>
             for (def, vis) in [types, values, macros].into_iter().flatten() {
                 if !matches!(vis, Visibility::Public)
                     || !is_of(db, def, krate)
-                    || !defs.insert(def)
+                    || !exported.defs.insert(def)
                 {
                     continue;
                 }
@@ -313,12 +275,12 @@ pub(crate) fn exported<'db>(db: &'db Db, krate: base_db::Crate) -> Exported<'db>
                     ModuleDefId::ModuleId(it) => modules.push(it),
                     ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                         for &(variant, _) in it.enum_variants(db).variants.values() {
-                            defs.insert(ModuleDefId::EnumVariantId(variant));
+                            exported.defs.insert(ModuleDefId::EnumVariantId(variant));
                         }
                     }
                     ModuleDefId::TraitId(it) => {
                         for &(_, item) in &it.trait_items(db).items {
-                            defs.insert(match item {
+                            exported.defs.insert(match item {
                                 AssocItemId::FunctionId(it) => it.into(),
                                 AssocItemId::ConstId(it) => it.into(),
                                 AssocItemId::TypeAliasId(it) => it.into(),
@@ -330,5 +292,5 @@ pub(crate) fn exported<'db>(db: &'db Db, krate: base_db::Crate) -> Exported<'db>
             }
         }
     }
-    Exported { defs: kept::Set::keep_set(db, defs) }
+    exported
 }

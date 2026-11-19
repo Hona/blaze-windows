@@ -120,9 +120,6 @@ fn resolve(
     mut hygiene: SyntaxContext,
 ) -> Option<InFile<TextRange>> {
     let (mut file, mut child) = (labeled.file_id, labeled.value);
-    // `hygiene` is of `labeled`'s file: every file the walk goes up through is of the same
-    // crate, so of the same table (or a file's own text, whose contexts are roots).
-    let arena = crate::cx::context_arena(labeled.file_id);
     let mut key: Option<SyntaxContext> = None;
     loop {
         let Some(parent) = child.parent() else {
@@ -134,7 +131,7 @@ fn resolve(
             return None;
         }
         if parent.kind() == SyntaxKind::STMT_LIST
-            && macro_definitions(cx, file, parent, child, &mut hygiene, arena)
+            && macro_definitions(cx, file, parent, child, &mut hygiene)
         {
             key = None;
         }
@@ -143,9 +140,8 @@ fn resolve(
             && lifetime.text() == name
         {
             let range = lifetime.syntax().text_range();
-            let key = *key.get_or_insert_with(|| hygiene.normalize_to_macro_rules(cx.db, arena));
-            let here = ctxt(cx, file, range);
-            if here.normalize_to_macro_rules(cx.db, crate::cx::context_arena(file)) == key {
+            let key = *key.get_or_insert_with(|| hygiene.normalize_to_macro_rules(cx.db));
+            if ctxt(cx, file, range).normalize_to_macro_rules(cx.db) == key {
                 return Some(InFile::new(file, range));
             }
         }
@@ -213,11 +209,10 @@ fn macro_definitions(
     list: ast::Node<'_>,
     child: ast::Node<'_>,
     hygiene: &mut SyntaxContext,
-    arena: blaze_memo::ArenaId,
 ) -> bool {
     let mut bound = child.text_range().start();
     let mut removed = false;
-    while let Some(call) = hygiene.outer_expn(cx.db, arena) {
+    while let Some(call) = hygiene.outer_expn(cx.db) {
         let Some(ast_id) = hir_expand::MacroCallId::from(call).loc(cx.db).def.ast_id().left()
         else {
             break;
@@ -235,7 +230,7 @@ fn macro_definitions(
         if !defined_here {
             break;
         }
-        hygiene.remove_mark(cx.db, arena);
+        hygiene.remove_mark(cx.db);
         removed = true;
         bound = start;
     }

@@ -21,9 +21,7 @@ use hir_ty::facts::proofs_at;
 use hir_ty::facts::Tier;
 use hir_ty_mir::mir::{MirOptLevel, MirOptions, devirt::DevirtWorld};
 
-/// Settings and a content id only: it names no arena (a query key it is part of is homed by
-/// its other arguments).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Build {
     /// `-C debug-assertions` of the compiling crate (`Recorder::debug_assertions`).
     pub(crate) debug_assertions: bool,

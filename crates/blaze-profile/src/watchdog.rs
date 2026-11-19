@@ -37,8 +37,7 @@ pub struct Progress {
     /// spans close on and on while a build stands still, as they did through the poolborrow
     /// stall's ten minutes (2026-11-02).
     pub jobs: u64,
-    /// Query work ended (`blaze_memo::completed`; until the port to the session memo,
-    /// `blaze_query::db::completed`, which this describes): queries brought up to date under their
+    /// Query work ended (`blaze_query::db::completed`): queries brought up to date under their
     /// flight, run or verified; rows the claim-free verification marked current; and items of
     /// a loop over the pool (`run_all`, `par_for_each`) that ran to their end. The last two
     /// are what a daemon does after a restart, every worker inside one loop's items proving
@@ -202,7 +201,6 @@ fn threads(f: &mut fmt::Formatter<'_>, threads: &[ThreadNow]) -> fmt::Result {
             unit: span.unit.as_deref(),
             awaits: span.awaits.as_deref(),
             owner: span.owner,
-            fields: span.fields.as_deref(),
             for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
         });
         thread_said(f, &thread.name, thread.tid, spans)?;
@@ -223,15 +221,10 @@ pub fn open_span(f: &mut impl fmt::Write, span: &OpenSpan) -> fmt::Result {
         unit: span.unit.as_deref(),
         awaits: span.awaits.as_deref(),
         owner: span.owner,
-        fields: span.fields.as_deref(),
         for_ns: i64::try_from(span.for_ns).unwrap_or(i64::MAX),
     };
     write!(f, "{said}")
 }
-
-/// The most of a span's [`SpanSaid::fields`] a line says: enough for a loop piece's `piece` and
-/// `completion`, so one span's long text does not drown the rest of a stuck line.
-pub const FIELDS_SAID_MAX: usize = 160;
 
 /// An open span as it is said ([`open_span`]), from a live thread or from a history's
 /// reading of a daemon that died (`slow::thread_line`): one form for both.
@@ -243,9 +236,6 @@ pub struct SpanSaid<'a> {
     pub unit: Option<&'a str>,
     pub awaits: Option<&'a str>,
     pub owner: Option<u64>,
-    /// Its fields that fill no column, as `name=value` text (the loop's `piece` and
-    /// `completion`): said in brackets, cut at [`FIELDS_SAID_MAX`] bytes.
-    pub fields: Option<&'a str>,
     pub for_ns: i64,
 }
 
@@ -266,14 +256,6 @@ impl fmt::Display for SpanSaid<'_> {
         }
         if let Some(owner) = self.owner {
             write!(f, ", run by task {owner}")?;
-        }
-        if let Some(fields) = self.fields {
-            if fields.len() <= FIELDS_SAID_MAX {
-                write!(f, " [{fields}]")?;
-            } else {
-                let cut = fields.floor_char_boundary(FIELDS_SAID_MAX);
-                write!(f, " [{}...]", &fields[..cut])?;
-            }
         }
         write!(f, " ({:.1} s)", self.for_ns as f64 / 1e9)
     }
@@ -537,7 +519,7 @@ mod tests {
         items: u64,
     }
 
-    /// The daemon's completed count (`blaze_memo::completed`) of `did`, as it counts.
+    /// `blaze_query::db::completed` of `did`, as it counts.
     fn completed(did: Did) -> u64 {
         did.flown + did.marked + did.items
     }

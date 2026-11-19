@@ -11,7 +11,7 @@ use hir_def::{
     },
 };
 
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn declaring_modules(db: &Db, krate: Crate) -> Box<[ModuleId]> {
     // alloc: the memo's result, shared by the native library, kept symbol and assembly queries
     let mut modules: Vec<_> = crate_def_map(db, krate).modules(db).map(|(id, _)| id).collect();

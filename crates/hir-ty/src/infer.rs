@@ -227,6 +227,7 @@ pub(crate) fn infer_body_in<'db>(
 
 fn infer_cycle_result<'db>(
     db: &'db Db,
+    _: blaze_query::db::Id,
     _: DefWithBodyId,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -281,6 +282,7 @@ fn infer_anon_const_query<'db>(db: &'db Db, def: AnonConstId<'db>) -> InferenceR
 
 fn infer_anon_const_cycle_result<'db>(
     db: &'db Db,
+    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -1297,7 +1299,7 @@ pub enum PatAdjust {
 /// When you add a field that stores types (including `Substitution` and the like), don't forget
 /// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
 /// not appear in the final inference result.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, blaze_query::Value)]
 pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
     pub(crate) method_resolutions: IndexColumn<ExprId, (FunctionId, StoredGenericArgs)>,
@@ -2141,9 +2143,22 @@ impl PartialOrd for UpvarCapture {
     }
 }
 
-/// The inference of a body.
-#[blaze_memo::tracked(returns(ref), cycle_result = infer_cycle_result, owns, mem_tag = Infer)]
-pub fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
+/// What an inference result weighs for the byte budget of [`infer_body_query`] and
+/// [`infer_anon_const_body_query`]: [`InferenceResult::heap_bytes`].
+fn inference_bytes(value: &InferenceResult<'_>) -> usize {
+    value.heap_bytes()
+}
+
+/// The inference of a body. Free functions rather than methods of a tracked impl, so that
+/// [`crate::evict`] can name them to drop their values.
+#[blaze_query::tracked(
+    returns(ref),
+    cycle_result = infer_cycle_result,
+    lru,
+    weigh = inference_bytes,
+    mem_tag = Infer
+)]
+pub(crate) fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
     if let Some(served) = crate::check_cache::served_inference(db, def) {
         return served;
     }
@@ -2155,7 +2170,13 @@ pub fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult
 /// Returns an `InferenceResult` containing type information for array lengths,
 /// const generic arguments, and other const expressions appearing in type
 /// positions within the item's signature.
-#[blaze_memo::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result, owns, mem_tag = Infer)]
+#[blaze_query::tracked(
+    returns(ref),
+    cycle_result = infer_anon_const_cycle_result,
+    lru,
+    weigh = inference_bytes,
+    mem_tag = Infer
+)]
 pub(crate) fn infer_anon_const_body_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
@@ -2664,9 +2685,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         lowering_mode: LoweringMode,
         frame: &'f Frame,
     ) -> Self {
-        // The owner's where clauses, or none for an anonymous constant that may not name its
-        // generic parameters (`InferBodyId::param_env` says why).
-        let trait_env = owner.param_env(db);
+        let trait_env = db.trait_environment(generic_def);
         let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
         let types = crate::next_solver::default_types();
         let target_features = match store_owner {
@@ -3758,7 +3777,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     if let Some(segment) = segments.first()
                         && let Some(variant) = EnumVariants::variant_written(
                             self.db,
-                            self.resolver.ctx_table(),
                             id,
                             segment.name,
                             path.segment_hygiene(written - segments.len()).syntax_context(),
@@ -3984,13 +4002,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         let at = path.segments().len() - remaining_segments.len();
                         let ctxt = path.segment_hygiene(at).syntax_context();
                         if let Some(variant) =
-                            EnumVariants::variant_written(
-                                self.db,
-                                self.resolver.ctx_table(),
-                                id,
-                                current_segment.name,
-                                ctxt,
-                            )
+                            EnumVariants::variant_written(self.db, id, current_segment.name, ctxt)
                         {
                             return if remaining_segments.len() == 1 {
                                 let segment = path.segments().len() - 1;
@@ -4079,13 +4091,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     let ctxt = path.segment_hygiene(remaining_idx + 1).syntax_context();
                     if let Some(variant) =
-                        EnumVariants::variant_written(
-                            self.db,
-                            self.resolver.ctx_table(),
-                            id,
-                            segment.name,
-                            ctxt,
-                        )
+                        EnumVariants::variant_written(self.db, id, segment.name, ctxt)
                     {
                         return if remaining_segments.len() == 2 {
                             let segment = remaining_idx + 1;
@@ -4158,7 +4164,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
                     && let Some(variant) = EnumVariants::variant_written(
                         self.db,
-                        self.resolver.ctx_table(),
                         id,
                         segment.name,
                         path.segment_hygiene(remaining_idx + 1).syntax_context(),
@@ -4349,7 +4354,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt()
             && let Some(variant) = EnumVariants::variant_written(
                 self.db,
-                self.resolver.ctx_table(),
                 enum_id,
                 &segments[first],
                 path.segment_hygiene(first).syntax_context(),

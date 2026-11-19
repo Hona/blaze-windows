@@ -27,7 +27,7 @@ mod decode;
 pub mod drop_early;
 mod dropck;
 mod flow;
-pub mod gate;
+mod gate;
 mod inference;
 mod intervals;
 mod liveness;
@@ -71,8 +71,6 @@ mod views_tests;
 mod kept_tests;
 #[cfg(test)]
 mod served;
-#[cfg(test)]
-mod trace_tests;
 
 #[cfg(test)]
 #[global_allocator]
@@ -136,7 +134,7 @@ pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct BorrowckDiagnostic {
     /// rustc's error code, as `E0382`, or `unused_mut` for the lint the borrow checker gives.
     pub code: &'static str,
@@ -163,7 +161,7 @@ pub struct BorrowckDiagnostic {
 /// What an E0320, "overflow while adding drop-check rules", is about: the type of the local
 /// dropped, the type the drop check went past the recursion limit at, and the limit, the
 /// crate's `#![recursion_limit]`. Regions erased.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct DropCheckOverflow {
     pub ty: hir_ty::next_solver::StoredTy,
     pub overflow_ty: hir_ty::next_solver::StoredTy,
@@ -293,7 +291,7 @@ impl BorrowckDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 pub struct BorrowckResult {
     pub diagnostics: Vec<BorrowckDiagnostic>,
     /// Why the body, or a closure in it, was not checked: MIR lowering does not support
@@ -305,7 +303,7 @@ pub struct BorrowckResult {
 }
 
 /// Why a body was not borrow checked, by the error rustc reports before borrow checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum NotChecked {
     /// `BLAZE_BORROWCK=off`.
     Off,
@@ -346,10 +344,8 @@ impl NotChecked {
 /// is the answer, `BorrowckResult::default()`, with no check run. A verdict is kept only for a
 /// result equal to that ([`kept`]), so the answer is the one the check would give. Under
 /// [`hir_ty::body_store::Mode::Verify`] a kept verdict runs the check as well, and its result is
-/// the answer (and is not offered again). Under [`hir_ty::body_store::Mode::Trace`] nothing is
-/// looked up, and the verdict is offered whatever it is, its answer the encoded refusal
-/// ([`gate::encode_verdict`]), so a body with a borrow error has a trace and a read list.
-#[blaze_memo::tracked(returns(ref), owns)]
+/// the answer (and is not offered again).
+#[blaze_query::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     let mode = mode(db);
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
@@ -367,11 +363,9 @@ pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
         return result;
     }
     let (result, reads) = hir_ty::body_store::capture(db, || borrowck_in_mode(db, def, mode));
-    // A store of records keeps only a silent pass (no bytes); a trace store any verdict.
-    let keep = kept(def, &result);
-    hir_ty::body_store::offer_verdict(db, def, checker, reads, keep, |out| {
-        gate::encode_verdict(gate::verdict(def, &result).err().as_ref(), out);
-    });
+    if kept(def, &result) {
+        hir_ty::body_store::offer_passed(db, def, checker, reads);
+    }
     result
 }
 
@@ -423,7 +417,7 @@ pub fn silent_pass(db: &Db, def: DefWithBodyId) -> Option<&'static str> {
 
 /// The name the item store files `mode`'s verdicts under: each checker accepts other programs.
 /// None when no check runs, whose verdict is never stored.
-pub fn checker(mode: Mode) -> Option<&'static str> {
+pub(crate) fn checker(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Nll => Some("nll"),
         Mode::Polonius => Some("polonius"),
@@ -574,7 +568,7 @@ fn type_check_failed(infer: &InferenceResult<'_>) -> bool {
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
 /// or a const generic argument or default, which rustc checks as a body of its own.
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub fn borrowck_anon_const<'db>(
     db: &'db Db,
     konst: hir_ty::db::AnonConstId<'db>,
@@ -671,7 +665,7 @@ fn check_owner_once<'db>(
         Err(error) => {
             // alloc: the owned result, once, when MIR lowering refuses the body
             // Rendered with `db` attached: the error's types name themselves only through it.
-            result.skipped = Some(blaze_memo::attach(db, || format!("{error:?}")));
+            result.skipped = Some(blaze_query::db::attach(db, || format!("{error:?}")));
             return result;
         }
     };
@@ -728,7 +722,7 @@ fn check_owner_once<'db>(
                 Err(error) => {
                     // alloc: the owned result, once, when MIR lowering refuses a body
                     result.skipped.get_or_insert_with(|| {
-                        blaze_memo::attach(db, || format!("{what}: {error:?}"))
+                        blaze_query::db::attach(db, || format!("{what}: {error:?}"))
                     });
                 }
             }
@@ -1326,7 +1320,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
 /// Whether `ty`, its regions `'static`, is `Copy` in `env`: a query, as what it asks of the
 /// solver can be long (a future through every type it holds) and is the same in every body of
 /// the environment, and after an edit.
-#[blaze_memo::tracked]
+#[blaze_query::tracked]
 fn is_copy_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
@@ -1341,7 +1335,7 @@ fn is_copy_query(
 
 /// [`hir_ty::drop::has_drop_glue`] of `ty`, its regions `'static`, in `env`, as the order of
 /// its variants: a query as [`is_copy_query`] is.
-#[blaze_memo::tracked]
+#[blaze_query::tracked]
 fn drop_glue_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,

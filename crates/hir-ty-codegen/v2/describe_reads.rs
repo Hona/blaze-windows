@@ -12,6 +12,7 @@
 
 use std::{
     collections::BTreeMap,
+    ops::ControlFlow,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -29,8 +30,9 @@ use blaze_codegen::{
 };
 use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
-use blaze_item_hash::{Bodies, identity::give_build, reads::mark_boundaries};
+use blaze_item_hash::{Bodies, identity::set_build};
 use blaze_items::key::item_key;
+use blaze_query::db::{Database as _, capture_reads};
 use hir_expand::fixture;
 use hir_ty::body_store::{BodyFacts, Classified, Step};
 
@@ -43,18 +45,16 @@ mod sealed_reach;
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Census {
     // One count per visited read, not one count per executed query. Sorted for --nocapture.
-    reads: BTreeMap<&'static str, [usize; 3]>,
+    reads: BTreeMap<&'static str, [usize; 4]>,
     // In walk order, not sorted. Only direct function refs in this all-monomorphic fixture.
     calls: Vec<ItemKey>,
 }
 
+#[blaze_query::tracked(returns(ref))]
 fn census(db: &Db, func: FunctionId, requester: Origin, facing: Facing) -> Census {
     let instance = root_in(db, func);
     let front = facing.front(db).unwrap();
-    let memo = blaze_memo::Database::memo(db);
-    let (answer, reads) =
-        blaze_memo::record(memo, || front.described(db, &instance, &requester, facing.world))
-            .expect("the fixture database keeps reads");
+    let (answer, reads) = capture_reads(db, || front.described(db, &instance, &requester, facing.world));
     let answer = answer.expect("the fixture's caller describes");
     let mut census = Census::default();
     for reference in answer.refs {
@@ -63,19 +63,23 @@ fn census(db: &Db, func: FunctionId, requester: Origin, facing: Facing) -> Censu
             census.calls.push(item_key(db, ItemId::Function(target)));
         }
     }
-    for read in reads {
-        let name = read.kind().name();
-        // The existing classifier's most permissive step: Infer and Mir can both be
-        // prerequisites. Its covered/fact counts are candidates, NOT evidence of safety
-        // for codegen, whose outputs also contain names, positions and references.
-        let class = Bodies.fact_of(db, func.into(), Step::Borrowck, read);
-        let index = match class {
-            Classified::Covered => 0,
-            Classified::Fact(_) | Classified::Scan(..) => 1,
-            Classified::Refused(_) => 2,
-        };
-        census.reads.entry(name).or_default()[index] += 1;
-    }
+    let storage = db.storage();
+    let _: Option<()> =
+        reads.expect("the fixture describe must be shareable").for_each_read(storage, |read| {
+            let name = storage.read_name(read.key, read.kind);
+            // The existing classifier's most permissive step: Infer and Mir can both be
+            // prerequisites. Its covered/fact counts are candidates, NOT evidence of safety
+            // for codegen, whose outputs also contain names, positions and references.
+            let class = Bodies.classify(db, func.into(), Step::Borrowck, read.key, read.kind, name);
+            let index = match class {
+                Classified::Covered => 0,
+                Classified::Fact(_) | Classified::Scan(_) => 1,
+                Classified::Refused => 2,
+                Classified::Through => 3,
+            };
+            census.reads.entry(name).or_default()[index] += 1;
+            ControlFlow::Continue(())
+        });
     census
 }
 
@@ -91,11 +95,8 @@ fn an_unchanged_callers_body_identity_cannot_validate_its_walk() {
              #[inline] pub fn mid(x: u32) -> u32 {{ {next}(x) }}\n\
              pub fn caller(x: u32) -> u32 {{ mid(x) }}"
         );
-        let mut db = fixture::db_with_boundaries(&text, mark_boundaries, blaze_memo::Reads::Kept)
-            .into_db();
-        let mut edit = db.edit();
-        give_build(&mut edit, ContentId([7; 32]));
-        _ = edit.commit();
+        let mut db = fixture::db(&text).into_db();
+        set_build(&mut db, ContentId([7; 32]));
         let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| None)));
         let front = HirFrontend::new(Databases::new(&db), hashes, BuildTime::default())
             .with_policy(&policy(OptLevel::O3));
@@ -105,13 +106,9 @@ fn an_unchanged_callers_body_identity_cannot_validate_its_walk() {
             let caller = func("caller");
             let identity = Bodies.identity(db, caller.into()).expect("the caller's body identity");
             let measured = census(db, caller, front.origin(db, krate), front.facing(None));
-            eprintln!("{next}: describe reads (covered, fact, refused): {:?}", measured.reads);
-            let refused: usize = measured.reads.values().map(|c| c[2]).sum();
-            assert!(
-                refused > 0,
-                "the describe must read inputs outside the caller's body identity: {:?}",
-                measured.reads
-            );
+            eprintln!("{next}: describe reads (covered, fact, refused, through): {:?}", measured.reads);
+            let unknown = measured.reads.get("code_walk").expect("the describe read code_walk");
+            assert!(unknown[2] > 0, "the missing walk fact has changed: {unknown:?}");
             let calls = |name| measured.calls.contains(&item_key(db, ItemId::Function(func(name))));
             assert!(calls(next));
             assert!(!calls(other));
@@ -333,11 +330,8 @@ fn run_in_fresh_db(
     store: Option<&MemoryStore>,
     warm_code_walk_first: bool,
 ) -> (Built, usize, Vec<String>) {
-    let mut db =
-        fixture::db_with_boundaries(text, mark_boundaries, blaze_memo::Reads::Kept).into_db();
-    let mut edit = db.edit();
-    give_build(&mut edit, ContentId([7; 32]));
-    _ = edit.commit();
+    let mut db = fixture::db(text).into_db();
+    set_build(&mut db, ContentId([7; 32]));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| None)));
     let pol = policy(OptLevel::O3);
     let front = HirFrontend::new(Databases::new(&db), hashes, BuildTime::default()).with_policy(&pol);
@@ -413,11 +407,8 @@ fn function_signature_map(built: &Built) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn traced_capture_classifies_all_code_walk_reads_and_includes_inlined_callee_mir() {
     let v1 = fixture_source("left", 1);
-    let mut db =
-        fixture::db_with_boundaries(&v1, mark_boundaries, blaze_memo::Reads::Kept).into_db();
-    let mut edit = db.edit();
-    give_build(&mut edit, ContentId([7; 32]));
-    _ = edit.commit();
+    let mut db = fixture::db(&v1).into_db();
+    set_build(&mut db, ContentId([7; 32]));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| None)));
     let pol = policy(OptLevel::O3);
     let front = HirFrontend::new(Databases::new(&db), hashes, BuildTime::default()).with_policy(&pol);
@@ -428,14 +419,15 @@ fn traced_capture_classifies_all_code_walk_reads_and_includes_inlined_callee_mir
         let mid_fn = func("mid");
         let caller = front.root(caller_fn);
         let origin = front.origin(db, krate);
-        // Warm `code_walk` first so capture proves flattening through a memo hit.
+        // Warm `code_walk` first so capture proves descent through a memo hit.
         let _ = refs::walk(db, &caller, refs::Walking::plain(true)).expect("warm walk");
-        let memo = blaze_memo::Database::memo(db);
-        let (desc, reads) =
-            blaze_memo::record(memo, || front.described(db, &caller, &origin, None))
-                .expect("describe reads must be recorded");
+        let mut scratch = Vec::new();
+        let ((desc, captured), _) = blaze_query::db::witnessed(db, &mut scratch, || {
+            capture_reads(db, || front.described(db, &caller, &origin, None))
+        });
         assert!(desc.is_ok(), "caller describes");
-        let facts = described::traced::capture_facts(db, krate, Some(caller_fn.into()), &reads)
+        let reads = captured.expect("describe reads must be shareable");
+        let facts = described::traced::capture_facts(db, krate, Some(caller_fn.into()), reads)
             .unwrap_or_else(|refused| {
                 panic!("traced describe refused read `{refused}` for `caller`")
             });

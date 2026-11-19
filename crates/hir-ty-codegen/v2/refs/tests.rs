@@ -29,7 +29,6 @@ use crate::{
         build::Build,
         by_id::ById,
         places::{self, Placer, Ref, place_requests},
-        tests::expand_builtin_derives,
     },
 };
 use db::TestDB;
@@ -455,7 +454,7 @@ pub fn roots(p: &Pair) -> bool {
 #[test]
 fn a_derived_method_is_reached_where_derives_are_expanded() {
     let mut expanded = fixture::db(DERIVED).into_db();
-    expand_builtin_derives(&mut expanded);
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
     let db: &'static TestDB = Box::leak(Box::new(expanded));
     let expanding =
         HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
@@ -492,7 +491,7 @@ pub fn roots(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 #[test]
 fn a_derived_debug_of_a_unit_struct_and_a_unit_variant_lowers() {
     let mut expanded = fixture::db(DERIVED_DEBUG).into_db();
-    expand_builtin_derives(&mut expanded);
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
     let db: &'static TestDB = Box::leak(Box::new(expanded));
     let frontend =
         HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default());
@@ -1034,7 +1033,7 @@ fn vtables_whose_types_differ_in_lifetimes_only_are_one() {
     let (db, frontend) = frontend(VTABLES_APART_IN_LIFETIMES);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");
@@ -1078,7 +1077,7 @@ fn vtables_whose_types_differ_in_binder_names_only_are_one() {
     let (db, frontend) = frontend(VTABLES_APART_IN_BINDERS);
     let root = frontend.root(function(&db, "root"));
     frontend.with(|db| {
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let facts = super::facts(db, &root, Walking::plain(false))
                 .unwrap_or_else(|e| panic!("{e}"))
                 .expect("the root's facts");

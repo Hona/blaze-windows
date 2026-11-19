@@ -34,8 +34,6 @@ pub struct Column<'s> {
 
 impl<'s> Schema<'s> {
     /// The table named `name`, without regard to ASCII case.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub fn table(&self, name: &str) -> Option<&'s Table<'s>> {
         self.tables.iter().copied().find(|table| table.name.eq_ignore_ascii_case(name))
     }
@@ -43,14 +41,11 @@ impl<'s> Schema<'s> {
 
 impl<'s> Table<'s> {
     /// The column named `name`, without regard to ASCII case, and its index.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub fn column(&self, name: &str) -> Option<(u32, &'s Column<'s>)> {
-        // Counted in `u32` as it is walked, so no index narrows.
         self.columns
             .iter()
-            .zip(0u32..)
-            .find(|(column, _)| column.name.eq_ignore_ascii_case(name))
-            .map(|(column, index)| (index, column))
+            .enumerate()
+            .find(|(_, column)| column.name.eq_ignore_ascii_case(name))
+            .map(|(index, column)| (index as u32, column))
     }
 }

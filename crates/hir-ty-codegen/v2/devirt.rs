@@ -172,7 +172,7 @@ pub(crate) fn takes_world(
 
 /// Whether the body of `instance` as any of [`Build::WALKS_INLINED`] builds it calls a trait
 /// method through a `dyn`: what `Devirtualize` looks at.
-#[blaze_memo::tracked(owns)]
+#[blaze_query::tracked]
 pub(crate) fn has_sites(
     db: &Db,
     instance: Instance,
@@ -720,15 +720,303 @@ impl State {
 
     pub(super) fn resume(
         &self,
-        _front: &HirFrontend<'_>,
-        _kept: &Checkpoint,
-        _view: u64,
-        _fn_roots: &[(HirInstance, Origin)],
-        _static_roots: &[HirStatic],
+        front: &HirFrontend<'_>,
+        kept: &Checkpoint,
+        view: u64,
+        fn_roots: &[(HirInstance, Origin)],
+        static_roots: &[HirStatic],
     ) -> Result<WorldChange<HirInstance>, &'static str> {
-        // Under blaze-memo, `HirFrontend::view` is `None` and the session memo names no
-        // changed set (`frontend.rs`), so a closed world is walked again rather than patched.
-        Err("the session memo names no changed set for world contributions")
+        use blaze_query::db::{Changed, View};
+        let (checkpoint, world_changed, changed_closed_fns, changed_closed_statics, consumers) =
+            front.with(|db| {
+                if self.makes.get() != Some(&kept.makes)
+                    || program_name(db, kept.makes.0, kept.makes.1) != kept.program
+                {
+                    return Err("another program made the world checkpoint");
+                }
+                let since = View::from_u64(view);
+                let facing = front.facing(None);
+                let Changed::Keys(changed_fn_ids) = contribution::changed_since(db, since) else {
+                    return Err("the changed set of world contributions is unknown");
+                };
+                let mut changed_plain_fns: Vec<((HirInstance, Origin), Arc<Contribution>)> =
+                    Vec::new();
+                let mut changed_closed_fns: Vec<(HirInstance, Origin)> = Vec::new();
+                let mut plain_edges_changed = false;
+                for id in changed_fn_ids {
+                    let Some((i, o, id_facing)) = contribution::arguments(db, id) else {
+                        return Err("a changed world contribution has no arguments");
+                    };
+                    if id_facing != facing {
+                        continue;
+                    }
+                    let asked = (i, o);
+                    if kept.closed.functions.contains_key(&asked) {
+                        changed_closed_fns.push(asked.clone());
+                    }
+                    if let Some(was) = kept.plain.functions.get(&asked) {
+                        let now = contribution(db, asked.0.clone(), o, facing)
+                            .as_ref()
+                            .map_err(|_| "a function's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            if now.edges != was.edges || now.origin != was.origin {
+                                plain_edges_changed = true;
+                            }
+                            changed_plain_fns.push((asked, now.clone()));
+                        }
+                    }
+                }
+                let Changed::Keys(changed_st_ids) = static_contribution::changed_since(db, since)
+                else {
+                    return Err("the changed set of static world contributions is unknown");
+                };
+                let mut changed_plain_statics: Vec<(HirStatic, Arc<StaticContribution>)> =
+                    Vec::new();
+                let mut changed_closed_statics: Vec<HirStatic> = Vec::new();
+                for id in changed_st_ids {
+                    let Some((s, id_facing)) = static_contribution::arguments(db, id) else {
+                        return Err("a changed static world contribution has no arguments");
+                    };
+                    if id_facing != facing {
+                        continue;
+                    }
+                    if kept.closed.statics.contains_key(&s) {
+                        changed_closed_statics.push(s);
+                    }
+                    if let Some(was) = kept.plain.statics.get(&s) {
+                        let now = static_contribution(db, s, facing)
+                            .as_ref()
+                            .map_err(|_| "a static's world contribution failed")?;
+                        if !Arc::ptr_eq(now, was) && now != was {
+                            if now.edges != was.edges || now.origin != was.origin {
+                                plain_edges_changed = true;
+                            }
+                            changed_plain_statics.push((s, now.clone()));
+                        }
+                    }
+                }
+
+                // Fast path 0: no plain-walk contribution changed at all.
+                if changed_plain_fns.is_empty() && changed_plain_statics.is_empty() {
+                    return Ok((
+                        kept.clone(),
+                        false,
+                        changed_closed_fns,
+                        changed_closed_statics,
+                        Vec::new(),
+                    ));
+                }
+
+                // Update `plain` (and its DRed reachability graph if any edge changed).
+                let mut plain = (*kept.plain).clone();
+                let (world_dirty, plain_graph) = if plain_edges_changed {
+                    let mut pg = match &kept.plain_graph {
+                        Some(existing) => (**existing).clone(),
+                        None => PlainGraph::build(&kept.plain, fn_roots, static_roots)?,
+                    };
+                    let dirty = pg.apply_edits(
+                        &mut plain,
+                        db,
+                        facing,
+                        &changed_plain_fns,
+                        &changed_plain_statics,
+                    )?;
+                    (dirty, Some(Arc::new(pg)))
+                } else {
+                    let mut dirty = false;
+                    for (asked, now) in changed_plain_fns {
+                        dirty |= plain.insert_fn(asked, now);
+                    }
+                    for (s, now) in changed_plain_statics {
+                        dirty |= plain.insert_static(s, now);
+                    }
+                    (dirty, kept.plain_graph.clone())
+                };
+
+                // Fast path 1: edges or non-world fields changed, but no contributor or consumer
+                // status changed, so the closed world is guaranteed unchanged.
+                if !world_dirty {
+                    let mut next = kept.clone();
+                    next.plain = Arc::new(plain);
+                    next.plain_graph = plain_graph;
+                    return Ok((
+                        next,
+                        false,
+                        changed_closed_fns,
+                        changed_closed_statics,
+                        Vec::new(),
+                    ));
+                }
+
+                // Fast path 2: rebuild the world from only the contributing items and diff per
+                // object key.
+                if plain.site_count == 0 {
+                    return Err("no reached function takes the program's dyn facts");
+                }
+                let Some(new_world) = world_from_set(
+                    front,
+                    db,
+                    (kept.makes.0, kept.program.clone()),
+                    &plain,
+                )?
+                else {
+                    return Err("no reached function takes the program's dyn facts");
+                };
+                if new_world.id == kept.held.world().id {
+                    let mut next = kept.clone();
+                    next.plain = Arc::new(plain);
+                    next.plain_graph = plain_graph;
+                    return Ok((
+                        next,
+                        false,
+                        changed_closed_fns,
+                        changed_closed_statics,
+                        Vec::new(),
+                    ));
+                }
+                let changed_objects = diff_objects(kept.held.world(), &new_world);
+                let consumers = kept.consumers.consumers_of(&changed_objects);
+                let held = devirt::give(new_world)
+                    .map_err(|_| "giving the updated dyn world failed")?;
+                let next = Checkpoint {
+                    makes: kept.makes,
+                    program: kept.program.clone(),
+                    held,
+                    plain: Arc::new(plain),
+                    plain_graph,
+                    closed: kept.closed.clone(),
+                    consumers: kept.consumers.clone(),
+                };
+                Ok((next, true, changed_closed_fns, changed_closed_statics, consumers))
+            })?;
+
+        self.resumed_world
+            .set(checkpoint.held.clone())
+            .map_err(|_| "the front end already resumed a world")?;
+        *self.resumed_state.lock() = Some(ResumedState {
+            checkpoint,
+            world_changed,
+            changed_closed_fns,
+            changed_closed_statics,
+            reverified_consumers: consumers.clone(),
+        });
+        self.using_resumed.store(true, Ordering::Release);
+        Ok(if world_changed {
+            WorldChange::Updated { consumers }
+        } else {
+            WorldChange::Unchanged
+        })
+    }
+
+    pub(super) fn finish_patch(
+        &self,
+        front: &HirFrontend<'_>,
+        patch: WorldPatch<'_, HirInstance, HirStatic>,
+    ) -> Result<(), &'static str> {
+        let mut guard = self.resumed_state.lock();
+        let Some(state) = guard.as_mut() else {
+            return Err("no resumed world checkpoint to finish");
+        };
+        let nothing_moved = patch.changed_functions.is_empty()
+            && patch.entered_functions.is_empty()
+            && patch.left_functions.is_empty()
+            && patch.changed_statics.is_empty()
+            && patch.entered_statics.is_empty()
+            && patch.left_statics.is_empty()
+            && state.changed_closed_fns.is_empty()
+            && state.changed_closed_statics.is_empty()
+            && state.reverified_consumers.is_empty()
+            && !state.world_changed;
+        if nothing_moved {
+            return Ok(());
+        }
+        let world_id = state.checkpoint.held.world().id;
+        let makes = state.checkpoint.makes;
+        let program = state.checkpoint.program.clone();
+        let facing = front.facing(None);
+        let mut closed = (*state.checkpoint.closed).clone();
+        let mut consumers = (*state.checkpoint.consumers).clone();
+        let mut closed_world_dirty = state.world_changed;
+
+        let mut left_fn_set = blaze_hash::HashSet::new_in(Global);
+        for asked in patch.left_functions {
+            left_fn_set.insert(asked.clone());
+            closed_world_dirty |= closed.remove_fn(asked);
+            consumers.remove(asked);
+        }
+        let mut left_st_set = blaze_hash::HashSet::new_in(Global);
+        for &s in patch.left_statics {
+            left_st_set.insert(s);
+            closed_world_dirty |= closed.remove_static(&s);
+        }
+
+        let mut refresh_fns: Vec<(HirInstance, Origin)> = Vec::new();
+        let mut seen_fn = blaze_hash::HashSet::new_in(Global);
+        for asked in patch
+            .entered_functions
+            .iter()
+            .chain(patch.changed_functions.iter())
+            .chain(state.changed_closed_fns.iter().filter(|it| closed.functions.contains_key(*it)))
+            .chain(state.reverified_consumers.iter().filter(|it| closed.functions.contains_key(*it)))
+        {
+            if !left_fn_set.contains(asked) && seen_fn.insert(asked.clone()) {
+                refresh_fns.push(asked.clone());
+            }
+        }
+        let mut refresh_statics: Vec<HirStatic> = Vec::new();
+        let mut seen_st = blaze_hash::HashSet::new_in(Global);
+        for &s in patch
+            .entered_statics
+            .iter()
+            .chain(patch.changed_statics.iter())
+            .chain(state.changed_closed_statics.iter().filter(|it| closed.statics.contains_key(*it)))
+        {
+            if !left_st_set.contains(&s) && seen_st.insert(s) {
+                refresh_statics.push(s);
+            }
+        }
+
+        front.with(|db| {
+            for asked in refresh_fns {
+                let c = contribution(db, asked.0.clone(), asked.1, facing)
+                    .as_ref()
+                    .map_err(|_| "a closed-walk function's world contribution failed")?
+                    .clone();
+                closed_world_dirty |= closed.insert_fn(asked.clone(), c.clone());
+                if c.sites {
+                    let inlined = front
+                        .inlines_for(db, &asked.0, &asked.1)
+                        .map_err(|_| "a closed-walk consumer's inline policy failed")?;
+                    let keys = refs::read_objects(
+                        db,
+                        &asked.0,
+                        refs::Walking { inlined, world: Some(world_id) },
+                    )
+                    .map_err(|_| "a closed-walk consumer's read objects failed")?;
+                    consumers.set(asked, keys.to_vec());
+                } else {
+                    consumers.remove(&asked);
+                }
+            }
+            for s in refresh_statics {
+                let c = static_contribution(db, s, facing)
+                    .as_ref()
+                    .map_err(|_| "a closed-walk static's world contribution failed")?
+                    .clone();
+                closed_world_dirty |= closed.insert_static(s, c);
+            }
+            if closed_world_dirty {
+                let made = world_from_set(front, db, (makes.0, program), &closed)?;
+                if !made.as_ref().is_some_and(|w| w.id == world_id) {
+                    return Err("the patched closed walk's dyn facts differ from the plain walk's");
+                }
+            }
+            Ok(())
+        })?;
+
+        state.checkpoint.closed = Arc::new(closed);
+        state.checkpoint.consumers = Arc::new(consumers);
+        Ok(())
     }
 }
 
@@ -957,6 +1245,7 @@ fn object_inputs(
     Ok(ids)
 }
 
+#[blaze_query::tracked(returns(ref))]
 fn contribution(
     db: &Db,
     i: HirInstance,
@@ -1017,6 +1306,7 @@ impl StaticContribution {
     }
 }
 
+#[blaze_query::tracked(returns(ref))]
 fn static_contribution(
     db: &Db,
     value: HirStatic,
@@ -1204,7 +1494,9 @@ fn world_of(
     }
     let mut seen = blaze_hash::HashSet::new_in(Global);
     for (instance, requester) in functions {
-        let c = contribution(db, instance.clone(), *requester, frontend.facing(None))?;
+        let c = contribution(db, instance.clone(), *requester, frontend.facing(None))
+            .as_ref()
+            .map_err(Clone::clone)?;
         if !seen.insert(instance) {
             continue;
         }
@@ -1231,7 +1523,9 @@ fn world_of(
     }
     for value in statics {
         // An `extern_weak` static holds a foreign symbol's address: no vtable of its value.
-        let c = static_contribution(db, *value, frontend.facing(None))?;
+        let c = static_contribution(db, *value, frontend.facing(None))
+            .as_ref()
+            .map_err(Clone::clone)?;
         for (ty, key) in &c.facts.vtables {
             objects.entry(*key).or_default().tys.push(ty.clone());
         }
@@ -1333,7 +1627,7 @@ fn object(
             Some(last) if last.id == target.id && last.ty == target.ty => {}
             Some(last) if last.id == target.id => {
                 // alloc: the error's message
-                return Err(blaze_memo::attach(db, || {
+                return Err(blaze_query::db::attach(db, || {
                     format!("{:?} and {:?} have one content ID {:?}", last.ty, target.ty, target.id)
                 }));
             }
@@ -1342,7 +1636,7 @@ fn object(
     }
     let open = found.open.as_deref().or(everything);
     let digest = devirt::object_digest(&trait_id, &args_id, &kept, open);
-    let name = blaze_memo::attach(db, || {
+    let name = blaze_query::db::attach(db, || {
         let trait_name = TraitSignature::of(db, key.trait_).name.as_str().to_owned();
         match after_self.is_empty() {
             true => format!("dyn {trait_name}"),

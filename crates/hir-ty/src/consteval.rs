@@ -38,7 +38,7 @@ use crate::{
 pub mod deps;
 pub mod discriminants;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
     MirEvalError(MirEvalError<'db>),
@@ -492,8 +492,8 @@ pub fn anon_const_is_dependent<'db>(db: &'db Db, anon: AnonConstId<'db>) -> bool
 
 /// One variant's discriminant, kept per variant so that what reads it is invalidated only when
 /// its own value changes. Every variant's at once is [`discriminants::enum_discriminants`].
-#[blaze_memo::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), owns, mem_tag = Infer)]
-pub fn const_eval_discriminant_variant<'db>(
+#[blaze_query::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
+pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db Db,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
@@ -502,6 +502,7 @@ pub fn const_eval_discriminant_variant<'db>(
 
 fn const_eval_discriminant_cycle_result<'db>(
     _: &'db Db,
+    _: blaze_query::db::Id,
     _: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -642,7 +643,7 @@ pub fn evaluate_by_mir<'db>(
         // The crate the constant is evaluated for, not the one it is in: the impls its
         // generic arguments select can be in crates its own doesn't depend on.
         ParamEnvAndCrate {
-            param_env: owner.param_env(db),
+            param_env: db.trait_environment(owner.generic_def(db)),
             krate: trait_env.map_or_else(|| owner.krate(db), |env| env.krate),
         }
         .store(),
@@ -650,7 +651,7 @@ pub fn evaluate_by_mir<'db>(
     Ok(db.interpret_mir(body, trait_env)?)
 }
 
-#[blaze_memo::tracked(returns(ref), cycle_result = const_eval_cycle_result, owns, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub fn const_eval_query<'db>(
     db: &'db Db,
     def: ConstId,
@@ -689,6 +690,7 @@ pub fn stored_constant<'db>(
 
 fn const_eval_cycle_result<'db>(
     _: &'db Db,
+    _: blaze_query::db::Id,
     _: ConstId,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -708,7 +710,7 @@ pub(crate) fn anon_const_eval<'db>(
     }
 }
 
-#[blaze_memo::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, owns, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn anon_const_eval_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
@@ -721,6 +723,7 @@ pub(crate) fn anon_const_eval_query<'db>(
 
 fn anon_const_eval_cycle_result<'db>(
     _: &'db Db,
+    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -738,8 +741,8 @@ pub(crate) fn const_eval_static<'db>(
     }
 }
 
-#[blaze_memo::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, owns, mem_tag = Infer)]
-pub fn const_eval_static_query<'db>(
+#[blaze_query::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0, mem_tag = Infer)]
+pub(crate) fn const_eval_static_query<'db>(
     db: &'db Db,
     def: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
@@ -748,6 +751,7 @@ pub fn const_eval_static_query<'db>(
 
 fn const_eval_static_cycle_result<'db>(
     _: &'db Db,
+    _: blaze_query::db::Id,
     _: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -1115,7 +1119,7 @@ mod tests {
         map.statics.push(StaticMemory {
             start: 0x9000,
             size: 16,
-            id: blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(7 + (2 << 20))),
+            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(7 + (2 << 20))),
         });
         map.note_pointer(crate::PointerAt::Memory(0x2000));
         map.note_pointer(crate::PointerAt::Value(8));

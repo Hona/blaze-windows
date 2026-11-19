@@ -56,7 +56,7 @@ const LONGEST: usize = 256;
 
 /// The set of functions a walk looks for: part of [`reaches_root`]'s key, so the two walks
 /// never share a memo (rule 21).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Roots {
     /// The global allocator: `hot_alloc`, `hot_alloc_call`, `hot_clone`.
     Alloc,
@@ -102,9 +102,9 @@ impl Roots {
 
 /// Whether the instance `f` with `args`, in the environment `env`, reaches a function of
 /// `roots`: through functions of workspace members too when `through_workspace`.
-#[blaze_memo::tracked(returns(copy), cycle_initial = |_, _, _, _, _, _| false)]
-pub(crate) fn reaches_root<'db>(
-    db: &'db Db,
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _, _, _| false)]
+pub(crate) fn reaches_root(
+    db: &Db,
     env: StoredParamEnvAndCrate,
     f: FunctionId,
     args: StoredGenericArgs,

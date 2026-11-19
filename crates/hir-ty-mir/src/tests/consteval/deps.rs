@@ -17,7 +17,7 @@ use std::alloc::Global;
 use crate::{
     consteval::{
         ConstEvalError,
-        deps::{Drained, drain, give_base, session_fact, set},
+        deps::{Drained, drain, set},
     },
     db::{GeneralConstId, HirDatabase},
     mir::MirEvalError,
@@ -108,18 +108,6 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &Env, _: &[u8]) -> Result<ContentId, String> {
         Err("these fixtures expand no proc macro".to_owned())
     }
-
-    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
-    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
-        // A test's store holds each value whole: no part of one is read alone.
-        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
-    }
-
-    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
-    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
-        // A test's store runs a batch in order on its own thread: the same result.
-        (0..count).for_each(task);
-    }
 }
 
 impl Memory {
@@ -168,27 +156,10 @@ fn const_named(db: &TestDB, krate: Crate, name: &str) -> ConstId {
 /// A database of [`FIXTURE`] keeping `lib`'s constants in `store` under `base`.
 fn database(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (TestDB, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
-    let lib = crate_named(&db, "lib").key(&db);
-    let fact = session_fact(mode);
+    let lib = crate_named(&db, "lib");
+    let crates = HashMap::from_iter_in([(lib, base)], Global);
     // dyn: hir-ty's `set` takes the driver's store, a boundary (`consteval::deps::Shared::store`)
-    let store: Arc<dyn ImageStore + Send + Sync> = Arc::clone(store) as _;
-    // Given as the driver gives it: a maker of the session arena under the mode's fact, which
-    // the commit makes again, so the crate's id is taken after it; and `lib`'s key, its own
-    // located gift, in the same edit.
-    let mut edit = db.edit();
-    edit.set_given(
-        None,
-        fact,
-        Box::new_in(
-            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
-                set(builder, fact, Arc::clone(&store), mode);
-            },
-            Global,
-        ),
-    );
-    give_base(&mut edit, lib, base);
-    _ = edit.commit();
-    let lib = db.krate(lib);
+    set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
     (db, lib)
 }
 

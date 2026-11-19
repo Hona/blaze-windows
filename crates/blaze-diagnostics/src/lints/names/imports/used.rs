@@ -1368,8 +1368,7 @@ mod tests {
             chain.reverse();
             let mut done = 0;
             for (i, &prefix) in chain.iter().enumerate() {
-                let arena = crate::cx::context_arena(file);
-                let Some(mod_path) = ModPath::from_src_view(cx.db, arena, prefix, &mut |range| {
+                let Some(mod_path) = ModPath::from_src_view(cx.db, prefix, &mut |range| {
                     span_map.span_for_range(range).ctx
                 }) else {
                     return;
@@ -1688,7 +1687,7 @@ mod tests {
     fn sides(source: &str, edition: &str, plant: Plant) -> [Read; 2] {
         let fixture = format!("//- /main.rs crate:main edition:{edition}\n{source}");
         let (db, names, _) = crate::tests::fixture_db(&fixture, "");
-        blaze_memo::attach(&db, || {
+        blaze_query::db::attach(&db, || {
             let krate = hir::check::workspace_crates(&db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(&db, krate, Files::new(&names, ""), &frame);

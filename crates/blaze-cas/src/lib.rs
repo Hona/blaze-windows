@@ -880,11 +880,6 @@ enum PlacedFile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlacePlant {
     None,
-    /// A key a place let go of whose value is a file of its own is asked to be forgotten
-    /// ([`Store::forget`]) as the path is placed from another value, as before 2026-11-14:
-    /// the value a unit record names is gone after another request placed over it
-    /// (`tests::a_value_placed_over_is_kept_while_nothing_but_its_path_let_go_of_it`).
-    ForgetsOnOverwrite,
     /// The names of the whole files kept as a set ([`whole::Names::plant_one_name`]): the
     /// file a path is placed from again goes although a second path still names it
     /// (`tests::place_crash`'s oracle `bounded`).
@@ -1165,9 +1160,6 @@ pub struct Store {
     failures: u32,
     /// What it publishes for readers and writers.
     shared: Arc<Shared>,
-    /// Its packs' mappings, shared by every direct reader of it ([`direct::Maps`]): a pack is
-    /// mapped once a process, not once a reading thread.
-    direct_maps: Arc<direct::Maps>,
     /// Its buffer pool, and which of its files are open in it ([`hot`]).
     hot: hot::Hot,
     /// Its own writer (segment 0): its puts, and the records a settle moves.
@@ -1358,8 +1350,6 @@ pub struct Store {
 #[derive(Clone)]
 pub struct Reader {
     shared: Arc<Shared>,
-    /// The store's packs' mappings, shared by its direct readers ([`direct::Maps`]).
-    maps: Arc<direct::Maps>,
 }
 
 impl Reader {
@@ -2687,8 +2677,6 @@ impl Store {
             broken: None,
             failures: 0,
             shared,
-            // Once a store: the table its direct readers share.
-            direct_maps: Arc::new_in(direct::Maps::default(), Global),
             hot,
             own,
             drains,
@@ -2851,7 +2839,7 @@ impl Store {
     /// A reader of it for any thread: what it reads is valid while the task it reads in runs.
     pub fn reader(&self) -> Reader {
         // clone: one `Arc` per reader made, once per thread that reads; its gets clone nothing
-        Reader { shared: self.shared.clone(), maps: Arc::clone(&self.direct_maps) }
+        Reader { shared: self.shared.clone() }
     }
 
     /// A writer of it for one worker: its puts go into a segment of its own, read at once by
@@ -4379,9 +4367,8 @@ impl Store {
         }
         // alloc: the whole files a step's places let go of, a few
         let mut let_go: Vec<ContentId> = Vec::new();
-        // The keys a step's places stopped holding, for the planted bug alone (below).
-        #[cfg(test)]
-        let mut unrooted: Vec<Key> = Vec::new_in(Global);
+        // alloc: the keys a step's places stopped holding, a few
+        let mut unrooted: Vec<Key> = Vec::new();
         for (to, Naming { file, base, key }, made) in std::mem::take(&mut self.renamed) {
             // A naming exists only as `begin_naming` counted it, so neither fails; were the
             // books to disagree, the store stops naming the path and the file.
@@ -4417,12 +4404,7 @@ impl Store {
                     // The mark made before does not hold the key the path holds now.
                     self.collecting.rooted();
                 }
-                // The key the path held before is kept (below): what it returns is the
-                // planted bug's alone.
-                #[cfg(test)]
                 unrooted.extend(self.names.hold(to.as_str(), key));
-                #[cfg(not(test))]
-                let _ = self.names.hold(to.as_str(), key);
             }
         }
         // The listing is written when a path's name moved: a step whose places named nothing
@@ -4435,40 +4417,33 @@ impl Store {
         let ended = let_go.clone();
         for content in self.names.doomed(let_go) {
             // A value that is a file of its own goes with its record, never by its file
-            // alone: the record is forgotten by the collector, or asked to be
-            // ([`Store::forget`]), and the file is removed once the head that says so is
-            // durable ([`forget`]).
+            // alone: the record is forgotten (below), and the file is removed once the head
+            // that says so is durable ([`forget`]).
             if self.tiers[0].externals.contains_key(&content) {
                 continue;
             }
             self.let_go(content, effects);
         }
-        // A key no path holds any more is kept: another value placed at a path is no reason
-        // to let go of the last one (D45, "what an output path holds"). Two requests that
-        // share a path (`run`'s launcher and `build`'s live image) each have a unit record
-        // that names its value, and the next switch clones that value back; a record whose
-        // value were gone would be replayed into "the store has nothing under .. to place"
-        // (measured on macOS 2026-11-14: run, build, run, build, then every `run` failed so,
-        // across restarts). What lets a value go is the collector by budget, under its own
-        // rule of roots and use ([`crate::collect`]), never a place over it. Until 2026-11-14
-        // a key a place let go of whose value was a file of its own was asked to be forgotten
-        // here: the planted bug of the controls ([`PlacePlant::ForgetsOnOverwrite`]).
-        #[cfg(test)]
-        if self.plant == PlacePlant::ForgetsOnOverwrite {
-            for key in unrooted {
-                if self.names.holds(&key) {
-                    continue;
+        // A key no path holds any more whose value is a file of its own: its record is asked
+        // to be forgotten, which happens once no root names it either ([`Store::forget_due`]):
+        // the file is the record's one home, and a home holds the current program's, not
+        // every build's. Whatever else names the file: a path placed from another key of the
+        // same bytes holds that key's record, which keeps the file. (Until 2026-11-13 it was
+        // asked only when nothing named the file, so a key let go of while a path of another
+        // key named its file was never asked again, and its record kept the file for good.)
+        for key in unrooted {
+            if self.names.holds(&key) {
+                continue;
+            }
+            let look = self.look();
+            let external = match look.find(&key) {
+                Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
+                    look.record(found, &key).ok().map(|(header, _)| header.content)
                 }
-                let look = self.look();
-                let external = match look.find(&key) {
-                    Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
-                        look.record(found, &key).ok().map(|(header, _)| header.content)
-                    }
-                    _ => None,
-                };
-                if external.is_some() {
-                    self.forget(key);
-                }
+                _ => None,
+            };
+            if external.is_some() {
+                self.forget(key);
             }
         }
         for content in ended {
@@ -8073,14 +8048,10 @@ impl Store {
                         .iter()
                         .position(|(it, _)| *it == at)
                         .expect("a pack the commit truncated it writes");
-                    // Written from the pool's pages its append put the bytes into, through the
-                    // page cache: it is the one read cache (store-pool.md, "Superseded for the
-                    // read path"), and the records a build put are the ones its next build and
-                    // the front end's direct reads ask first (`direct`'s docs, "Records beside
-                    // each other"); written around it, each was a device read after the commit.
-                    // `committed` and the end are block ends (each commit pads its packs), and
-                    // the pages are the write's buffer, pinned by the append until the commit
-                    // ends.
+                    // Written from the pool's pages its append put the bytes into, around the
+                    // page cache: `committed` and the end are block ends (each commit pads its
+                    // packs), and the pages are the write's buffer, pinned by the append until
+                    // the commit ends.
                     let parts =
                         commit.appends[n].as_ref().expect("a pack cut by the commit has its append").parts();
                     commit.writes[n] = parts.len() as u32;
@@ -8091,7 +8062,7 @@ impl Store {
                             file: pack.file.clone(),
                             at,
                             from,
-                            cache: Cache::Kept,
+                            cache: Cache::Bypassed,
                             tag,
                         });
                         commit.steps += 1;

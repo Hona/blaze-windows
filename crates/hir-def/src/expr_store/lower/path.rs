@@ -117,7 +117,6 @@ fn lower_path_on_stacks(
                     }
                     break kind = resolve_crate_root(
                         collector.db,
-                        collector.expander.current_file_id().context_arena(),
                         collector.expander.ctx_for_range(name_ref.syntax().text_range()),
                     )
                     .map(PathKind::DollarCrate)
@@ -147,10 +146,7 @@ fn lower_path_on_stacks(
                     true => collector
                         .expander
                         .ctx_for_range(name_ref.syntax().text_range())
-                        .normalize_to_macros_2_0(
-                            collector.db,
-                            collector.expander.current_file_id().context_arena(),
-                        ),
+                        .normalize_to_macros_2_0(collector.db),
                     false => root,
                 });
             }
@@ -278,11 +274,10 @@ fn lower_path_on_stacks(
         && let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast)
     {
         let syn_ctxt = collector.expander.ctx_for_range(path.segment()?.syntax().text_range());
-        let table = collector.expander.current_file_id().context_arena();
-        if let Some(macro_call_id) = syn_ctxt.outer_expn(collector.db, table)
+        if let Some(macro_call_id) = syn_ctxt.outer_expn(collector.db)
             && hir_expand::MacroCallId::from(macro_call_id).loc(collector.db).def.local_inner
         {
-            kind = match resolve_crate_root(collector.db, table, syn_ctxt) {
+            kind = match resolve_crate_root(collector.db, syn_ctxt) {
                 Some(crate_root) => PathKind::DollarCrate(crate_root),
                 None => PathKind::Crate,
             }

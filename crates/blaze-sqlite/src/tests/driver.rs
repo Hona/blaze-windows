@@ -11,10 +11,7 @@ use blaze_sql::desc::{Backend, RustTy, Slot, Storage, ValueRef};
 use blaze_sql::schema::{Column, Schema, Table};
 use blaze_sim::{Config, Tape};
 
-use crate::{
-    ColumnTypeError, Connection, DeclaredType, Error, Found, SchemaDifference, SchemaError,
-    Statement, Step,
-};
+use crate::{Connection, Error, Found, SchemaDifference, Statement, Step};
 
 const BOOL: RustTy<'static> = RustTy { name: "bool", id: TypeId::of::<bool>() };
 const I64: RustTy<'static> = RustTy { name: "i64", id: TypeId::of::<i64>() };
@@ -207,7 +204,7 @@ fn verify_after(script: &str) -> Error {
 fn assert_schema_error(error: Error, table: &str, want: SchemaDifference) {
     let message = format!("{error}");
     match error {
-        Error::Schema(SchemaError { table: got_table, difference }) => {
+        Error::Schema { table: got_table, difference } => {
             assert_eq!(got_table, table, "{message}");
             assert_eq!(difference, want, "{message}");
             assert!(message.contains(table), "the message names the table: {message}");
@@ -240,10 +237,10 @@ fn verify_names_a_column_of_another_storage() {
     let message = format!("{error}");
     // SQLite may give the declared type in another case than it was written in.
     match error {
-        Error::Schema(SchemaError {
+        Error::Schema {
             table,
-            difference: SchemaDifference::Storage(DeclaredType { column, expected, declared }),
-        }) => {
+            difference: SchemaDifference::Storage { column, expected, declared },
+        } => {
             assert_eq!(table, "maybe", "{message}");
             assert_eq!(column, "ratio", "{message}");
             assert_eq!(expected, Storage::Real, "{message}");
@@ -347,7 +344,7 @@ fn column_refuses_text_in_an_integer_column_of_a_table_not_strict() {
         statement.column(0).err().unwrap_or_else(|| panic!("column read text as an integer"));
     let message = format!("{error}");
     match error {
-        Error::ColumnType(ColumnTypeError { column, index, expected, got, .. }) => {
+        Error::ColumnType { column, index, expected, got, .. } => {
             assert_eq!(column, "n");
             assert_eq!(index, 0);
             assert_eq!(expected.storage, Storage::Integer);

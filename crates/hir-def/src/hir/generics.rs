@@ -131,7 +131,7 @@ impl TypeParamProvenance {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub enum TypeOrConstParamData {
     TypeParamData(TypeParamData),
     ConstParamData(ConstParamData),

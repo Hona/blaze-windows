@@ -12,8 +12,6 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use blaze_codegen::{CompiledFunction, InstanceKey, driver::Built, memo::Memo};
 
-use crate::v2::tests::write_file;
-
 use super::{
     Edit, ITEMS, Kept, LIBRARIES, Model, build, database,
     identity::{Order, identities},
@@ -55,7 +53,7 @@ fn build_shifted(at: usize, lines: usize, heap_to_stack: bool) -> (Built, Built,
     // clone: the first build is returned to compare, and the store keeps its puts too
     store.0.extend(first.puts.iter().map(|it| (it.key, it.bytes.clone())));
     let body = shifted(&model, at, lines);
-    write_file(&mut db, file, &body);
+    db.set_file_text(file, &body);
     let again = build(&db, &memo, &store, blaze_store_check::Setting::OFF, heap_to_stack)
         .unwrap_or_else(|why| panic!("{why}\n{body}"));
     (first, again, body)
@@ -145,7 +143,7 @@ fn a_function_reading_its_line_recompiles_nothing_below_an_inserted_line() {
         // clone: the first build is compared, and the store keeps its puts too
         store.0.extend(first.puts.iter().map(|it| (it.key, it.bytes.clone())));
         let body = line_reader_shifted(lines);
-        write_file(&mut db, file, &body);
+        db.set_file_text(file, &body);
         let again = build(&db, &memo, &store, blaze_store_check::Setting::OFF, false)
             .unwrap_or_else(|why| panic!("{why}\n{body}"));
         assert_eq!(again.stats.compiled, 0, "{lines} lines above `here` compiled again");
@@ -178,7 +176,7 @@ fn the_control_a_body_edited_below_the_lines_compiles_again() {
         .unwrap_or_else(|why| panic!("{why}"));
     store.0.extend(first.puts.into_iter().map(|it| (it.key, it.bytes)));
     model.apply(Edit::ChangeInlined(model.inlined + 1));
-    write_file(&mut db, file, &shifted(&model, 1, 3));
+    db.set_file_text(file, &shifted(&model, 1, 3));
     let again = build(&db, &memo, &store, blaze_store_check::Setting::OFF, false)
         .unwrap_or_else(|why| panic!("{why}"));
     assert!(again.stats.compiled > 0, "an edited body was not compiled again");

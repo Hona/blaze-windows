@@ -34,7 +34,7 @@ use super::{
 };
 use crate::{
     blaze::{Lint, test_code},
-    kept, query,
+    query,
 };
 
 /// The fewest tokens a function's body has, its braces left out, to be compared whole: below it
@@ -79,18 +79,18 @@ impl Role {
     }
 }
 
-/// A body's shapes: what the crate's pass groups by. Its lists are kept in the body's arena.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Shape<'db> {
+/// A body's shapes: what the crate's pass groups by.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Shape {
     pub(crate) role: Role,
     /// The shape of the whole function past [`FN_FLOOR`], or of the constant past its floors.
     pub(crate) whole: Option<u64>,
     /// Its blocks and rows of statements past [`BLOCK_FLOOR`], by shape.
-    pub(crate) pieces: &'db [Piece],
+    pub(crate) pieces: Box<[Piece]>,
     /// Its blocks and rows past [`paste::PASTE_FLOOR`], by structure.
-    pub(crate) skeletons: &'db [Piece],
+    pub(crate) skeletons: Box<[Piece]>,
     /// The MinHash sketch of a body past [`near::NEAR_FLOOR`].
-    pub(crate) sketch: Option<&'db [u32]>,
+    pub(crate) sketch: Option<Box<[u32]>>,
     /// A test's shape with its literals erased ([`shape::erased`]): tests of one table share it.
     pub(crate) erased: Option<u64>,
     /// The structure of a function past [`FN_FLOOR`] ([`shape::structure`]): functions that
@@ -100,8 +100,8 @@ pub(crate) struct Shape<'db> {
 
 /// The shapes of `def`'s body, from its anchor: [`shape_of`] of its item, or nothing for a body
 /// a macro writes, test code other than a `#[test]` function, and what [`Role::Other`] is.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn body_shape<'db>(db: &'db Db, def: DefWithBodyId) -> Shape<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn body_shape(db: &Db, def: DefWithBodyId) -> Shape {
     let role = role_of(db, def);
     if role == Role::Other {
         return Shape::default();
@@ -111,14 +111,14 @@ pub(crate) fn body_shape<'db>(db: &'db Db, def: DefWithBodyId) -> Shape<'db> {
     let anchor = ast::Node::root(&tree);
     let Some(owner) = ast::try_to_node(syntax.item, anchor) else { return Shape::default() };
     if role == Role::Free && is_test_fn(owner) {
-        return shape_of(db, owner, Role::Test);
+        return shape_of(owner, Role::Test);
     }
     if module_is_test(db, hir::DefWithBody::from(def).module(db))
         || std::iter::once(owner).chain(owner.ancestors()).any(test_attr)
     {
         return Shape::default();
     }
-    shape_of(db, owner, role)
+    shape_of(owner, role)
 }
 
 /// Whether `node` is a function marked `#[test]` (or `#[something::test]`).
@@ -130,16 +130,16 @@ pub(crate) fn is_test_fn(node: ast::Node<'_>) -> bool {
         })
 }
 
-/// The shapes of `owner`, a function or constant item, as `role`, their lists kept in the
-/// current run's arena.
-pub(crate) fn shape_of<'db>(db: &'db Db, owner: ast::Node<'_>, role: Role) -> Shape<'db> {
+/// The shapes of `owner`, a function or constant item, as `role`.
+pub(crate) fn shape_of(owner: ast::Node<'_>, role: Role) -> Shape {
     let toks = shape::tokens(owner);
     let mut scratch = shape::Renumber::default();
+    let empty = || Vec::new_in(Global).into_boxed_slice();
     let only = |whole: Option<u64>, erased: Option<u64>| Shape {
         role,
         whole,
-        pieces: &[],
-        skeletons: &[],
+        pieces: empty(),
+        skeletons: empty(),
         sketch: None,
         erased,
         outline: None,
@@ -165,9 +165,9 @@ pub(crate) fn shape_of<'db>(db: &'db Db, owner: ast::Node<'_>, role: Role) -> Sh
     Shape {
         role,
         whole,
-        pieces: kept::slice(db, pieces),
-        skeletons: kept::slice(db, skeletons),
-        sketch: sketch.map(|it| kept::slice(db, it)),
+        pieces: pieces.into_boxed_slice(),
+        skeletons: skeletons.into_boxed_slice(),
+        sketch,
         erased: None,
         outline,
     }
@@ -289,8 +289,8 @@ pub(crate) type WholeRow = (u64, DefWithBodyId);
 
 /// The whole functions and constants of a crate past their floors, by their shape, sorted:
 /// what a dependent crate searches for its own, and what [`merge_siblings`] merges.
-#[blaze_memo::tracked(returns(copy))]
-pub(crate) fn crate_wholes<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [WholeRow] {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn crate_wholes(db: &Db, krate: base_db::Crate) -> Box<[WholeRow]> {
     let mut out: Vec<WholeRow, Global> = Vec::new_in(Global);
     if !is_test_target(db, krate) {
         for body in query::lint_plan(db, krate).bodies.iter() {
@@ -300,7 +300,7 @@ pub(crate) fn crate_wholes<'db>(db: &'db Db, krate: base_db::Crate) -> &'db [Who
         }
     }
     out.sort_unstable();
-    kept::slice(db, out)
+    out.into_boxed_slice()
 }
 
 /// [`Order::krate`] of the crate checked: after every dependency.
@@ -399,7 +399,7 @@ pub(crate) struct Index {
 }
 
 /// The findings of `def`'s body: its slice of its crate's [`dup_index`].
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn body_findings(db: &Db, def: DefWithBodyId) -> Box<[Found]> {
     use hir_def::HasModule as _;
     let index = dup_index(db, def.krate(db));
@@ -411,7 +411,7 @@ pub(crate) fn body_findings(db: &Db, def: DefWithBodyId) -> Box<[Found]> {
 }
 
 /// Every finding of `krate`'s bodies: one pass over their shapes.
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn dup_index(db: &Db, krate: base_db::Crate) -> Index {
     let mut ix = Indexer::new(db, krate);
     // A test target is all test code: only its tests are compared, with each other.
@@ -469,7 +469,7 @@ struct Indexer<'db> {
     db: &'db Db,
     krate: base_db::Crate,
     /// The crate's bodies, with where each is.
-    bodies: Vec<(DefWithBodyId, &'db Shape<'db>, u32, syntax::TextSize), Global>,
+    bodies: Vec<(DefWithBodyId, &'db Shape, u32, syntax::TextSize), Global>,
     reads: HashMap<DefWithBodyId, Option<Read<'db>>, Global>,
     /// What a reported group covers, by body: a smaller copy inside is not reported again.
     covered: Vec<(DefWithBodyId, TextRange), Global>,
@@ -1156,8 +1156,8 @@ fn drop_overlaps(group: &mut Vec<Member, Global>) {
 }
 
 /// The duplicate types of a crate's files.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TypeEntry<'db> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TypeEntry {
     /// The type's fields or variants as a set.
     key: u64,
     /// As a list, in order.
@@ -1166,15 +1166,13 @@ pub(crate) struct TypeEntry<'db> {
     order: (u32, u32),
     /// Its name's range in its file.
     name_at: TextRange,
-    /// Kept in the crate's arena.
-    name: &'db str,
+    name: String,
     is_enum: bool,
 }
 
-/// The structs and enums of a crate past their floors, sorted by key and place: kept in the
-/// crate's arena.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Types<'db>(&'db [TypeEntry<'db>]);
+/// The structs and enums of a crate past their floors, sorted by key and place.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Types(Box<[TypeEntry]>);
 
 /// The fewest fields of a struct, or variants of an enum with data, two copies of which are one
 /// type written twice: two fields alike is a pair (`start`, `end`), not a type.
@@ -1183,9 +1181,9 @@ pub(crate) const FIELDS_FLOOR: usize = 3;
 pub(crate) const UNIT_VARIANTS_FLOOR: usize = 4;
 
 /// The types of `krate`'s module files, outside test code.
-#[blaze_memo::tracked(returns(copy))]
-pub(crate) fn crate_types<'db>(db: &'db Db, krate: base_db::Crate) -> Types<'db> {
-    let mut out: Vec<TypeEntry<'db>, Global> = Vec::new_in(Global);
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn crate_types(db: &Db, krate: base_db::Crate) -> Types {
+    let mut out: Vec<TypeEntry, Global> = Vec::new_in(Global);
     if is_test_target(db, krate) {
         return Types::default();
     }
@@ -1222,13 +1220,13 @@ pub(crate) fn crate_types<'db>(db: &'db Db, krate: base_db::Crate) -> Types<'db>
                 file: module.file,
                 order: (file_index, u32::from(name.text_range().start())),
                 name_at: name.text_range(),
-                name: kept::text(db, name.text()),
+                name: name.text().to_owned(), // alloc: the type's name, per type past the floors
                 is_enum,
             });
         }
     }
     out.sort_by(|a, b| (a.key, a.order).cmp(&(b.key, b.order)));
-    Types(kept::slice(db, out))
+    Types(out.into_boxed_slice())
 }
 
 /// Whether the `mod` item at `range` of `file` is test code.
@@ -1336,9 +1334,9 @@ pub(crate) struct TypeFound {
 
 /// The duplicate types of `krate`'s `file`: each type past the floors whose fields or variants
 /// an earlier type of the crate, or one of its local dependencies, has too.
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn type_findings(db: &Db, krate: base_db::Crate, file: EditionedFileId) -> Box<[TypeFound]> {
-    let own = crate_types(db, krate).0;
+    let own = &crate_types(db, krate).0;
     let deps = local_deps(db, krate);
     let mut out: Vec<TypeFound, Global> = Vec::new_in(Global);
     let mut start = 0;
@@ -1354,7 +1352,7 @@ pub(crate) fn type_findings(db: &Db, krate: base_db::Crate, file: EditionedFileI
             Vec::new_in(Global);
         let mut in_order: Vec<u64, Global> = Vec::new_in(Global);
         for &dep in &deps {
-            let theirs = crate_types(db, dep).0;
+            let theirs = &crate_types(db, dep).0;
             let from = theirs.partition_point(|it| it.key < key);
             let name = hir::Crate::from(dep)
                 .display_name(db)

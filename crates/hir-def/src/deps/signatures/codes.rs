@@ -8,12 +8,11 @@ use hir_expand::name::Name;
 use la_arena::Arena;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
+use triomphe::Arc;
 
-use super::AssocRecord;
 use crate::{
-    AssocItemId, FxIndexMap,
+    FxIndexMap,
     expr_store::ExpressionStore,
-    item_tree::RawVisibility,
     hir::{
         columns::{Checked, below, raw},
         generics::{
@@ -381,13 +380,10 @@ pub(super) struct TypeAlias;
 pub(super) struct Fields;
 /// [`EnumVariants::of`].
 pub(super) struct Variants;
-/// `ImplItems::of` and `TraitItems::query_with_diagnostics`, with the written visibilities
-/// ([`AssocRecord`]).
-pub(super) struct Assoc;
 
 impl Sig for Struct {
     type Of = StructSignature;
-    type Value = StructSignature;
+    type Value = Arc<StructSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -417,13 +413,14 @@ impl Sig for Struct {
             store: needs(store, r)?,
         };
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Union {
     type Of = UnionSignature;
-    type Value = UnionSignature;
+    type Value = Arc<UnionSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -451,13 +448,14 @@ impl Sig for Union {
             store: needs(store, r)?,
         };
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Enum {
     type Of = EnumSignature;
-    type Value = EnumSignature;
+    type Value = Arc<EnumSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -485,13 +483,14 @@ impl Sig for Enum {
             store: needs(store, r)?,
         };
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Const {
     type Of = ConstSignature;
-    type Value = ConstSignature;
+    type Value = Arc<ConstSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -519,13 +518,14 @@ impl Sig for Const {
             store: needs(store, r)?,
         };
         check(Ids(&signature.store).ty(signature.type_ref), r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Static {
     type Of = StaticSignature;
-    type Value = StaticSignature;
+    type Value = Arc<StaticSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -553,13 +553,14 @@ impl Sig for Static {
             store: needs(store, r)?,
         };
         check(Ids(&signature.store).ty(signature.type_ref), r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Impl {
     type Of = ImplSignature;
-    type Value = ImplSignature;
+    type Value = Arc<ImplSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -592,13 +593,14 @@ impl Sig for Impl {
         let ids = Ids(&signature.store);
         check(ids.ty(signature.self_ty), r)?;
         check(signature.target_trait.map_or(Ok(()), |it| ids.path(it.path)), r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Trait {
     type Of = TraitSignature;
-    type Value = TraitSignature;
+    type Value = Arc<TraitSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -626,13 +628,14 @@ impl Sig for Trait {
             store: needs(store, r)?,
         };
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Function {
     type Of = FunctionSignature;
-    type Value = FunctionSignature;
+    type Value = Arc<FunctionSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -670,13 +673,14 @@ impl Sig for Function {
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;
         let types = signature.params.iter().copied().chain(signature.ret_type);
         check(Ids(&signature.store).types(types), r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for TypeAlias {
     type Of = TypeAliasSignature;
-    type Value = TypeAliasSignature;
+    type Value = Arc<TypeAliasSignature>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -709,13 +713,14 @@ impl Sig for TypeAlias {
         };
         check_in_store(&signature.store, &signature.generic_params, &signature.bounds, r)?;
         check(Ids(&signature.store).types(signature.ty), r)?;
-        Ok(signature)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
 impl Sig for Fields {
     type Of = VariantFields;
-    type Value = VariantFields;
+    type Value = Arc<VariantFields>;
 
     fn of(value: &Self::Value) -> &Self::Of {
         value
@@ -743,7 +748,8 @@ impl Sig for Fields {
             check(ids.ty(field.type_ref), r)?;
             check(field.default_value.map_or(Ok(()), |it| ids.konst(it)), r)?;
         }
-        Ok(value)
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(value))
     }
 }
 
@@ -802,49 +808,6 @@ impl Sig for Variants {
             inactive.push(InactiveEnumVariantCode { cfg: cfg_expr, opts: cfg.clone(), ast_id });
         }
         Ok((EnumVariants::from_parts(variants, &explicit), inactive))
-    }
-}
-
-/// The words: whose (an impl's, a trait's), the items in their order (each its name and id,
-/// relocated through the table, so an item of an expansion names its call), the macro calls
-/// at assoc position, and the visibilities: of an impl one an item at its index, of a trait
-/// one, the trait's.
-impl Sig for Assoc {
-    type Of = AssocRecord;
-    type Value = AssocRecord;
-
-    fn of(value: &Self::Value) -> &Self::Of {
-        value
-    }
-
-    fn store(_: &Self::Of) -> Option<&ExpressionStore> {
-        None
-    }
-
-    fn put(of: &Self::Of, w: &mut Words) {
-        w.bool(of.is_trait);
-        w.put(&of.items);
-        w.put(&of.macro_calls);
-        w.put(&of.visibilities);
-    }
-
-    fn get(
-        r: &mut Read<'_>,
-        store: Option<ExpressionStore>,
-        _: &CfgOptions,
-    ) -> Result<Self::Value, FormatError> {
-        if store.is_some() {
-            return Err(r.invalid("assoc items with a store"));
-        }
-        let is_trait = r.bool()?;
-        let items: Box<[(Name, AssocItemId)]> = r.get()?;
-        let macro_calls = r.get()?;
-        let visibilities: Box<[RawVisibility]> = r.get()?;
-        let wanted = if is_trait { 1 } else { items.len() };
-        if visibilities.len() != wanted {
-            return Err(r.invalid("assoc items whose visibilities are not one an item (an impl's) or one (a trait's)"));
-        }
-        Ok(AssocRecord { is_trait, items, macro_calls, visibilities })
     }
 }
 

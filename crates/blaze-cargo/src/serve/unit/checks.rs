@@ -38,9 +38,7 @@ mod tests;
 
 /// The check of a unit's crate, and whether it failed. See the module.
 pub(crate) struct Checking {
-    /// By key: a run may be in a later snapshot than `new`'s, whose crate ids are gone, and
-    /// takes the crate again in its own.
-    krate: base_db::CrateKey,
+    krate: hir::Crate,
     /// The plan of the run under way, or of the next; none only while a run after the first
     /// makes its own. Locked to read or leave the field, never across the plan's work.
     plan: Lock<Option<Arc<EveryBody>>>,
@@ -60,7 +58,7 @@ impl Checking {
         // alloc: once per unit checked, the plan its check and its codegen share
         let plan = Arc::new(Plan::of_every_body(db, &[krate], false));
         Checking {
-            krate: krate.base().key(db),
+            krate,
             plan: Lock::new("unit.checking.plan", Some(plan)),
             begun: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -80,7 +78,6 @@ impl Checking {
         // unit's sources were set: a cold build of a large workspace does it between the two
         // for some unit), where that plan does not run: what it visits is the changed set up
         // to its own view.
-        let krate = hir::Crate::from(db.krate(self.krate));
         let made = match self.begun.swap(true, Ordering::AcqRel) {
             true => None,
             // clone: a refcount, once per unit checked
@@ -94,13 +91,13 @@ impl Checking {
                 let spent = self.plan.lock().take();
                 drop(spent);
                 // alloc: once per run of a unit's check posted again or begun in a later view
-                let plan = Arc::new(Plan::of_every_body(db, &[krate], false));
+                let plan = Arc::new(Plan::of_every_body(db, &[self.krate], false));
                 // clone: a refcount, once per such run
                 *self.plan.lock() = Some(plan.clone());
                 plan
             }
         };
-        let check = blaze_diagnostics::check_planned(db, krate, &*plan, files, options);
+        let check = blaze_diagnostics::check_planned(db, self.krate, &*plan, files, options);
         if failed(&check.diags) {
             self.failed.store(true, Ordering::Release);
         }

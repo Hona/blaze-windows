@@ -17,7 +17,6 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use blaze_memo::Database as _;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, code_hash, item_key};
 use hir_def::{FunctionId, ItemContainerId, attrs::AttrFlags, signatures::FunctionSignature};
@@ -63,18 +62,17 @@ pub(crate) enum LeafKind {
 }
 
 /// One instance of a step's walk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Node {
     Walk(Body, StoredGenericArgs),
-    Leaf(FunctionId, StoredGenericArgs, #[home(skip)] LeafKind),
+    Leaf(FunctionId, StoredGenericArgs, LeafKind),
 }
 
-/// One instance's part of a step's identity, and what it runs, in site order, kept in the
-/// memo's arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Summary<'db> {
+/// One instance's part of a step's identity, and what it runs, in site order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Summary {
     content: ContentId,
-    callees: &'db [Node],
+    callees: Box<[Node]>,
 }
 
 /// The CodeId of the compute step whose root is `root`, a function, closure or `async` block
@@ -101,8 +99,8 @@ pub fn code_id(
             ),
         ));
     };
-    // clone: an error's text, once
-    blaze_memo::attach(db, || code_id_of(db, *root, *env, checked).clone())
+    // clone: the query's keys, reference counts; an error's text, once
+    blaze_query::db::attach(db, || code_id_of(db, root.clone(), env.clone(), checked).clone())
 }
 
 /// [`code_id`] of the function item or closure type `callable`, as const eval answers
@@ -113,13 +111,13 @@ pub fn fn_code_id<'db>(
     callable: Ty<'db>,
     env: &StoredParamEnvAndCrate,
 ) -> Result<CodeId, Unidentified> {
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let cx = Cx::new(db, env);
         // alloc: error path
         let refuse = |what: String| Unidentified::named(format!("`{callable:?}`"), what);
         let (body, args) = match cx.normalize(callable).kind() {
             TyKind::Closure(id, args) => (
-                Body::Closure(blaze_memo::Id::gid(id.0)),
+                Body::Closure(blaze_query::db::AsId::as_id(&id.0)),
                 GenericArgs::new_from_slice(args.as_closure().parent_args()),
             ),
             TyKind::FnDef(def, args) => {
@@ -155,7 +153,11 @@ pub fn fn_code_id<'db>(
     })
 }
 
-#[blaze_memo::tracked(returns(ref), owns, cycle_result = code_id_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = code_id_cycle)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn code_id_of(
     db: &Db,
     root: Instance,
@@ -171,12 +173,17 @@ fn code_id_of(
         ));
     };
     root_params(db, &env, body, &root.args).map_err(|what| Unidentified::of(db, &root, what))?;
-    // clone: an error's text, once
-    node_id(db, env, Node::Walk(body, root.args), checked).clone().map(CodeId)
+    // clone: the query's keys, reference counts; an error's text, once
+    node_id(db, env.clone(), Node::Walk(body, root.args.clone()), checked).clone().map(CodeId)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value"
+)]
 fn code_id_cycle(
     db: &Db,
+    _: blaze_query::db::Id,
     root: Instance,
     _: StoredParamEnvAndCrate,
     _: bool,
@@ -185,7 +192,11 @@ fn code_id_cycle(
 }
 
 /// The behaviour identity of `node`: of the step rooted at it.
-#[blaze_memo::tracked(returns(ref), owns, cycle_result = node_id_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = node_id_cycle)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
 fn node_id(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -195,8 +206,13 @@ fn node_id(
     scc::identity(&Behaviour { db, env: &env, checked }, CODE_ID_DOMAIN, &node, INSTANCES)
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the `cycle_result` signature `blaze_query::tracked` calls, with the query's arguments by value"
+)]
 fn node_id_cycle(
     db: &Db,
+    _: blaze_query::db::Id,
     _: StoredParamEnvAndCrate,
     node: Node,
     _: bool,
@@ -205,19 +221,20 @@ fn node_id_cycle(
 }
 
 /// Whether `node` is on a cycle of what instances run: `true` from its fallback, which
-/// blaze_memo gives every member of a query cycle ([`crate::scc`]).
-#[blaze_memo::tracked(returns(copy), cycle_result = on_cycle)]
+/// blaze_query gives every member of a query cycle ([`crate::scc`]).
+#[blaze_query::tracked(returns(copy), cycle_result = on_cycle)]
 fn behaviour_cyclic(db: &Db, env: StoredParamEnvAndCrate, node: Node, checked: bool) -> bool {
-    if let Ok(it) = summary(db, env, node, checked) {
-        for &callee in it.callees {
+    // clone: the query's keys, reference counts
+    if let Ok(it) = summary(db, env.clone(), node, checked) {
+        for callee in it.callees.iter() {
             // Every callee, never stopping early: a member that does not ask is not one.
-            let _ = behaviour_cyclic(db, env, callee, checked);
+            let _ = behaviour_cyclic(db, env.clone(), callee.clone(), checked); // clone: as above
         }
     }
     false
 }
 
-fn on_cycle(_: &Db, _: StoredParamEnvAndCrate, _: Node, _: bool) -> bool {
+fn on_cycle(_: &Db, _: blaze_query::db::Id, _: StoredParamEnvAndCrate, _: Node, _: bool) -> bool {
     true
 }
 
@@ -233,19 +250,20 @@ impl<'a> Graph<'a> for Behaviour<'a> {
     type Error = Unidentified;
 
     fn local(&self, node: &Node) -> Result<Local<'a, Node>, Unidentified> {
-        match summary(self.db, *self.env, *node, self.checked) {
-            Ok(it) => Ok(Local { content: it.content, callees: it.callees }),
+        // clone: the query's keys, reference counts
+        match summary(self.db, self.env.clone(), node.clone(), self.checked) {
+            Ok(it) => Ok(Local { content: it.content, callees: &it.callees }),
             Err(what) => Err(Unidentified::named(node_name(self.db, node), what.to_string())), // alloc: error path
         }
     }
 
     fn cyclic(&self, node: &Node) -> bool {
-        behaviour_cyclic(self.db, *self.env, *node, self.checked)
+        behaviour_cyclic(self.db, self.env.clone(), node.clone(), self.checked) // clone: as above
     }
 
     fn id(&self, node: &Node) -> Result<ContentId, Unidentified> {
-        // clone: an error's text, once
-        node_id(self.db, *self.env, *node, self.checked).clone()
+        // clone: as above; an error's text, once
+        node_id(self.db, self.env.clone(), node.clone(), self.checked).clone()
     }
 
     fn name(&self, node: &Node) -> Result<ContentId, Unidentified> {
@@ -355,33 +373,21 @@ fn outside_code<'db>(
 /// One instance's part of a step's identity and the instances it runs, in site order. Its
 /// constants are evaluated here, so a body whose constant reads the CodeId of a step that runs
 /// it re-enters this query: [`SELF_READ`].
-#[blaze_memo::tracked(returns(ref), cycle_result = summary_cycle)]
-fn summary<'db>(
-    db: &'db Db,
-    env: StoredParamEnvAndCrate,
-    node: Node,
-    checked: bool,
-) -> Result<Summary<'db>, &'db str> {
-    let memo = db.memo();
-    match summarize(db, env, node, checked) {
-        Ok((content, callees)) => {
-            Ok(Summary { content, callees: blaze_memo::keep_slice(memo, &callees) })
-        }
-        Err(what) => Err(blaze_memo::keep_str(memo, &what)),
-    }
-}
-
-/// [`summary`]'s part and callees, before they are kept in the memo's arena.
-fn summarize(
+#[blaze_query::tracked(returns(ref), cycle_result = summary_cycle)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+)]
+fn summary(
     db: &Db,
     env: StoredParamEnvAndCrate,
     node: Node,
     checked: bool,
-) -> Result<(ContentId, Vec<Node, Global>), String> {
+) -> Result<Summary, Box<str>> {
     let cx = Cx::new(db, &env);
     let mut follow = Follow {
         cx: &cx,
-        callees: Vec::new_in(Global),
+        callees: Vec::new(), // alloc: one instance's callees, this query's miss, memoized after
         seen: HashSet::new_in(Global),
         dropped: HashSet::new_in(Global),
         failed: None,
@@ -433,7 +439,7 @@ fn summarize(
             facts.body(mir);
             let Facts { h, edges, failed, .. } = facts;
             if let Some(what) = failed {
-                return Err(what);
+                return Err(what.into_boxed_str());
             }
             for edge in edges {
                 follow.edge(edge);
@@ -442,9 +448,9 @@ fn summarize(
         }
     };
     if let Some(what) = follow.failed {
-        return Err(what);
+        return Err(what.into_boxed_str());
     }
-    Ok((content, follow.callees))
+    Ok(Summary { content, callees: follow.callees.into_boxed_slice() })
 }
 
 /// The monomorphized runtime body of `body` with `args` in `env`, made for the caller and
@@ -458,8 +464,8 @@ fn body_once<'db>(
     #[cfg(test)]
     if plant::keeps_bodies() {
         // The planted bug of the held-count test: the memoized body, as until 2026-11-13.
-        // clone: the memo's body, a planted bug's copy
-        return dispatch::body_of(db, *env, body, *args).map(Clone::clone);
+        // clone: the body query's keys, reference counts; the memo's body, a planted bug's copy
+        return dispatch::body_of(db, env.clone(), body, args.clone()).map(Clone::clone);
     }
     dispatch::body_once(db, env, body, args)
 }
@@ -487,19 +493,20 @@ pub(crate) mod plant {
     }
 }
 
-fn summary_cycle<'db>(
-    _: &'db Db,
+fn summary_cycle(
+    _: &Db,
+    _: blaze_query::db::Id,
     _: StoredParamEnvAndCrate,
     _: Node,
     _: bool,
-) -> Result<Summary<'db>, &'db str> {
-    Err(SELF_READ)
+) -> Result<Summary, Box<str>> {
+    Err(SELF_READ.into())
 }
 
 /// What one instance's edges run, as dispatch resolves them: the walk's next instances.
 struct Follow<'a, 'db> {
     cx: &'a Cx<'db>,
-    callees: Vec<Node, Global>,
+    callees: Vec<Node>,
     seen: HashSet<Node, Global>,
     dropped: HashSet<Ty<'db>, Global>,
     failed: Option<String>,
@@ -514,7 +521,7 @@ impl<'db> Follow<'_, 'db> {
 
     fn push(&mut self, node: Node) {
         if !self.seen.contains(&node) {
-            self.seen.insert(node);
+            self.seen.insert(node.clone()); // clone: a reference count
             self.callees.push(node);
         }
     }
@@ -632,7 +639,7 @@ impl<'db> Follow<'_, 'db> {
         match self.cx.normalize(ty).kind() {
             TyKind::Closure(id, args) => {
                 let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                self.walk(Body::Closure(blaze_memo::Id::gid(id.0)), parent);
+                self.walk(Body::Closure(blaze_query::db::AsId::as_id(&id.0)), parent);
                 self.drop_glue(ty);
             }
             TyKind::FnDef(def, args) => {

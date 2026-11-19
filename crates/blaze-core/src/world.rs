@@ -37,4 +37,3 @@ pub mod children;
 pub mod clock;
 pub mod disk;
 pub mod threads;
-pub mod weak;

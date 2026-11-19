@@ -2,16 +2,12 @@ use std::path::PathBuf;
 
 use snafu::Snafu;
 
-/// Every way an astlog run over tree-sitter trees can fail: the engine's errors and this
-/// source's own.
-pub type Error = astlog_engine::Error<SourceError>;
-
-/// The tree-sitter source's own failures, from reading sources to applying edits.
+/// Every way an astlog run can fail, from reading sources to applying edits.
 ///
 /// Displays never embed `{source}`: callers walk the chain.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
-pub enum SourceError {
+pub enum Error {
     #[snafu(display("read {}", path.display()))]
     ReadFile { path: PathBuf, source: std::io::Error },
 
@@ -27,6 +23,9 @@ pub enum SourceError {
     #[snafu(display("tree-sitter failed to parse {}", path.display()))]
     ParseFile { path: PathBuf },
 
+    #[snafu(display("rules:{line}: {message}"))]
+    Dsl { line: usize, message: String },
+
     #[snafu(display("rules:{line}: unknown language `{name}`"))]
     UnknownLangName { name: String, line: usize },
 
@@ -39,18 +38,50 @@ pub enum SourceError {
     ))]
     PredicateUnsupported { line: usize },
 
+    #[snafu(display("rules:{line}: invalid regex `{pattern}` in text-match"))]
+    Regex { line: usize, pattern: String, source: regex::Error },
+
+    #[snafu(display("rules:{line}: head variable `{var}` is not bound by the body"))]
+    UnboundHeadVar { line: usize, var: String },
+
+    #[snafu(display("rules:{line}: builtin `{name}` needs argument `{arg}` bound at this point"))]
+    UnboundBuiltinArg { line: usize, name: String, arg: String },
+
+    #[snafu(display("rules:{line}: builtin `{name}` takes {expected} arguments, got {got}"))]
+    BuiltinArity { line: usize, name: String, expected: usize, got: usize },
+
+    #[snafu(display("rules:{line}: builtin `{name}` needs a node, but `{arg}` is text"))]
+    BuiltinNotNode { line: usize, name: String, arg: String },
+
+    #[snafu(display("rules:{line}: relation `{name}` is not defined by any rule"))]
+    UnknownRelation { name: String, line: usize },
+
+    #[snafu(display(
+        "rules:{line}: relation `{name}` used with arity {got}, defined with arity {expected}"
+    ))]
+    ArityMismatch { name: String, expected: usize, got: usize, line: usize },
+
     #[snafu(display("rules:{line}: capture index {index} out of range for query"))]
     CaptureIndex { line: usize, index: u32 },
 
-    #[snafu(display(
-        "rules:{line}: capture `@{capture}` matched nothing in a match of {} (a `?`, `*` or \
-         alternation left it out); give the optional part its own match",
-        path.display()
-    ))]
-    CaptureAbsent { line: usize, capture: String, path: PathBuf },
+    #[snafu(display("rewrite `{name}`: replacement target `{var}` is bound to text, not a node"))]
+    ReplaceNotNode { name: String, var: String },
 
-    #[snafu(display("rules:{line}: `{name}` needs a node, but `{arg}` is {what}"))]
-    NotNode { line: usize, name: String, arg: String, what: &'static str },
+    #[snafu(display("rules:{line}: template references unbound variable `{var}`"))]
+    TemplateVar { var: String, line: usize },
+
+    #[snafu(display("rules:{line}: lint severity must be `error` or `warning`, got `{got}`"))]
+    LintSeverity { got: String, line: usize },
+
+    #[snafu(display(
+        "rules:{line}: lint message references `{{{var}}}`, which is not a head variable of `{relation}`"
+    ))]
+    LintVar { relation: String, var: String, line: usize },
+
+    #[snafu(display(
+        "lint `{rule}` (rules:{line}): relation row has no node-valued column to locate the finding"
+    ))]
+    LintNoNode { rule: String, line: usize },
 
     #[snafu(display(
         "overlapping rewrites in {}: bytes {first_start}..{first_end} and {second_start}..{second_end}",
@@ -63,4 +94,19 @@ pub enum SourceError {
         second_start: usize,
         second_end: usize,
     },
+
+    #[snafu(display(
+        "rules:{line}: variable `{var}` is used only inside `(not ...)`; \
+         negation can only filter variables a positive atom already binds"
+    ))]
+    UnsafeNegation { var: String, line: usize },
+
+    #[snafu(display(
+        "rules: negation through recursion has no stratification (a relation \
+         depends on itself via `(not ...)`); first rule `{rule}` at rules:{line}"
+    ))]
+    UnstratifiableProgram { rule: String, line: usize },
+
+    #[snafu(display("internal invariant broken: {what}"))]
+    Internal { what: String },
 }

@@ -2,10 +2,9 @@
 //!
 //! A probe's answer is a function of the inputs [`PickKey`] names, its reads aside. For a
 //! receiver with no inference variables those are known before the probe, so the answer is
-//! stored once per database, crate and snapshot and shared by every body: a body that takes it
-//! notes the reads the probe made (`next_solver::interner::replay`) in its own record, so it is
-//! checked again when any of them changes, as the solver's shared cache does
-//! (`next_solver/interner/tls_cache.rs`).
+//! stored once per database, crate and revision and shared by every body: a body that takes it
+//! replays the reads the probe made (`blaze_query::db::replay_reads`), so it is checked again when any of
+//! them changes, as the solver's shared cache does (`next_solver/interner/tls_cache.rs`).
 //!
 //! The autoderef steps of a canonical receiver are stored the same way, by what
 //! `method_autoderef_steps` reads: rustc's `method_autoderef_steps` query.
@@ -19,7 +18,7 @@ use std::hash::{Hash, Hasher};
 
 use base_db::Nonce;
 use blaze_hash::FixedHasher;
-use blaze_memo::{Database as _, Epoch, Gid, Id as _};
+use blaze_query::db::{AsId, Reads, View};
 use hir_expand::name::Name;
 use rustc_type_ir::{
     RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
@@ -33,7 +32,6 @@ use super::{
 };
 use crate::next_solver::{
     Canonical, Const, DbInterner, PredefinedOpaques, Region, RegionExt, Ty, TypingMode,
-    interner::{Reads, recorded, replay},
 };
 
 /// What a probe found out about itself that decides whether, and under which key, its answer is
@@ -51,10 +49,10 @@ pub(super) struct ProbeFacts {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PickKey {
     nonce: Nonce,
-    solver_crate: Gid,
-    resolver_crate: Gid,
-    /// `None`, or the module of the call when the answer depends on it.
-    module: Option<Gid>,
+    solver_crate: u32,
+    resolver_crate: u32,
+    /// 0, or the module of the call when the answer depends on it.
+    module: u32,
     /// The receiver with its free regions erased.
     self_ty: u32,
     name: u32,
@@ -81,8 +79,8 @@ impl Key for PickKey {
     fn hint(&self) -> u64 {
         let mut hasher = FixedHasher::default();
         self.nonce.hash(&mut hasher);
-        (self.solver_crate, self.resolver_crate, self.module).hash(&mut hasher);
-        hasher.write_u32(self.self_ty);
+        hasher.write_u64(pair(self.solver_crate, self.resolver_crate));
+        hasher.write_u64(pair(self.module, self.self_ty));
         hasher.write_u64(pair(self.name, self.scope));
         hasher.write_u64(pair(self.param_env, self.typing_defs));
         hasher.write_u32(self.bits);
@@ -96,7 +94,7 @@ fn pair(high: u32, low: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-/// What the pick table holds for a key in a snapshot.
+/// What the pick table holds for a key in a revision.
 enum Cached {
     /// The answer depends on the module of the call: it is under the key with the module.
     ByModule,
@@ -119,7 +117,7 @@ const PICK_BITS: u32 = 16;
     clippy::disallowed_types,
     reason = "the process's one method pick table: shared across all databases"
 )]
-static PICKS: std::sync::LazyLock<Table<PickKey, Epoch, Cached>> =
+static PICKS: std::sync::LazyLock<Table<PickKey, View, Cached>> =
     std::sync::LazyLock::new(|| Table::new(PICK_BITS));
 
 /// The answer of the probe for `name` on `self_ty` in `ctx`: from the table when it holds it,
@@ -134,20 +132,20 @@ pub(super) fn pick<'db>(
     probe: impl FnOnce(&mut ProbeFacts) -> PickResult<'db>,
 ) -> PickResult<'db> {
     let db = ctx.infcx.interner.db;
-    let (nonce, epoch) = (db.nonce(), db.memo().snapshot_epoch());
+    let (nonce, revision) = db.nonce_and_revision();
     let Some(mut key) = PickKey::new(ctx, nonce, mode, name, self_ty, allow_unstable, scope) else {
         // Outside the cache's domain the probe is the one path.
         return probe(&mut ProbeFacts::default());
     };
     {
         let guard = blaze_reclaim::enter();
-        let mut found = PICKS.get(&guard, &key, epoch);
+        let mut found = PICKS.get(&guard, &key, revision);
         if let Some(Cached::ByModule) = found {
-            key.module = Some(ctx.resolver.module().gid());
-            found = PICKS.get(&guard, &key, epoch);
+            key.module = ctx.resolver.module().as_id().as_u32();
+            found = PICKS.get(&guard, &key, revision);
         }
         if let Some(Cached::Answer(answer, reads)) = found {
-            replay(db, reads);
+            blaze_query::db::replay_reads(db, *reads);
             let result = answer.to_result();
             #[cfg(test)]
             tests::on_hit(answer, &result, || probe(&mut ProbeFacts::default()));
@@ -155,17 +153,17 @@ pub(super) fn pick<'db>(
         }
     }
     let mut facts = ProbeFacts::default();
-    let (result, reads) = recorded(db, || probe(&mut facts));
+    let (result, reads) = blaze_query::db::capture_reads(db, || probe(&mut facts));
     if let Some(reads) = reads
         && facts.cacheable
         && let Some(answer) = Answer::of(&result)
     {
         let guard = blaze_reclaim::enter();
-        if facts.module_dependent && key.module.is_none() {
-            PICKS.insert(&guard, key, epoch, Cached::ByModule);
-            key.module = Some(ctx.resolver.module().gid());
+        if facts.module_dependent && key.module == 0 {
+            PICKS.insert(&guard, key, revision, Cached::ByModule);
+            key.module = ctx.resolver.module().as_id().as_u32();
         }
-        PICKS.insert(&guard, key, epoch, Cached::Answer(answer, reads));
+        PICKS.insert(&guard, key, revision, Cached::Answer(answer, reads));
     }
     result
 }
@@ -217,9 +215,9 @@ impl PickKey {
             | flag(features.supertrait_item_shadowing, FLAG_SUPERTRAIT_ITEM_SHADOWING);
         Some(PickKey {
             nonce,
-            solver_crate: interner.expect_crate().gid(),
-            resolver_crate: ctx.resolver.krate().gid(),
-            module: None,
+            solver_crate: interner.expect_crate().as_id().as_u32(),
+            resolver_crate: ctx.resolver.krate().as_id().as_u32(),
+            module: 0,
             self_ty: erase_free_regions(interner, self_ty).index(),
             name: name.symbol().id(),
             scope: scope.id(),
@@ -348,7 +346,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for EraseFreeRegions<'db> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct StepsKey {
     nonce: Nonce,
-    solver_crate: Gid,
+    solver_crate: u32,
     self_ty: u32,
     opaques: u32,
     var_kinds: u32,
@@ -365,7 +363,7 @@ impl Key for StepsKey {
     fn hint(&self) -> u64 {
         let mut hasher = FixedHasher::default();
         self.nonce.hash(&mut hasher);
-        self.solver_crate.hash(&mut hasher);
+        hasher.write_u32(self.solver_crate);
         hasher.write_u64(pair(self.self_ty, self.opaques));
         hasher.write_u64(pair(self.var_kinds, self.max_universe));
         hasher.write_u64(pair(self.param_env, self.typing_defs));
@@ -380,14 +378,14 @@ struct CachedSteps {
 }
 
 /// Steps of every database alive, `1 << STEPS_BITS` of them: the distinct canonical receivers
-/// probed in a snapshot.
+/// probed in a revision.
 const STEPS_BITS: u32 = 14;
 
 #[expect(
     clippy::disallowed_types,
     reason = "the process's one autoderef steps table: shared across all databases"
 )]
-static STEPS: std::sync::LazyLock<Table<StepsKey, Epoch, CachedSteps>> =
+static STEPS: std::sync::LazyLock<Table<StepsKey, View, CachedSteps>> =
     std::sync::LazyLock::new(|| Table::new(STEPS_BITS));
 
 /// Runs `f` on the autoderef steps of `input`: the table's, borrowed in place, when it holds
@@ -405,12 +403,12 @@ pub(super) fn with_steps<'db, R>(
         // Outside the cache's domain the steps are made for this probe alone.
         return f(&compute());
     }
-    let (nonce, epoch) = (db.nonce(), db.memo().snapshot_epoch());
+    let (nonce, revision) = db.nonce_and_revision();
     let (typing_tag, typing_defs) = typing_mode_key(ctx.infcx.typing_mode_raw());
     let (self_ty, opaques) = input.value;
     let key = StepsKey {
         nonce,
-        solver_crate: interner.expect_crate().gid(),
+        solver_crate: interner.expect_crate().as_id().as_u32(),
         self_ty: self_ty.index(),
         opaques: opaques.index(),
         var_kinds: input.var_kinds.index(),
@@ -423,17 +421,17 @@ pub(super) fn with_steps<'db, R>(
             | flag(ctx.features.arbitrary_self_types_pointers, FLAG_ARBITRARY_SELF_TYPES_POINTERS),
     };
     let guard = blaze_reclaim::enter();
-    if let Some(cached) = STEPS.get(&guard, &key, epoch) {
-        replay(db, &cached.reads);
+    if let Some(cached) = STEPS.get(&guard, &key, revision) {
+        blaze_query::db::replay_reads(db, cached.reads);
         return f(erase::unerase_steps(&cached.steps));
     }
-    let (steps, reads) = recorded(db, compute);
+    let (steps, reads) = blaze_query::db::capture_reads(db, compute);
     match reads {
         Some(reads) => {
             let cached = STEPS.insert(
                 &guard,
                 key,
-                epoch,
+                revision,
                 CachedSteps { steps: erase::steps(steps), reads },
             );
             f(erase::unerase_steps(&cached.steps))
@@ -446,10 +444,9 @@ pub(super) fn with_steps<'db, R>(
 ///
 /// The `'db` of these types marks interned handles (types, generic argument lists, bound
 /// variable lists: an index into a process-wide table that is never freed, and a
-/// `PhantomData<&'db ()>`) and `blaze_memo` ids (`Gid`s); none is a reference into the
-/// database. A table entry is handed out only to a probe of the database its key's nonce names,
-/// in the snapshot its state names, so every handle in it was made by that database as it still
-/// is.
+/// `PhantomData<&'db ()>`) and `blaze_query::db::Id`s; none is a reference into the database. A table entry
+/// is handed out only to a probe of the database its key's nonce names, in the revision its
+/// state names, so every handle in it was made by that database as it still is.
 ///
 /// The safe version is a lift: a fold over every handle of the pick or of each step's canonical
 /// type, rebuilding the value on every insert and every hit, where this is a move or a borrow.

@@ -5,7 +5,6 @@
 mod budget;
 mod db;
 mod edits;
-mod params;
 mod rename;
 mod replace;
 mod retarget;

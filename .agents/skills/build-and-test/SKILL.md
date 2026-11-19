@@ -59,33 +59,20 @@ committing. A result you can't tie to a tree is not evidence.
 
 ## work-in-ix-vms (rule 34)
 
-The Mac is a full place for blaze's work since 2026-11-15: builds, one crate's tests or the whole
-test run, the smoke before a merge (`proof-before-merge`) and real-project runs all may run there,
-and they do whenever the VM does not answer, is busy, or its disk hangs; nobody waits on the VM. On
-the Mac: one cargo or blaze build at a time, niced, `-j 6`, a target directory per worktree (two
-worktrees sharing one run each other's stale binaries), outputs kept outside `/tmp`, the disk
-watched (a 312 GB target filled it on 2026-11-13; the machine restarted under load on 2026-11-15). A
-number measured on the Mac says so; the edit-loop table that compares runs stays on one machine. The
-rest of this rule is how the VM is used when it is. There is one ix VM for blaze's Linux work:
-`blaze-vm` (arm64, 128 cores, 256 GiB committed; how-to `H12` under `agents/howto/` has its layout
-and how to remake it). Builds, tests, benchmarks, real-project runs and experiments on Linux all run
-there: nobody makes another VM (`ix new`) for a lane, a measurement or a project. It holds the one
-tree at `/root/blaze` with a warm build; blaze is built only through `/root/loop.sh <branch>
-<command...>`, which takes a lock, checks out the branch, builds once, installs to `/root/inst` and
-runs the command (ten minutes at most inside the lock); a lane's own state lives under
-`/root/wt/<lane>/` and long runs are systemd units it polls. Because every lane shares the machine,
-a timing names the load average it was taken under and compares base and new alternately in one
-window; for a table a claim rests on, the main agent holds the other work and the row says so. The
-exceptions are facts the one VM cannot give, each named in the lane's brief with its reason: the Mac
-for macOS behaviour (one build at a time, since three at once made every number of a night
-unusable). There is no x86-64 machine for now: x86-64 is CI's, and an x86 run (an EPYC VM, `ix new
---cpu epyc-5`) is an exception the owner is asked for first. Never AWS (`fleet-ops`, `dev-aws-N`).
-Where none of these can do it, stop and say what is missing. The machine has one budget, whoever's
-tree a build is in: one release build at a time, at `-j 48`, taken with `flock
-/root/locks/release.lock` around the cargo call; debug checks and tests run beside it at `-j 32` at
-most. A session tells the others before a release build, and a job that needs one waits for the
-lock, never starts beside another. Three release builds at `-j 64` with tests beside them left the
-guest unreachable for minutes, twice in one afternoon (2026-11-14).
+There is one ix VM for all of blaze's work: `blaze-vm` (arm64, 128 cores, 256 GiB committed; how-to
+`H12` under `agents/howto/` has its layout and how to remake it). Builds, tests, benchmarks,
+real-project runs and experiments on Linux all run there: nobody makes another VM (`ix new`) for a
+lane, a measurement or a project. It holds the one tree at `/root/blaze` with a warm build; blaze is
+built only through `/root/loop.sh <branch> <command...>`, which takes a lock, checks out the branch,
+builds once, installs to `/root/inst` and runs the command (ten minutes at most inside the lock); a
+lane's own state lives under `/root/wt/<lane>/` and long runs are systemd units it polls. Because
+every lane shares the machine, a timing names the load average it was taken under and compares base
+and new alternately in one window; for a table a claim rests on, the main agent holds the other work
+and the row says so. The exceptions are facts the one VM cannot give, each named in the lane's brief
+with its reason: the Mac for macOS behaviour (one build at a time, since three at once made every
+number of a night unusable). There is no x86-64 machine for now: x86-64 is CI's, and an x86 run (an
+EPYC VM, `ix new --cpu epyc-5`) is an exception the owner is asked for first. Never AWS
+(`fleet-ops`, `dev-aws-N`). Where none of these can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
@@ -126,11 +113,7 @@ line in its report: the main agent runs it in the next round and sends the answe
 are named in a lane's brief with the reason, and are few: one lane measuring a real project that
 takes minutes per run (it measures; it does not hold others up), and tools that need no build at all
 (a Python or TypeScript check that takes seconds). Landing: main takes the integration tree, or a
-part of it, when a round is clean on that exact commit and the smoke run has passed on it. A piece
-is cut without stopping the other lanes: the green head's tree is read into a scratch index, only
-the reporting lane's paths are added from the directory as they are on disk, and that one commit is
-what the VM compiles (`git read-tree <green>`, `git add -A -- <the lane's paths>`, `git write-tree`,
-`git commit-tree`); the lanes still writing are not in it, so its errors are that lane's.
+part of it, when a round is clean on that exact commit and the smoke run has passed on it.
 
 ## worktree-per-lane (rule 36)
 
@@ -218,9 +201,7 @@ status: `blaze debug inspect` for a blaze still running, `blaze slow` in its dir
 flight recording the watchdog names (`bounded-progress`); the report quotes that line. A timeout is
 a finding: a hang in blaze is a bug to report with that line and file (an annoyance row at least),
 and the fix is in blaze. Never wait a hang out, never rerun with a longer limit hoping it passes
-(`no-fallback`), and never let a script sleep and poll with no bound. A wait of more than a minute
-(a build, a job on the VM, a pull request's checks) runs in the background with a notification when
-it ends; the main agent never sits in a foreground wait while lanes and jobs need it.
+(`no-fallback`), and never let a script sleep and poll with no bound.
 
 ## act-on-snapshots (rule 80)
 
@@ -233,24 +214,6 @@ build on write, a lane's half-written files are not compiled until it says its p
 (`fan-out-write-only`), and no script publishes a result for a tree that changed under it. How: a
 command reads the tree once, at its start, and refuses by name a file that changed while it ran,
 never mixing two states.
-
-## real-run-first (rule 82)
-
-A new command, path or mode (a check with no daemon, a new backend, a new store) is run end to end
-on a real project, hello-world first, on the day its first piece compiles and before more is built
-on it: by the main agent, with a release blaze of the exact tree (`measure-the-exact-tree`), and
-again after every round of lanes. It writes the profile from that first run (`slow-is-p0-traced`),
-and the run is read through it: what `blaze explain` cannot say about the run's time or memory is
-the run's first bug, fixed before the next piece. What that run prints is the state of the work: its
-first failure is the next task, and its timing line says where the time goes before anyone
-optimises. Unit tests on fixtures and a passing simulation say the pieces agree with their models,
-not that the command works: nothing is reported as working, and no second piece is designed on top,
-until the real run has been made and its output read. A lane's brief names the real run that judges
-its piece. Where the real run cannot be made yet because a piece is not written, say which piece,
-and make the nearest real run that can be made (the real std keyed by the new key rule, the real
-project gathered) instead of a fixture. When finding each failure of the real run would cost one
-release build, first write the test that finds every such case in one run (key every crate of std,
-check every item), then fix what it lists.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

@@ -20,25 +20,26 @@
 #![forbid(unsafe_code)]
 
 use base_db::{
-    AbsPathBuf, CrateDisplayName, CrateKey, CrateName, CrateOrigin, CrateType, CrateTypes,
-    CrateWorkspaceData, Edit, Env, FileId, WorldDependency,
+    AbsPathBuf, BuiltDependency, Crate, CrateDisplayName, CrateName, CrateOrigin, CrateType,
+    CrateTypes, CrateWorkspaceData, Db, Env, FileId,
 };
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
+use blaze_query::db::Durability;
 use blaze_units::{
     query::{PackagePlan, Units},
     schema::{BuiltFor, Mode, Unit},
     stdlib::target::{self, CfgArgs},
 };
 use cfg::{CfgAtom, CfgDiff, CfgOptions};
-use hir_expand::proc_macro::ProcMacro;
+use hir_expand::proc_macro::{ProcMacro, ProcMacros};
 use hir_ty_mir::const_macro::{CONST_AST, CONST_AST_NAME};
 use intern::Symbol;
 use span::Edition;
 use std::alloc::Global;
 use triomphe::Arc;
 
-use super::{LowerError, Lowering, crates, files, give_macros};
+use super::{LowerError, Lowering, crates, files};
 
 /// The cfg every crate of a package with const macros has.
 pub(crate) const CFG: &str = "blaze_const_macros";
@@ -66,7 +67,7 @@ pub(crate) struct Group {
     /// The standard library's `proc_macro` and `core` for the platform.
     pub(crate) proc_macro: usize,
     pub(crate) core: usize,
-    pub(crate) krate: Option<CrateKey>,
+    pub(crate) krate: Option<Crate>,
 }
 
 /// The build's macro crates, and which units depend on each.
@@ -79,7 +80,7 @@ pub(crate) struct Plan {
     pub(crate) after: Vec<Vec<usize>>,
     /// By what it is built for ([`BuiltFor`] in the front end's form): the crate of
     /// `const-ast`, once made.
-    pub(crate) const_ast: HashMap<base_db::BuiltFor, CrateKey, Global>,
+    pub(crate) const_ast: HashMap<base_db::BuiltFor, Crate, Global>,
 }
 
 impl Plan {
@@ -90,7 +91,7 @@ impl Plan {
 
 /// A macro crate as made, which [`Loaded::reload`] keeps up with its file.
 pub(crate) struct Loaded {
-    pub(crate) krate: CrateKey,
+    pub(crate) krate: Crate,
     pub(crate) root: FileId,
     pub(crate) edition: Edition,
     /// The content of the root file its macros were listed from.
@@ -241,17 +242,18 @@ pub(crate) struct Cx<'a> {
     pub(crate) const_ast_root: Option<FileId>,
     pub(crate) const_ast_dir: &'a str,
     pub(crate) proc_macro_cwd: AbsPathBuf,
+    pub(crate) durability: Durability,
 }
 
-/// The macro crate of `group`, made in `edit` with the crate of `const-ast` for its platform if
-/// that is not made yet: each made pushed to `all`, dependencies first. Its macros are listed
-/// from its file's text as `edit` has written it.
+/// The macro crate of `group`, made with the crate of `const-ast` for its platform if that is
+/// not made yet: each made pushed to `all`, dependencies first. Its macros are listed from its
+/// file's text.
 pub(crate) fn make(
-    edit: &mut Edit<'_>,
+    db: &mut Db,
     plan: &mut Plan,
     group: usize,
     cx: Cx<'_>,
-    all: &mut Vec<CrateKey>,
+    all: &mut Vec<Crate>,
 ) -> Result<(Loaded, Vec<ProcMacro>), LowerError> {
     let Group { package, anchor, proc_macro, core, .. } = plan.groups[group];
     let file = plan.groups[group].file.clone();
@@ -293,7 +295,7 @@ pub(crate) fn make(
                     cx.const_ast_dir,
                 ));
             };
-            let core = WorldDependency::with_prelude(name("core"), made(core)?, true, true);
+            let core = BuiltDependency::with_prelude(name("core"), made(core)?, true, true);
             let mut target_cfg = CfgOptions::default();
             for it in target::target_cfg(cx.triple, &CfgArgs::default())
                 .map_err(|why| LowerError::at(why, cx.triple))?
@@ -301,15 +303,15 @@ pub(crate) fn make(
                 target_cfg
                     .extend([crates::atom(&it).map_err(|why| LowerError::at(why, cx.triple))?]);
             }
-            let made_crate = |edit: &mut Edit<'_>,
+            let made_crate = |db: &mut Db,
                               crate_name: &str,
-                              dependencies: Vec<WorldDependency, Global>,
+                              dependencies: Vec<BuiltDependency>,
                               is_proc_macro: bool,
                               crate_type: CrateType,
                               cfg_flag: &str|
-             -> Result<CrateKey, LowerError> {
+             -> Result<Crate, LowerError> {
                 let kind = base_db::TargetKind::Lib { is_proc_macro };
-                let data = base_db::WorldCrateData {
+                let data = base_db::BuiltCrateData {
                     root_file_id: const_ast_root,
                     edition: Edition::Edition2024,
                     dependencies,
@@ -332,28 +334,42 @@ pub(crate) fn make(
                 // clone: the target's few cfg atoms, once for each of the two crates
                 let mut cfg = target_cfg.clone();
                 cfg.extend([CfgAtom::Flag(Symbol::intern(cfg_flag))]);
-                // Not sealed: the world seals a crate by the pin of the tree it is read from
-                // (`CrateData::sealed`), and blaze's copy of `const-ast` is in none.
-                Ok(edit.create_crate(data, extra, cx.workspace.clone(), cfg, Env::default()))
+                Ok(Crate::create(
+                    db,
+                    data,
+                    extra,
+                    cx.workspace.clone(),
+                    cfg,
+                    Env::default(),
+                    Durability::HIGH,
+                ))
             };
             // `const_ast::quote!`'s crate: the same root file as a proc-macro crate, whose one
             // macro, `quote`, is the host's lowering of the quote to builder calls.
-            let mut on_core = Vec::with_capacity_in(1, Global);
-            on_core.push(core.clone()); // clone: its one dependency, once a platform
-            let quote =
-                made_crate(edit, CONST_AST_QUOTE_NAME, on_core, true, CrateType::ProcMacro, QUOTE_CFG)?;
+            let quote = made_crate(
+                db,
+                CONST_AST_QUOTE_NAME,
+                vec![core.clone()], // alloc, clone: its one dependency, once a platform
+                true,
+                CrateType::ProcMacro,
+                QUOTE_CFG,
+            )?;
             all.push(quote);
-            let mut quote_macros = Vec::with_capacity_in(1, Global);
-            quote_macros.push(hir_ty_mir::const_macro::quote::proc_macro());
-            give_macros(edit, quote, Ok(quote_macros));
+            let quote_macros = vec![hir_ty_mir::const_macro::quote::proc_macro()]; // alloc: its one macro
+            ProcMacros::give(db, [(quote, Ok(quote_macros))]);
             // `const_ast` itself, with the const heap and `quote!` re-exported from that crate,
             // which its root names by path (`pub use const_ast_quote::quote`): in its extern
             // prelude, not a sysroot crate.
             let on_quote =
-                WorldDependency::with_prelude(name(CONST_AST_QUOTE_NAME), quote, true, false);
-            let mut both = Vec::with_capacity_in(2, Global);
-            both.extend([core, on_quote]);
-            let krate = made_crate(edit, CONST_AST_NAME, both, false, CrateType::Rlib, CONST_EVAL_CFG)?;
+                BuiltDependency::with_prelude(name(CONST_AST_QUOTE_NAME), quote, true, false);
+            let krate = made_crate(
+                db,
+                CONST_AST_NAME,
+                vec![core, on_quote], // alloc: its two dependencies, once a platform
+                false,
+                CrateType::Rlib,
+                CONST_EVAL_CFG,
+            )?;
             all.push(krate);
             plan.const_ast.insert(platform, krate);
             krate
@@ -367,14 +383,14 @@ pub(crate) fn make(
         dependencies.push(crates::dependency(unit, on, dep, made(dep.index)?, what)?);
     }
     if !dependencies.iter().any(|it| it.name.as_str() == "proc_macro") {
-        dependencies.push(WorldDependency::with_prelude(
+        dependencies.push(BuiltDependency::with_prelude(
             name("proc_macro"),
             made(proc_macro)?,
             true,
             true,
         ));
     }
-    dependencies.push(WorldDependency::with_prelude(name(CONST_AST_NAME), const_ast, true, false));
+    dependencies.push(BuiltDependency::with_prelude(name(CONST_AST_NAME), const_ast, true, false));
 
     let edition = crates::edition(unit, what)?;
     let mut cfg = crates::cfg(unit, plan_of, cx.triple, cx.host_cpu, what)?;
@@ -383,7 +399,7 @@ pub(crate) fn make(
         vec![CfgAtom::Flag(Symbol::intern("test"))],
     ));
     let stem = stem(file);
-    let data = base_db::WorldCrateData {
+    let data = base_db::BuiltCrateData {
         root_file_id: root,
         edition,
         dependencies,
@@ -404,18 +420,13 @@ pub(crate) fn make(
         build_script_runs: crates::build_script_runs(units, unit, |at| cx.lowerings[at].class),
     };
     let env: Env = plan_of.env.iter().cloned().collect();
-    // Never sealed: its root is the file the manifest names, pinned by no tree (`sealed`).
-    let krate = edit.create_crate(data, extra, cx.workspace, cfg, env);
+    let krate = Crate::create(db, data, extra, cx.workspace, cfg, env, cx.durability);
     all.push(krate);
     plan.groups[group].krate = Some(krate);
-    // Its file's text as this edit has written it: the snapshot has none of it yet.
-    let Some((text, content)) = edit.written_file_text(root) else {
-        return Err(LowerError::at(
-            format!("the const macros' file `{file}` has no text (its bytes are not UTF-8)"),
-            file,
-        ));
-    };
-    let macros = listed(root, &text, edition);
+    let db: &Db = db;
+    let file_text = db.file_text(root);
+    let macros = listed(root, &**file_text.text(db), edition);
+    let content = file_text.content(db);
     let loaded = Loaded { krate, root, edition, content, what: what.clone() };
     Ok((loaded, macros))
 }
@@ -448,20 +459,20 @@ fn listed(root: FileId, text: &str, edition: Edition) -> Vec<ProcMacro> {
     macros
 }
 
-/// Gives each crate of `made` its macros, in `edit`: a macro crate made in it, or one whose
-/// file's text moved ([`Loaded::reload`]), so its list is another either way.
-pub(crate) fn set_macros(edit: &mut Edit<'_>, made: Vec<(CrateKey, Vec<ProcMacro>)>) {
-    for (krate, macros) in made {
-        give_macros(edit, krate, Ok(macros));
+/// Sets each of `made`'s macros among the database's proc macros.
+pub(crate) fn set_macros(db: &mut Db, made: Vec<(Crate, Vec<ProcMacro>)>) {
+    if made.is_empty() {
+        return;
     }
+    ProcMacros::give(db, made.into_iter().map(|(krate, macros)| (krate, Ok(macros))));
 }
 
 impl Loaded {
-    /// Its macros listed again if its file changed since, as `edit` has written it; none when
-    /// it did not. An error when the file is gone from the front end, or has no text.
+    /// Its macros listed again if its file changed since; none when it did not. An error when
+    /// the file is gone from the front end.
     pub(crate) fn reload(
         &mut self,
-        edit: &Edit<'_>,
+        db: &Db,
         paths: &std::collections::HashMap<FileId, String>,
     ) -> Result<Option<Vec<ProcMacro>>, LowerError> {
         if !paths.contains_key(&self.root) {
@@ -470,17 +481,13 @@ impl Loaded {
                 self.what.clone(),
             ));
         }
-        let Some((text, content)) = edit.written_file_text(self.root) else {
-            return Err(LowerError::at(
-                "the file of the const macros has no text (its bytes are not UTF-8)",
-                self.what.clone(),
-            ));
-        };
+        let input = db.file_text(self.root);
+        let content = input.content(db);
         if content == self.content {
             return Ok(None);
         }
         self.content = content;
-        Ok(Some(listed(self.root, &text, self.edition)))
+        Ok(Some(listed(self.root, &**input.text(db), self.edition)))
     }
 }
 

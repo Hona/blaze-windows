@@ -120,7 +120,7 @@ const SURFACE_TEXT: &str = "blaze v2 file surface text 2";
 /// when a setting of its closure moved. The directories a path is written against are told
 /// the database once, before any key is asked ([`base_db::Files::set_port`]), and are not an
 /// input: a database is one checkout's under one home.
-#[blaze_memo::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn ported_crate(db: &Db, krate: Crate) -> ContentId {
     krate.ported_content(db, &|dep| ported_crate(db, dep))
 }
@@ -236,31 +236,17 @@ pub(crate) fn root_alone(db: &Db, krate: Crate) -> bool {
         && reads_root_alone(db, EditionedFileId::new(db, data.root_file_id, data.edition))
 }
 
-/// [`root_alone_of`] of `file`'s parse; false for a file with no text. Whether it has text is
-/// the caller's read, as in [`code_text`].
+/// [`root_alone_of`] of `file`'s parse; false for a file with no text. The text is read
+/// before the parse, as [`code_text`] reads it.
+#[blaze_query::tracked(returns(copy))]
 fn reads_root_alone(db: &Db, file: EditionedFileId) -> bool {
-    has_text(db, file) && parsed_root_alone(db, file)
-}
-
-/// [`root_alone_of`] of `file`'s parse, for a file with text ([`has_text`]).
-#[blaze_memo::tracked(returns(copy))]
-fn parsed_root_alone(db: &Db, file: EditionedFileId) -> bool {
-    _ = db.file_text(file.file_id(db)).text(db);
-    root_alone_of(&file.parse(db).syntax_node())
-}
-
-/// Whether `file` has text, read by the caller (a query keyed by its crate), never by a query
-/// keyed by `file` alone: an [`EditionedFileId`] is homed with its file's text, so the id of a
-/// file with none (bytes that are not UTF-8) names no arena, and a query keyed by it is homed
-/// at the session, where it may read no crate's data. For a file with none, its bytes are read
-/// too, so that it getting text again reruns the caller.
-fn has_text(db: &Db, file: EditionedFileId) -> bool {
     let id = file.file_id(db);
     if !db.has_file_text(id) {
         _ = db.file_content(id);
         return false;
     }
-    true
+    _ = db.file_text(id).text(db);
+    root_alone_of(&file.parse(db).syntax_node())
 }
 
 /// The macros of the standard library a [`root_alone_of`] file may call: none reads a file,
@@ -456,7 +442,7 @@ fn use_could_rename(node: &SyntaxNode) -> bool {
 /// archive a build script left in `OUT_DIR`, which [`crate::Lowered::ran`] puts in its
 /// package's source root) is its bytes' content ([`Db::file_content`], what `include_bytes!`
 /// reads), never its text: `file_text` has none for it.
-#[blaze_memo::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn own_code(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let root_file = data.root_file_id;
@@ -545,7 +531,7 @@ pub(crate) struct OwnNarrow {
 /// [`OwnNarrow`] of `krate`: the files [`crate::Lowered::identity`] holds of it (its root
 /// alone for a [`root_alone`] crate, else every file of its source root by path), each Rust
 /// file as its code text or its interface text, any other by its bytes.
-#[blaze_memo::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
     let data = krate.data(db);
     let root_file = data.root_file_id;
@@ -573,7 +559,7 @@ pub(crate) fn library_narrowed(db: &Db, krate: Crate) -> bool {
 /// [`own_narrow`], of every file of its source root (its identity holds them all), each Rust
 /// file parsed in full for this alone ([`whole_code_text`]). What the driver keeps under
 /// [`library_key`]: asked only where the store has none.
-#[blaze_memo::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn library_narrow(db: &Db, krate: Crate) -> OwnNarrow {
     let data = krate.data(db);
     let edition = data.edition;
@@ -807,36 +793,37 @@ pub(crate) fn observed(db: &Db, krate: Crate, file: base_db::FileId) -> Option<C
 
 /// [`code_text`] of a library source root's `file`, whose parse the database keeps as an
 /// outline: from a full parse made here and dropped, so the database holds no tree for it.
-/// Whether it has text is the caller's read, as in [`code_text`].
+#[blaze_query::tracked(returns(copy))]
 fn whole_code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
-    has_text(db, file).then(|| parsed_whole_code_text(db, file))
-}
-
-/// [`whole_code_text`] of a file with text ([`has_text`]).
-#[blaze_memo::tracked(returns(copy))]
-fn parsed_whole_code_text(db: &Db, file: EditionedFileId) -> CodeText {
     let (id, edition) = file.unpack(db);
+    if !db.has_file_text(id) {
+        // Its bytes, read so that it getting text again reruns this.
+        _ = db.file_content(id);
+        return None;
+    }
     let text = db.file_text(id);
     let text: &str = &**text.text(db);
     let parse = syntax::SourceFile::parse(text, edition);
-    code_text_of(parse.tree().syntax(), text)
+    Some(code_text_of(parse.tree().syntax(), text))
 }
 
 /// [`code_text_of`] of `file`'s parse; none for a file with no text (bytes that are not
 /// UTF-8), which [`own_code`] takes by its bytes' content and the compiler refuses to parse.
-/// Whether it has text is the caller's read ([`has_text`]), so a file that loses its text
-/// reruns the caller, and the parse, which would read the text it no longer has, is not asked.
+///
+/// The text is read before the parse: a file that loses its text then reruns this from its
+/// first input, and its parse, which would read the text it no longer has, is not checked.
+#[blaze_query::tracked(returns(copy))]
 fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
-    has_text(db, file).then(|| parsed_code_text(db, file))
-}
-
-/// [`code_text_of`] of `file`'s parse, for a file with text ([`has_text`]).
-#[blaze_memo::tracked(returns(copy))]
-fn parsed_code_text(db: &Db, file: EditionedFileId) -> CodeText {
-    let text = db.file_text(file.file_id(db));
+    let id = file.file_id(db);
+    if !db.has_file_text(id) {
+        // Its bytes, read so that it getting text again reruns this.
+        _ = db.file_content(id);
+        return None;
+    }
+    let text = db.file_text(id);
     let text = text.text(db);
     let parse = file.parse(db);
-    code_text_of(&parse.syntax_node(), text)
+    Some(code_text_of(&parse.syntax_node(), text))
 }
 
 /// What of a file of text `text`, parsed as `root`, its crate's code can observe (the module's

@@ -29,7 +29,7 @@ pub(super) static SWEPT: blaze_core::lock::Lock<Vec<(base_db::Nonce, bool, usize
 /// The memos the sweeps of `db` asked since the last take, over both sets of passes, and
 /// whether any sweep had nothing kept.
 fn take_asked(db: &base_db::Db) -> (usize, bool) {
-    let nonce = db.nonce();
+    let nonce = db.nonce_and_revision().0;
     let mut swept = SWEPT.lock();
     let (mut asked, mut whole) = (0, false);
     swept.retain(|&(of, _, count, all)| {
@@ -45,7 +45,7 @@ fn take_asked(db: &base_db::Db) -> (usize, bool) {
 /// The bodies whose lints ran in `db` since the last take, once for each of the passes
 /// before the abort and the late passes, in no order.
 fn take_linted(db: &base_db::Db) -> Vec<DefWithBodyId> {
-    let nonce = db.nonce();
+    let nonce = db.nonce_and_revision().0;
     let mut linted = LINTED.lock();
     let mut own = Vec::new();
     linted.retain(|&(of, def, _)| {
@@ -82,7 +82,7 @@ fn fixture(n: usize) -> String {
 fn with_cx(n: usize, check: impl FnOnce(&Cx<'_, '_>)) {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(db, krate, checked.files(), &frame);
@@ -188,7 +188,7 @@ fn edit_cost(near: usize, functions: usize, kept: bool) -> (usize, usize, bool) 
     let run = |db: &base_db::Db, codegen: bool, args: &[&str]| {
         let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
         let cmd = crate::lints::CommandLine::parse(&args).expect("the test's lint flags parse");
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
             let cx = Cx::new(db, krate, Files::unnamed(), &frame).with_lints(&cmd);
@@ -202,7 +202,7 @@ fn edit_cost(near: usize, functions: usize, kept: bool) -> (usize, usize, bool) 
     assert!(first >= 2 * functions, "the first check lints every body: {first} of {functions}");
     let (asked, whole) = take_asked(&db);
     assert!(whole && asked >= 2 * functions, "the first sweeps ask every memo: {asked}");
-    crate::tests::set_file_text(&mut db, main, &edited_main(near));
+    db.set_file_text(main, &edited_main(near));
     match kept {
         true => run(&db, true, &[]),
         false => run(&db, false, &["-A", "unused-comparisons"]),
@@ -216,7 +216,6 @@ fn edit_cost(near: usize, functions: usize, kept: bool) -> (usize, usize, bool) 
 /// same among 20 bodies and 200. Until 2026-11-19 each sweep asked every memo on every check
 /// (11,368 of opencode-desktop's binary, a verification each).
 #[test]
-#[ignore = "blaze-memo: no changed set names the memos an edit reached; every sweep asks every member, reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_asks_the_memos_it_reached_and_no_other() {
     let near = 4;
     let (_, small, small_whole) = edit_cost(near, 20, true);
@@ -240,12 +239,7 @@ fn the_oracle_catches_a_sweep_that_asks_every_memo() {
 /// most those of the edited file (the edited body, and a body after it whose lints read
 /// where it is written, which the edit moved), whatever the size of the rest of the crate:
 /// never a body of a file the edit did not touch.
-///
-/// False by design on blaze-memo (port decision: reuse across edits comes from records, not
-/// the memo): an edit of a file now rebuilds its crate's arena, so every body of the crate is
-/// linted again, whatever file it is in. Left failing.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_lints_no_body_of_another_file_again() {
     let near = 4;
     let small = linted_after_an_edit(near, 20, true);

@@ -33,10 +33,7 @@ use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 
 use super::{Lint, alloc::written_callee, facts};
-use crate::{
-    check::{self, Cx},
-    kept,
-};
+use crate::check::{self, Cx};
 
 const LINT: Lint = Lint::InternCandidate;
 
@@ -87,14 +84,15 @@ pub(crate) struct Count {
 }
 
 /// The [`Count`] of each type of the crate its bodies key a map by, compare or clone.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Uses<'db>(kept::Map<'db, AdtId, Count>);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Uses(HashMap<AdtId, Count, Global>);
 
 /// What `krate`'s bodies do with each type, as the module docs say, once per crate.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn intern_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db> {
-    let mut uses: HashMap<AdtId, Count, Global> = HashMap::new_in(Global);
-    let mut defs: Vec<DefWithBodyId, Global> = Vec::new_in(Global);
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn intern_uses(db: &Db, krate: base_db::Crate) -> Uses {
+    let mut uses = Uses(HashMap::new_in(Global));
+    // alloc: the crate's bodies, once per crate and edit
+    let mut defs = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         check::bodies_of(db, module.scope(db), &mut defs);
     }
@@ -106,9 +104,9 @@ pub(crate) fn intern_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db> 
                 check::bodies_of(db, module.scope(db), &mut defs);
             }
         }
-        count_in(db, def, &mut uses);
+        count_in(db, def, &mut uses.0);
     }
-    Uses(kept::Map::keep(db, uses))
+    uses
 }
 
 /// Adds what the body of `def` does with each type to `out`.

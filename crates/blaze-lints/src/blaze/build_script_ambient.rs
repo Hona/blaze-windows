@@ -45,8 +45,7 @@ use super::{
     Lint, frozen_collection,
     std_use::{self, Authority},
 };
-use crate::{check::Cx, kept};
-use std::alloc::Global;
+use crate::check::Cx;
 
 const LINT: Lint = Lint::BuildScriptAmbient;
 
@@ -82,10 +81,10 @@ impl Authority {
 }
 
 /// One item of std's ambient authority a build script uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Use<'db> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Use {
     /// As a finding names it: `std::env::var`, `std::process::Command`.
-    name: &'db str,
+    name: String,
     authority: Authority,
     /// How many paths and method calls of the script's bodies are of it.
     count: u32,
@@ -96,14 +95,15 @@ pub(crate) struct Use<'db> {
 
 /// The items of std's ambient authority a crate's bodies use, in the order they are first met:
 /// the crate's bodies in the order of its modules and their declarations.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Uses<'db>(&'db [Use<'db>]);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Uses(Box<[Use]>);
 
 /// Every use of std's ambient authority in `krate`'s bodies, as the module docs say, once per
 /// crate; asked only of a build script.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn ambient_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db> {
-    let mut uses: Vec<Use<'db>, Global> = Vec::new_in(Global);
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn ambient_uses(db: &Db, krate: base_db::Crate) -> Uses {
+    // alloc: the query's value, a few items, once per build script and edit
+    let mut uses: Vec<Use> = Vec::new();
     for def in frozen_collection::crate_bodies(db, krate) {
         let written = body_syntax(db, def).is_some();
         let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
@@ -113,8 +113,7 @@ pub(crate) fn ambient_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db>
             let at = match uses.iter().position(|it| it.name == used.name) {
                 Some(at) => at,
                 None => {
-                    let name = kept::text(db, &used.name);
-                    uses.push(Use { name, authority, count: 0, first: None });
+                    uses.push(Use { name: used.name, authority, count: 0, first: None });
                     uses.len() - 1
                 }
             };
@@ -128,7 +127,7 @@ pub(crate) fn ambient_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db>
             }
         }
     }
-    Uses(kept::slice(db, uses))
+    Uses(uses.into_boxed_slice())
 }
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {

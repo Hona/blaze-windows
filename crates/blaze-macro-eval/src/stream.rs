@@ -496,14 +496,9 @@ mod tests {
         builder.build()
     }
 
-    /// A span of a macro's body in an expansion: not of the root context. A context's word is
-    /// its slot in its arena's table above the two edition bits, slot 0 being the roots: so the
-    /// word of slot 1 (`1 << 2`), the first context an expansion makes. (A word below 4 is a
-    /// root, of the edition it names.)
+    /// A span of a macro's body in an expansion: not of the root context.
     fn in_expansion(start: u32, end: u32) -> Span {
-        let ctx = SyntaxContext::from_u32(1 << 2);
-        assert!(!ctx.is_root(), "premise: the context of an expansion is no root");
-        Span { ctx, ..at(start, end) }
+        Span { ctx: SyntaxContext::from_u32(1), ..at(start, end) }
     }
 
     /// `left = x` in a group without delimiters at `group`, in parentheses at `parens`: the

@@ -245,7 +245,7 @@ impl<'db> HirFrontend<'db> {
                 continue;
             }
             if let Some(bytes) = self.reach_written(db, &asked, Some((producer, stage))) {
-                shared.push(Put { key: key_of(producer, &describe), kind: RECORD_KIND, bytes, of: None });
+                shared.push(Put { key: key_of(producer, &describe), kind: RECORD_KIND, bytes });
             }
         }
     }
@@ -287,7 +287,9 @@ impl<'db> HirFrontend<'db> {
                     }
                     // One a describe record could hold and none was read or made: the walk
                     // did not describe it here.
-                    None if self.sealed_key_with_stage(db, &asked.0, &asked.1, stage).is_some() => {
+                    None if self.sealed_key_with_stage(db, &asked.0, &asked.1, stage).is_some()
+                        && !names_files(db, &asked.0.0) =>
+                    {
                         return None;
                     }
                     None => {}

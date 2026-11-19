@@ -2,13 +2,9 @@
 //! store key is made of (its code hash and the facts of its type arguments).
 
 use std::alloc::Global;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use base_db::{Crate, Db, FileId};
-use hir_def::DefWithBodyId;
 use blaze_codegen::{
     Owner,
     backend::{FrontRef, Frontend},
@@ -77,31 +73,13 @@ impl Codegen {
     }
 }
 
-/// An instance as a pass saw it, with nothing of its snapshot's ids: what outlives the
-/// commit after the pass.
-pub(crate) struct Instance {
-    /// What its store key is made of: its code hash and its arguments' facts.
-    pub(crate) key: (ContentId, ContentId),
-    /// What a debugger calls it, for a report.
-    pub(crate) name: String,
-    /// Whether an edit of the body the pass was told of may change its key
-    /// ([`HirInstance::of_body`]); false when it was told of none.
-    pub(crate) of_edited: bool,
-}
-
-/// Every instance a pass reached, by its identity ([`blaze_codegen::backend::Described::identity`]),
-/// which an edit of its body keeps; in identity order.
-pub(crate) type Keys = BTreeMap<ContentId, Instance, Global>;
+/// What an instance's store key is made of: its code hash and its arguments' facts.
+pub(crate) type Keys = blaze_hash::HashMap<HirInstance, (ContentId, ContentId), Global>;
 
 /// Every instance `krate`'s functions reach, by what its key is made of. A dependency's
 /// instance is listed, and what it reaches is not walked: no edit of the crate reaches into
-/// it ([`Owner::Dependency`]). Each is told whether it is `edited`'s, while its ids are live.
-pub(crate) fn instances(
-    db: &Db,
-    krate: Crate,
-    codegen: &Codegen,
-    edited: Option<DefWithBodyId>,
-) -> Result<Keys, String> {
+/// it ([`Owner::Dependency`]).
+pub(crate) fn instances(db: &Db, krate: Crate, codegen: &Codegen) -> Result<Keys, String> {
     let names = Arc::clone(&codegen.names);
     let hashes = ItemHashes::new(Box::new(move |file: FileId| {
         // alloc: tests only, once a pass
@@ -114,11 +92,9 @@ pub(crate) fn instances(
         .with_policy(&codegen.policy)
         .with_image(true);
     let mut queue = frontend.every_function(krate);
-    // The walk's own: ids of this snapshot, dropped with it.
-    let mut walked = blaze_hash::HashSet::<HirInstance, Global>::new_in(Global);
-    let mut keys = Keys::new_in(Global);
+    let mut keys = Keys::default();
     while let Some(instance) = queue.pop() {
-        if walked.contains(&instance) {
+        if keys.contains_key(&instance) {
             continue;
         }
         let described =
@@ -126,27 +102,14 @@ pub(crate) fn instances(
         if described.owner == Owner::Workspace {
             for reference in &described.refs {
                 if let FrontRef::Function(callee) = reference
-                    && !walked.contains(callee)
+                    && !keys.contains_key(callee)
                 {
                     // clone: tests only, a handle of the instance
                     queue.push(callee.clone());
                 }
             }
         }
-        let of_edited = edited.is_some_and(|body| instance.of_body(db, body));
-        let seen = Instance {
-            key: (described.code.0, described.args),
-            name: described.name,
-            of_edited,
-        };
-        if let Some(other) = keys.insert(described.identity, seen) {
-            return Err(format!(
-                "two instances have one identity {:?}: `{}` and another; the harness tells \
-                 instances apart across commits by it",
-                described.identity, other.name
-            ));
-        }
-        walked.insert(instance);
+        keys.insert(instance, (described.code.0, described.args));
     }
     Ok(keys)
 }

@@ -10,7 +10,6 @@
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, HashSet};
-use blaze_memo::Database as _;
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule as _, ModuleId,
     attrs::AttrFlags,
@@ -55,8 +54,8 @@ pub enum Why {
 }
 
 /// A value held across a call that may park the fiber, which must not cross threads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Held<'db> {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Held {
     /// The call.
     pub call: Site,
     /// The binding that holds it, when one does; else it is a temporary.
@@ -66,7 +65,7 @@ pub struct Held<'db> {
     pub ty: StoredTy,
     pub why: Why,
     /// The calls from the call to the root, each named.
-    pub path: &'db [&'db str],
+    pub path: Box<[String]>,
 }
 
 /// What an unmarked `dyn` or pointer call promises (never to suspend), broken where the code
@@ -83,19 +82,19 @@ pub enum Promise {
     Unseen(Unseen),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Broken<'db> {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Broken {
     pub at: Site,
     pub promise: Promise,
     /// The calls from what was made to the root, each named; empty for [`Promise::Unseen`].
-    pub path: &'db [&'db str],
+    pub path: Box<[String]>,
 }
 
 /// What the check found.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Found<'db> {
-    pub held: &'db [Held<'db>],
-    pub broken: &'db [Broken<'db>],
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    pub held: Box<[Held]>,
+    pub broken: Box<[Broken]>,
     /// Why nothing was checked although the crate graph has `blaze_graph`: an error of its own.
     pub unchecked: Option<Unchecked>,
 }
@@ -149,30 +148,24 @@ pub fn unchecked(db: &Db, krate: Crate) -> Option<Unchecked> {
     (!roots.found.is_empty() && send_trait(db, krate).is_none()).then_some(Unchecked::NoSend)
 }
 
-impl Held<'_> {
+impl Held {
     /// The path as an error says it: `` `variance` → `fetch` → `get_or_run` → `suspend` ``.
     pub fn path_said(&self) -> String {
         self.path.join(" → ")
     }
 }
 
-impl Broken<'_> {
+impl Broken {
     pub fn path_said(&self) -> String {
         self.path.join(" → ")
     }
 }
 
-/// [`path`] kept in the current query run's arena, for a query's value.
-fn kept_path<'db>(db: &'db Db, path: &[String]) -> &'db [&'db str] {
-    let memo = db.memo();
-    blaze_memo::keep_iter(memo, path.iter().map(|it| blaze_memo::keep_str(memo, it)))
-}
-
 /// A call that may park the fiber, and every value held across it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Point<'db> {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Point {
     pub call: Site,
-    pub held: &'db [HeldLocal],
+    pub held: Box<[HeldLocal]>,
     target: Target,
     env: StoredParamEnvAndCrate,
 }
@@ -189,7 +182,7 @@ pub struct HeldLocal {
     pub why: Option<Why>,
 }
 
-impl Point<'_> {
+impl Point {
     /// The calls from the call to the root, each named.
     pub fn path(&self, db: &Db) -> Box<[String]> {
         path(db, &self.env, &self.target)
@@ -202,20 +195,20 @@ impl Point<'_> {
 
 /// The crate's walk: every instance reached from its functions with no type or const
 /// parameter, and which of them are checked here. Empty when the graph has no root or no `Send`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Walk<'db> {
-    order: &'db [Instance],
-    checked: &'db [Instance],
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Walk {
+    order: Box<[Instance]>,
+    checked: Box<[Instance]>,
     /// The fiber driver's modules: those of a function that calls a root itself.
-    drivers: &'db [ModuleId],
+    drivers: Box<[ModuleId]>,
 }
 
 fn env_of(krate: Crate) -> StoredParamEnvAndCrate {
     ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store()
 }
 
-#[blaze_memo::tracked(returns(ref))]
-fn walk<'db>(db: &'db Db, krate: Crate) -> Walk<'db> {
+#[blaze_query::tracked(returns(ref))]
+fn walk(db: &Db, krate: Crate) -> Walk {
     if roots(db, krate).found.is_empty() || send_trait(db, krate).is_none() {
         return Walk::default();
     }
@@ -236,7 +229,7 @@ fn walk<'db>(db: &'db Db, krate: Crate) -> Walk<'db> {
         },
     );
     let order = reached(db, &env, &starts);
-    let mut drivers: Vec<ModuleId, Global> = Vec::new_in(Global);
+    let mut drivers: Vec<ModuleId> = Vec::new(); // alloc: a few modules, once per crate
     for instance in &order {
         if summary(db, env, *instance).driver
             && let Some(module) = module_of(db, instance.def)
@@ -245,28 +238,21 @@ fn walk<'db>(db: &'db Db, krate: Crate) -> Walk<'db> {
             drivers.push(module);
         }
     }
-    let memo = db.memo();
-    let checked = blaze_memo::keep_iter(
-        memo,
-        order
-            .iter()
-            .filter(|it| {
-                checked_here(db, krate, it)
-                    && module_of(db, it.def).is_none_or(|it| !drivers.contains(&it))
-            })
-            .copied(),
-    );
-    Walk {
-        order: blaze_memo::keep_slice(memo, &order),
-        checked,
-        drivers: blaze_memo::keep_slice(memo, &drivers),
-    }
+    let checked = order
+        .iter()
+        .filter(|it| {
+            checked_here(db, krate, it)
+                && module_of(db, it.def).is_none_or(|it| !drivers.contains(&it))
+        })
+        .copied()
+        .collect();
+    Walk { order: order.into_boxed_slice(), checked, drivers: drivers.into_boxed_slice() }
 }
 
 /// What the check finds in `krate`: nothing, and nothing walked, when its crate graph has no
 /// `blaze_graph`; the error [`Found::unchecked`] when it has one it can't check from.
-#[blaze_memo::tracked(returns(ref))]
-pub fn suspend_check<'db>(db: &'db Db, krate: Crate) -> Found<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub fn suspend_check(db: &Db, krate: Crate) -> Found {
     if let Some(unchecked) = unchecked(db, krate) {
         return Found { unchecked: Some(unchecked), ..Found::default() };
     }
@@ -274,8 +260,8 @@ pub fn suspend_check<'db>(db: &'db Db, krate: Crate) -> Found<'db> {
         return Found::default();
     }
     let env = env_of(krate);
-    let mut held: Vec<Held<'db>, Global> = Vec::new_in(Global);
-    let mut broken: Vec<Broken<'db>, Global> = Vec::new_in(Global);
+    let mut held: Vec<Held> = Vec::new();
+    let mut broken: Vec<Broken> = Vec::new();
     let mut seen_held: HashSet<(Site, Option<Site>, Why), Global> = HashSet::new_in(Global);
     let mut seen_broken: HashSet<(Site, Promise), Global> = HashSet::new_in(Global);
     for instance in walk(db, krate).checked.iter() {
@@ -291,44 +277,39 @@ pub fn suspend_check<'db>(db: &'db Db, krate: Crate) -> Found<'db> {
                         made: local.made,
                         ty: local.ty,
                         why,
-                        path: kept_path(db, &point.path(db)),
+                        path: point.path(db),
                     });
                 }
             }
         }
         for it in checked.broken.iter() {
             if seen_broken.insert((it.at, it.promise)) {
-                broken.push(*it);
+                broken.push(it.clone()); // clone: an error, once
             }
         }
     }
-    let memo = db.memo();
-    Found {
-        held: blaze_memo::keep_slice(memo, &held),
-        broken: blaze_memo::keep_slice(memo, &broken),
-        unchecked: None,
-    }
+    Found { held: held.into_boxed_slice(), broken: broken.into_boxed_slice(), unchecked: None }
 }
 
 /// Every call in `owner`'s body (its closures' and `async` blocks' included) that may park the
 /// fiber, with what is held across it, as [`suspend_check`] finds them in `krate`: once per
 /// instance of a generic body that differs. Empty for a body the check does not check (the fiber
 /// driver's, one no function of `krate` reaches).
-#[blaze_memo::tracked(returns(ref))]
-pub fn suspend_points<'db>(db: &'db Db, krate: Crate, owner: DefWithBodyId) -> &'db [Point<'db>] {
+#[blaze_query::tracked(returns(ref))]
+pub fn suspend_points(db: &Db, krate: Crate, owner: DefWithBodyId) -> Box<[Point]> {
     let env = env_of(krate);
-    let mut points: Vec<Point<'db>, Global> = Vec::new_in(Global);
+    let mut points: Vec<Point> = Vec::new(); // alloc: the body's points, none when it has none
     for instance in walk(db, krate).checked.iter() {
         if owner_of(db, instance.def) != Some(owner) {
             continue;
         }
         for point in instance_check(db, env, *instance).points.iter() {
             if !points.contains(point) {
-                points.push(*point);
+                points.push(point.clone()); // clone: a body's points, once
             }
         }
     }
-    blaze_memo::keep_slice(db.memo(), &points)
+    points.into_boxed_slice()
 }
 
 /// The path of the call at `site` to the root, as an error says it, when the call may park the
@@ -344,8 +325,8 @@ pub fn may_suspend_at(db: &Db, krate: Crate, site: Site) -> Option<String> {
 /// driver's code reaches, and those that may suspend (which only run on a fiber). A function
 /// reached only through a `dyn` call or a function pointer the driver makes elsewhere is not
 /// seen from the driver; it is here when it may suspend.
-#[blaze_memo::tracked(returns(ref))]
-pub fn on_fiber<'db>(db: &'db Db, krate: Crate) -> &'db [FunctionId] {
+#[blaze_query::tracked(returns(ref))]
+pub fn on_fiber(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let env = env_of(krate);
     let walk = walk(db, krate);
     let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global);
@@ -356,7 +337,7 @@ pub fn on_fiber<'db>(db: &'db Db, krate: Crate) -> &'db [FunctionId] {
         .copied()
         .collect();
     stack.extend(walk.order.iter().filter(|it| summary(db, env, **it).suspends.is_some()));
-    let mut out: Vec<FunctionId, Global> = Vec::new_in(Global);
+    let mut out: Vec<FunctionId> = Vec::new(); // alloc: the functions, once per crate
     while let Some(instance) = stack.pop() {
         if !seen.insert(instance) {
             continue;
@@ -368,7 +349,7 @@ pub fn on_fiber<'db>(db: &'db Db, krate: Crate) -> &'db [FunctionId] {
         }
         stack.extend(summary(db, env, instance).callees.iter().filter(|it| !seen.contains(*it)));
     }
-    blaze_memo::keep_slice(db.memo(), &out)
+    out.into_boxed_slice()
 }
 
 /// Every instance `starts` reach, in walk order (depth first, each where first reached).
@@ -385,7 +366,7 @@ fn reached(db: &Db, env: &StoredParamEnvAndCrate, starts: &[Instance]) -> Vec<In
         stack.push((order.len() - 1, 0));
         while let Some(top) = stack.last_mut() {
             let (at, next) = *top;
-            let callees = summary(db, *env, order[at]).callees;
+            let callees = &summary(db, *env, order[at]).callees;
             let Some(callee) = callees.get(next) else {
                 stack.pop();
                 continue;
@@ -413,37 +394,32 @@ fn module_of(db: &Db, def: Body) -> Option<ModuleId> {
 }
 
 /// What the check finds in one instance: its points, and the promises it breaks.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Checked<'db> {
-    points: &'db [Point<'db>],
-    broken: &'db [Broken<'db>],
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Checked {
+    points: Box<[Point]>,
+    broken: Box<[Broken]>,
 }
 
-#[blaze_memo::tracked(returns(ref))]
-fn instance_check<'db>(
-    db: &'db Db,
-    env: StoredParamEnvAndCrate,
-    instance: Instance,
-) -> Checked<'db> {
-    let memo = db.memo();
+#[blaze_query::tracked(returns(ref))]
+fn instance_check(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Checked {
     let cx = Cx::new(db, env);
     let Some(owner) = owner_of(db, instance.def) else { return Checked::default() };
     let site = |span| Site { owner, span };
-    let mut broken: Vec<Broken<'db>, Global> = Vec::new_in(Global);
+    let mut broken = Vec::new(); // alloc: the instance's errors, none when it has none
     match summary(db, cx.stored, instance).unseen {
         // The code generator reports a body that does not lower, as the build's error.
         None | Some(Unseen::NoMir) => {}
         Some(unseen) => broken.push(Broken {
             at: site(MirSpan::Unknown),
             promise: Promise::Unseen(unseen),
-            path: &[],
+            path: Box::default(),
         }),
     }
     // Read again, once, for the check, and dropped with it: `summary` dropped its own. Two
     // instantiations of an instance this crate checks, where the memo kept one per instance the
     // walk reached for the build's life.
     let Ok(body) = body_once(db, &cx.stored, &instance) else {
-        return Checked { broken: blaze_memo::keep_slice(memo, &broken), ..Checked::default() };
+        return Checked { broken: broken.into_boxed_slice(), ..Checked::default() };
     };
     let body = &body;
     let sites = sites(&cx, body);
@@ -456,7 +432,7 @@ fn instance_check<'db>(
             firsts.push(target);
         }
     }
-    let mut points: Vec<Point<'db>, Global> = Vec::new_in(Global);
+    let mut points = Vec::new(); // alloc: the instance's points, none when it has none
     // `walk` checks no instance of a graph without `Send`.
     if !blocks.is_empty()
         && let Some(send) = send_trait(db, cx.env.krate)
@@ -465,9 +441,9 @@ fn instance_check<'db>(
             let across = body.held_across_calls_in(frame, &blocks);
             for ((&block, &&target), locals) in blocks.iter().zip(&firsts).zip(across) {
                 let Some(terminator) = &body.basic_blocks[block].terminator else { continue };
-                let held = blaze_memo::keep_iter(
-                    memo,
-                    locals.iter().map(|&local| {
+                let held = locals
+                    .iter()
+                    .map(|&local| {
                         let ty = cx.normalize(body.locals[local].ty.as_ref());
                         let why = match must_not_suspend(&cx, ty) {
                             Some(adt) => Some(Why::MustNotSuspend(adt)),
@@ -483,8 +459,8 @@ fn instance_check<'db>(
                             ty: ty.store(),
                             why,
                         }
-                    }),
-                );
+                    })
+                    .collect();
                 points.push(Point { call: site(terminator.span), held, target, env });
             }
         });
@@ -501,7 +477,7 @@ fn instance_check<'db>(
             broken.push(Broken {
                 at: site(slot.span),
                 promise: Promise::Dyn { method: slot.method, concrete: slot.concrete.store() },
-                path: kept_path(db, &path(db, &cx.stored, target)),
+                path: path(db, &cx.stored, target),
             });
         }
     }
@@ -513,14 +489,11 @@ fn instance_check<'db>(
             broken.push(Broken {
                 at: site(reified.span),
                 promise: Promise::Pointer,
-                path: kept_path(db, &path(db, &cx.stored, target)),
+                path: path(db, &cx.stored, target),
             });
         }
     }
-    Checked {
-        points: blaze_memo::keep_slice(memo, &points),
-        broken: blaze_memo::keep_slice(memo, &broken),
-    }
+    Checked { points: points.into_boxed_slice(), broken: broken.into_boxed_slice() }
 }
 
 /// The ADT marked `#[must_not_suspend]` that `ty` is or holds, as rustc's

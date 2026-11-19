@@ -38,7 +38,7 @@ use hir_expand::{AstId, HirFileId};
 use hir_ty::{InferenceResult, method_resolution::CandidateId, next_solver::TyKind};
 use rustc_type_ir::inherent::IntoKind as _;
 
-use crate::{blaze::facts as type_facts, check, kept};
+use crate::{blaze::facts as type_facts, check};
 
 /// An item, a field or a variant, by where it is written: its file, its id in the file's AST
 /// map and, for a field, its place in its struct or variant plus one (zero for the rest).
@@ -258,21 +258,13 @@ pub(crate) fn facts(db: &Db, home: hir::Crate, subject: Subject) -> Facts {
 
 /// The workspace crates that can name an item of `home`: every configuration of `home` (the
 /// local crates of its root file) and every local crate that depends on one of them.
-///
-/// Keyed by `home` alone, and so homed in `home`'s arena: its run reads crates above `home`
-/// (every crate's root file and the reverse dependencies), which a read may do (each sets a
-/// borrow, so the entry goes when one of them changes), but a key may name only its home's
-/// declared closure. Until 2026-11-15 it was keyed by the session's greatest crate as well,
-/// whose arena declares no borrow of `home` in a workspace of many crates: `blaze check
-/// --workspace` of blaze refused the key ("is homed at arena 1410.2 but names arena 766.6").
-/// Its asker, the body's lints (`query::body_lints`), is homed at `home` too, and so borrowed
-/// every crate this reads already; the greatest crate's own edits dropped it as well.
-#[blaze_memo::tracked(returns(copy))]
-pub(crate) fn readers<'db>(db: &'db Db, home: base_db::Crate) -> &'db [base_db::Crate] {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn readers(db: &Db, home: base_db::Crate) -> Box<[base_db::Crate]> {
     let home = hir::Crate::from(home);
     let root = home.root_file(db);
+    // alloc: the query's value and its seen set, once per crate
     let mut seen: HashSet<base_db::Crate, Global> = HashSet::new_in(Global);
-    let mut out: Vec<base_db::Crate, Global> = Vec::new_in(Global);
+    let mut out = Vec::new();
     for krate in hir::Crate::all(db) {
         if !krate.origin(db).is_local() || krate.root_file(db) != root {
             continue;
@@ -283,13 +275,13 @@ pub(crate) fn readers<'db>(db: &'db Db, home: base_db::Crate) -> &'db [base_db::
             }
         }
     }
-    kept::slice(db, out)
+    out.into_boxed_slice()
 }
 
 /// A crate's fold: the rows of each of its bodies (those a derive made included, which the
 /// lint plan leaves out), its impls of traits and its ADTs' bounds.
-#[blaze_memo::tracked(returns(ref), owns)]
-pub(crate) fn crate_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Fold {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn crate_uses(db: &Db, krate: base_db::Crate) -> Fold {
     let mut fold = Fold::new();
     // alloc: the crate's bodies and modules, once per crate
     let mut defs = Vec::new();
@@ -395,8 +387,8 @@ pub(crate) fn role(db: &Db, def: DefWithBodyId) -> Role {
 }
 
 /// One body's rows.
-#[blaze_memo::tracked(returns(ref), owns)]
-pub(crate) fn body_uses<'db>(db: &'db Db, def: DefWithBodyId) -> Fold {
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn body_uses(db: &Db, def: DefWithBodyId) -> Fold {
     let mut fold = Fold::new();
     let role = role(db, def);
     let body = Body::of(db, def);

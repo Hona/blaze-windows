@@ -38,7 +38,6 @@ use crate::{
     conf::Conf,
     diag::{self, Code, Diag, Expansion, MacroKind, MultiSpan, Span, Sublevel},
     famous::{self, Famous},
-    kept,
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
     lints::{self, Implemented, On},
     profile,
@@ -80,7 +79,7 @@ pub fn check(
     setup: &Setup,
     name_of: NameOf<'_>,
 ) -> Result<Vec<Found>, diag::CheckError> {
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         // A flag that names a lint no level waives, below `deny`, refuses the check: it is
         // never read as if it had not been given.
         for (name, level) in &setup.command_line.lints.opts {
@@ -112,7 +111,7 @@ struct File<'q> {
     /// the last of its [`Driver::nesting`], which `declared`'s file's nesting comes before.
     place: Option<(u32, u32)>,
     /// The lint names its text writes, with the range of what the attribute naming each is on.
-    names: &'q FileNames<'q>,
+    names: &'q FileNames,
     /// The lints named around the file's module, in the files declaring it.
     around: On,
 }
@@ -168,7 +167,7 @@ struct Driver<'q> {
     pending: Vec<Pending>,
     expectations: Vec<Expectation>,
     /// The crate's functions as the configured profile has them ([`crate::profile`]).
-    hits: Option<&'q profile::Hits<'q>>,
+    hits: Option<&'q profile::Hits>,
 }
 
 impl<'q> Driver<'q> {
@@ -650,9 +649,9 @@ impl<'q> Driver<'q> {
 
 /// The lint names `file` writes, each with what the attribute it is in is on:
 /// [`query::lint_names`].
-pub(crate) fn names_of<'db>(db: &'db Db, file: EditionedFileId) -> FileNames<'db> {
+pub(crate) fn names_of(db: &Db, file: EditionedFileId) -> FileNames {
     let text = db.file_text(file.file_id(db)).text(db);
-    // alloc: the names found, until the query's value keeps them, once per edit of the file
+    // alloc: the query's value, once per edit of the file
     let mut names = Vec::new();
     let mut on = On::EMPTY;
     let mut root = None;
@@ -662,13 +661,12 @@ pub(crate) fn names_of<'db>(db: &'db Db, file: EditionedFileId) -> FileNames<'db
         names.push(Named { at, owner, lints });
         on |= lints;
     });
-    FileNames { names: kept::slice(db, names), on }
+    FileNames { names: names.into_boxed_slice(), on }
 }
 
 /// The files and bodies the driver walks of `krate`: [`query::lint_plan`].
-pub(crate) fn plan_of<'db>(db: &'db Db, krate: base_db::Crate) -> Plan<'db> {
-    // alloc: the query's rows until its value keeps them, and its worklist, once per crate
-    // and edit
+pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
+    // alloc: the query's value and its worklist, once per crate and edit
     let mut files: Vec<ModuleFile> = Vec::new();
     let mut seen: HashSet<EditionedFileId, Global> = HashSet::new_in(Global);
     for module in hir::Crate::from(krate).modules(db) {
@@ -699,7 +697,7 @@ pub(crate) fn plan_of<'db>(db: &'db Db, krate: base_db::Crate) -> Plan<'db> {
         }
         bodies.extend(body_at(db, def));
     }
-    Plan { files: kept::slice(db, files), bodies: kept::slice(db, bodies) }
+    Plan { files: files.into_boxed_slice(), bodies: bodies.into_boxed_slice() }
 }
 
 /// Where `def`'s body is in the file the driver names it by.
@@ -948,7 +946,7 @@ pub(crate) struct Cx<'q: 't, 't> {
     /// The crate's [`query::famous_defs`], read once per query.
     famous_defs: OnceCell<&'q [Option<hir::ModuleDef>]>,
     /// The crate's [`lints::disallowed::disallowed_defs`], read once per query.
-    disallowed: OnceCell<&'q lints::disallowed::Resolved<'q>>,
+    disallowed: OnceCell<&'q lints::disallowed::Resolved>,
     /// The first path a lint looked up that [`famous::KNOWN`] does not list.
     not_known: OnceCell<String>,
     /// Why the may-suspend check a fiber lint asked of checks nothing, said
@@ -1498,7 +1496,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
     }
 
     /// The `disallowed-*` entries of the crate's configuration, resolved.
-    pub(crate) fn disallowed(&self) -> &'q lints::disallowed::Resolved<'q> {
+    pub(crate) fn disallowed(&self) -> &'q lints::disallowed::Resolved {
         self.disallowed.get_or_init(|| {
             // clone: the configuration, once per query that reads the entries
             let key = lints::disallowed::ConfKey::new(self.db, self.conf.clone());
@@ -1531,7 +1529,7 @@ impl<'q: 't, 't> Cx<'q, 't> {
             self.not_known.get_or_init(|| path.join("::"));
             return None;
         };
-        let defs = self.famous_defs.get_or_init(|| query::famous_defs(self.db, self.krate));
+        let defs = self.famous_defs.get_or_init(|| &**query::famous_defs(self.db, self.krate));
         defs[at]
     }
 

@@ -4,10 +4,7 @@
 //! `compiler/rustc_middle/src/ty/print/pretty.rs` and `compiler/rustc_hir/src/definitions.rs`
 //! (MIT or Apache-2.0).
 
-use std::alloc::Global;
-
 use base_db::Db;
-use blaze_memo::Database as _;
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, BlockIdLt, ConstId, DefWithBodyId, EnumVariantId, ExternCrateId,
     FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
@@ -289,19 +286,19 @@ pub fn closures_around(
     owner: DefWithBodyId,
     target: ExprId,
 ) -> Option<&[(usize, ClosureKind)]> {
-    closures_around_query(db, owner, target)
+    closures_around_query(db, owner, target).as_deref()
 }
 
 /// [`closures_around`], kept: it may read the source map, which changes with every edit above
 /// the body, and what it finds does not. The map orders closures by the macro calls they are
 /// in, so a body that called no macro is ordered without it, as every closure of it is in
 /// the same file.
-#[blaze_memo::tracked(returns(copy))]
-fn closures_around_query<'db>(
-    db: &'db Db,
+#[blaze_query::tracked(returns(ref))]
+fn closures_around_query(
+    db: &Db,
     owner: DefWithBodyId,
     target: ExprId,
-) -> Option<&'db [(usize, ClosureKind)]> {
+) -> Option<Vec<(usize, ClosureKind)>> {
     let body = Body::of(db, owner);
     // alloc: once per closure, in the query that keeps its result
     let mut around = Vec::new();
@@ -328,12 +325,8 @@ fn closures_around_query<'db>(
         let Expr::Closure { closure_kind, .. } = body.expr(closure) else { return None };
         Some((beside.iter().position(|&it| it == closure)?, closure_kind))
     });
-    // Gathered here and kept in the query's arena: none of it when one place is missing.
-    let mut kept = Vec::new_in(Global);
-    for place in places {
-        kept.push(place?);
-    }
-    Some(blaze_memo::keep_iter(db.memo(), kept))
+    // alloc: the result the query keeps
+    places.collect()
 }
 
 /// The closures `target` is written in, looking for it from `at` down.

@@ -113,12 +113,9 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                 fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                     let this = *self;
                     #plumbing::attached_interned::<#config, _>(this.0, |fields| match fields {
-                        // One level: each field cut at `FIELD_CAP`, and an id inside a field
-                        // prints as its kind and id (`attached_interned` refuses its fields).
                         ::core::option::Option::Some(fields) => f
                             .debug_struct(::core::stringify!(#ident))
-                            .field("[id]", &this.0)
-                            #(.field(#names, &#plumbing::Bounded::field(#loads)))*
+                            #(.field(#names, #loads))*
                             .finish(),
                         ::core::option::Option::None => {
                             f.debug_tuple(::core::stringify!(#ident)).field(&this.0).finish()
@@ -129,23 +126,6 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
         }
     });
 
-    // `owns`: the fields may own memory, dropped with their arena; else the no-drop check at
-    // item level, which `cargo check` sees (the fields are never generic).
-    let owns = options.owns.is_some();
-    let no_drop = (!owns).then(|| {
-        quote! {
-            const _: () = ::core::assert!(
-                !::core::mem::needs_drop::<(#(#stored,)*)>(),
-                ::core::concat!(
-                    "the fields of interned ",
-                    ::core::module_path!(),
-                    "::",
-                    ::core::stringify!(#ident),
-                    " own memory to drop: hold `&'db [T]` or ids, or mark it `owns` (counted debt)"
-                )
-            );
-        }
-    });
     let declaration = structs::declaration(item, struct_lt);
     let id_impls = structs::id_impls(ident, struct_lt);
     Ok(quote! {
@@ -163,10 +143,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             impl #plumbing::Interned for #config {
                 type Fields = (#(#stored,)*);
                 const KIND: &'static #plumbing::Kind = &#kind_static;
-                const OWNS: bool = #owns;
             }
-
-            #no_drop
 
             #id_impls
 
@@ -186,23 +163,6 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                         (#(#stores,)*),
                     );
                     #make
-                }
-
-                /// The struct `gid` names, when it names a live entry of this struct in the
-                /// snapshot (its arena held at that generation, its index filled, the entry of
-                /// this kind); `None` for any other id, never a panic: how an id from outside
-                /// (a proc macro's reply) is checked instead of trusted. Notes the read as a
-                /// getter does.
-                #[inline]
-                pub fn try_from_gid<#method_lt #database>(
-                    db: &#db_lt #database,
-                    gid: #plumbing::Gid,
-                ) -> ::core::option::Option<Self>
-                where
-                    #database: ?::core::marker::Sized + #plumbing::Database,
-                {
-                    #plumbing::try_interned::<#config>(#plumbing::Database::memo(db), gid)?;
-                    ::core::option::Option::Some(#make)
                 }
 
                 #getters

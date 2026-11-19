@@ -2,6 +2,7 @@
 //! walk lists of what the IR builder asks for.
 
 mod db;
+mod witnessed;
 
 use base_db::Db;
 use blaze_codegen::{
@@ -30,44 +31,6 @@ use super::{
 use crate::InstanceDef;
 use db::TestDB;
 
-/// Sets `file`'s text in a new snapshot: one edit and its commit (a text equal to the one held
-/// moves nothing and keeps the snapshot). A file's id is the same across it; every other id
-/// (an item's, a `Crate`, an interned `EditionedFileId`) is of the snapshot it was taken in,
-/// taken again after. A test that writes several files in one step opens one edit for them.
-pub(super) fn write_file(db: &mut TestDB, file: base_db::FileId, text: &str) {
-    let mut edit = db.edit();
-    edit.set_file_text(file, text);
-    _ = edit.commit();
-}
-
-/// What `work` gives, and the queries it ran on `db`, from the database's run log (a
-/// fixture's database keeps one): the runs before it are taken off first, so none of them is
-/// counted as its. A run is told by its query's kind (`Ran::is::<q>(&(key,))`).
-pub(super) fn runs_of<T>(db: &TestDB, work: impl FnOnce() -> T) -> (T, Vec<blaze_memo::testing::Ran, std::alloc::Global>) {
-    let log = db.runs().expect("a fixture's database keeps a run log");
-    _ = log.take();
-    let value = work();
-    (value, log.take())
-}
-
-/// Has `db`'s snapshots from its next on expand builtin derives, as a build's do: an input of
-/// the session arena, made each time that arena is, set in one commit. Every id taken of `db`
-/// before it is of the snapshot the commit replaced: take it again after.
-pub(super) fn expand_builtin_derives(db: &mut TestDB) {
-    let mut edit = db.edit();
-    edit.set_given(
-        None,
-        hir_def::nameres::builtin_derives_fact(true),
-        Box::new_in(
-            |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
-                hir_def::nameres::set_expand_builtin_derives(inputs, true);
-            },
-            std::alloc::Global,
-        ),
-    );
-    _ = edit.commit();
-}
-
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     held(fixture::db(text).into_db())
@@ -93,7 +56,7 @@ fn stencils() -> Option<String> {
 }
 
 /// A build at `level` of members and dependencies, whose units are as [`spec`]'s.
-pub(crate) fn policy(level: OptLevel) -> Policy {
+pub(super) fn policy(level: OptLevel) -> Policy {
     let toolchain =
         Toolchain { llvm: Some("test".to_owned()), stencils: stencils(), ..spec().toolchain };
     Policy {
@@ -336,7 +299,7 @@ fn instances_with_one_share_key_are_one() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = frontend(SHARED);
     // A failure's message formats instances, whose types are the database's.
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -480,7 +443,7 @@ fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
     // A failure's message formats instances, whose types are the database's.
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
@@ -529,7 +492,7 @@ fn an_inline_body_that_inherits_overflow_checks_takes_its_users_setting() {
 fn overflow_checks_reach_an_inheriting_body_through_inline_bodies_without_checks() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &checks_policy(true));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let by_ref = frontend.with(|hir| called(hir, &root, function(db, "by_ref")));
@@ -565,7 +528,7 @@ fn an_instance_its_users_compile_is_walked_alike_for_every_asker() {
     use blaze_codegen::{backend::Frontend as _, plan::Origin};
     let policy = checks_policy(true);
     let (db, frontend) = held_as(fixture::db(INHERITED_CHECKS).into_db(), &policy);
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
         let sums = frontend.with(|hir| called(hir, &root, function(db, "sum")));
@@ -638,7 +601,7 @@ fn equal_share_keys_compile_to_one_shape() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let keyed = |instance: &HirInstance| {
@@ -728,7 +691,7 @@ fn a_key_covers_the_types_of_the_locals_a_debugger_is_told() {
         let mut policy = policy(OptLevel::O0);
         policy.profile.debuginfo = debuginfo;
         let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "roots"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let func = function(db, "id");
@@ -776,7 +739,7 @@ fn one_instance_under_two_debuginfo_levels_shares_a_key_only_with_its_shape() {
             let mut policy = policy(OptLevel::O0);
             policy.profile.debuginfo = debuginfo;
             let (db, frontend) = held_as(fixture::db(SHAPES).into_db(), &policy);
-            blaze_memo::attach(db, || {
+            blaze_query::db::attach(db, || {
                 let root = frontend.root(function(db, "roots"));
                 let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
                 let mut all = Vec::new(); // alloc: a test's list
@@ -866,7 +829,7 @@ fn described_in(
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let main = named("main");
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(hir_def::test_items::function(db, main, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, main));
         let func = hir_def::test_items::function(db, named(krate), name);
@@ -974,7 +937,7 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     use blaze_codegen::backend::Frontend as _;
     let code = |deep: &str| {
         let (db, frontend) = frontend(&cached_fixture(deep));
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let root = frontend.root(function(db, "cached"));
             let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
             let described = (frontend.describe(&root, &origin))
@@ -1041,7 +1004,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     };
     let refused = cached_reading(deep, "deep()");
     let (db, front) = frontend(&refused);
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let cached = function(db, "cached");
         let compiled =
             crate::compiled_root(db, cached).as_ref().map(|_| ()).map_err(ToString::to_string);
@@ -1059,7 +1022,7 @@ fn a_cached_function_whose_body_blaze_cannot_compile_is_an_error() {
     for read in ["unsafe { M }", "(unsafe { M }, deep())"] {
         let impure = cached_reading(deep, read);
         let (db, _) = frontend(&impure);
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let compiled = crate::compiled_root(db, function(db, "cached"));
             if let Err(e) = compiled {
                 panic!("an impure cached function reading `{read}` compiles, uncached: {e}");
@@ -1073,7 +1036,7 @@ fn a_root_takes_function_items_for_its_type_parameters() {
     use blaze_codegen::backend::Frontend as _;
     let src = "pub fn expand<'a, F>(_: &'a u8) {}\npub fn two<F, G>() {}\npub fn sized<const N: usize, F>() {}\npub fn mac() {}\npub fn other() {}\n";
     let (db, frontend) = frontend(src);
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let [expand, two, sized, mac, other] =
             ["expand", "two", "sized", "mac", "other"].map(|name| function(db, name));
         let root = |func, items: &[_]| frontend.root_with_fn_items(func, items);
@@ -1482,7 +1445,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_imaged(fixture::db(OVER_A_PATH_CRATE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend
                 .describe(instance, &origin)
@@ -1544,7 +1507,7 @@ fn a_registry_crate_over_a_path_crate_is_the_workspaces() {
     let (db, frontend) = held_as(fixture::db(OVER_A_PATH_CRATE).into_db(), &policy(OptLevel::O0));
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let rooted =
             frontend.describe(&root, &origin).unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
         for it in &rooted.refs {
@@ -1571,7 +1534,7 @@ fn an_asm_function_a_dependencys_generic_asks_for_is_the_images() {
     let (db, frontend) = held_imaged(fixture::db(ASKED_BY_THE_IMAGE).into_db());
     let root = frontend.root(function(&db, "roots"));
     let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let describe = |instance: &HirInstance| {
             frontend
                 .describe(instance, &origin)
@@ -2648,7 +2611,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
     let (distance, twice) = (method("distance"), method("twice"));
     let (concrete, bounded) = (function(db, "concrete"), function(db, "bounded"));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let interner = DbInterner::new_with(db, krate);
         let env = |def: FunctionId| ParamEnvAndCrate {
             param_env: db.trait_environment(def.into()),
@@ -2664,7 +2627,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         .expect_err("no impl of `P` is for `S`");
         assert!(why.starts_with("trait P method distance for [S"), "{why}");
         assert!(why.ends_with(": no impl holds"), "{why}");
-    
+
         let param = GenericArgs::identity_for_item(interner, bounded.into()).type_at(0);
         let (found, _) = crate::impl_method(
             db,
@@ -2674,7 +2637,7 @@ pub fn bounded<T: P>(at: &T) -> usize {
         )
         .expect("a where clause proves `T: P`");
         assert_eq!(found, either::Either::Left(distance));
-    
+
         let inherits = Ty::new_adt(interner, AdtId::StructId(inherits), GenericArgs::empty());
         let (found, _) = crate::impl_method(
             db,
@@ -2706,7 +2669,7 @@ pub fn roots(x: u32) {
 "#,
     );
     // A failure's message formats instances, whose types are the database's.
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -2776,7 +2739,7 @@ pub fn roots(a: A, b: B) {
 "#,
     );
     // A failure's message formats instances, whose types are the database's.
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let policy = policy(OptLevel::O0);
         let root = frontend.root(function(db, "roots"));
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(&db)));
@@ -2805,7 +2768,7 @@ pub fn roots(a: A, b: B) {
         };
         let one = function(db, "one");
         let ones = |instance: &HirInstance| frontend.with(|hir| called(hir, instance, one)).len();
-    
+
         let twos = of("two");
         let [ab, aa, bb] = &twos[..] else { panic!("{twos:?}") };
         // The precondition: one code and one shared identity, so only the placement tells
@@ -2817,14 +2780,14 @@ pub fn roots(a: A, b: B) {
         assert_ne!(key(ab).0, key(aa).0, "{ab:?} and {aa:?}");
         assert_ne!(key(ab).0, key(bb).0, "{ab:?} and {bb:?}");
         assert_eq!(key(aa).0, key(bb).0, "{aa:?} and {bb:?}");
-    
+
         let threes = of("three");
         let [aba, abb] = &threes[..] else { panic!("{threes:?}") };
         assert_eq!((key(aba).1, shared(aba)), (key(abb).1, shared(abb)), "{aba:?} and {abb:?}");
         // Two places each: only which one the third call is given differs.
         assert_eq!((ones(aba), ones(abb)), (2, 2));
         assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
-    
+
         let reifieds = of("reified");
         let [aba, abb] = &reifieds[..] else { panic!("{reifieds:?}") };
         assert_ne!(key(aba).0, key(abb).0, "{aba:?} and {abb:?}");
@@ -2878,7 +2841,7 @@ fn every_pointer_to_dyn_in_a_constant_points_at_its_vtable() {
     use crate::fragment::DataRequest;
     let (db, frontend) = frontend(POINTERS_TO_DYN);
     let word = crate::Target::for_fixtures().word() as u32;
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let cases =
             [("raw", "A"), ("aliased", "B"), ("behind", "C"), ("wrap", "D"), ("raw_slice", "E")];
         for (name, of) in cases {
@@ -3112,7 +3075,7 @@ pub fn id_num() -> (&'static dyn Tr, P) { ID_NUM }
 /// description (a vtable's type), or the error building it stops with.
 fn constant_datas(name: &str) -> Result<Vec<(crate::fragment::DataRequest, String)>, String> {
     let (db, frontend) = frontend(CONSTANT_MEMORY);
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let root = frontend.root(function(db, name));
         frontend.with(|db| {
             let code = built(db, &root, crate::Target::for_fixtures(), false, Build::of(&spec()));
@@ -3905,7 +3868,7 @@ fn an_instance_is_not_compiled_in_a_crate_that_misses_a_specializing_impl_its_as
             .unwrap_or_else(|| panic!("no crate `{name}`"))
     };
     let (k, dep, main) = (named("k"), named("dep"), named("main"));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         assert!(
             !loaded_crates(db, k).contains(&dep),
             "the fixture's premise: `k` names `dep` only through a macro"
@@ -4000,7 +3963,7 @@ fn a_callers_key_holds_what_the_inliner_put_in_a_callee_it_builds_in() {
             hir_def::test_items::function(db, dep, "always"),
         );
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let [caller] = &frontend.with(|hir| called(hir, &root, generic))[..] else {
                 panic!("one `generic::<u8>`")
             };
@@ -4086,7 +4049,7 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
     let resize = hir_def::test_items::function(db, dep, "resize");
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let described = |it: &HirInstance, by: &Origin| {
             frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
         };
@@ -4161,7 +4124,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
     let origin = frontend.with(|hir| frontend.origin(hir, main));
     let root = frontend.root(function(db, "roots"));
     let executable = super::RootKind::Executable;
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         assert_eq!(frontend.devirt.world(), None, "no world before the first walk ends");
         frontend
             .with(|hir| frontend.devirt.makes(hir, executable, main))
@@ -4182,7 +4145,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
         }
         assert!(frontend.closed(&reached, &[]).expect("the program's dyn facts"));
         let world = frontend.devirt.world().expect("the world the first walk closed");
-    
+
         std::thread::scope(|scope| {
             for _ in 0..16 {
                 scope.spawn(|| {
@@ -4196,7 +4159,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
                 });
             }
         });
-    
+
         // The same facts again: the world held, and no new one.
         assert!(!frontend.closed(&reached, &[]).expect("the facts the bodies were built against"));
         // Another program of the same front end: refused, naming both.
@@ -4213,27 +4176,33 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
     });
 }
 
-/// The invariant: under the session memo (no changed set), resuming a world checkpoint is
-/// refused; a fresh walk after a literal edit closes to the same world, while adding another
-/// closure closes to a different world.
+/// The invariant: after a literal edit the plain and closed walk still support the same
+/// world (`WorldChange::Unchanged`). Changing the graph to reach another closure updates the
+/// world incrementally (`WorldChange::Updated`) and names only the consumer (`dep::resize`).
 #[test]
 fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
     use blaze_codegen::backend::{Frontend as _, WorldChange};
     let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
-    let mut fixture = fixture::db(DYN_FN_BUILT_IN);
-    let file = fixture.file_at("/main.rs").file_id(fixture.db());
+    let fixture = fixture::db(DYN_FN_BUILT_IN);
+    let file = fixture.file_at("/main.rs");
+    let mut db = fixture.into_db();
+    let file = file.file_id(&db);
+    let krate = fixture::test_crate(&db);
     let policy = policy(OptLevel::O3);
-    let walk = |db: &TestDB| {
-        let krate = fixture::test_crate(db);
+    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
         let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
-            .with_policy(&policy);
+            .with_policy(policy);
         f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
-        assert_eq!(f.view(), None);
+        f
+    }
+    let (kept, view, world_before, fn_roots) = {
+        let f = front(&db, &policy, krate);
+        let view = f.view().unwrap();
+        let root = f.root(function(&db, "roots"));
+        let origin = f.with(|db| f.origin(db, krate));
         for closed in [true, false] {
-            let root = f.root(function(db, "roots"));
-            let origin = f.with(|db| f.origin(db, krate));
             let mut reached = Vec::new();
-            let mut queue = vec![(root, origin)];
+            let mut queue = vec![(root.clone(), origin)];
             while let Some((i, o)) = queue.pop() {
                 if reached.contains(&(i.clone(), o)) {
                     continue;
@@ -4248,32 +4217,289 @@ fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
             }
             assert_eq!(f.closed(&reached, &[]).unwrap(), closed);
         }
-        (f.kept_world().unwrap(), f.devirt.world().unwrap())
+        (f.kept_world().unwrap(), view, f.devirt.world().unwrap(), vec![(root, origin)])
     };
-    let (kept, initial) = walk(fixture.db());
-    _ = fixture.edit(|edit| _ = edit.set_file_text(file, &source.replace("y * 3", "y * 4")));
-    {
-        let db = fixture.db();
-        let krate = fixture::test_crate(db);
-        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
-            .with_policy(&policy);
-        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
-        assert!(f.resume_world(&kept, 0, &[], &[]).is_err());
+    db.set_file_text(file, &source.replace("y * 3", "y * 4"));
+    let since = {
+        let f = front(&db, &policy, krate);
+        assert_eq!(f.resume_world(&kept, view, &fn_roots, &[]).unwrap(), WorldChange::Unchanged);
+        assert_eq!(f.devirt.world(), Some(world_before));
+        f.abandon_resumed_world();
         assert!(f.devirt.world().is_none());
+        f.view().unwrap()
+    };
+    db.set_file_text(
+        file,
+        &source.replace(
+            "dep::resize::<K>(x, &|y| y * 3)",
+            "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)",
+        ),
+    );
+    let f = front(&db, &policy, krate);
+    let change = f.resume_world(&kept, since, &fn_roots, &[]).unwrap();
+    let WorldChange::Updated { consumers } = change else {
+        panic!("adding a new closure vtable must update the world: {change:?}");
+    };
+    assert_ne!(f.devirt.world().unwrap(), world_before);
+    assert!(
+        consumers.iter().any(|(i, _)| f.spell(i).contains("resize")),
+        "consumers should name dep::resize: {:?}",
+        consumers.iter().map(|(i, _)| f.spell(i)).collect::<Vec<_>>()
+    );
+}
+
+/// The invariant (B10):
+/// 1. A structural body edit that adds/removes helper calls with no impl or trait-object
+///    coercion keeps the closed world unchanged (`WorldChange::Unchanged`).
+/// 2. Adding a duplicate coercion to an already-present concrete type keeps the world
+///    unchanged.
+/// 3. Adding or removing a concrete type for `dyn A` (including `PRESENT <-> ABSENT`) updates
+///    the world incrementally to the exact world a fresh whole walk builds and asks to
+///    re-verify ONLY consumers of `dyn A` (`use_a`), never consumers of unrelated `dyn B`
+///    (`use_b`).
+#[test]
+fn a_body_edit_without_dyn_changes_keeps_the_world_and_a_dyn_edit_re_verifies_only_its_consumers() {
+    use blaze_codegen::{
+        backend::{Frontend as _, WorldChange, WorldPatch},
+        plan::Origin,
+    };
+    const TWO_TRAITS: &str = r#"
+//- minicore: sized, copy, option, coerce_unsized, dispatch_from_dyn
+//- /main.rs crate:main
+pub trait A { fn a(&self) -> u32; }
+pub trait B { fn b(&self) -> u32; }
+pub struct A1;
+impl A for A1 { fn a(&self) -> u32 { 1 } }
+pub struct A2;
+impl A for A2 { fn a(&self) -> u32 { 2 } }
+pub struct B1;
+impl B for B1 { fn b(&self) -> u32 { 10 } }
+#[inline(never)]
+pub fn use_a(x: &dyn A) -> u32 { x.a() }
+#[inline(never)]
+pub fn use_b(x: &dyn B) -> u32 { x.b() }
+#[inline(never)]
+pub fn helper1(x: u32) -> u32 { x + 1 }
+#[inline(never)]
+pub fn helper2(x: u32) -> u32 { x + 2 }
+pub fn roots(x: u32, opt: Option<&dyn A>) -> u32 {
+    let extra = match opt { Some(a) => use_a(a), None => 0 };
+    let base = use_a(&A1) + use_b(&B1);
+    base + extra + helper1(x)
+}
+"#;
+    let fixture = fixture::db(TWO_TRAITS);
+    let file = fixture.file_at("/main.rs");
+    let mut db = fixture.into_db();
+    let file = file.file_id(&db);
+    let krate = fixture::test_crate(&db);
+    let policy = policy(OptLevel::O3);
+    let base_text = db.file_text(file).text(&db).to_string();
+
+    fn front<'a>(db: &'a TestDB, policy: &Policy, krate: base_db::Crate) -> HirFrontend<'a> {
+        let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
+            .with_policy(policy);
+        f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
+        f
     }
-    let (_, after_literal) = walk(fixture.db());
-    assert_eq!(initial, after_literal);
-    _ = fixture.edit(|edit| {
-        _ = edit.set_file_text(
-            file,
-            &source.replace(
-                "dep::resize::<K>(x, &|y| y * 3)",
-                "dep::resize::<K>(x, &|y| y * 4) + dep::resize::<K>(x, &|y| y + 2)",
-            ),
-        );
-    });
-    let (_, after_new_closure) = walk(fixture.db());
-    assert_ne!(initial, after_new_closure);
+
+    fn whole_walk(
+        db: &TestDB,
+        policy: &Policy,
+        krate: base_db::Crate,
+    ) -> (super::DynCheckpoint, u64, hir_ty_mir::mir::devirt::DevirtWorld, Vec<(HirInstance, Origin)>) {
+        let f = front(db, policy, krate);
+        let view = f.view().unwrap();
+        let root = f.root(function(db, "roots"));
+        let origin = f.with(|db| f.origin(db, krate));
+        let mut last_reached = Vec::new();
+        for closed in [true, false] {
+            let mut reached = Vec::new();
+            let mut queue = vec![(root.clone(), origin)];
+            while let Some((i, o)) = queue.pop() {
+                if reached.contains(&(i.clone(), o)) {
+                    continue;
+                }
+                let d = f.describe(&i, &o).unwrap();
+                for r in d.refs {
+                    if let FrontRef::Function(callee) = r {
+                        queue.push((callee, d.origin));
+                    }
+                }
+                reached.push((i, o));
+            }
+            assert_eq!(f.closed(&reached, &[]).unwrap(), closed);
+            last_reached = reached;
+        }
+        let _ = last_reached;
+        (f.kept_world().unwrap(), view, f.devirt.world().unwrap(), vec![(root, origin)])
+    }
+
+    let (mut kept, mut view, w1, fn_roots) = whole_walk(&db, &policy, krate);
+
+    // Edit 1: structural body edit swapping non-dyn helpers (helper1 -> helper2).
+    let text_e1 = base_text.replace("base + extra + helper1(x)", "base + extra + helper2(x)");
+    db.set_file_text(file, &text_e1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        assert_eq!(change, WorldChange::Unchanged, "non-dyn helper swap must keep the world");
+        assert_eq!(f.devirt.world(), Some(w1));
+        let root = fn_roots[0].clone();
+        let h1 = (f.root(function(&db, "helper1")), fn_roots[0].1);
+        let h2 = (f.root(function(&db, "helper2")), fn_roots[0].1);
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        let _ = f.describe(&h2.0, &h2.1).unwrap();
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &[root],
+            entered_functions: &[h2],
+            left_functions: &[h1],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 2: duplicate coercion to an already-present concrete type (`&A1`).
+    let text_e2 = text_e1.replace("use_a(&A1) + use_b(&B1)", "use_a(&A1) + use_a(&A1) + use_b(&B1)");
+    db.set_file_text(file, &text_e2);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        assert_eq!(change, WorldChange::Unchanged, "duplicate coercion must keep the world");
+        assert_eq!(f.devirt.world(), Some(w1));
+        let root = fn_roots[0].clone();
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &[root],
+            entered_functions: &[],
+            left_functions: &[],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 3: add a new coercion `&A2 as &dyn A` -> ONLY `use_a` is invalidated, NOT `use_b`.
+    let text_e3 =
+        text_e2.replace("use_a(&A1) + use_a(&A1) + use_b(&B1)", "use_a(&A1) + use_a(&A2) + use_b(&B1)");
+    db.set_file_text(file, &text_e3);
+    let (_, _, w2_fresh, _) = whole_walk(&db, &policy, krate);
+    assert_ne!(w2_fresh, w1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("adding &A2 as &dyn A must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w2_fresh), "incremental world must match fresh whole walk");
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must be re-verified: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must NOT be re-verified: {names:?}");
+        // Re-describe roots + consumers under W2 and finish the patch (discovering newly
+        // reachable A2::a and its vtable shim).
+        let root = fn_roots[0].clone();
+        let mut entered = Vec::new();
+        let mut queue = vec![root.clone()];
+        queue.extend(consumers.iter().cloned());
+        let mut described_here = Vec::new();
+        while let Some((i, o)) = queue.pop() {
+            if described_here.contains(&(i.clone(), o)) {
+                continue;
+            }
+            let d = f.describe(&i, &o).unwrap();
+            for r in d.refs {
+                if let FrontRef::Function(callee) = r {
+                    let next = (callee, d.origin);
+                    if f.spell(&next.0).contains("A2") && !entered.contains(&next) {
+                        entered.push(next.clone());
+                        queue.push(next);
+                    }
+                }
+            }
+            described_here.push((i, o));
+        }
+        let mut changed_fns = vec![root];
+        changed_fns.extend(consumers.iter().cloned());
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &changed_fns,
+            entered_functions: &entered,
+            left_functions: &[],
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 4: remove ALL coercions to `dyn A` (`use_a` stays reachable via `opt`, so `dyn A`
+    // transitions from `[A1, A2]` to `ABSENT` while `dyn B` stays `[B1]`).
+    let text_e4 = text_e3.replace(
+        "let base = use_a(&A1) + use_a(&A2) + use_b(&B1);",
+        "let base = use_b(&B1);",
+    );
+    db.set_file_text(file, &text_e4);
+    let (_, _, w_absent_fresh, _) = whole_walk(&db, &policy, krate);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("removing all dyn A coercions must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w_absent_fresh));
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must see ABSENT: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must stay untouched: {names:?}");
+        // Finish the patch so `kept` records `use_a` reading `ABSENT` for `ObjectKey(A)`.
+        let root = fn_roots[0].clone();
+        let _ = f.describe(&root.0, &root.1).unwrap();
+        for (i, o) in &consumers {
+            let _ = f.describe(i, o).unwrap();
+        }
+        // Any A1/A2 method and drop_glue that left the closed walk.
+        let mut left = Vec::new();
+        for (i, o) in kept.closed_functions_for_test() {
+            let sp = f.spell(&i);
+            if sp.contains("A1") || sp.contains("A2") {
+                left.push((i, o));
+            }
+        }
+        let mut changed_fns = vec![root];
+        changed_fns.extend(consumers.iter().cloned());
+        f.finish_world_patch(WorldPatch {
+            changed_functions: &changed_fns,
+            entered_functions: &[],
+            left_functions: &left,
+            changed_statics: &[],
+            entered_statics: &[],
+            left_statics: &[],
+        })
+        .unwrap();
+        kept = f.kept_world().unwrap();
+        view = f.view().unwrap();
+    }
+
+    // Edit 5: re-add `&A1 as &dyn A` (`ABSENT -> [A1]`): `use_a` must still be notified!
+    db.set_file_text(file, &text_e1);
+    {
+        let f = front(&db, &policy, krate);
+        let change = f.resume_world(&kept, view, &fn_roots, &[]).unwrap();
+        let WorldChange::Updated { consumers } = change else {
+            panic!("re-adding &A1 after ABSENT must update the world: {change:?}");
+        };
+        assert_eq!(f.devirt.world(), Some(w1));
+        let names: Vec<String> = consumers.iter().map(|(i, _)| f.spell(i)).collect();
+        assert!(names.iter().any(|n| n.contains("use_a")), "use_a must wake from ABSENT: {names:?}");
+        assert!(!names.iter().any(|n| n.contains("use_b")), "use_b must stay untouched: {names:?}");
+    }
 }
 
 /// `reads` costs the MIR inliner more than it takes where its UB checks are on, a call at
@@ -4406,7 +4632,7 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
     let program = |derived: bool| {
         let mut db = fixture::db(&downstream_debug(derived)).into_db();
         // As a build's database: builtin derives expanded, so `D`'s derived `Debug::fmt` has a body.
-        expand_builtin_derives(&mut db);
+        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
         let db: &'static TestDB = Box::leak(Box::new(db));
         let lib = (all_crates(db).iter().copied())
             .find(|it: &Crate| {
@@ -4423,7 +4649,7 @@ fn a_downstream_impl_changes_its_generic_instances_exec_bound() {
         let root = frontend.root(function(db, "roots"));
         let g = hir_def::test_items::function(db, lib, "g");
         let origin = frontend.with(|hir| frontend.origin(hir, fixture::test_crate(db)));
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             let [instance] = &frontend.with(|hir| called(hir, &root, g))[..] else {
                 panic!("one `g::<D>`")
             };
@@ -4598,20 +4824,8 @@ fn built_after_a_release() {
     assert!(!before.is_empty());
     let released = hir::evict::release_process_tables();
     assert!(released.tables > 0, "{released:?}");
-    let shapes = shapes_let_go(AFTER_RELEASE);
-    use std::sync::atomic::Ordering::Relaxed;
-    // Printed before the shapes' line, which `child` reads to its end.
-    println!(
-        "{STALE_AFTER}{} read, {} wrong",
-        crate::plant::STALE_READS.load(Relaxed),
-        crate::plant::STALE_WRONG.load(Relaxed)
-    );
-    println!("{SHAPES_AFTER}{shapes:?}");
+    println!("{SHAPES_AFTER}{:?}", shapes_let_go(AFTER_RELEASE));
 }
-
-/// What the planted child prints of its map's keys from before the release
-/// ([`crate::plant::STALE_READS`]), for the control's message.
-const STALE_AFTER: &str = "stale erased rows: ";
 
 #[test]
 #[ignore = "a child of `a_build_after_a_release_equals_a_fresh_build`, alone in its process"]
@@ -4674,33 +4888,11 @@ fn a_build_after_a_release_equals_a_fresh_build() {
     assert!(after_passed, "the build after a release failed");
     assert_eq!(after, fresh, "the build after a release differs from a fresh build");
     let (kept_passed, kept) = child("child_builds_after_a_release_keeping_erased");
-    // Where the control fails, what the planted map gave: no read of a key it held at the
-    // release (the fixture no longer reaches the map across it: the fixture is to change), reads
-    // all right (the rows were renumbered in step, so the stale map is right by coincidence:
-    // the fixtures are to intern apart), or reads wrong with the shapes equal (the shapes miss a
-    // wrong row: the oracle is to change).
     assert!(
         !kept_passed || kept != fresh,
         "the control: with `erase_regions`' map kept across the release the build is still \
-         the fresh one's, so the test does not see a stale row ({})",
-        child_stale("child_builds_after_a_release_keeping_erased")
+         the fresh one's, so the test does not see a stale row"
     );
-}
-
-/// The [`STALE_AFTER`] line the child `name` prints, run again alone: only for a failing
-/// control's message.
-fn child_stale(name: &str) -> String {
-    let exe = std::env::current_exe().expect("the test binary's path");
-    let path = format!("v2::tests::{name}");
-    let out = std::process::Command::new(exe)
-        .args(["--exact", &path, "--ignored", "--nocapture", "--test-threads=1"])
-        .output()
-        .unwrap_or_else(|e| panic!("running {path}: {e}"));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .find_map(|line| line.find(STALE_AFTER).map(|at| line[at..].to_owned()))
-        .unwrap_or_else(|| format!("{path} printed no `{STALE_AFTER}` line"))
 }
 
 /// The invariant: what the builds over a database keep for the next walk (its kept walks,

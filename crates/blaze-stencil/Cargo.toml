@@ -53,7 +53,6 @@ base-db.workspace = true
 blaze-format.workspace = true
 blaze-lower.workspace = true
 blaze-macro-eval.workspace = true
-blaze-memo.workspace = true
 blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true

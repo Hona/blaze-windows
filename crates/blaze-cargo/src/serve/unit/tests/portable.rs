@@ -143,7 +143,7 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
-    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
+    })
     .unwrap();
     let places = at.places();
     // clone: the test's places, told the front end as the daemon tells it
@@ -176,7 +176,6 @@ impl Checkout {
                 makers: changed.makers,
                 kind: compile::keyed_kind(crate::serve::work::JobKind::Build, &changed.unit),
                 goal: compile::goal_byte(blaze_api::Goal::Edit),
-                build: 0,
                 verified: false,
                 reached: false,
                 pgo: None,

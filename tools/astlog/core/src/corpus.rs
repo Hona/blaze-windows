@@ -6,6 +6,7 @@
 //! rows.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ast_merge_langs::Lang;
 use blaze_hash::HashMap;
@@ -16,8 +17,12 @@ use crate::error::{
     Error, LanguageSnafu, ParseFileSnafu, ReadFileSnafu, UnknownLanguageSnafu, WalkSnafu,
 };
 
-/// One value in a relation row: a syntax node, derived text or a count.
-pub type Value = astlog_engine::Value<NodeRef>;
+/// One value in a relation row: a syntax node or derived text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Value {
+    Node(NodeRef),
+    Text(Arc<str>),
+}
 
 /// A node identified by corpus file index and node-table index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -114,13 +119,12 @@ impl Corpus {
         &file.text[info.start..info.end]
     }
 
-    /// Text behind any value: a node's source slice, the text itself, or a count's digits.
+    /// Text behind any value: a node's source slice or the text itself.
     #[must_use]
-    pub fn value_text<'a>(&'a self, value: &'a Value) -> std::borrow::Cow<'a, str> {
+    pub fn value_text<'a>(&'a self, value: &'a Value) -> &'a str {
         match value {
-            Value::Node(node) => std::borrow::Cow::Borrowed(self.node_text(*node)),
-            Value::Text(text) => std::borrow::Cow::Borrowed(text),
-            Value::Int(int) => std::borrow::Cow::Owned(int.to_string()),
+            Value::Node(node) => self.node_text(*node),
+            Value::Text(text) => text,
         }
     }
 

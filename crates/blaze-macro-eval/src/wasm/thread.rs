@@ -33,7 +33,7 @@ use base_db::Db;
 use blaze_core::lock::{Lock, Signal};
 use blaze_graph::sched::Event;
 use blaze_lower::{SubRequest, SubResponse};
-use blaze_memo::ArenaId;
+use span::{Edition, SyntaxContext};
 
 use crate::{guest::Stop, server::Answer};
 
@@ -41,12 +41,20 @@ use crate::{guest::Stop, server::Answer};
 /// shims and the server under it.
 const STACK: usize = 16 << 20;
 
-/// What the job and its expansion thread pass each other. A question is a span's (a span's
-/// edition is in its context's word, so it is never one), with the table its contexts are
-/// words of.
+enum Question {
+    Span(SubRequest),
+    Edition(SyntaxContext),
+}
+
+enum Reply {
+    Span(SubResponse),
+    Edition(Edition),
+}
+
+/// What the job and its expansion thread pass each other.
 struct Board<T> {
-    question: Option<(ArenaId, SubRequest)>,
-    reply: Option<SubResponse>,
+    question: Option<Question>,
+    reply: Option<Reply>,
     /// What the expansion gave, or why its thread panicked.
     done: Option<Result<T, Stop>>,
     /// The job unwound while it waited: no reply comes.
@@ -85,8 +93,8 @@ impl<T> Link<T> {
 
     /// The job's reply to `question`, the expansion thread blocked until it comes, counted in
     /// [`ASKING`] for as long as it waits.
-    fn ask(&self, contexts: ArenaId, question: SubRequest) -> Result<SubResponse, Stop> {
-        self.post(|board| board.question = Some((contexts, question)));
+    fn ask(&self, question: Question) -> Result<Reply, Stop> {
+        self.post(|board| board.question = Some(question));
         let mut board = self.board.lock();
         let _asking = Asking::now();
         // wakes: the job's reply and the link's end (`gone`) each notify `replied`
@@ -98,8 +106,20 @@ impl<T> Link<T> {
 }
 
 impl<T> Answer for Link<T> {
-    fn answer(&self, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, Stop> {
-        self.ask(contexts, req)
+    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
+        match self.ask(Question::Span(req))? {
+            Reply::Span(it) => Ok(it),
+            Reply::Edition(_) => {
+                Err(Stop("was told an edition when it asked of a span".to_owned()))
+            } // alloc: error path
+        }
+    }
+
+    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop> {
+        match self.ask(Question::Edition(ctx))? {
+            Reply::Edition(it) => Ok(it),
+            Reply::Span(_) => Err(Stop("was told of a span when it asked an edition".to_owned())), // alloc: error path
+        }
     }
 }
 
@@ -149,10 +169,13 @@ pub(crate) fn run<T: Send + 'static>(
         if let Some(done) = board.done.take() {
             return done;
         }
-        if let Some((contexts, question)) = board.question.take() {
+        if let Some(question) = board.question.take() {
             drop(board);
             let answering = Answering::enter();
-            let reply = db.answer(contexts, question)?;
+            let reply = match question {
+                Question::Span(req) => Reply::Span(db.answer(req)?),
+                Question::Edition(ctx) => Reply::Edition(db.edition(ctx)?),
+            };
             drop(answering);
             link.board.lock().reply = Some(reply);
             link.replied.notify_all();
@@ -266,7 +289,7 @@ pub(crate) fn ceiling() -> usize {
 
 thread_local! {
     /// How many expansions' questions the job on this thread is answering now: carried with
-    /// the job across its waits ([`blaze_graph::sched::carry`]), so an expansion its answer asks for
+    /// the job across its waits ([`blaze_query::carry`]), so an expansion its answer asks for
     /// is known as nested wherever the job resumes.
     static ANSWERING: Cell<usize> = const { Cell::new(0) };
 }
@@ -294,7 +317,7 @@ fn put_answering(taken: std::num::NonZeroUsize) {
 fn carry_answering() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
-        blaze_graph::sched::carry(blaze_graph::sched::Carried::word(take_answering, put_answering))
+        blaze_query::carry(blaze_query::Carried::word(take_answering, put_answering))
     });
 }
 

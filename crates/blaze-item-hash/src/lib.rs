@@ -7,12 +7,12 @@
 //!   key, made before lowering"): its crate's settings, its owner by key, its module chain and
 //!   its item's own text. Nothing it resolves is in it: what a step resolves is a fact of the
 //!   step's shape, negatives included. One tracked query per body, with early cutoff.
-//! - [`reads`]: what each row of a step's read list stands for (section 6), the one table of
-//!   fact boundary kinds and their rules ([`reads::BOUNDARIES`], marked by
-//!   [`reads::mark_boundaries`]), and the keys of a body's owner and container, which its
-//!   identity hashes.
+//! - [`reads`]: what each read of a step stands for (section 6): covered by the key, one
+//!   fact, or refused.
 //! - [`values`]: each fact's value now (section 5), lane items' and this crate's own.
 //! - [`keys`]: the item key of a definition a record names, and back.
+//! - [`impls`]: the identities of impls and head defs that the impl-set hashes name them by,
+//!   installed once per database ([`impls::install`]).
 //! - [`presentation`](mod@presentation): the names and positions of a body that reach the output (section 3.7),
 //!   hashed apart from its identity, for codegen to key debuginfo, symbols and locations by.
 //!
@@ -24,6 +24,7 @@
 #![register_tool(blaze)]
 
 pub mod identity;
+pub mod impls;
 pub mod keys;
 pub mod presentation;
 pub mod reads;
@@ -46,7 +47,7 @@ use hir_ty::{
 
 /// Lane item-hash's side of `hir_ty::body_store`: a body's steps are filed under its key made
 /// before lowering ([`identity::early_identity`]) and every name its steps look up is a fact
-/// of their shape ([`reads::fact_of`], over the rows of the memo's read list). The identity made from the lowered, resolved body
+/// of their shape ([`reads::classify`]). The identity made from the lowered, resolved body
 /// and the switch between the two (`RecordedNames`, `reads::Names`) are deleted
 /// (end-state/engine.md section 5); `.clippy.toml` bans their names.
 pub struct Bodies;
@@ -56,18 +57,30 @@ impl BodyFacts for Bodies {
         identity::early_identity(db, def).ok()
     }
 
-    fn fact_of(
+    fn classify(
         &self,
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        read: blaze_memo::Read,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
+        name: &'static str,
     ) -> Classified {
-        reads::fact_of(db, def, step, read)
+        reads::classify(db, def, step, read, kind, name)
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
         values::value_in(db, def, fact)
+    }
+
+    fn sealed(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        group: blaze_query::db::SealGroup,
+        facts: &mut Vec<FactRef>,
+    ) -> bool {
+        reads::sealed(db, def, group, facts)
     }
 
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {

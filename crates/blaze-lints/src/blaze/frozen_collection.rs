@@ -39,10 +39,7 @@ use std::alloc::Global;
 use syntax::view::{self as ast, AstNode as _, HasAttrs as _, HasName as _};
 
 use super::{Lint, facts};
-use crate::{
-    check::{self, Cx},
-    kept,
-};
+use crate::check::{self, Cx};
 
 const LINT: Lint = Lint::FrozenCollection;
 
@@ -51,10 +48,10 @@ const LINT: Lint = Lint::FrozenCollection;
 const UP: usize = 16;
 
 /// The fields of a crate some body of it may change.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Mutated<'db>(kept::Set<'db, FieldId>);
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mutated(HashSet<FieldId, Global>);
 
-impl Mutated<'_> {
+impl Mutated {
     /// Whether some body of the crate may change `field` (`jagged_vec` asks too).
     pub(crate) fn contains(&self, field: FieldId) -> bool {
         self.0.contains(&field)
@@ -62,13 +59,13 @@ impl Mutated<'_> {
 }
 
 /// The fields `krate`'s bodies change, as the module docs say, once per crate.
-#[blaze_memo::tracked(returns(ref))]
-pub(crate) fn mutated_fields<'db>(db: &'db Db, krate: base_db::Crate) -> Mutated<'db> {
-    let mut mutated: HashSet<FieldId, Global> = HashSet::new_in(Global);
+#[blaze_query::tracked(returns(ref))]
+pub(crate) fn mutated_fields(db: &Db, krate: base_db::Crate) -> Mutated {
+    let mut mutated = Mutated::default();
     for def in crate_bodies(db, krate) {
-        changed_in(db, def, &mut mutated);
+        changed_in(db, def, &mut mutated.0);
     }
-    Mutated(kept::Set::keep_set(db, mutated))
+    mutated
 }
 
 /// Every body of `krate`: its functions, consts and statics, those of its traits and impls

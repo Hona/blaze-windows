@@ -18,7 +18,7 @@
 
 use base_db::{Crate, Db};
 use blaze_format::{Aligned, FormatError, Persist, open_as};
-use blaze_memo::Id;
+use blaze_query::db::{AsId, FromId};
 use hir_expand::MacroCallId;
 use syntax::ast;
 
@@ -27,7 +27,7 @@ use crate::{
     expr_store::{ExpressionStore, persist::StoreRoot},
     hir::{
         columns::ExprKind,
-        persist::{Kind, Portable, Relocation, SessionBytes, entry_id, syntax_context},
+        persist::{Kind, Relocation, entry_id, syntax_context},
     },
     nameres::{
         block_def_map,
@@ -37,8 +37,8 @@ use crate::{
 
 type R<T = ()> = Result<T, String>;
 
-fn id<T: Id>(bits: u64) -> T {
-    T::from_gid(entry_id(bits))
+fn id<T: FromId>(bits: u64) -> T {
+    T::from_id(entry_id(bits))
 }
 
 /// Appends to `out` the macro calls `table` names: what a record of it is made from beyond
@@ -52,7 +52,7 @@ pub(super) fn calls(table: &Relocation, out: &mut Vec<MacroCallId>) {
 }
 
 /// The bytes of `table`, empty for an empty table.
-pub(crate) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
+pub(super) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
     if table.is_empty() {
         // alloc: none; an empty `Vec` holds no allocation.
         return Ok(Vec::new());
@@ -79,9 +79,6 @@ pub(crate) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
             Kind::Macro2 => enc.def(ModuleDefId::MacroId(MacroId::Macro2Id(id(bits))))?,
             Kind::MacroRules => enc.def(ModuleDefId::MacroId(MacroId::MacroRulesId(id(bits))))?,
             Kind::ProcMacro => enc.def(ModuleDefId::MacroId(MacroId::ProcMacroId(id(bits))))?,
-            // A context of `krate`'s table (its signatures' contexts are its own expansions',
-            // a dependency's carried in by `SyntaxContext::translate`), written by structure
-            // (`Enc::context`), never its crate-local word (port decision 3).
             Kind::Context => {
                 let context = syntax_context(bits as u32).ok_or("a syntax context of u32::MAX")?;
                 enc.context(context)?;
@@ -108,13 +105,13 @@ fn block(enc: &mut Enc<'_>, db: &Db, table: &Relocation, index: usize, block: Bl
     let module = block.module(db);
     let Some(outer) = module.block(db) else {
         enc.u8(0);
-        return enc.module(ModuleId::from_gid(module.gid()));
+        return enc.module(ModuleId::from_id(module.as_id()));
     };
-    if block_def_map(db, outer.to_static()).root_module_id().gid() != module.gid() {
+    if block_def_map(db, outer).root_module_id().as_id() != module.as_id() {
         // alloc: the reason of a corrupt image's panic, or of a part that fails.
         return Err("a block in a module of a block other than its root".to_owned());
     }
-    let outer = (Kind::Block, bits(outer));
+    let outer = (Kind::Block, u64::from(outer.as_id().as_u32()));
     let at = (table.entries()[..index].iter().position(|&it| it == outer))
         .ok_or("a block in a block the table names after it, or not at all")?;
     enc.u8(1);
@@ -124,7 +121,7 @@ fn block(enc: &mut Enc<'_>, db: &Db, table: &Relocation, index: usize, block: Bl
 
 /// The table of `bytes`, [`encode`]'s, each id made again in this database. Run inside the
 /// query whose value holds what the table names: a block is a tracked struct, made here.
-pub(crate) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
+pub(super) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
     if bytes.is_empty() {
         return Ok(Relocation::new());
     }
@@ -142,7 +139,6 @@ pub(crate) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
             Kind::Block => read_block(&mut dec, db, &entries)?,
             Kind::Impl => bits(dec.impl_id()?),
             Kind::EnumVariant => bits(dec.variant()?),
-            // Interned into `krate`'s table (`Dec`'s own arena): the word is this session's.
             Kind::Context => u64::from(dec.context()?.into_u32()),
             Kind::SpanFile => u64::from(dec.file()?.span_file_id(db).as_u32()),
             Kind::Function
@@ -163,8 +159,8 @@ pub(crate) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
     Ok(Relocation::of(entries))
 }
 
-fn bits(it: impl Id) -> u64 {
-    crate::hir::persist::session_word(it.gid())
+fn bits(it: impl AsId + Copy) -> u64 {
+    u64::from(it.as_id().as_u32())
 }
 
 /// The bits of `def`, which must be of `kind`.
@@ -283,12 +279,9 @@ fn set_wide(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_ne_bytes());
 }
 
-/// The store buffer `written`, which this process wrote, with each of its session words
-/// moved to its index in `table` (adding those it lacks): the one way [`SessionBytes`] become
-/// [`Portable`].
-pub(crate) fn relocate_store(written: SessionBytes, table: &mut Relocation) -> Portable {
-    let mut patched = written.into_patched();
-    let bytes = &mut patched[..];
+/// Moves each id of the store buffer `bytes`, which this process wrote, to its index in
+/// `table`, adding those it lacks.
+pub(crate) fn relocate_store(bytes: &mut [u8], table: &mut Relocation) {
     let sites = sites(&Aligned::copy_from(bytes)).expect("a store buffer just written reads");
     for at in sites.scopes {
         let index = table.index(Kind::Block, wide(bytes, at));
@@ -310,7 +303,6 @@ pub(crate) fn relocate_store(written: SessionBytes, table: &mut Relocation) -> P
         let index = table.index(Kind::Context, u64::from(word(bytes, at)));
         set_word(bytes, at, index);
     }
-    Portable::written(patched)
 }
 
 /// A store buffer as this database reads it.

@@ -326,7 +326,6 @@ name = "astlog-core"
 version = "0.0.0"
 dependencies = [
  "ast-merge-langs",
- "astlog-engine",
  "blaze-hash",
  "edit-applier",
  "ignore",
@@ -334,16 +333,6 @@ dependencies = [
  "snafu",
  "tempfile",
  "tree-sitter",
-]
-
-[[package]]
-name = "astlog-engine"
-version = "0.0.0"
-dependencies = [
- "blaze-hash",
- "blaze-sim",
- "regex",
- "snafu",
 ]
 
 [[package]]
@@ -378,20 +367,23 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-core",
+ "blaze-dbsp",
  "blaze-format",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
  "blaze-lint-defs",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "blaze-vfs",
  "cfg",
  "crossbeam-channel",
+ "crossbeam-queue",
  "hashbrown 0.17.1",
  "indexmap",
  "intern",
+ "inventory",
  "la-arena",
  "paths",
  "semver",
@@ -489,26 +481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-astlog"
-version = "0.0.0"
-dependencies = [
- "astlog-engine",
- "base-db",
- "blaze-api",
- "blaze-hash",
- "blaze-intent",
- "blaze-memo",
- "blaze-vfs",
- "either",
- "hir",
- "hir-def",
- "hir-expand",
- "memchr",
- "snafu",
- "syntax",
-]
-
-[[package]]
 name = "blaze-audit"
 version = "0.0.0"
 dependencies = [
@@ -529,9 +501,8 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
- "blaze-mem",
- "blaze-memo",
  "blaze-profile",
+ "blaze-query",
  "blaze-rng",
  "tracing",
 ]
@@ -569,14 +540,12 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-api",
- "blaze-astlog",
  "blaze-audit",
  "blaze-build-script",
  "blaze-cas",
  "blaze-certify",
  "blaze-codegen",
  "blaze-codegen-code",
- "blaze-command",
  "blaze-core",
  "blaze-diagnostics",
  "blaze-doc",
@@ -608,7 +577,6 @@ dependencies = [
  "blaze-macro-eval",
  "blaze-manifest",
  "blaze-mem",
- "blaze-memo",
  "blaze-metadata",
  "blaze-new",
  "blaze-pack",
@@ -656,7 +624,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "similar",
  "span",
  "stdx",
  "syntax",
@@ -793,7 +760,6 @@ name = "blaze-codegen"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-api",
  "blaze-cas",
  "blaze-check",
  "blaze-core",
@@ -826,45 +792,6 @@ dependencies = [
  "glob",
  "serde_json",
  "toml",
-]
-
-[[package]]
-name = "blaze-command"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-build-script",
- "blaze-cas",
- "blaze-codegen",
- "blaze-core",
- "blaze-format",
- "blaze-front",
- "blaze-hash",
- "blaze-host",
- "blaze-ids",
- "blaze-item-hash",
- "blaze-items",
- "blaze-keyed",
- "blaze-link",
- "blaze-mem",
- "blaze-memo",
- "blaze-program",
- "blaze-query",
- "blaze-sim",
- "blaze-solo",
- "blaze-unitkey",
- "blaze-units",
- "blaze-vfs",
- "cfg",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-codegen",
- "intern",
- "span",
- "syntax",
- "tracing",
- "triomphe",
 ]
 
 [[package]]
@@ -914,8 +841,8 @@ dependencies = [
  "blaze-items",
  "blaze-lint-defs",
  "blaze-mem",
- "blaze-memo",
  "blaze-phf",
+ "blaze-query",
  "blaze-report",
  "blaze-serde",
  "blaze-sim",
@@ -964,7 +891,7 @@ dependencies = [
  "base-db",
  "blaze-diff",
  "blaze-hash",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "hir-def",
  "hir-expand",
@@ -984,7 +911,7 @@ dependencies = [
  "blaze-core",
  "blaze-graph",
  "blaze-hash",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir",
  "hir-def",
@@ -1017,7 +944,6 @@ dependencies = [
  "blaze-lower",
  "blaze-manifest",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-registry",
  "blaze-report",
@@ -1120,7 +1046,7 @@ dependencies = [
  "blaze-items",
  "blaze-lints",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "hir",
  "hir-def",
@@ -1204,29 +1130,6 @@ dependencies = [
  "blaze-v2-proof",
  "serde",
  "zstd",
-]
-
-[[package]]
-name = "blaze-front"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-format",
- "blaze-host",
- "blaze-ids",
- "blaze-item-hash",
- "blaze-items",
- "blaze-keyed",
- "blaze-mem",
- "blaze-memo",
- "blaze-query",
- "blaze-rng",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-borrowck",
- "hir-ty-pure",
- "tracing",
 ]
 
 [[package]]
@@ -1523,7 +1426,6 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "memchr",
- "snafu",
  "syntax",
 ]
 
@@ -1539,7 +1441,6 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-sim",
  "cfg",
@@ -1552,6 +1453,7 @@ dependencies = [
  "rustc_type_ir",
  "smallvec",
  "span",
+ "syntax",
 ]
 
 [[package]]
@@ -1565,7 +1467,6 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-serde",
  "cfg",
@@ -1730,9 +1631,9 @@ dependencies = [
  "blaze-intent",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
  "blaze-phf",
  "blaze-profile",
+ "blaze-query",
  "blaze-report",
  "blaze-serde",
  "blaze-sim",
@@ -1790,10 +1691,8 @@ dependencies = [
  "blaze-core",
  "blaze-hash",
  "blaze-ids",
- "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-sim",
  "blaze-units",
@@ -1809,7 +1708,6 @@ dependencies = [
  "span",
  "syntax",
  "toml",
- "tracing",
  "triomphe",
 ]
 
@@ -1828,7 +1726,6 @@ dependencies = [
  "blaze-items",
  "blaze-lower",
  "blaze-mem",
- "blaze-memo",
  "blaze-profile",
  "blaze-query",
  "blaze-serde",
@@ -1909,7 +1806,6 @@ name = "blaze-memo"
 version = "0.0.0"
 dependencies = [
  "blaze-core",
- "blaze-format",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
@@ -1917,9 +1813,6 @@ dependencies = [
  "blaze-mem",
  "blaze-memo-macros",
  "blaze-sim",
- "crossbeam-queue",
- "intern",
- "la-arena",
 ]
 
 [[package]]
@@ -1991,7 +1884,6 @@ name = "blaze-pg"
 version = "0.0.0"
 dependencies = [
  "base64",
- "blaze-cast",
  "blaze-sha256",
  "blaze-sim",
  "blaze-sql",
@@ -2291,7 +2183,7 @@ dependencies = [
  "base-db",
  "blaze-hash",
  "blaze-items",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "expect-test",
  "hir-def",
@@ -2362,7 +2254,6 @@ dependencies = [
 name = "blaze-sqlite"
 version = "0.0.0"
 dependencies = [
- "blaze-cast",
  "blaze-sim",
  "blaze-sql",
  "libsqlite3-sys",
@@ -2416,7 +2307,6 @@ dependencies = [
  "blaze-lower",
  "blaze-macro-eval",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-serde",
  "blaze-spin",
@@ -2544,7 +2434,6 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-sim",
- "blaze-units",
  "cfg",
  "intern",
  "syntax",
@@ -2557,7 +2446,6 @@ dependencies = [
  "anyhow",
  "blaze-alloc-count",
  "blaze-audit",
- "blaze-build-script",
  "blaze-core",
  "blaze-fetch",
  "blaze-format",
@@ -3957,12 +3845,10 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-core",
  "blaze-format",
- "blaze-graph",
  "blaze-hash",
  "blaze-hashcons",
  "blaze-ids",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-report",
  "cfg",
@@ -4006,16 +3892,11 @@ dependencies = [
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
- "blaze-keyed",
  "blaze-mem",
- "blaze-memo",
  "blaze-phf",
  "blaze-query",
  "blaze-record",
  "blaze-sim",
- "blaze-unitkey",
- "blaze-units",
- "blaze-vfs",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
@@ -4056,8 +3937,8 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
- "blaze-memo",
  "blaze-phf",
+ "blaze-query",
  "blaze-vfs",
  "cfg",
  "cov-mark",
@@ -4089,7 +3970,6 @@ dependencies = [
  "blaze-ids",
  "blaze-lower",
  "blaze-macro-eval",
- "blaze-memo",
  "blaze-query",
  "blaze-serde",
  "blaze-sim",
@@ -4115,8 +3995,8 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-lint-defs",
- "blaze-memo",
  "blaze-phf",
+ "blaze-query",
  "cfg",
  "hashbrown 0.17.1",
  "hir-def",
@@ -4148,7 +4028,6 @@ dependencies = [
  "blaze-ids",
  "blaze-kernel",
  "blaze-mem",
- "blaze-memo",
  "blaze-phf",
  "blaze-query",
  "blaze-reclaim",
@@ -4201,7 +4080,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4224,7 +4103,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-hash",
- "blaze-memo",
+ "blaze-query",
  "cfg",
  "charon",
  "hir-def",
@@ -4254,7 +4133,6 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
  "blaze-query",
  "blaze-record",
  "blaze-serde",
@@ -4312,7 +4190,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4338,7 +4216,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4359,7 +4237,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4380,7 +4258,7 @@ dependencies = [
  "base-db",
  "blaze-core",
  "blaze-ids",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "cfg",
  "expect-test",
@@ -4400,7 +4278,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4417,7 +4295,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4442,9 +4320,8 @@ dependencies = [
  "blaze-hash",
  "blaze-hashcons",
  "blaze-ids",
- "blaze-items",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "blaze-rng",
  "blaze-sim",
  "blaze-units",
@@ -4489,7 +4366,7 @@ dependencies = [
  "base-db",
  "blaze-hash",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4508,13 +4385,12 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-core",
- "blaze-graph",
  "blaze-hash",
  "blaze-ids",
  "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "either",
  "hir-def",
@@ -4541,7 +4417,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-items",
- "blaze-memo",
+ "blaze-query",
  "blaze-sim",
  "hir-def",
  "hir-expand",
@@ -4559,7 +4435,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4576,7 +4452,7 @@ dependencies = [
  "base-db",
  "blaze-hash",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4592,7 +4468,7 @@ name = "hir-ty-tailck"
 version = "0.0.0"
 dependencies = [
  "base-db",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-ty",
@@ -4608,7 +4484,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4628,7 +4504,7 @@ name = "hir-ty-unsafeck"
 version = "0.0.0"
 dependencies = [
  "base-db",
- "blaze-memo",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -4649,7 +4525,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-format",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -6686,7 +6562,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
- "blaze-memo",
+ "blaze-query",
  "stdx",
  "syntax",
  "text-size",

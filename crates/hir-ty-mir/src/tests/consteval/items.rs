@@ -66,8 +66,7 @@ impl Held for Bytes {
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
-/// Also the store of `tests::mir::body_store`.
-pub(in crate::tests) struct Memory {
+struct Memory {
     values: Lock<HashMap<ContentId, Arc<Bytes>, Global>>,
 }
 
@@ -97,18 +96,6 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &Env, _: &[u8]) -> Result<ContentId, String> {
         Err("these fixtures expand no proc macro".to_owned())
     }
-
-    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
-    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
-        // A test's store holds each value whole: no part of one is read alone.
-        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
-    }
-
-    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
-    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
-        // A test's store runs a batch in order on its own thread: the same result.
-        (0..count).for_each(task);
-    }
 }
 
 /// The facts of these fixtures: a body's identity is its item's key and its body as printed
@@ -125,10 +112,18 @@ impl BodyFacts for Facts {
         Some(Hasher::new("blaze v2 item store constant test identity 1").id(&key).part(printed.as_bytes()).finish())
     }
 
-    fn fact_of(&self, _: &TestDB, _: DefWithBodyId, step: Step, _: blaze_memo::Read) -> Classified {
+    fn classify(
+        &self,
+        _: &TestDB,
+        _: DefWithBodyId,
+        step: Step,
+        _: blaze_query::db::DatabaseKeyIndex,
+        _: blaze_query::db::ReadKind,
+        _: &'static str,
+    ) -> Classified {
         match step {
             Step::Const => Classified::Covered,
-            _ => Classified::Refused("a read of a step other than a constant's, which these fixtures store none of"),
+            _ => Classified::Refused,
         }
     }
 
@@ -148,9 +143,7 @@ impl BodyFacts for Facts {
 /// A database of `fixture` with an item store over `memory`. The store is uninstalled before
 /// the database drops: it is declared after it where this is called.
 fn session(fixture: &str, memory: &Arc<Memory>, mode: Mode) -> (TestDB, Installed) {
-    // A step's read list is what the store files it under: only a snapshot that keeps read
-    // lists records one (else every offer is refused as unshareable).
-    let db: TestDB = fixture::db_with_reads(fixture).into_db();
+    let db: TestDB = fixture::db(fixture).into_db();
     // dyn: hir-ty's `install` takes the driver's store and facts, a boundary
     let images = Arc::clone(memory) as Arc<dyn ImageStore + Send + Sync>;
     let installed = install(&db, images, Arc::new(Facts), BUILD, mode).expect("a first store of a database");
@@ -177,7 +170,7 @@ fn constant(db: &TestDB, name: &str) -> ConstId {
 /// What `const_eval_query` does with the store once the constant step is on: `def`'s value
 /// through the item store, evaluated by MIR where the store has none; `None` for one that
 /// does not evaluate.
-#[blaze_memo::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn stored_value(db: &Db, def: ConstId) -> Option<StoredAllocation> {
     stored_constant(db, def, || {
         evaluate_by_mir(db, def.into(), GenericArgs::empty(), None).map(|it| it.store())

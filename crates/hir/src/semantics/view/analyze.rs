@@ -273,13 +273,12 @@ impl<'db> Semantics<'db> {
         let kind = token.kind();
         self.descend_into_macros_all(
             self.wrap_token_infile(token),
-            &mut |InFile { value, file_id }, ctx| {
+            &mut |InFile { value, .. }, ctx| {
                 let mapped_kind = value.kind();
                 let any_ident_match = kind.is_any_identifier() && mapped_kind.is_any_identifier();
-                // `ctx` is of the expansion `value` is in: its table is that file's.
                 if (kind == mapped_kind || any_ident_match)
                     && text == value.text()
-                    && !ctx.is_opaque(self.db, file_id.context_arena())
+                    && !ctx.is_opaque(self.db)
                 {
                     r.push(value);
                 }

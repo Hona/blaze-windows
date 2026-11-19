@@ -6,6 +6,7 @@
 //! 4,197,786 of them under one unit's codegen.
 
 use base_db::Db;
+use blaze_query::db::Database as _;
 use hir_ty_mir::mir::dispatch::Body;
 
 use super::{
@@ -39,7 +40,7 @@ fn held_after_the_walk(instances: usize, keeps_bodies: bool) -> usize {
     let db: Db = db_with(&ladder(instances));
     let krate = crate_named(&db, "kernel");
     let root = fn_named(&db, krate, "root");
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         let (env, args) = generic(&db, root);
         let instance = Instance { def: Def::Body(Body::Fn(root)), args };
         let walk = || _ = summary(&db, env, instance);
@@ -48,7 +49,7 @@ fn held_after_the_walk(instances: usize, keeps_bodies: bool) -> usize {
             false => walk(),
         }
     });
-    hir_ty_mir::mir::held::held(&db)
+    db.storage().values_of(blaze_mem::Tag::Mir)
 }
 
 /// The invariant: the MIR the purity walk leaves held is by body, never by instance: a walk
@@ -74,14 +75,14 @@ fn held_after_the_identity(instances: usize, keeps_bodies: bool) -> usize {
     let db: Db = db_with(&ladder(instances));
     let krate = crate_named(&db, "kernel");
     let root = fn_named(&db, krate, "root");
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         let parts = || _ = identity_parts(&db, root);
         match keeps_bodies {
             true => plant::keeping_bodies(parts),
             false => parts(),
         }
     });
-    hir_ty_mir::mir::held::held(&db)
+    db.storage().values_of(blaze_mem::Tag::Mir)
 }
 
 /// The invariant: an instance's identity part keeps the part, never the body it was read

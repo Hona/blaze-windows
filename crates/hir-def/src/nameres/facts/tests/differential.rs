@@ -248,7 +248,8 @@ fn the_reader_finds_fixtures_and_skips_expectations() {
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures of the notes' §8: programs whose answer a resolver could take from its schedule,
-// which rustc rejects or (the third) resolves one way.
+// which rustc rejects or (the third) resolves one way. `delta::tests::DIFFERENCES` compares
+// the maps of each.
 
 pub(in crate::nameres) struct OrderDependent {
     pub(in crate::nameres) name: &'static str,

@@ -103,7 +103,7 @@ fn edition(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Edition {
     let Some(call) = node.file_id.macro_file() else { return b.cx.edition };
     let db = b.db();
     match node.map(|it| it.text_range()).original_node_file_range_opt(db) {
-        Some((_, ctxt)) => ctxt.edition(),
+        Some((_, ctxt)) => ctxt.edition(db),
         None => call.loc(db).def.edition,
     }
 }

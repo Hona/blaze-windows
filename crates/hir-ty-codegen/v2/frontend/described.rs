@@ -25,14 +25,14 @@
 //! crate it names is the home's or one of its dependencies' ([`Closure`], checked, never
 //! assumed): the standard library's own, a dependency's, and their generics over each other's
 //! types. Code an edit reaches (a workspace crate's, a generic over its types) has none and is
-//! described by the walk's own task.
+//! described by the walk's own task, as before (`frontend/witnesses.rs`).
 //!
 //! **The record** ([`HirFrontend::to_record_in`]) is the [`Described`] with its origin as
 //! "the requester's" or the item's crate's own, each reference ported, and with each function
 //! it refers to what the recursion limit reads of it ([`Counted`]): the walk asks that of a
 //! callee before it describes it, and working it out reads the callee's optimized body
-//! (`compiled_by_user`). No describe reads what the build calls a file: a `file!()` is a span
-//! the link names.
+//! (`compiled_by_user`). Not kept: a describe that reads what the build calls a file
+//! ([`names_files`]), which no key holds.
 //!
 //! What a database read from a record is remembered beside it ([`Found`]), for the three
 //! asks that would otherwise run the describe after all: whether a kept describe still holds
@@ -45,12 +45,11 @@ use blaze_format::{
     schema_of,
 };
 use blaze_hash::SharedMap;
-use blaze_memo::Id as _;
+use blaze_query::db::AsId as _;
 use hir_ty::check_cache::port;
 
 use super::*;
 
-pub(crate) mod plan;
 pub(crate) mod reach;
 pub(crate) mod traced;
 
@@ -171,30 +170,23 @@ pub(super) struct Found {
     counted: SharedMap<HirInstance, Counted>,
 }
 
-/// Where an owner keeps what its database read from records ([`found_in`]): the table, with
-/// the session memo's arenas it was made under.
-pub(super) type FoundSlot = Option<(Vec<blaze_memo::ArenaId, Global>, Arc<Found>)>;
-
-/// What `db` read from records while every arena of its session memo is the one it was made
-/// under, kept in `slot` with those arenas (its owner's, [`super::Walks`]; or none, for a
-/// front end whose builds keep nothing). The table names instances by their ids
-/// ([`blaze_memo::Gid`]), and an id names the same thing only while its arena lives; an edit
-/// drops its crate's arena (a new generation is another [`blaze_memo::ArenaId`]), so after
-/// one nothing read before it is kept. That is coarser than the floor: an edit of a
-/// workspace crate empties a table of library describes whose arenas it did not drop
-/// (front-end-on-memo.md, the cost of decision 4). No process static holds any: until
+/// What `db` read from records since the last write of an input a library's describe may
+/// read (its durable view, as [`Frontend::durable_view`] gives it), kept in `slot` with that
+/// view (its owner's, [`super::Walks`]; or none, for a front end whose builds keep nothing):
+/// after such a write nothing read before it is kept, as a kept walk is not patched across
+/// one. A count ([`Found::counted`]) is of a function by its id, and what an id names is the
+/// same only while no library's source was written. No process static holds any: until
 /// 2026-11-13 one did, by the database's nonce, and nothing let it go.
-pub(super) fn found_in(slot: &mut FoundSlot, db: &Db) -> Arc<Found> {
-    let memo = blaze_memo::Database::memo(db);
+pub(super) fn found_in(slot: &mut Option<(u64, Arc<Found>)>, db: &Db) -> Arc<Found> {
+    let durable = blaze_query::db::Database::storage(db).durable_view().as_u64();
     if let Some((was, found)) = slot
-        && was.iter().copied().eq(memo.arenas())
+        && *was == durable
     {
         return found.clone(); // clone: a reference count, once a build
     }
-    let mut arenas = Vec::new_in(Global);
-    arenas.extend(memo.arenas());
+    // alloc: once per owner and write of a library's input, an empty table
     let made = Arc::new(Found::default());
-    *slot = Some((arenas, made.clone())); // clone: a reference count
+    *slot = Some((durable, made.clone())); // clone: a reference count
     made
 }
 
@@ -271,8 +263,6 @@ fn item_named(db: &Db, name: &port::Name) -> Option<port::Item> {
 const CODE: u8 = 0;
 const ASM: u8 = 1;
 const START: u8 = 2;
-/// After the references' tags: an instance's and a reference's share one byte.
-const ALLOCATOR: u8 = 6;
 
 /// The tags of a reference in a record, after an instance's.
 const STATIC: u8 = 3;
@@ -280,7 +270,8 @@ const EXTERN: u8 = 4;
 const WEAK: u8 = 5;
 
 /// `instance` into `out`, its ids and arguments into `writer`. `None` for one with no
-/// portable form: an environment that is not empty, or a home outside `closure`.
+/// portable form: an environment that is not empty, a home outside `closure`, a function of
+/// the allocator shim.
 fn put_instance<'db>(
     closure: &Closure<'db>,
     writer: &mut port::Writer<'db>,
@@ -295,12 +286,12 @@ fn put_instance<'db>(
             }
             let (def, entry) = match code.def {
                 InstanceDef::Fn(func) => (0u8, writer.function(func)),
-                InstanceDef::Closure(id) => (1, writer.closure(InternedClosureId::from_gid(id))),
+                InstanceDef::Closure(id) => (1, writer.closure(InternedClosureId::from_id(id))),
                 InstanceDef::Coroutine(id) => {
-                    (2, writer.coroutine(InternedCoroutineId::from_gid(id)))
+                    (2, writer.coroutine(InternedCoroutineId::from_id(id)))
                 }
                 InstanceDef::CoroutineByMove(id) => {
-                    (3, writer.coroutine(InternedCoroutineId::from_gid(id)))
+                    (3, writer.coroutine(InternedCoroutineId::from_id(id)))
                 }
                 InstanceDef::DropGlue => (4, NO_ENTRY),
                 InstanceDef::CallOnceShim => (5, NO_ENTRY),
@@ -327,21 +318,7 @@ fn put_instance<'db>(
             out.put_u8(START);
             out.put_u32(writer.function(*main));
         }
-        // An entry of the allocator shim: its symbol, the symbol it calls (which says whether
-        // the program has a `#[global_allocator]` or an `#[alloc_error_handler]`, so the name
-        // of its plan moves when one is added or removed), its shape, and the program's crate
-        // it is built in, which its code does not read but its describe is classified by.
-        Kind::Allocator(forward) => {
-            if !closure.holds(forward.krate) {
-                return None;
-            }
-            out.put_u8(ALLOCATOR);
-            out.put_bytes_u32(forward.symbol.as_bytes());
-            put_text(out, forward.to);
-            out.put_u8(forward.params);
-            out.put_u8(u8::from(forward.returns));
-            out.put_bytes(&blaze_items::key::crate_key(db, forward.krate).0);
-        }
+        Kind::Allocator(_) => return None,
     }
     Some(())
 }
@@ -361,9 +338,9 @@ fn get_instance<'db>(
             let krate = ContentId(*bytes.array::<32>()?);
             let def = match def {
                 0 => InstanceDef::Fn(ported.function(entry)?),
-                1 => InstanceDef::Closure(ported.closure(entry)?.gid()),
-                2 => InstanceDef::Coroutine(ported.coroutine(entry)?.gid()),
-                3 => InstanceDef::CoroutineByMove(ported.coroutine(entry)?.gid()),
+                1 => InstanceDef::Closure(ported.closure(entry)?.as_id()),
+                2 => InstanceDef::Coroutine(ported.coroutine(entry)?.as_id()),
+                3 => InstanceDef::CoroutineByMove(ported.coroutine(entry)?.as_id()),
                 4 => InstanceDef::DropGlue,
                 5 => InstanceDef::CallOnceShim,
                 6 => InstanceDef::VtableShim(ported.function(entry)?),
@@ -383,21 +360,6 @@ fn get_instance<'db>(
             Kind::Asm(text, flag(bytes.u8()?)?)
         }
         START => Kind::Start(ported.function(bytes.u32()?)?),
-        ALLOCATOR => {
-            use super::super::allocator::{Forward, known};
-            let unknown = "an allocator shim entry naming a symbol of no shim table";
-            let symbol = known(bytes.str_u32()?).ok_or(unknown)?;
-            let to = match flag(bytes.u8()?)? {
-                true => Some(known(bytes.str_u32()?).ok_or(unknown)?),
-                false => None,
-            };
-            let params = bytes.u8()?;
-            let returns = flag(bytes.u8()?)?;
-            let krate = ContentId(*bytes.array::<32>()?);
-            let krate = blaze_items::key::resolve_crate(db, &krate)
-                .ok_or("an allocator shim entry whose program crate is no crate of this database")?;
-            Kind::Allocator(Forward { symbol, to, params, returns, krate })
-        }
         // alloc: the reason of a refusal
         other => return Err(format!("a reference of no kind ({other})")),
     }))
@@ -430,23 +392,32 @@ fn put_text(out: &mut Vec<u8>, text: Option<&str>) {
     }
 }
 
+fn get_text(bytes: &mut Reader<'_>) -> R<Option<String>> {
+    Ok(match flag(bytes.u8()?)? {
+        true => Some(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
+        false => None,
+    })
+}
+
 /// An origin by its kind and its package's name; tag 0 is "the requester's", which only a
 /// describe's own origin is written as.
 fn put_origin(out: &mut Vec<u8>, origin: &Origin) {
-    let (tag, name) = origin_tag(origin);
-    out.put_u8(tag);
-    out.put_bytes_u32(name.as_bytes());
-}
-
-/// An origin's tag and package name as [`put_origin`] writes them: the one table of tags,
-/// which a static plan's head writes too (`plan`'s `put_static_head`).
-fn origin_tag(origin: &Origin) -> (u8, &str) {
-    match origin {
+    let (tag, name) = match origin {
         Origin::Std => (1u8, ""),
         Origin::Dependency(name) => (2, name.as_str()),
         Origin::BuildTime(name) => (3, name.as_str()),
         Origin::Member(name) => (4, name.as_str()),
+    };
+    out.put_u8(tag);
+    out.put_bytes_u32(name.as_bytes());
+}
+
+fn get_origin(bytes: &mut Reader<'_>, requester: &Origin) -> R<Origin> {
+    let tag = bytes.u8()?;
+    if tag == 0 {
+        return Ok(*requester);
     }
+    origin_tagged(bytes, tag)
 }
 
 /// The origin [`put_origin`] wrote with `tag`, which is not 0.
@@ -511,10 +482,9 @@ fn ask_written(db: &Db, (instance, origin): &(HirInstance, Origin)) -> Option<Ve
     let closure = match &instance.0 {
         Kind::Code(_, env) => Closure::of(db, env.krate),
         Kind::Start(main) => Closure::of(db, main.krate(db)),
-        // An allocator shim entry names its program's crate by key.
-        Kind::Allocator(forward) => Closure::of(db, forward.krate),
-        // An `asm!` function names no item.
-        Kind::Asm(..) => Closure { db, crates: &[] },
+        // An `asm!` function names no item; the allocator shim's has no portable form,
+        // which `put_instance` says.
+        Kind::Asm(..) | Kind::Allocator(_) => Closure { db, crates: &[] },
     };
     let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
     // alloc: once per ask written, the instance's few words
@@ -712,7 +682,7 @@ impl<'db> HirFrontend<'db> {
     /// Its items are named by their item keys and its types by content, as a describe record's
     /// are, over the crates its home may name ([`Closure`]): the home is `env.krate` of a
     /// function, `main`'s crate of the C `main`, and no crate of an `asm!` function, which
-    /// names no item. `None` for an instance with no portable form: one
+    /// names no item. `None` for an instance with no portable form: the allocator shim's, one
     /// worked out in an environment that is not empty, and one naming an item of a crate its
     /// home does not load. Unlike a record key it needs no image: a workspace function's ask is
     /// bytes too, and its items' keys name it in the next database as in this one.
@@ -766,35 +736,8 @@ impl<'db> HirFrontend<'db> {
     }
 }
 
-impl<'db> HirFrontend<'db> {
-    /// [`Frontend::to_record`], given the database.
-    pub(super) fn to_record_in(
-        &self,
-        db: &'db Db,
-        instance: &HirInstance,
-        requester: &Origin,
-        described: &Described<HirInstance, HirStatic>,
-    ) -> Option<Vec<u8>> {
-        let (_, _, closure) = self.under(db, instance, requester)?;
-        // Whose code it is, by the one rule ([`Self::compiled_for`]): its crate's own, or
-        // whoever asks.
-        let own = match crate_of(db, &instance.0) {
-            Some(krate) if !user_compiled(db, &instance.0) => Some(self.origin(db, krate)),
-            _ => None,
-        };
-        if described.origin != own.unwrap_or(*requester) {
-            return None;
-        }
-        encode_described(db, &closure, own.as_ref(), described)
-    }
-}
-
-/// The bytes of a describe record ([`HirFrontend::to_record_in`]'s layout, which
-/// [`HirFrontend::from_record_in`] and [`Head::read`] read), its items named over `closure`:
-/// `own` its crate's origin when the instance is compiled there, `None` when it is the
-/// requester's (tag 0). `None` for a describe with no portable form: a reference outside
-/// `closure`, a list past `u32::MAX`. One encoder, which the describe record and the plan
-/// record ([`plan`]) both write.
+/// Encodes `described` into portable bytes naming every instance and static by content.
+/// Shared by sealed single-key records and unsealed traced records ([`traced`]).
 pub(super) fn encode_described<'db>(
     db: &'db Db,
     closure: &Closure<'db>,
@@ -861,7 +804,7 @@ pub(super) fn encode_body<'db>(
         }
         None => out.put_u8(0),
     }
-    match &own {
+    match own {
         Some(own) => put_origin(out, own),
         None => out.put_u8(0),
     }
@@ -919,226 +862,17 @@ pub(super) fn encode_body<'db>(
     Some(())
 }
 
-/// The part of a describe record that names no item or type: every field of [`Described`]
-/// but its references, read with no database, in place. What a driver with no front end reads
-/// of a plan ([`plan`]): the instance's key (`code`, `args`, its settings from `origin` and
-/// `overflow_checks`), its template's key (`template_code`), its own span tables (`anchors`)
-/// and what the link names it by (`symbol`, `name`, weak or strong, cold).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Head<'r> {
-    pub item: ItemKey,
-    pub code: CodeHash,
-    pub template_code: CodeHash,
-    pub built_in_code: CodeHash,
-    pub args: ContentId,
-    pub identity: ContentId,
-    pub abi: ContentId,
-    pub anchors: Option<[ContentId; blaze_codegen::template::OWN_TABLES]>,
-    /// The origin it is compiled for; `None` for "the requester's" (tag 0), which the reader
-    /// supplies ([`Head::origin_for`]).
-    pub origin: Option<Origin>,
-    /// [`encode_described`]'s flags byte, below `1 << 6`.
-    flags: u8,
-    pub overflow_checks: Option<bool>,
-    pub symbol: Option<&'r str>,
-    pub name: &'r str,
-    pub bound: Result<ContentId, &'r str>,
-    /// The built-in list, `u32` little-endian each.
-    built_in: &'r [u8],
-}
-
-/// What a head that does not read is refused as.
-const NO_NAME: &str = "a describe with no name";
-const BAD_FLAGS: &str = "a describe with flags past the six it has";
-const BAD_OVERFLOW: &str = "a describe whose overflow checks are of no kind";
-const BAD_FLAG: &str = "a describe with a flag that is neither 0 nor 1";
-const BAD_ORIGIN: &str = "a describe whose origin is of no kind";
-
-fn cursor(error: blaze_format::cursor::Error) -> &'static str {
-    error.as_str()
-}
-
-fn flag_of(byte: u8) -> Result<bool, &'static str> {
-    match byte {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(BAD_FLAG),
-    }
-}
-
-fn id_of(bytes: &mut Reader<'_>) -> Result<ContentId, &'static str> {
-    Ok(ContentId(*bytes.array::<32>().map_err(cursor)?))
-}
-
-impl<'r> Head<'r> {
-    /// The head at `bytes`, which stand just past the record's ported buffer; `bytes` is left
-    /// at the count of its references.
-    pub fn read(bytes: &mut Reader<'r>) -> Result<Head<'r>, &'static str> {
-        let item = ItemKey(id_of(bytes)?);
-        let code = CodeHash(id_of(bytes)?);
-        let template_code = CodeHash(id_of(bytes)?);
-        let built_in_code = CodeHash(id_of(bytes)?);
-        let args = id_of(bytes)?;
-        let identity = id_of(bytes)?;
-        let abi = id_of(bytes)?;
-        let anchors = match flag_of(bytes.u8().map_err(cursor)?)? {
-            true => {
-                let mut anchors = [ContentId::default(); blaze_codegen::template::OWN_TABLES];
-                for anchor in &mut anchors {
-                    *anchor = id_of(bytes)?;
-                }
-                Some(anchors)
-            }
-            false => None,
-        };
-        let origin = match bytes.u8().map_err(cursor)? {
-            0 => None,
-            tag => Some(origin_tagged(bytes, tag).map_err(|_| BAD_ORIGIN)?),
-        };
-        let flags = bytes.u8().map_err(cursor)?;
-        if flags >= 1 << 7 {
-            return Err(BAD_FLAGS);
-        }
-        let overflow_checks = match bytes.u8().map_err(cursor)? {
-            0 => None,
-            1 => Some(false),
-            2 => Some(true),
-            _ => return Err(BAD_OVERFLOW),
-        };
-        let text = |bytes: &mut Reader<'r>| -> Result<Option<&'r str>, &'static str> {
-            Ok(match flag_of(bytes.u8().map_err(cursor)?)? {
-                true => Some(bytes.str_u32().map_err(cursor)?),
-                false => None,
-            })
-        };
-        let symbol = text(bytes)?;
-        let name = text(bytes)?.ok_or(NO_NAME)?;
-        let bound = match flag_of(bytes.u8().map_err(cursor)?)? {
-            true => Ok(id_of(bytes)?),
-            false => Err(bytes.str_u32().map_err(cursor)?),
-        };
-        let count = bytes.count_u32(size_of::<u32>()).map_err(cursor)?;
-        let built_in = bytes.take(count * size_of::<u32>()).map_err(cursor)?;
-        Ok(Head {
-            item,
-            code,
-            template_code,
-            built_in_code,
-            args,
-            identity,
-            abi,
-            anchors,
-            origin,
-            flags,
-            overflow_checks,
-            symbol,
-            name,
-            bound,
-            built_in,
-        })
-    }
-
-    /// The head of the describe record `record`, read past its ported buffer, with the reader
-    /// left at the count of its references.
-    pub fn of(record: &'r [u8]) -> Result<(Head<'r>, Reader<'r>), &'static str> {
-        let mut bytes = Reader::new(record);
-        bytes.bytes_u32().map_err(cursor)?;
-        let head = Head::read(&mut bytes)?;
-        Ok((head, bytes))
-    }
-
-    /// The origin it is compiled for when `requester` asks.
-    pub fn origin_for(&self, requester: &Origin) -> Origin {
-        self.origin.unwrap_or(*requester)
-    }
-
-    pub fn editable(&self) -> bool {
-        self.flags & 1 != 0
-    }
-
-    pub fn over_editable(&self) -> bool {
-        self.flags & 2 != 0
-    }
-
-    pub fn cold(&self) -> bool {
-        self.flags & 4 != 0
-    }
-
-    pub fn address(&self) -> Address {
-        if self.flags & 8 != 0 { Address::Significant } else { Address::Free }
-    }
-
-    pub fn linkage(&self) -> blaze_codegen::Linkage {
-        match self.flags & 16 != 0 {
-            true => blaze_codegen::Linkage::Weak,
-            false => blaze_codegen::Linkage::Strong,
-        }
-    }
-
-    pub fn owner(&self) -> Owner {
-        if self.flags & 32 != 0 { Owner::Workspace } else { Owner::Dependency }
-    }
-
-    pub fn takes_world(&self) -> bool {
-        self.flags & 64 != 0
-    }
-
-    /// [`Described::built_in`], in order.
-    pub fn built_in(&self) -> impl Iterator<Item = u32> + 'r {
-        (self.built_in.chunks_exact(size_of::<u32>()))
-            .map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]))
-    }
-
-    /// The describe of this head with `refs`, its origin `requester`'s where the record says
-    /// "the requester's".
-    fn described(
-        &self,
-        requester: &Origin,
-        refs: Vec<FrontRef<HirInstance, HirStatic>>,
-    ) -> Described<HirInstance, HirStatic> {
-        Described {
-            item: self.item,
-            code: self.code,
-            template_code: self.template_code,
-            anchors: self.anchors,
-            built_in_code: self.built_in_code,
-            args: self.args,
-            origin: self.origin_for(requester),
-            editable: self.editable(),
-            takes_world: self.takes_world(),
-            over_editable: self.over_editable(),
-            overflow_checks: self.overflow_checks,
-            address: self.address(),
-            // alloc: the describe's own text
-            symbol: self.symbol.map(str::to_owned),
-            linkage: self.linkage(),
-            refs,
-            // alloc: the describe's own list
-            built_in: self.built_in().collect(),
-            name: self.name.to_owned(), // alloc: the describe's own text
-            owner: self.owner(),
-            identity: self.identity,
-            abi: self.abi,
-            bound: self.bound.map_err(str::to_owned), // alloc: the describe's own text
-            cold: self.cold(),
-        }
-    }
-}
-
-/// The describe in `record` ([`encode_described`]'s bytes), made in `db`, its origin
-/// `requester`'s where the record says "the requester's"; `counted` is told what the record
-/// says the recursion limit reads of each function it refers to. An `Err` names why it does
-/// not read: an item `db` has none of, bytes cut short or left over. Never a panic: the bytes
-/// are a store's.
-pub(super) fn decode_described(
-    db: &Db,
+/// Decodes portable bytes written by [`encode_described`] in `db`, invoking `on_counted` for
+/// each callee's recursion-limit count.
+pub(super) fn decode_described<'db>(
+    db: &'db Db,
     requester: &Origin,
     record: &[u8],
-    counted: impl FnMut(&HirInstance, Counted),
+    on_counted: impl FnMut(&HirInstance, Counted),
 ) -> R<Described<HirInstance, HirStatic>> {
     let mut bytes = Reader::new(record);
-    // The ported buffer is read in place at its own alignment, which a store's bytes at an
-    // offset do not have.
+    // The ported buffer is read in place at its own alignment, which a store's bytes at
+    // an offset do not have.
     let ported = Aligned::copy_from(bytes.bytes_u32()?);
     let mut ported = port::Reader::open(
         db,
@@ -1146,7 +880,7 @@ pub(super) fn decode_described(
         &ported,
         &mut |name| item_named(db, name),
     )?;
-    let described = decode_body(db, requester, &mut ported, &mut bytes, counted)?;
+    let described = decode_body(db, requester, &mut ported, &mut bytes, on_counted)?;
     bytes.finish()?;
     Ok(described)
 }
@@ -1158,9 +892,50 @@ pub(super) fn decode_body<'db>(
     requester: &Origin,
     ported: &mut port::Reader<'_, 'db>,
     bytes: &mut Reader<'_>,
-    mut counted: impl FnMut(&HirInstance, Counted),
+    mut on_counted: impl FnMut(&HirInstance, Counted),
 ) -> R<Described<HirInstance, HirStatic>> {
-    let head = Head::read(bytes)?;
+    let item = ItemKey(get_id(bytes)?);
+    let code = CodeHash(get_id(bytes)?);
+    let template_code = CodeHash(get_id(bytes)?);
+    let built_in_code = CodeHash(get_id(bytes)?);
+    let args = get_id(bytes)?;
+    let identity = get_id(bytes)?;
+    let abi = get_id(bytes)?;
+    let anchors = match flag(bytes.u8()?)? {
+        true => {
+            let mut anchors = [ContentId::default(); blaze_codegen::template::OWN_TABLES];
+            for anchor in &mut anchors {
+                *anchor = get_id(bytes)?;
+            }
+            Some(anchors)
+        }
+        false => None,
+    };
+    let origin = get_origin(bytes, requester)?;
+    let flags = bytes.u8()?;
+    if flags >= 1 << 7 {
+        // alloc: the reason of a refusal
+        return Err(format!("a describe with flags {flags:#x}"));
+    }
+    let overflow_checks = match bytes.u8()? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        // alloc: the reason of a refusal
+        other => return Err(format!("overflow checks of no kind ({other})")),
+    };
+    let symbol = get_text(bytes)?;
+    let name = get_text(bytes)?.ok_or("a describe with no name")?;
+    let bound = match flag(bytes.u8()?)? {
+        true => Ok(get_id(bytes)?),
+        false => Err(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
+    };
+    let count = bytes.count_u32(size_of::<u32>())?;
+    // alloc: the describe's own list
+    let mut built_in = Vec::with_capacity(count);
+    for _ in 0..count {
+        built_in.push(bytes.u32()?);
+    }
     let count = bytes.count_u32(1)?;
     // alloc: the describe's own list
     let mut refs = Vec::with_capacity(count);
@@ -1171,15 +946,63 @@ pub(super) fn decode_body<'db>(
             WEAK => FrontRef::Weak(bytes.str_u32()?.to_owned()), // alloc: the describe's own text
             tag => {
                 let callee = get_instance(db, ported, bytes, tag)?;
-                counted(&callee, get_counted(bytes)?);
+                let counted = get_counted(bytes)?;
+                on_counted(&callee, counted);
                 FrontRef::Function(callee)
             }
         });
     }
-    Ok(head.described(requester, refs))
+    Ok(Described {
+        item,
+        code,
+        template_code,
+        anchors,
+        built_in_code,
+        args,
+        origin,
+        editable: flags & 1 != 0,
+        takes_world: flags & 64 != 0,
+        over_editable: flags & 2 != 0,
+        overflow_checks,
+        address: if flags & 8 != 0 { Address::Significant } else { Address::Free },
+        symbol,
+        linkage: match flags & 16 != 0 {
+            true => blaze_codegen::Linkage::Weak,
+            false => blaze_codegen::Linkage::Strong,
+        },
+        refs,
+        built_in,
+        name,
+        owner: if flags & 32 != 0 { Owner::Workspace } else { Owner::Dependency },
+        identity,
+        abi,
+        bound,
+        cold: flags & 4 != 0,
+    })
 }
 
 impl<'db> HirFrontend<'db> {
+    /// [`Frontend::to_record`], given the database.
+    pub(super) fn to_record_in(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        described: &Described<HirInstance, HirStatic>,
+    ) -> Option<Vec<u8>> {
+        let (_, _, closure) = self.under(db, instance, requester)?;
+        // Described by the build's own front end each build: what the build calls the file
+        // is in no key.
+        if names_files(db, &instance.0) {
+            return None;
+        }
+        let own = self.own_origin(db, instance);
+        if described.origin != own.unwrap_or(*requester) {
+            return None;
+        }
+        encode_described(db, &closure, own.as_ref(), described)
+    }
+
     /// Whose code `instance` is, by the one rule ([`Self::compiled_for`]): its crate's own, or
     /// (`None`) whoever asks.
     fn own_origin(&self, db: &'db Db, instance: &HirInstance) -> Option<Origin> {
@@ -1308,11 +1131,8 @@ impl<'db> HirFrontend<'db> {
                 return self.given_sealed(db, instance, requester, Some(under), &desc);
             }
             let now = self.described_now(db, instance, requester)?;
-            if !(world_active && now.takes_world) {
-                let own = match crate_of(db, &instance.0) {
-                    Some(krate) if !user_compiled(db, &instance.0) => Some(self.origin(db, krate)),
-                    _ => None,
-                };
+            if !(world_active && now.takes_world) && !names_files(db, &instance.0) {
+                let own = self.own_origin(db, instance);
                 if now.origin == own.unwrap_or(*requester)
                     && let Some(bytes) = encode_described(db, &closure, own.as_ref(), &now)
                 {
@@ -1322,7 +1142,6 @@ impl<'db> HirFrontend<'db> {
                         key,
                         kind: blaze_codegen::driver::RECORD_KIND,
                         bytes,
-                        of: None,
                     });
                     // clone: the front end's shared copy, as above
                     self.reach.saw(asked, now.clone());
@@ -1659,7 +1478,7 @@ pub fn roots() {
         })
     }
 
-    /// Why `instance` has no portable form, where it has none: an
+    /// Why `instance` has no portable form, where it has none: the allocator shim's, an
     /// environment that is not empty, or (written over every crate of the database, so only
     /// its home's closure refused it) an item outside its home's closure.
     fn unported(
@@ -1669,6 +1488,7 @@ pub fn roots() {
     ) -> Option<&'static str> {
         let every: Vec<Crate> = all_crates(db).iter().copied().collect();
         frontend.with(|_| match &instance.0 {
+            Kind::Allocator(_) => Some("the allocator shim's"),
             Kind::Code(_, env) if env.param_env(db) != ParamEnv::empty() => {
                 Some("of an environment that is not empty")
             }
@@ -1698,7 +1518,7 @@ pub fn roots() {
             return match unported(first, db, &asked.0) {
                 Some(_) => Ok(()),
                 None => Err(format!(
-                    "{asked:?} has no ask, and it is not of an environment \
+                    "{asked:?} has no ask, and it is not the allocator shim's, of an environment \
                      that is not empty, nor naming an item outside its home's closure"
                 )),
             };

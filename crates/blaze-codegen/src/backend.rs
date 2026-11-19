@@ -422,7 +422,6 @@ pub trait Frontend: Sync {
                         key,
                         kind: crate::driver::RECORD_KIND,
                         bytes,
-                        of: None,
                     });
                 }
                 Ok((now, false))

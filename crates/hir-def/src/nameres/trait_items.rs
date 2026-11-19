@@ -73,8 +73,7 @@ impl DefMap {
         let cfg_options = module.krate(db).cfg_options(db);
         let container = ItemContainerId::TraitId(trait_);
         for item in list.assoc_items() {
-            let table = file_id.context_arena();
-            let attrs = match AttrsOrCfg::lower(db, table, item, &|| cfg_options, span_map) {
+            let attrs = match AttrsOrCfg::lower(db, item, &|| cfg_options, span_map) {
                 AttrsOrCfg::Enabled { attrs } => attrs,
                 AttrsOrCfg::CfgDisabled(_) => continue,
             };

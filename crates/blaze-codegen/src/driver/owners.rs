@@ -89,7 +89,6 @@ where
             Some(owned.statics[at].2)
         }
         Target::Data(_)
-        | Target::Text(_)
         | Target::Extern(_)
         | Target::Weak(_)
         | Target::Position(_)

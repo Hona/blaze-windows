@@ -48,9 +48,6 @@ pub(crate) mod sealed;
 #[cfg(feature = "native")]
 pub(crate) mod inspect;
 mod job;
-/// cargo's words as a load's config keeps them: the daemon's jobs and `check --no-daemon`
-/// (`cli::no_daemon`) hand the load the same ones.
-pub(crate) use job::undrawn;
 #[cfg(unix)]
 pub(crate) mod log;
 /// Where no daemon is started with its output in `serve.log` (the start is unix's,
@@ -1282,6 +1279,7 @@ pub(crate) fn engine(
         color: false,
         build,
         settings,
+        outside: blaze_vfs::outside::dirs(),
         stall: serving.stall.unwrap_or(blaze_profile::Watchdog::BOUND),
         #[cfg(unix)]
         activated: serving.activated,
@@ -1321,18 +1319,13 @@ pub(crate) fn engine(
     // first; a hook something else set first would leave the watchdog counting nothing.
     #[expect(
         clippy::disallowed_types,
-        reason = "blaze_memo's run hook is set once per process; this keeps whether this process's set took"
+        reason = "blaze_query's run hook is set once per process; this keeps whether this process's set took"
     )]
     static WATCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Both engines: base-db and hir-expand still run on blaze-query's tracked engine
-    // (front-end-on-memo.md "base-db: not ported"), the rest on blaze-memo.
-    if !*WATCHED.get_or_init(|| {
-        blaze_memo::on_each_run(blaze_profile::moved).is_ok()
-            && blaze_query::on_each_run(blaze_profile::moved).is_ok()
-    }) {
+    if !*WATCHED.get_or_init(|| blaze_query::on_each_run(blaze_profile::moved).is_ok()) {
         anyhow::bail!(
-            "blaze_memo::on_each_run or blaze_query::on_each_run already has a hook other than \
-             the daemon's, so the stall watchdog would not see query runs as progress"
+            "blaze_query::on_each_run already has a hook other than the daemon's, so the stall \
+             watchdog would not see query runs as progress"
         );
     }
     let steps = {

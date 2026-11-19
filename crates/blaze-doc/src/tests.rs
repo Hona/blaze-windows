@@ -294,12 +294,12 @@ fn load_text(text: &str, no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
     let (fixture, dep) = (named("fixture"), named("dep"));
     let mut test_only = crate::TestOnly::default();
     if dep_for_tests {
-        test_only.insert((fixture.base().key(&db), dep.base().key(&db)));
+        test_only.insert((fixture, dep));
     }
     let asked = [Asked { krate: fixture, private: false }];
-    let mut crates = crate::crates_to_document(&db, &asked, no_deps, &test_only)
+    let crates = crate::crates_to_document(&db, &asked, no_deps, &test_only)
         .expect("the fixture's crates are named");
-    crate::set_cfg_doc(&mut db, &mut crates);
+    crate::set_cfg_doc(&mut db, &crates);
     let model = crate::model(&db, crates, test_only);
     (db, model)
 }

@@ -266,7 +266,6 @@ fn render_value(analysis: &Analysis, value: &Value) -> String {
             format!("{path}:{line}:{column} `{text}`", line = at.line, column = at.column)
         }
         Value::Text(text) => format!("\"{text}\""),
-        Value::Int(int) => int.to_string(),
     }
 }
 
@@ -323,7 +322,6 @@ fn json_value(analysis: &Analysis, value: &Value) -> serde_json::Value {
             })
         }
         Value::Text(text) => serde_json::Value::String(text.to_string()),
-        Value::Int(int) => serde_json::Value::from(*int),
     }
 }
 

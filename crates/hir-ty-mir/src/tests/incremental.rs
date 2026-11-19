@@ -1,5 +1,4 @@
-use std::alloc::Global;
-
+use blaze_query::db::{Database as _, EventKind};
 use expect_test::Expect;
 use hir_def::{DefWithBodyId, ModuleDefId};
 use hir_expand::fixture;
@@ -7,23 +6,12 @@ use hir_expand::fixture;
 use crate::{
     InferenceResult,
     method_resolution::TraitImpls,
-    test_db::{TestDB, TestDBExt as _, runs_of, write_file},
+    test_db::{TestDB, TestDBExt as _},
 };
 
 use super::visit_module;
 
-/// The kinds `required` counts, by their generated names: a body's inference and a crate's
-/// trait impls.
-const INFER: &str = crate::kinds::infer_body_query::KIND_NAME;
-const TRAIT_IMPLS_FOR_CRATE: &str = crate::kinds::TraitImpls_for_crate::KIND_NAME;
-
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims an edit of
-// the file runs only the queries that read the changed text (`infer_body_query` 0 times). An
-// edit of a file now rebuilds its crate's arena, so every query of that crate runs again; reuse
-// across edits comes from records (the body store), not from the memo. The first snapshot (the
-// cold run's list) is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_whitespace_inside_a_function_should_not_invalidate_types() {
     let fx = fixture::db(
         "
@@ -34,12 +22,10 @@ fn foo() -> i32 {
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
@@ -47,7 +33,7 @@ fn foo() -> i32 {
                 }
             });
         },
-        &[(INFER, 1)],
+        &[("infer_body_query", 1)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -81,12 +67,12 @@ fn foo() -> i32 {
     1
 }";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
@@ -94,7 +80,7 @@ fn foo() -> i32 {
                 }
             });
         },
-        &[(INFER, 0)],
+        &[("infer_body_query", 0)],
         &expect_test::expect![[r#"
             [
                 "file_outline",
@@ -107,12 +93,7 @@ fn foo() -> i32 {
     );
 }
 
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims an edit of
-// one body infers only that body again (`infer_body_query` once). An edit of a file now rebuilds
-// its crate's arena, so every body of the crate is inferred again; reuse across edits comes from
-// records (the body store), not from the memo. The first snapshot is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_a_function_should_not_invalidate_types_in_another() {
     let fx = fixture::db(
         "
@@ -129,12 +110,10 @@ fn baz() -> i32 {
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
@@ -142,7 +121,7 @@ fn baz() -> i32 {
                 }
             });
         },
-        &[(INFER, 3)],
+        &[("infer_body_query", 3)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -205,12 +184,12 @@ fn baz() -> i32 {
 }
 ";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
@@ -218,7 +197,7 @@ fn baz() -> i32 {
                 }
             });
         },
-        &[(INFER, 1)],
+        &[("infer_body_query", 1)],
         &expect_test::expect![[r#"
             [
                 "file_outline",
@@ -236,12 +215,7 @@ fn baz() -> i32 {
     );
 }
 
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims adding a
-// struct leaves the crate's trait impls (`TraitImpls::for_crate` 0 times). An edit of a file now
-// rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
-// from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_struct_invalidates_infer() {
     let fx = fixture::db(
         "
@@ -257,16 +231,14 @@ $0",
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 1)],
+        &[("TraitImpls::for_crate", 1)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -289,28 +261,23 @@ pub struct NewStruct {
 }
 ";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 0)],
+        &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
         &expect_test::expect![[r#"
             []
         "#]],
     );
 }
 
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims adding an
-// enum leaves the crate's trait impls (`TraitImpls::for_crate` 0 times). An edit of a file now
-// rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
-// from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_enum_query_log() {
     let fx = fixture::db(
         "
@@ -326,16 +293,14 @@ $0",
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 1)],
+        &[("TraitImpls::for_crate", 1)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -359,28 +324,23 @@ pub enum SomeEnum {
 }
 ";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 0)],
+        &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
         &expect_test::expect![[r#"
             []
         "#]],
     );
 }
 
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims adding a
-// `use` leaves the crate's trait impls (`TraitImpls::for_crate` 0 times). An edit of a file now
-// rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
-// from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_use_query_log() {
     let fx = fixture::db(
         "
@@ -396,16 +356,14 @@ $0",
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 1)],
+        &[("TraitImpls::for_crate", 1)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -426,28 +384,23 @@ fn bar() -> f32 {
 }
 ";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 0)],
+        &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
         &expect_test::expect![[r#"
             []
         "#]],
     );
 }
 
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): this claims adding an
-// inherent impl leaves the crate's trait impls (`TraitImpls::for_crate` 0 times). An edit of a
-// file now rebuilds its crate's arena, so every query of that crate runs again; reuse across
-// edits comes from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_impl_query_log() {
     let fx = fixture::db(
         "
@@ -467,16 +420,14 @@ $0",
     );
     let pos = fx.position();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = pos.file_id.file_id(&db);
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 1)],
+        &[("TraitImpls::for_crate", 1)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -505,16 +456,16 @@ impl SomeStruct {
 }
 ";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(pos.file_id.file_id(&db));
             let _crate_def_map = module.def_map(&db);
             TraitImpls::for_crate(&db, module.krate(&db));
         },
-        &[(TRAIT_IMPLS_FOR_CRATE, 0)],
+        &[("TraitImpls::for_crate", 0), ("trait_bodies", 0)],
         &expect_test::expect![[r#"
             []
         "#]],
@@ -522,13 +473,7 @@ impl SomeStruct {
 }
 
 // FIXME(next-solver): does this test make sense with fast path?
-// False by design on blaze-memo (left failing; port lane 3, 2026-11-14): the second snapshot
-// claims adding a struct reruns only the queries that read the changed text (one
-// `infer_body_query`, no signatures). An edit of a file now rebuilds its crate's arena, so every
-// query of that crate runs again; reuse across edits comes from records, not from the memo. The
-// first snapshot (the cold run's list) is only to re-bless.
 #[test]
-#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn add_struct_invalidates_trait_solve() {
     let fx = fixture::db(
         "
@@ -548,13 +493,11 @@ fn main() {
     );
     let file_id = fx.only_file();
     let mut db = fx.into_db();
-    // A file's id is the same across a commit; the interned `EditionedFileId` is not.
-    let file = file_id.file_id(&db);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             let mut defs: Vec<DefWithBodyId> = vec![];
             visit_module(&db, crate_def_map, module, &mut |it| {
@@ -573,7 +516,7 @@ fn main() {
             }
         },
         // FIXME: What does this test check for now? trait_solve_shim is no longer a query
-        &[],
+        &[("trait_solve_shim", 0)],
         &expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -644,12 +587,12 @@ fn main() {
     s.$0
 }";
 
-    write_file(&mut db, file, new_text);
+    db.set_file_text(file_id.file_id(&db), new_text);
 
     execute_assert_events(
         &db,
         || {
-            let module = db.module_for_file(file);
+            let module = db.module_for_file(file_id.file_id(&db));
             let crate_def_map = module.def_map(&db);
             let mut defs: Vec<DefWithBodyId> = vec![];
 
@@ -668,7 +611,7 @@ fn main() {
                 let _inference_result = InferenceResult::of(&db, def);
             }
         },
-        &[],
+        &[("trait_solve_shim", 0)],
         &expect_test::expect![[r#"
             [
                 "file_body_syntax",
@@ -696,24 +639,31 @@ fn execute_assert_events(
     required: &[(&str, usize)],
     expect: &Expect,
 ) {
-    blaze_memo::attach(db, || {
-        let runs = runs_of(db, f);
-        // Each run by its query's own name, the last segment of its kind's (a method of a
-        // tracked impl is `Type_method`), in the order they ran.
-        let executed: Vec<&str, Global> = {
-            let mut names = Vec::new_in(Global);
-            names.extend(
-                runs.iter().map(|it| it.query.rsplit_once("::").map_or(it.query, |(_, name)| name)),
-            );
-            names
-        };
+    blaze_query::db::attach(db, || {
+        let events = db.log(f);
+        let executed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::WillExecute { database_key } => {
+                    Some(db.storage().ingredient_name(database_key.ingredient_index()).to_owned())
+                }
+                _ => None,
+            })
+            .collect();
         expect.assert_debug_eq(&executed);
-        for &(kind, count) in required {
-            let n = runs.iter().filter(|it| it.query == kind).count();
+        for (event, count) in required {
+            let n = executed.iter().filter(|it| it.contains(event)).count();
             assert_eq!(
-                n, count,
-                "Expected {kind} to be executed {count} times, but only got {n}:\n \
-             Run log: {runs:#?}",
+                n,
+                *count,
+                "Expected {event} to be executed {count} times, but only got {n}:\n \
+             Executed: {executed:#?}\n \
+             Event log: {events:#?}",
+                events = events
+                    .iter()
+                    .filter(|event| !matches!(event.kind, EventKind::WillCheckCancellation))
+                    .map(|event| { format!("{:?}", event.kind) })
+                    .collect::<Vec<_>>(),
             );
         }
     });

@@ -18,7 +18,7 @@ use hir::{
     AsAssocItem, Crate, Field, HasVisibility, ModuleDef, PathResolution, Trait, Visibility,
     view::Semantics,
 };
-use std::alloc::{Allocator, Global};
+use std::alloc::Global;
 use syntax::{
     LexedStr, NodeOrToken, SyntaxKind, TextRange, TextSize,
     view::{self as ast, AstNode as _, HasAttrs as _},
@@ -32,7 +32,7 @@ use crate::{
 
 /// What a rename renames.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Def {
+enum Def {
     Item(ModuleDef),
     Field(Field),
 }
@@ -99,7 +99,7 @@ pub(crate) fn rename(
     let mut hits = Vec::new();
     let finder = memchr::memmem::Finder::new(bare.as_bytes());
     let files = cx.files;
-    for file in files_of(cx.db, def, Global) {
+    for file in files_of(cx.db, def) {
         let path = files.path(file).ok_or_else(|| {
             fail(format!("a file of a crate that can see `{}` is outside the view", target.item))
         })?;
@@ -213,13 +213,13 @@ fn implements(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
 }
 
 /// Whether `found`, a reference resolved, is `item` or implements it.
-pub(crate) fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
+fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
     found == item || implements(db, found, item)
 }
 
 /// The files of the crates that can name `def`: its own, and those depending on it when it is
 /// public.
-pub(crate) fn files_of<A: Allocator>(db: &Db, def: Def, alloc: A) -> Vec<FileId, A> {
+fn files_of(db: &Db, def: Def) -> Vec<FileId> {
     let (krate, public) = match def {
         Def::Item(item) => {
             let module = match item {
@@ -238,7 +238,7 @@ pub(crate) fn files_of<A: Allocator>(db: &Db, def: Def, alloc: A) -> Vec<FileId,
     }
     let mut seen_crates = HashSet::new_in(Global);
     let mut seen = HashSet::new_in(Global);
-    let mut files = Vec::new_in(alloc);
+    let mut files = Vec::new();
     for krate in crates {
         if !seen_crates.insert(krate) {
             continue;
@@ -285,13 +285,10 @@ fn classify<'db>(
     Ok(found)
 }
 
-/// Why an occurrence the front end can't resolve refuses a rename or a change of parameters.
-pub(crate) const UNRESOLVED: &str = "the front end can't resolve this occurrence (cfg'd out \
-     under this view's configuration, or unresolved), so can't tell whether it names the renamed \
-     item";
-
 fn unresolved() -> String {
-    UNRESOLVED.to_owned()
+    "the front end can't resolve this occurrence (cfg'd out under this view's configuration, or \
+     unresolved), so can't tell whether it names the renamed item"
+        .to_owned()
 }
 
 fn classify_one<'db>(

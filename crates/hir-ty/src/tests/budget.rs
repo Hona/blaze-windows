@@ -5,6 +5,7 @@
 use base_db::{Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_mem::{Tag, frame};
+use blaze_query::db::{Database, Durability};
 use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
 use hir_expand::fixture;
 
@@ -129,12 +130,11 @@ fn a_recheck_of_unchanged_bodies_allocates_nothing() {
     let mut db = db_of(FIXTURE);
     let bodies = bodies(&db);
     infer_all(&db, &bodies);
-    // A snapshot that changed nothing carries every arena (spec B, `synthetic_write`): the
-    // first re-check in one warms what a worker keeps; the second is the steady state. An
-    // empty edit's commit is that snapshot; its carried arenas keep every id.
-    _ = db.edit().commit();
+    // The first re-check after a write warms what verification keeps per worker; the second is
+    // the steady state.
+    db.storage_mut().synthetic_write(Durability::LOW);
     infer_all(&db, &bodies);
-    _ = db.edit().commit();
+    db.storage_mut().synthetic_write(Durability::LOW);
     assert_at_most(0, "re-checking the inference of unchanged bodies", || infer_all(&db, &bodies));
 }
 

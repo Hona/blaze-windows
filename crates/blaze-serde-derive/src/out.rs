@@ -44,29 +44,25 @@ impl Out {
     #[track_caller]
     pub(crate) fn s(&mut self, text: &str) -> &mut Self {
         let site = Location::caller();
-        // Each piece ends with the delimiter that cut it, but for the last, which has none:
-        // the text before a delimiter is the piece's characters less its last, read from the
-        // characters and not by a byte index.
-        for piece in text.split_inclusive(['(', ')', '[', ']', '{', '}']) {
-            let mut before = piece.chars();
-            let delimiter = match before.next_back() {
-                Some('(' | ')') => Delimiter::Parenthesis,
-                Some('[' | ']') => Delimiter::Bracket,
-                Some('{' | '}') => Delimiter::Brace,
-                Some(_) | None => {
-                    self.text(piece, site);
-                    continue;
-                }
+        let mut run = 0;
+        for (at, ch) in text.char_indices() {
+            let delimiter = match ch {
+                '(' | ')' => Delimiter::Parenthesis,
+                '[' | ']' => Delimiter::Bracket,
+                '{' | '}' => Delimiter::Brace,
+                _ => continue,
             };
-            self.text(before.as_str(), site);
+            self.text(&text[run..at], site);
+            run = at + 1;
             self.flush();
-            if piece.ends_with(['(', '[', '{']) {
+            if matches!(ch, '(' | '[' | '{') {
                 // alloc: the text that opened a group, for the error if nothing closes it
                 self.open.push(Open { delimiter, site, text: text.to_owned(), tokens: Vec::new() });
             } else {
                 self.close(delimiter, site, text);
             }
         }
+        self.text(&text[run..], site);
         self.text(" ", site);
         self
     }

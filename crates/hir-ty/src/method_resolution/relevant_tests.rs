@@ -150,7 +150,7 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 #[test]
 fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_memo::attach(&db, || the_relevant_impls_in(&db));
+    blaze_query::db::attach(&db, || the_relevant_impls_in(&db));
 }
 
 fn the_relevant_impls_in(db: &Db) {
@@ -213,38 +213,4 @@ fn a_warm_read_of_the_relevant_impls_allocates_nothing() {
     blaze_alloc_count::assert_at_most(0, "a warm read of the relevant impls", || {
         assert_eq!(std::hint::black_box(read()), warm);
     });
-}
-
-#[test]
-fn an_expansion_adding_only_an_unnamed_const_publishes_its_trait_impl() {
-    use hir_def::{ModuleDefId, nameres::crate_def_map, signatures::TraitSignature};
-
-    let mut fixture = fixture::db(
-        "//- /main.rs crate:main deps:derive\npub trait T {} pub struct S; derive::make!(S);\n//- /derive.rs crate:derive\n#[macro_export] macro_rules! make { ($s:ty) => {}; }",
-    );
-    let trait_named = |db: &Db, krate: Crate, name: &str| -> TraitId {
-        crate_def_map(db, krate)
-            .modules(db)
-            .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-            .find_map(|it| match it {
-                ModuleDefId::TraitId(t) if TraitSignature::of(db, t).name.as_str() == name => {
-                    Some(t)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no trait `{name}`"))
-    };
-    let krate = crate_named(fixture.db(), "main");
-    let t = trait_named(fixture.db(), krate, "T");
-    assert_eq!(TraitImpls::for_crate_and_trait(fixture.db(), krate, t).impls().count(), 0);
-    let source = fixture.file_at("/derive.rs").file_id(fixture.db());
-    _ = fixture.edit(|edit| {
-        _ = edit.set_file_text(
-            source,
-            "#[macro_export] macro_rules! make { ($s:ty) => { const _: () = { impl crate::T for $s {} }; }; }",
-        );
-    });
-    let krate = crate_named(fixture.db(), "main");
-    let t = trait_named(fixture.db(), krate, "T");
-    assert_eq!(TraitImpls::for_crate_and_trait(fixture.db(), krate, t).impls().count(), 1);
 }

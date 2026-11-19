@@ -18,7 +18,7 @@ use core::iter;
 
 use crate::ast::{
     self, CallArgs, CaseArm, ChainLink, ChainOp, CompareOp, Expr, ExprKind, JoinKind, Name,
-    ResultColumn, Span, Statement, TableRef, UnaryOp,
+    ResultColumn, Span, SqlType, Statement, TableRef, UnaryOp,
 };
 use crate::desc::{Description, Param, ResultCol, Returns, Storage, Ty};
 use crate::funcs::{self, Args, Function, Gives};
@@ -27,72 +27,6 @@ use crate::funcs::{self, Args, Function, Gives};
 use crate::parse::MAX_DEPTH;
 use crate::same::same_expr;
 use crate::schema::{Column, Schema, Table};
-
-/// The subset's keywords as the checker's messages and the rendered text spell them: lower
-/// case, each the word itself. A message names a clause or an operator by one, and
-/// [`crate::render`] writes them, so each word is written here once.
-pub(crate) mod keyword {
-    /// The keyword `select`.
-    pub(crate) const SELECT: &str = "select";
-    /// The keyword `distinct`.
-    pub(crate) const DISTINCT: &str = "distinct";
-    /// The keyword `from`.
-    pub(crate) const FROM: &str = "from";
-    /// The keyword `join`.
-    pub(crate) const JOIN: &str = "join";
-    /// The keyword `on`.
-    pub(crate) const ON: &str = "on";
-    /// The keyword `where`.
-    pub(crate) const WHERE: &str = "where";
-    /// The keyword `having`.
-    pub(crate) const HAVING: &str = "having";
-    /// The keyword `desc`.
-    pub(crate) const DESC: &str = "desc";
-    /// The keyword `limit`.
-    pub(crate) const LIMIT: &str = "limit";
-    /// The keyword `offset`.
-    pub(crate) const OFFSET: &str = "offset";
-    /// The keyword `as`.
-    pub(crate) const AS: &str = "as";
-    /// The keyword `values`.
-    pub(crate) const VALUES: &str = "values";
-    /// The keyword `update`.
-    pub(crate) const UPDATE: &str = "update";
-    /// The keyword `set`.
-    pub(crate) const SET: &str = "set";
-    /// The keyword `returning`.
-    pub(crate) const RETURNING: &str = "returning";
-    /// The keyword `and`.
-    pub(crate) const AND: &str = "and";
-    /// The keyword `or`.
-    pub(crate) const OR: &str = "or";
-    /// The keyword `not`.
-    pub(crate) const NOT: &str = "not";
-    /// The keyword `is`.
-    pub(crate) const IS: &str = "is";
-    /// The keyword `null`.
-    pub(crate) const NULL: &str = "null";
-    /// The keyword `true`.
-    pub(crate) const TRUE: &str = "true";
-    /// The keyword `false`.
-    pub(crate) const FALSE: &str = "false";
-    /// The keyword `in`.
-    pub(crate) const IN: &str = "in";
-    /// The keyword `between`.
-    pub(crate) const BETWEEN: &str = "between";
-    /// The keyword `like`.
-    pub(crate) const LIKE: &str = "like";
-    /// The keyword `case`.
-    pub(crate) const CASE: &str = "case";
-    /// The keyword `when`.
-    pub(crate) const WHEN: &str = "when";
-    /// The keyword `then`.
-    pub(crate) const THEN: &str = "then";
-    /// The keyword `else`.
-    pub(crate) const ELSE: &str = "else";
-    /// The keyword `end`.
-    pub(crate) const END: &str = "end";
-}
 
 /// Why a statement does not type against a schema: what, where, and the rule.
 #[derive(Debug)]
@@ -146,7 +80,7 @@ pub enum TypeErrorKind<'s> {
     /// A function not in [`funcs::FUNCTIONS`].
     UnknownFunction { name: &'s str },
     /// A call with the wrong number of arguments.
-    Arity { function: &'static str, arity: funcs::Arity, found: usize },
+    Arity { function: &'static str, arity: funcs::Arity, found: u32 },
     /// `f(distinct ..)` for an `f` that is not an aggregate.
     DistinctNotAggregate { function: &'static str },
     /// `f(*)` for an `f` that is not `count`.
@@ -171,7 +105,7 @@ pub enum TypeErrorKind<'s> {
     /// An `insert` leaving out a column that is not nullable and is not the table's integer key.
     MissingColumn { table: &'s str, column: &'s str },
     /// A row of `values` not as wide as the column list. `row` counts from 1.
-    RowWidth { row: usize, columns: usize, values: usize },
+    RowWidth { row: u32, columns: u32, values: u32 },
     /// `null` into a column that is not nullable.
     NullIntoNonNull { column: &'s str },
     /// A nullable value into a column that is not nullable.
@@ -234,40 +168,19 @@ pub struct TyName<'s> {
     pub list: bool,
 }
 
-/// Whether a parameter is one value or a list of them (`in $list`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Form {
-    Scalar,
-    List,
-}
-
-impl Form {
-    #[blaze::pure]
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
-    fn is_list(self) -> bool {
-        matches!(self, Form::List)
-    }
-}
-
 impl<'s> TyName<'s> {
-    fn of(ty: Ty<'s>, form: Form) -> TyName<'s> {
-        let list = form.is_list();
+    fn of(ty: Ty<'s>, list: bool) -> TyName<'s> {
         TyName { storage: ty.storage, rust: ty.rust.name, nullable: ty.nullable, list }
     }
 }
 
-/// A `fmt::Write` that writes ASCII upper case as lower: a storage's message name is its
-/// variant's derived `Debug` name in lower case (`Integer` is `integer`), so a rename follows it.
-struct Lower<'f, 'a>(&'f mut fmt::Formatter<'a>);
-
-impl fmt::Write for Lower<'_, '_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            fmt::Write::write_char(&mut *self.0, c.to_ascii_lowercase())?;
-        }
-        Ok(())
+fn storage_name(storage: Storage) -> &'static str {
+    match storage {
+        Storage::Boolean => "boolean",
+        Storage::Integer => "integer",
+        Storage::Real => "real",
+        Storage::Text => "text",
+        Storage::Blob => "blob",
     }
 }
 
@@ -290,9 +203,7 @@ impl fmt::Display for TyName<'_> {
         } else {
             write!(f, "`{}`", self.rust)?;
         }
-        f.write_str(" (")?;
-        fmt::Write::write_fmt(&mut Lower(&mut *f), format_args!("{:?}", self.storage))?;
-        f.write_str(")")
+        write!(f, " ({})", storage_name(self.storage))
     }
 }
 
@@ -328,13 +239,7 @@ impl fmt::Display for What<'_> {
 impl fmt::Display for Expected {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expected::One(
-                storage @ (Storage::Boolean
-                | Storage::Integer
-                | Storage::Real
-                | Storage::Text
-                | Storage::Blob),
-            ) => f.write_str(storage_with_article(*storage)),
+            Expected::One(storage) => f.write_str(storage_with_article(*storage)),
             Expected::Number => f.write_str("an integer or a real"),
             Expected::NotBoolean => f.write_str("anything but a boolean"),
         }
@@ -343,11 +248,7 @@ impl fmt::Display for Expected {
 
 impl fmt::Display for TypeErrorKind<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use Expected as E;
-        use Place as P;
-        use Storage as S;
         use TypeErrorKind as K;
-        use What as W;
         match self {
             K::TooDeep { limit } => {
                 write!(f, "the expression nests deeper than {limit} levels, the most the checker types")
@@ -370,15 +271,7 @@ impl fmt::Display for TypeErrorKind<'_> {
                 f,
                 "column `{column}` is in both `{first}` and `{second}`; qualify it, as `{first}.{column}`"
             ),
-            K::ColumnNotAllowed {
-                column,
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-            } => {
+            K::ColumnNotAllowed { column, place } => {
                 write!(f, "column `{column}` cannot be read {place}, which sees no columns")
             }
             K::StarWithoutFrom => f.write_str("`*` needs a `from` to take its columns from"),
@@ -387,36 +280,12 @@ impl fmt::Display for TypeErrorKind<'_> {
                 "integer `{magnitude}` is above the largest 64-bit integer, 9223372036854775807"
             ),
             K::RealNotFinite => f.write_str("the real literal is outside the finite 64-bit floats"),
-            K::WrongStorage {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-                expected: expected @ (E::One(_) | E::Number | E::NotBoolean),
-                found: found @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-            } => write!(
+            K::WrongStorage { what, place, expected, found } => write!(
                 f,
                 "{what} {place} must be {expected}, but it is {}",
                 storage_with_article(*found)
             ),
-            K::MixedArithmetic {
-                op,
-                left: left @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-                right: right @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-            } => write!(
+            K::MixedArithmetic { op, left, right } => write!(
                 f,
                 "`{op}` takes two integers or two reals, not {} and {}; `cast` one side",
                 storage_with_article(*left),
@@ -425,79 +294,25 @@ impl fmt::Display for TypeErrorKind<'_> {
             K::RealRemainder => f.write_str(
                 "`%` takes integers, not reals (SQLite and Postgres disagree on a real remainder); `cast` both sides to integer",
             ),
-            K::CompareStorage {
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-                left: left @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-                right: right @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-            } => write!(
+            K::CompareStorage { place, left, right } => write!(
                 f,
                 "{} and {} are compared {place}; both sides must have one storage, so `cast` one",
                 storage_with_article(*left),
                 storage_with_article(*right)
             ),
-            K::CompareTypes {
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-                left,
-                right,
-            } => write!(
+            K::CompareTypes { place, left, right } => write!(
                 f,
                 "`{left}` and `{right}` are compared {place}, but they are different Rust types"
             ),
-            K::BranchTypes {
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-                first,
-                other,
-            } => write!(
+            K::BranchTypes { place, first, other } => write!(
                 f,
                 "the values {place} must have one type, but one is {first} and another {other}"
             ),
-            K::NeedsCast {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-            } => write!(
+            K::NeedsCast { what, place } => write!(
                 f,
                 "{what} {place} gets no type from its position; give it one with `cast(.. as <type>)`"
             ),
-            K::ParamsBothSides {
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-                left,
-                right,
-            } => write!(
+            K::ParamsBothSides { place, left, right } => write!(
                 f,
                 "parameters `${left}` and `${right}` {place} give each other no type; `cast` one of them"
             ),
@@ -508,11 +323,7 @@ impl fmt::Display for TypeErrorKind<'_> {
             K::UnknownFunction { name } => {
                 write!(f, "no function `{name}`; the functions are {}", funcs::Known)
             }
-            K::Arity {
-                function,
-                arity: arity @ (funcs::Arity::Exactly(_) | funcs::Arity::AtLeast(_)),
-                found,
-            } => {
+            K::Arity { function, arity, found } => {
                 write!(f, "`{function}` takes {arity}, not {found}")
             }
             K::DistinctNotAggregate { function } => {
@@ -521,15 +332,7 @@ impl fmt::Display for TypeErrorKind<'_> {
             K::StarNotCount { function } => {
                 write!(f, "`*` is an argument only of `count`, not of `{function}`")
             }
-            K::AggregateNotAllowed {
-                function,
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-            } => {
+            K::AggregateNotAllowed { function, place } => {
                 write!(f, "aggregate `{function}` is not allowed {place}")
             }
             K::NotGrouped { column } => write!(
@@ -537,19 +340,7 @@ impl fmt::Display for TypeErrorKind<'_> {
                 "column `{column}` is neither in `group by` nor inside an aggregate; group by it or aggregate it"
             ),
             K::HavingWithoutGroup => f.write_str("`having` needs a `group by` or an aggregate"),
-            K::NotInDistinct {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-            } => write!(
+            K::NotInDistinct { what } => write!(
                 f,
                 "{what} in `order by` of a `select distinct` must be one of its result columns"
             ),
@@ -557,19 +348,7 @@ impl fmt::Display for TypeErrorKind<'_> {
                 f,
                 "`{clause} {position}` is positional, which is not in the subset; name the expression"
             ),
-            K::Unnamed {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-            } => {
+            K::Unnamed { what } => {
                 write!(f, "{what} as a result column needs a name; add `as <name>`")
             }
             K::DuplicateResultName { name } => write!(
@@ -587,60 +366,16 @@ impl fmt::Display for TypeErrorKind<'_> {
             K::NullIntoNonNull { column } => {
                 write!(f, "`null` cannot go into column `{column}`, which is not nullable")
             }
-            K::NullableIntoNonNull {
-                column,
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-            } => {
+            K::NullableIntoNonNull { column, what } => {
                 write!(f, "{what} may be null, but column `{column}` is not nullable")
             }
             K::AssignType { column, expected, found } => {
                 write!(f, "column `{column}` is {expected}, but the value is {found}")
             }
-            K::NullableNotAllowed {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-                place:
-                    place @ (P::Clause(_)
-                    | P::Operand(_)
-                    | P::Argument(_)
-                    | P::Result
-                    | P::InsideAggregate),
-            } => {
+            K::NullableNotAllowed { what, place } => {
                 write!(f, "{what} {place} may be null, and it must not be")
             }
-            K::CastToBoolean {
-                what:
-                    what @ (W::Column(_)
-                    | W::Param(_)
-                    | W::Null
-                    | W::Boolean(_)
-                    | W::Integer(_)
-                    | W::Real(_)
-                    | W::Text(_)
-                    | W::Blob(_)
-                    | W::Call(_)
-                    | W::Operator(_)),
-                found: found @ (S::Boolean | S::Integer | S::Real | S::Text | S::Blob),
-            } => write!(
+            K::CastToBoolean { what, found } => write!(
                 f,
                 "{what} is {}, and `cast(.. as boolean)` takes only a boolean or a parameter (SQLite has no boolean to cast to); write `x <> 0` instead",
                 storage_with_article(*found)
@@ -660,8 +395,6 @@ fn err<'s, T>(kind: TypeErrorKind<'s>, span: Span) -> Result<T, TypeError<'s>> {
 }
 
 /// Types `statement` against `schema`.
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub fn infer<'s, A: Allocator + Copy>(
     schema: &Schema<'s>,
     statement: &Statement<'s, A>,
@@ -685,8 +418,6 @@ pub(crate) enum Plant {}
 
 /// [`infer`] with `plant` planted.
 #[cfg(feature = "plant")]
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub fn infer_planted<'s, A: Allocator + Copy>(
     schema: &Schema<'s>,
     statement: &Statement<'s, A>,
@@ -729,52 +460,33 @@ fn run<'s, A: Allocator + Copy>(
 
 /// A name as written against a name of the schema: an unquoted one without regard to ASCII
 /// case (the schema's rule), a quoted one exactly.
-#[blaze::pure]
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn names_schema(name: &Name<'_>, schema_name: &str) -> bool {
     if name.quoted { name.text == schema_name } else { name.text.eq_ignore_ascii_case(schema_name) }
 }
 
 /// Two names as written, by Postgres's rule, which is SQLite's narrowed: an unquoted name folds
 /// to lower case, a quoted one is exact.
-#[blaze::pure]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn names_same(a: &Name<'_>, b: &Name<'_>) -> bool {
-    match (a.quoted, b.quoted) {
-        (false, false) => a.text.eq_ignore_ascii_case(b.text),
-        (true, true) => a.text == b.text,
-        (true, false) => Unquoted(b.text).folds_to(a.text),
-        (false, true) => Unquoted(a.text).folds_to(b.text),
+pub(crate) fn names_same(a: &str, a_quoted: bool, b: &str, b_quoted: bool) -> bool {
+    match (a_quoted, b_quoted) {
+        (false, false) => a.eq_ignore_ascii_case(b),
+        (true, true) => a == b,
+        (true, false) => folds_to(b, a),
+        (false, true) => folds_to(a, b),
     }
 }
 
-/// The text of an unquoted name, which folds to lower case.
-#[derive(Clone, Copy)]
-struct Unquoted<'a>(&'a str);
-
-impl Unquoted<'_> {
-    /// Whether it folds to the quoted name `quoted`.
-    #[blaze::pure]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
-    fn folds_to(self, quoted: &str) -> bool {
-        self.0.len() == quoted.len()
-            && self.0.bytes().zip(quoted.bytes()).all(|(u, q)| u.to_ascii_lowercase() == q)
-    }
+/// Whether unquoted `unquoted` folds to quoted `quoted`.
+fn folds_to(unquoted: &str, quoted: &str) -> bool {
+    unquoted.len() == quoted.len()
+        && unquoted.bytes().zip(quoted.bytes()).all(|(u, q)| u.to_ascii_lowercase() == q)
 }
 
 /// The table of `schema` that `name` names.
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn table_of<'s>(schema: &Schema<'s>, name: &Name<'_>) -> Option<&'s Table<'s>> {
     schema.tables.iter().copied().find(|table| names_schema(name, table.name))
 }
 
 /// The column of `table` that `name` names.
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn column_of<'s>(table: &'s Table<'s>, name: &Name<'_>) -> Option<&'s Column<'s>> {
     table.columns.iter().find(|column| names_schema(name, column.name))
 }
@@ -789,16 +501,22 @@ fn integer_key<'s>(table: &'s Table<'s>) -> Option<&'s Column<'s>> {
     }
 }
 
-/// The type of `column` read through `entry`: nullable if the column is, or if the entry is
-/// the right side of a `left join`.
-fn column_ty<'s>(column: &'s Column<'s>, entry: &Entry<'s>) -> Ty<'s> {
-    Ty { storage: column.storage, rust: column.rust, nullable: column.nullable || entry.nullable }
+fn column_ty<'s>(column: &'s Column<'s>, entry_nullable: bool) -> Ty<'s> {
+    Ty { storage: column.storage, rust: column.rust, nullable: column.nullable || entry_nullable }
 }
 
-/// The plain Rust type of `storage`, non-null; `Ty { nullable, ..plain(storage) }` for one that
-/// may be null.
-fn plain(storage: Storage) -> Ty<'static> {
-    Ty { storage, rust: storage.plain(), nullable: false }
+fn plain(storage: Storage, nullable: bool) -> Ty<'static> {
+    Ty { storage, rust: storage.plain(), nullable }
+}
+
+fn sql_storage(to: SqlType) -> Storage {
+    match to {
+        SqlType::Boolean => Storage::Boolean,
+        SqlType::Integer => Storage::Integer,
+        SqlType::Real => Storage::Real,
+        SqlType::Text => Storage::Text,
+        SqlType::Blob => Storage::Blob,
+    }
 }
 
 fn is_number(storage: Storage) -> bool {
@@ -840,14 +558,10 @@ fn is_plain(ty: &Ty<'_>) -> bool {
     ty.rust == ty.storage.plain()
 }
 
-#[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn chain_text(op: ChainOp) -> &'static str {
     match op {
-        ChainOp::Or => keyword::OR,
-        ChainOp::And => keyword::AND,
+        ChainOp::Or => "or",
+        ChainOp::And => "and",
         ChainOp::Add => "+",
         ChainOp::Sub => "-",
         ChainOp::Mul => "*",
@@ -857,10 +571,6 @@ pub(crate) fn chain_text(op: ChainOp) -> &'static str {
     }
 }
 
-#[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn compare_text(op: CompareOp) -> &'static str {
     match op {
         CompareOp::Eq => "=",
@@ -869,7 +579,7 @@ pub(crate) fn compare_text(op: CompareOp) -> &'static str {
         CompareOp::Le => "<=",
         CompareOp::Gt => ">",
         CompareOp::Ge => ">=",
-        CompareOp::Is => keyword::IS,
+        CompareOp::Is => "is",
         CompareOp::IsNot => "is not",
     }
 }
@@ -893,30 +603,19 @@ fn what<'s, X: Allocator>(e: &Expr<'s, X>) -> What<'s> {
         ExprKind::Column { column, .. } => What::Column(column.text),
         ExprKind::Param(name) => What::Param(name.text),
         ExprKind::Unary { op: UnaryOp::Neg, .. } => What::Operator("-"),
-        ExprKind::Unary { op: UnaryOp::Not, .. } => What::Operator(keyword::NOT),
+        ExprKind::Unary { op: UnaryOp::Not, .. } => What::Operator("not"),
         // The tree a chain means is left-nested: its outermost operator is the last link's.
         ExprKind::Chain { rest, .. } => match rest.last() {
             Some(link) => What::Operator(chain_text(link.op)),
             // Not reached: a chain without links was peeled above.
             None => What::Operator("chain"),
         },
-        ExprKind::Compare {
-            op:
-                op @ (CompareOp::Eq
-                | CompareOp::Ne
-                | CompareOp::Lt
-                | CompareOp::Le
-                | CompareOp::Gt
-                | CompareOp::Ge
-                | CompareOp::Is
-                | CompareOp::IsNot),
-            ..
-        } => What::Operator(compare_text(*op)),
+        ExprKind::Compare { op, .. } => What::Operator(compare_text(*op)),
         ExprKind::IsNull { .. } => What::Operator("is null"),
-        ExprKind::InList { .. } | ExprKind::InParam { .. } => What::Operator(keyword::IN),
-        ExprKind::Between { .. } => What::Operator(keyword::BETWEEN),
-        ExprKind::Like { .. } => What::Operator(keyword::LIKE),
-        ExprKind::Case { .. } => What::Operator(keyword::CASE),
+        ExprKind::InList { .. } | ExprKind::InParam { .. } => What::Operator("in"),
+        ExprKind::Between { .. } => What::Operator("between"),
+        ExprKind::Like { .. } => What::Operator("like"),
+        ExprKind::Case { .. } => What::Operator("case"),
         ExprKind::Cast { .. } => What::Operator("cast"),
         ExprKind::Call { function, .. } => What::Call(function.text),
     }
@@ -931,24 +630,7 @@ fn no_anchor<'e, 's: 'e, X: Allocator + 'e>(
 ) -> TypeError<'s> {
     let mut params = items.filter_map(|item| match &item.kind {
         ExprKind::Param(name) => Some(name.text),
-        ExprKind::Null
-        | ExprKind::Boolean(_)
-        | ExprKind::Integer(_)
-        | ExprKind::Real(_)
-        | ExprKind::Text(_)
-        | ExprKind::Blob(_)
-        | ExprKind::Column { .. }
-        | ExprKind::Unary { .. }
-        | ExprKind::Chain { .. }
-        | ExprKind::Compare { .. }
-        | ExprKind::IsNull { .. }
-        | ExprKind::InList { .. }
-        | ExprKind::InParam { .. }
-        | ExprKind::Between { .. }
-        | ExprKind::Like { .. }
-        | ExprKind::Case { .. }
-        | ExprKind::Cast { .. }
-        | ExprKind::Call { .. } => None,
+        _ => None,
     });
     let kind = match (params.next(), params.next()) {
         (Some(left), Some(right)) => TypeErrorKind::ParamsBothSides { place, left, right },
@@ -987,7 +669,8 @@ struct Side<'s> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Entry<'s> {
     /// The name the statement refers to it by: its alias, or its name as written.
-    pub(crate) name: Name<'s>,
+    pub(crate) name: &'s str,
+    pub(crate) quoted: bool,
     /// `name` is an alias, not the table's name.
     pub(crate) alias: bool,
     pub(crate) table: &'s Table<'s>,
@@ -1011,7 +694,7 @@ struct Seen<'s> {
     /// The byte offset of its first use, which orders the description's parameters.
     first: u32,
     ty: Ty<'s>,
-    form: Form,
+    list: bool,
 }
 
 /// The values of a `case`'s branches or `coalesce`'s arguments, unified.
@@ -1041,9 +724,6 @@ pub(crate) struct Cx<'s, A: Allocator + Copy> {
 }
 
 impl<'s, A: Allocator + Copy> Cx<'s, A> {
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn new(schema: &Schema<'s>, plant: Option<Plant>, alloc: A) -> Self {
         Cx {
             schema: *schema,
@@ -1076,8 +756,6 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
     }
 
     /// The table `name` names.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn table(&self, name: &Name<'s>) -> Result<&'s Table<'s>, TypeError<'s>> {
         match table_of(&self.schema, name) {
             Some(table) => Ok(table),
@@ -1085,76 +763,78 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         }
     }
 
-    fn push_entry(&mut self, entry: Entry<'s>) -> Result<(), TypeError<'s>> {
-        if self.scope.iter().any(|seen| names_same(&seen.name, &entry.name)) {
-            return err(TypeErrorKind::TableTwice { name: entry.name.text }, entry.name.span);
+    fn push_entry(
+        &mut self,
+        table: &'s Table<'s>,
+        name: &Name<'s>,
+        alias: bool,
+        nullable: bool,
+    ) -> Result<(), TypeError<'s>> {
+        if self
+            .scope
+            .iter()
+            .any(|entry| names_same(entry.name, entry.quoted, name.text, name.quoted))
+        {
+            return err(TypeErrorKind::TableTwice { name: name.text }, name.span);
         }
-        self.scope.push(entry);
+        self.scope.push(Entry { name: name.text, quoted: name.quoted, alias, table, nullable });
         Ok(())
     }
 
-    /// The entry `table_ref` makes, its columns as nullable as the table's.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
-    fn table_entry(&self, table_ref: &TableRef<'s>) -> Result<Entry<'s>, TypeError<'s>> {
+    fn push_table_ref(
+        &mut self,
+        table_ref: &TableRef<'s>,
+        nullable: bool,
+    ) -> Result<(), TypeError<'s>> {
         let table = self.table(&table_ref.table)?;
-        Ok(match table_ref.alias {
-            Some(alias) => Entry { name: alias, alias: true, table, nullable: false },
-            None => Entry { name: table_ref.table, alias: false, table, nullable: false },
-        })
+        match &table_ref.alias {
+            Some(alias) => self.push_entry(table, alias, true, nullable),
+            None => self.push_entry(table, &table_ref.table, false, nullable),
+        }
     }
 
     /// Puts the tables of `from` in scope, typing each join's `on` as it comes.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn enter_from<X: Allocator>(
         &mut self,
         from: &ast::From<'s, X>,
     ) -> Result<(), TypeError<'s>> {
-        let first = self.table_entry(&from.first)?;
-        self.push_entry(first)?;
+        self.push_table_ref(&from.first, false)?;
         for join in from.joins.iter() {
             let nullable = match join.kind {
                 JoinKind::Inner => false,
                 JoinKind::Left => left_join_nullable(self.plant),
             };
-            let entry = self.table_entry(&join.table)?;
-            self.push_entry(Entry { nullable, ..entry })?;
-            let on = Place::Clause(keyword::ON);
+            self.push_table_ref(&join.table, nullable)?;
+            let on = Place::Clause("on");
             self.within(Some(on), None, |cx| cx.boolean(&join.on, on).map(|_| ()))?;
         }
         Ok(())
     }
 
     /// Puts the one table of an `insert`, `update` or `delete` in scope.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn enter_table(&mut self, name: &Name<'s>) -> Result<&'s Table<'s>, TypeError<'s>> {
         let table = self.table(name)?;
-        self.push_entry(Entry { name: *name, alias: false, table, nullable: false })?;
+        self.push_entry(table, name, false, false)?;
         Ok(table)
     }
 
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn entry(&self, index: usize) -> Option<&Entry<'s>> {
         self.scope.get(index)
     }
 
     /// The index in scope of the table `name` names.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn find_entry(&self, name: &Name<'s>) -> Result<usize, TypeError<'s>> {
-        match self.scope.iter().position(|entry| names_same(&entry.name, name)) {
+        match self
+            .scope
+            .iter()
+            .position(|entry| names_same(entry.name, entry.quoted, name.text, name.quoted))
+        {
             Some(index) => Ok(index),
             None => err(TypeErrorKind::NotInScope { table: name.text }, name.span),
         }
     }
 
     /// Resolves `table.column` or `column` in scope.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn resolve(
         &self,
         table: Option<&Name<'s>>,
@@ -1173,9 +853,11 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     return err(TypeErrorKind::NotInScope { table: table.text }, table.span);
                 };
                 match column_of(entry.table, column) {
-                    Some(found) => {
-                        Ok(Resolved { entry: index, column: found, ty: column_ty(found, entry) })
-                    }
+                    Some(found) => Ok(Resolved {
+                        entry: index,
+                        column: found,
+                        ty: column_ty(found, entry.nullable),
+                    }),
                     None => err(
                         TypeErrorKind::NoSuchColumn { table: table.text, column: column.text },
                         column.span,
@@ -1191,14 +873,14 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                             TypeErrorKind::AmbiguousColumn {
                                 column: column.text,
                                 first,
-                                second: entry.name.text,
+                                second: entry.name,
                             },
                             column.span,
                         );
                     }
                     found = Some((
-                        Resolved { entry: index, column: hit, ty: column_ty(hit, entry) },
-                        entry.name.text,
+                        Resolved { entry: index, column: hit, ty: column_ty(hit, entry.nullable) },
+                        entry.name,
                     ));
                 }
                 match found {
@@ -1209,17 +891,16 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         }
     }
 
-    /// Records that parameter `name` has type `ty` (a list of it, for [`Form::List`]) at this
-    /// use.
-    fn bind(&mut self, name: Name<'s>, ty: Ty<'s>, form: Form) -> Result<(), TypeError<'s>> {
+    /// Records that parameter `name` has type `ty` (a list of it, when `list`) at this use.
+    fn bind(&mut self, name: Name<'s>, ty: Ty<'s>, list: bool) -> Result<(), TypeError<'s>> {
         for seen in self.params.iter_mut() {
             if seen.name == name.text {
-                if seen.ty != ty || seen.form != form {
+                if seen.ty != ty || seen.list != list {
                     return err(
                         TypeErrorKind::ParamConflict {
                             name: name.text,
-                            first: TyName::of(seen.ty, seen.form),
-                            second: TyName::of(ty, form),
+                            first: TyName::of(seen.ty, seen.list),
+                            second: TyName::of(ty, list),
                         },
                         name.span,
                     );
@@ -1228,13 +909,11 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 return Ok(());
             }
         }
-        self.params.push(Seen { name: name.text, first: name.span.start, ty, form });
+        self.params.push(Seen { name: name.text, first: name.span.start, ty, list });
         Ok(())
     }
 
     /// Types `e`, leaving a bare parameter or `null` for its position to type.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn synth<X: Allocator>(
         &mut self,
         e: &Expr<'s, X>,
@@ -1251,8 +930,6 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
     }
 
     /// Types `e`, which must have a type of its own here.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn typed<X: Allocator>(
         &mut self,
         e: &Expr<'s, X>,
@@ -1294,7 +971,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
     ) -> Result<bool, TypeError<'s>> {
         match shape {
             Shape::Param(name) => {
-                self.bind(name, plain(storage), Form::Scalar)?;
+                self.bind(name, plain(storage, false), false)?;
                 Ok(false)
             }
             Shape::Null => Ok(true),
@@ -1352,53 +1029,41 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         let ty = match &e.kind {
             ExprKind::Null => return Ok(Shape::Null),
             ExprKind::Param(name) => return Ok(Shape::Param(*name)),
-            ExprKind::Boolean(_) => plain(Storage::Boolean),
+            ExprKind::Boolean(_) => plain(Storage::Boolean, false),
             ExprKind::Integer(magnitude) => {
-                if *magnitude > i64::MAX.unsigned_abs() {
+                if *magnitude > i64::MAX as u64 {
                     return err(TypeErrorKind::IntegerTooLarge { magnitude: *magnitude }, e.span);
                 }
-                plain(Storage::Integer)
+                plain(Storage::Integer, false)
             }
             ExprKind::Real(value) => {
                 if !value.is_finite() {
                     return err(TypeErrorKind::RealNotFinite, e.span);
                 }
-                plain(Storage::Real)
+                plain(Storage::Real, false)
             }
-            ExprKind::Text(_) => plain(Storage::Text),
-            ExprKind::Blob(_) => plain(Storage::Blob),
+            ExprKind::Text(_) => plain(Storage::Text, false),
+            ExprKind::Blob(_) => plain(Storage::Blob, false),
             ExprKind::Column { table, column } => self.resolve(table.as_ref(), column)?.ty,
             ExprKind::Unary { op: UnaryOp::Neg, operand } => {
                 // `-9223372036854775808` is the one literal above `i64::MAX` that is an integer.
                 if let ExprKind::Integer(magnitude) = operand.kind
                     && magnitude == i64::MIN.unsigned_abs()
                 {
-                    plain(Storage::Integer)
+                    plain(Storage::Integer, false)
                 } else {
                     let place = Place::Operand("-");
                     let ty = self.typed(operand, place)?;
                     Self::number(&ty, operand, place)?;
-                    Ty { nullable: ty.nullable, ..plain(ty.storage) }
+                    plain(ty.storage, ty.nullable)
                 }
             }
             ExprKind::Unary { op: UnaryOp::Not, operand } => {
-                let nullable = self.boolean(operand, Place::Operand(keyword::NOT))?;
-                Ty { nullable, ..plain(Storage::Boolean) }
+                let nullable = self.boolean(operand, Place::Operand("not"))?;
+                plain(Storage::Boolean, nullable)
             }
             ExprKind::Chain { first, rest } => return self.chain(first, rest),
-            ExprKind::Compare {
-                op:
-                    op @ (CompareOp::Eq
-                    | CompareOp::Ne
-                    | CompareOp::Lt
-                    | CompareOp::Le
-                    | CompareOp::Gt
-                    | CompareOp::Ge
-                    | CompareOp::Is
-                    | CompareOp::IsNot),
-                left,
-                right,
-            } => {
+            ExprKind::Compare { op, left, right } => {
                 let place = Place::Operand(compare_text(*op));
                 let cmp = match op {
                     CompareOp::Is | CompareOp::IsNot => Cmp::Is,
@@ -1410,54 +1075,45 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     | CompareOp::Ge => Cmp::Plain,
                 };
                 let nullable = self.compare(left, iter::once(&**right), place, cmp, e.span)?;
-                Ty { nullable, ..plain(Storage::Boolean) }
+                plain(Storage::Boolean, nullable)
             }
             ExprKind::IsNull { operand, negated } => {
                 let place = Place::Operand(if *negated { "is not null" } else { "is null" });
                 self.typed(operand, place)?;
-                plain(Storage::Boolean)
+                plain(Storage::Boolean, false)
             }
             ExprKind::InList { operand, list, .. } => {
-                let place = Place::Operand(keyword::IN);
-                let nullable = self.compare(operand, list.iter(), place, Cmp::Plain, e.span)?;
-                Ty { nullable, ..plain(Storage::Boolean) }
+                let nullable =
+                    self.compare(operand, list.iter(), Place::Operand("in"), Cmp::Plain, e.span)?;
+                plain(Storage::Boolean, nullable)
             }
             ExprKind::InParam { operand, list, .. } => {
-                let ty = self.typed(operand, Place::Operand(keyword::IN))?;
-                let item = Ty { storage: ty.storage, rust: ty.rust, nullable: false };
-                self.bind(*list, item, Form::List)?;
-                Ty { nullable: ty.nullable, ..plain(Storage::Boolean) }
+                let ty = self.typed(operand, Place::Operand("in"))?;
+                self.bind(*list, Ty { storage: ty.storage, rust: ty.rust, nullable: false }, true)?;
+                plain(Storage::Boolean, ty.nullable)
             }
             ExprKind::Between { operand, low, high, .. } => {
                 let bounds = [&**low, &**high];
                 let nullable = self.compare(
                     operand,
                     bounds.into_iter(),
-                    Place::Operand(keyword::BETWEEN),
+                    Place::Operand("between"),
                     Cmp::Plain,
                     e.span,
                 )?;
-                Ty { nullable, ..plain(Storage::Boolean) }
+                plain(Storage::Boolean, nullable)
             }
             ExprKind::Like { operand, pattern, .. } => {
-                let place = Place::Operand(keyword::LIKE);
+                let place = Place::Operand("like");
                 let left = self.fixed(operand, Storage::Text, place)?;
                 let right = self.fixed(pattern, Storage::Text, place)?;
-                Ty { nullable: left || right, ..plain(Storage::Boolean) }
+                plain(Storage::Boolean, left || right)
             }
             ExprKind::Case { operand, arms, otherwise } => {
                 self.case(operand.as_deref(), arms, otherwise.as_deref(), e.span)?
             }
-            ExprKind::Cast {
-                operand,
-                to:
-                    to @ (Storage::Boolean
-                    | Storage::Integer
-                    | Storage::Real
-                    | Storage::Text
-                    | Storage::Blob),
-            } => {
-                let storage = *to;
+            ExprKind::Cast { operand, to } => {
+                let storage = sql_storage(*to);
                 match self.synth(operand)? {
                     // SQLite has no boolean to cast to (`cast(5 as integer)` is 5, not a 0 or 1)
                     // and Postgres refuses `cast(bigint as boolean)`: only a Boolean or a
@@ -1479,17 +1135,15 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                             e.span,
                         );
                     }
-                    Shape::Typed(ty) => Ty { nullable: ty.nullable, ..plain(storage) },
+                    Shape::Typed(ty) => plain(storage, ty.nullable),
                     Shape::Param(name) => {
-                        self.bind(name, plain(storage), Form::Scalar)?;
-                        plain(storage)
+                        self.bind(name, plain(storage, false), false)?;
+                        plain(storage, false)
                     }
-                    Shape::Null => Ty { nullable: true, ..plain(storage) },
+                    Shape::Null => plain(storage, true),
                 }
             }
-            ExprKind::Call { function, args: args @ (CallArgs::Star | CallArgs::List { .. }) } => {
-                self.call(function, args, e.span)?
-            }
+            ExprKind::Call { function, args } => self.call(function, args, e.span)?,
         };
         Ok(Shape::Typed(ty))
     }
@@ -1532,13 +1186,13 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     self.fixed_shape(left.0, left.1.what, left.1.span, Storage::Boolean, place)?;
                 let r =
                     self.fixed_shape(right.0, right.1.what, right.1.span, Storage::Boolean, place)?;
-                Ty { nullable: l || r, ..plain(Storage::Boolean) }
+                plain(Storage::Boolean, l || r)
             }
             ChainOp::Concat => {
                 let l = self.fixed_shape(left.0, left.1.what, left.1.span, Storage::Text, place)?;
                 let r =
                     self.fixed_shape(right.0, right.1.what, right.1.span, Storage::Text, place)?;
-                Ty { nullable: l || r, ..plain(Storage::Text) }
+                plain(Storage::Text, l || r)
             }
             ChainOp::Add | ChainOp::Sub | ChainOp::Mul | ChainOp::Div | ChainOp::Rem => {
                 self.arithmetic(op, left, right, at)?
@@ -1558,8 +1212,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         let symbol = chain_text(op);
         let place = Place::Operand(symbol);
         let anchor = match (left.0, right.0) {
-            (Shape::Typed(ty), Shape::Typed(_) | Shape::Param(_) | Shape::Null)
-            | (Shape::Param(_) | Shape::Null, Shape::Typed(ty)) => ty,
+            (Shape::Typed(ty), _) | (_, Shape::Typed(ty)) => ty,
             (Shape::Param(l), Shape::Param(r)) => {
                 return err(
                     TypeErrorKind::ParamsBothSides { place, left: l.text, right: r.text },
@@ -1592,13 +1245,13 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     nullable |= ty.nullable;
                 }
                 Shape::Null => nullable = true,
-                Shape::Param(name) => self.bind(name, plain(anchor.storage), Form::Scalar)?,
+                Shape::Param(name) => self.bind(name, plain(anchor.storage, false), false)?,
             }
         }
         if op == ChainOp::Rem && anchor.storage == Storage::Real {
             return err(TypeErrorKind::RealRemainder, at);
         }
-        Ok(Ty { nullable, ..plain(anchor.storage) })
+        Ok(plain(anchor.storage, nullable))
     }
 
     /// `operand` compared with each of `others` (`=`, `in (..)`, `between`, a `case`'s `when`s):
@@ -1640,7 +1293,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         let param = Ty { storage: anchor.storage, rust: anchor.rust, nullable: cmp == Cmp::Is };
         for item in iter::once(operand).chain(others) {
             if let ExprKind::Param(name) = &item.kind {
-                self.bind(*name, param, Form::Scalar)?;
+                self.bind(*name, param, false)?;
             }
         }
         Ok(match cmp {
@@ -1700,8 +1353,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                         return err(
                             TypeErrorKind::BranchTypes {
                                 place,
-                                first: TyName::of(first, Form::Scalar),
-                                other: TyName::of(ty, Form::Scalar),
+                                first: TyName::of(first, false),
+                                other: TyName::of(ty, false),
                             },
                             item.span,
                         );
@@ -1722,7 +1375,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         let param = Ty { storage: anchor.storage, rust: anchor.rust, nullable: false };
         for item in items {
             if let ExprKind::Param(name) = &item.kind {
-                self.bind(*name, param, Form::Scalar)?;
+                self.bind(*name, param, false)?;
             }
         }
         Ok(Unified {
@@ -1745,19 +1398,19 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 self.compare(
                     operand,
                     arms.iter().map(|arm| &arm.when),
-                    Place::Operand(keyword::CASE),
+                    Place::Operand("case"),
                     Cmp::Plain,
                     at,
                 )?;
             }
             None => {
                 for arm in arms {
-                    self.boolean(&arm.when, Place::Operand(keyword::WHEN))?;
+                    self.boolean(&arm.when, Place::Operand("when"))?;
                 }
             }
         }
         let branches = arms.iter().map(|arm| &arm.then).chain(otherwise);
-        let unified = self.unify(branches, Place::Operand(keyword::CASE), at)?;
+        let unified = self.unify(branches, Place::Operand("case"), at)?;
         Ok(Ty {
             storage: unified.ty.storage,
             rust: unified.ty.rust,
@@ -1773,7 +1426,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
     ) -> Result<Ty<'s>, TypeError<'s>> {
         #[cfg(test)]
         crate::tests::stack::touch();
-        let Some(function) = funcs::lookup(name) else {
+        let Some(function) = funcs::lookup(name.text, name.quoted) else {
             return err(TypeErrorKind::UnknownFunction { name: name.text }, name.span);
         };
         if function.aggregate {
@@ -1786,7 +1439,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             self.saw_aggregate = true;
         }
         match args {
-            CallArgs::Star if function.takes_star => Ok(plain(Storage::Integer)),
+            CallArgs::Star if function.takes_star => Ok(plain(Storage::Integer, false)),
             CallArgs::Star => err(TypeErrorKind::StarNotCount { function: function.name }, at),
             CallArgs::List { distinct, args } => {
                 if *distinct && !function.aggregate {
@@ -1800,7 +1453,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                         TypeErrorKind::Arity {
                             function: function.name,
                             arity: function.arity,
-                            found: args.len(),
+                            found: u32::try_from(args.len()).unwrap_or(u32::MAX),
                         },
                         at,
                     );
@@ -1859,7 +1512,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             }
             Args::Text => {
                 let nullable = self.fixed(first, Storage::Text, place)?;
-                (Ty { nullable, ..plain(Storage::Text) }, nullable)
+                (plain(Storage::Text, nullable), nullable)
             }
             Args::OneType => {
                 let unified = self.unify(args.iter(), place, at)?;
@@ -1867,22 +1520,20 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             }
         };
         Ok(match function.gives {
-            Gives::Count => plain(Storage::Integer),
-            Gives::StorageNullable => Ty { nullable: true, ..plain(arg.storage) },
+            Gives::Count => plain(Storage::Integer, false),
+            Gives::StorageNullable => plain(arg.storage, true),
             Gives::ArgumentNullable => Ty { storage: arg.storage, rust: arg.rust, nullable: true },
-            Gives::RealNullable => Ty { nullable: true, ..plain(Storage::Real) },
+            Gives::RealNullable => plain(Storage::Real, true),
             Gives::FirstNonNull => {
                 Ty { storage: arg.storage, rust: arg.rust, nullable: all_nullable }
             }
-            Gives::Text => Ty { nullable: arg.nullable, ..plain(Storage::Text) },
-            Gives::Integer => Ty { nullable: arg.nullable, ..plain(Storage::Integer) },
-            Gives::Storage => Ty { nullable: arg.nullable, ..plain(arg.storage) },
+            Gives::Text => plain(Storage::Text, arg.nullable),
+            Gives::Integer => plain(Storage::Integer, arg.nullable),
+            Gives::Storage => plain(arg.storage, arg.nullable),
         })
     }
 
     /// The storage of `e`, which has a type of its own; for rendering a `sum`.
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn storage_of<X: Allocator>(
         &mut self,
         e: &Expr<'s, X>,
@@ -1920,7 +1571,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
     ) -> Result<(), TypeError<'s>> {
         let target = Ty { storage: column.storage, rust: column.rust, nullable: column.nullable };
         match self.synth(e)? {
-            Shape::Param(name) => self.bind(name, target, Form::Scalar),
+            Shape::Param(name) => self.bind(name, target, false),
             Shape::Null if column.nullable => Ok(()),
             Shape::Null => err(TypeErrorKind::NullIntoNonNull { column: column.name }, e.span),
             Shape::Typed(ty) => {
@@ -1929,8 +1580,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     return err(
                         TypeErrorKind::AssignType {
                             column: column.name,
-                            expected: TyName::of(target, Form::Scalar),
-                            found: TyName::of(ty, Form::Scalar),
+                            expected: TyName::of(target, false),
+                            found: TyName::of(ty, false),
                         },
                         e.span,
                     );
@@ -1960,7 +1611,10 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     }
                     for entry in self.scope.iter() {
                         for field in entry.table.columns.iter() {
-                            let col = ResultCol { name: field.name, ty: column_ty(field, entry) };
+                            let col = ResultCol {
+                                name: field.name,
+                                ty: column_ty(field, entry.nullable),
+                            };
                             push_result(out, col, *span)?;
                         }
                     }
@@ -1971,39 +1625,21 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                         return err(TypeErrorKind::NotInScope { table: table.text }, table.span);
                     };
                     for field in entry.table.columns.iter() {
-                        let col = ResultCol { name: field.name, ty: column_ty(field, entry) };
+                        let col =
+                            ResultCol { name: field.name, ty: column_ty(field, entry.nullable) };
                         push_result(out, col, table.span)?;
                     }
                 }
                 ResultColumn::Expr { expr, alias } => {
                     let ty = self.typed(expr, Place::Result)?;
-                    let name = match alias {
-                        Some(alias) => alias.text,
-                        None => match &expr.kind {
-                            ExprKind::Column { table, column } => {
-                                self.resolve(table.as_ref(), column)?.column.name
-                            }
-                            ExprKind::Null
-                            | ExprKind::Boolean(_)
-                            | ExprKind::Integer(_)
-                            | ExprKind::Real(_)
-                            | ExprKind::Text(_)
-                            | ExprKind::Blob(_)
-                            | ExprKind::Param(_)
-                            | ExprKind::Unary { .. }
-                            | ExprKind::Chain { .. }
-                            | ExprKind::Compare { .. }
-                            | ExprKind::IsNull { .. }
-                            | ExprKind::InList { .. }
-                            | ExprKind::InParam { .. }
-                            | ExprKind::Between { .. }
-                            | ExprKind::Like { .. }
-                            | ExprKind::Case { .. }
-                            | ExprKind::Cast { .. }
-                            | ExprKind::Call { .. } => {
-                                return err(TypeErrorKind::Unnamed { what: what(expr) }, expr.span);
-                            }
-                        },
+                    let name = match (alias, &expr.kind) {
+                        (Some(alias), _) => alias.text,
+                        (None, ExprKind::Column { table, column }) => {
+                            self.resolve(table.as_ref(), column)?.column.name
+                        }
+                        (None, _) => {
+                            return err(TypeErrorKind::Unnamed { what: what(expr) }, expr.span);
+                        }
                     };
                     push_result(out, ResultCol { name, ty }, expr.span)?;
                 }
@@ -2020,14 +1656,12 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             return Ok(Returns::Count);
         }
         let mut out = Vec::with_capacity_in(columns.len(), self.alloc);
-        self.within(Some(Place::Clause(keyword::RETURNING)), None, |cx| {
+        self.within(Some(Place::Clause("returning")), None, |cx| {
             cx.result_columns(columns, &mut out)
         })?;
         Ok(Returns::Rows(out))
     }
 
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn select<X: Allocator>(
         &mut self,
         select: &ast::Select<'s, X>,
@@ -2038,7 +1672,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         let mut out = Vec::with_capacity_in(select.columns.len(), self.alloc);
         self.within(None, None, |cx| cx.result_columns(&select.columns, &mut out))?;
         if let Some(filter) = &select.filter {
-            let place = Place::Clause(keyword::WHERE);
+            let place = Place::Clause("where");
             self.within(Some(place), None, |cx| cx.boolean(filter, place))?;
         }
         for group in select.group_by.iter() {
@@ -2047,7 +1681,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             self.within(Some(place), None, |cx| cx.typed(group, place))?;
         }
         if let Some(having) = &select.having {
-            let place = Place::Clause(keyword::HAVING);
+            let place = Place::Clause("having");
             self.within(None, None, |cx| cx.boolean(having, place))?;
         }
         for term in select.order_by.iter() {
@@ -2059,10 +1693,10 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             self.within(None, None, |cx| cx.typed(&term.expr, place))?;
         }
         if let Some(limit) = &select.limit {
-            self.count_clause(limit, keyword::LIMIT)?;
+            self.count_clause(limit, "limit")?;
         }
         if let Some(offset) = &select.offset {
-            self.count_clause(offset, keyword::OFFSET)?;
+            self.count_clause(offset, "offset")?;
         }
 
         let grouped = !select.group_by.is_empty() || self.saw_aggregate;
@@ -2098,7 +1732,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         if select.distinct {
             for term in select.order_by.iter() {
                 if order_alias(&term.expr, &select.columns).is_none()
-                    && !self.in_results(&term.expr, &select.columns)?
+                    && !self.in_results(&term.expr, &select.columns)
                 {
                     return err(
                         TypeErrorKind::NotInDistinct { what: what(&term.expr) },
@@ -2123,24 +1757,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                     resolved.entry == entry && core::ptr::eq(resolved.column, column)
                 })
             }
-            ExprKind::Null
-            | ExprKind::Boolean(_)
-            | ExprKind::Integer(_)
-            | ExprKind::Real(_)
-            | ExprKind::Text(_)
-            | ExprKind::Blob(_)
-            | ExprKind::Param(_)
-            | ExprKind::Unary { .. }
-            | ExprKind::Chain { .. }
-            | ExprKind::Compare { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::InList { .. }
-            | ExprKind::InParam { .. }
-            | ExprKind::Between { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::Case { .. }
-            | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => false,
+            _ => false,
         })
     }
 
@@ -2187,62 +1804,22 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 }
             }
             ExprKind::Call { function, .. }
-                if funcs::lookup(function).is_some_and(|f| f.aggregate) =>
+                if funcs::lookup(function.text, function.quoted).is_some_and(|f| f.aggregate) =>
             {
                 Ok(())
             }
-            ExprKind::Null
-            | ExprKind::Boolean(_)
-            | ExprKind::Integer(_)
-            | ExprKind::Real(_)
-            | ExprKind::Text(_)
-            | ExprKind::Blob(_)
-            | ExprKind::Param(_)
-            | ExprKind::Unary { .. }
-            | ExprKind::Chain { .. }
-            | ExprKind::Compare { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::InList { .. }
-            | ExprKind::InParam { .. }
-            | ExprKind::Between { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::Case { .. }
-            | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => {
-                for_each_child(e, &mut |child| self.grouped(child, group_by, depth + 1))
-            }
+            _ => for_each_child(e, &mut |child| self.grouped(child, group_by, depth + 1)),
         }
     }
 
     /// Whether `e` is one of the result columns `columns` (an `order by` term of a `select
     /// distinct`): the same expression, or a column `*` or `t.*` covers.
-    fn in_results<X: Allocator>(
-        &self,
-        e: &Expr<'s, X>,
-        columns: &[ResultColumn<'s, X>],
-    ) -> Result<bool, TypeError<'s>> {
+    fn in_results<X: Allocator>(&self, e: &Expr<'s, X>, columns: &[ResultColumn<'s, X>]) -> bool {
         let resolved = match &e.kind {
-            ExprKind::Column { table, column } => Some(self.resolve(table.as_ref(), column)?),
-            ExprKind::Null
-            | ExprKind::Boolean(_)
-            | ExprKind::Integer(_)
-            | ExprKind::Real(_)
-            | ExprKind::Text(_)
-            | ExprKind::Blob(_)
-            | ExprKind::Param(_)
-            | ExprKind::Unary { .. }
-            | ExprKind::Chain { .. }
-            | ExprKind::Compare { .. }
-            | ExprKind::IsNull { .. }
-            | ExprKind::InList { .. }
-            | ExprKind::InParam { .. }
-            | ExprKind::Between { .. }
-            | ExprKind::Like { .. }
-            | ExprKind::Case { .. }
-            | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => None,
+            ExprKind::Column { table, column } => self.resolve(table.as_ref(), column).ok(),
+            _ => None,
         };
-        Ok(columns.iter().any(|column| match column {
+        columns.iter().any(|column| match column {
             ResultColumn::Expr { expr, .. } => {
                 same_expr(expr, e)
                     || match (&expr.kind, resolved) {
@@ -2259,11 +1836,9 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 (Ok(index), Some(want)) => index == want.entry,
                 _ => false,
             },
-        }))
+        })
     }
 
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn insert<X: Allocator>(
         &mut self,
         insert: &ast::Insert<'s, X>,
@@ -2294,7 +1869,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 );
             }
         }
-        let place = Place::Clause(keyword::VALUES);
+        let place = Place::Clause("values");
         for (index, row) in insert.rows.iter().enumerate() {
             if row.len() != listed.len() {
                 let span = match (row.first(), row.last()) {
@@ -2305,9 +1880,9 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 };
                 return err(
                     TypeErrorKind::RowWidth {
-                        row: index.saturating_add(1),
-                        columns: listed.len(),
-                        values: row.len(),
+                        row: u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1),
+                        columns: u32::try_from(listed.len()).unwrap_or(u32::MAX),
+                        values: u32::try_from(row.len()).unwrap_or(u32::MAX),
                     },
                     span,
                 );
@@ -2317,19 +1892,17 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                 self.within(Some(place), Some(place), |cx| cx.assign(value, column))?;
             }
         }
-        self.push_entry(Entry { name: insert.table, alias: false, table, nullable: false })?;
+        self.push_entry(table, &insert.table, false, false)?;
         self.returning(&insert.returning)
     }
 
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn update<X: Allocator>(
         &mut self,
         update: &ast::Update<'s, X>,
     ) -> Result<Returns<'s, A>, TypeError<'s>> {
         let table = self.enter_table(&update.table)?;
         let mut set: Vec<&'s Column<'s>, A> = Vec::with_capacity_in(update.sets.len(), self.alloc);
-        let place = Place::Clause(keyword::SET);
+        let place = Place::Clause("set");
         for assignment in update.sets.iter() {
             let Some(column) = column_of(table, &assignment.column) else {
                 return err(
@@ -2350,21 +1923,19 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             self.within(Some(place), None, |cx| cx.assign(&assignment.value, column))?;
         }
         if let Some(filter) = &update.filter {
-            let place = Place::Clause(keyword::WHERE);
+            let place = Place::Clause("where");
             self.within(Some(place), None, |cx| cx.boolean(filter, place))?;
         }
         self.returning(&update.returning)
     }
 
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub(crate) fn delete<X: Allocator>(
         &mut self,
         delete: &ast::Delete<'s, X>,
     ) -> Result<Returns<'s, A>, TypeError<'s>> {
         self.enter_table(&delete.table)?;
         if let Some(filter) = &delete.filter {
-            let place = Place::Clause(keyword::WHERE);
+            let place = Place::Clause("where");
             self.within(Some(place), None, |cx| cx.boolean(filter, place))?;
         }
         self.returning(&delete.returning)
@@ -2376,7 +1947,7 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
         seen.sort_unstable_by_key(|param| param.first);
         let mut params = Vec::with_capacity_in(seen.len(), self.alloc);
         for param in seen.iter() {
-            params.push(Param { name: param.name, ty: param.ty, list: param.form.is_list() });
+            params.push(Param { name: param.name, ty: param.ty, list: param.list });
         }
         Description { params, returns }
     }
@@ -2403,41 +1974,24 @@ fn positional<'s, X: Allocator>(
 ) -> Result<(), TypeError<'s>> {
     match e.kind {
         ExprKind::Integer(position) => err(TypeErrorKind::Positional { clause, position }, e.span),
-        ExprKind::Null
-        | ExprKind::Boolean(_)
-        | ExprKind::Real(_)
-        | ExprKind::Text(_)
-        | ExprKind::Blob(_)
-        | ExprKind::Column { .. }
-        | ExprKind::Param(_)
-        | ExprKind::Unary { .. }
-        | ExprKind::Chain { .. }
-        | ExprKind::Compare { .. }
-        | ExprKind::IsNull { .. }
-        | ExprKind::InList { .. }
-        | ExprKind::InParam { .. }
-        | ExprKind::Between { .. }
-        | ExprKind::Like { .. }
-        | ExprKind::Case { .. }
-        | ExprKind::Cast { .. }
-        | ExprKind::Call { .. } => Ok(()),
+        _ => Ok(()),
     }
 }
 
 /// The result column alias an `order by` term names: a bare unquoted or quoted name equal to
 /// an alias, which both engines read as that result column before any table's column.
-#[blaze::noalloc]
-#[blaze::nonblocking]
 pub(crate) fn order_alias<'a, 's, X: Allocator>(
     e: &Expr<'s, X>,
     columns: &'a [ResultColumn<'s, X>],
 ) -> Option<&'a Name<'s>> {
     let ExprKind::Column { table: None, column } = &e.kind else { return None };
     columns.iter().find_map(|result| match result {
-        ResultColumn::Expr { alias: Some(alias), .. } if names_same(alias, column) => Some(alias),
-        ResultColumn::Expr { .. } | ResultColumn::Star { .. } | ResultColumn::TableStar { .. } => {
-            None
+        ResultColumn::Expr { alias: Some(alias), .. }
+            if names_same(alias.text, alias.quoted, column.text, column.quoted) =>
+        {
+            Some(alias)
         }
+        _ => None,
     })
 }
 
@@ -2495,9 +2049,9 @@ fn for_each_child<'s, X: Allocator, E>(
                 None => Ok(()),
             }
         }
-        ExprKind::Call { args: CallArgs::Star, .. } => Ok(()),
-        ExprKind::Call { args: CallArgs::List { args, .. }, .. } => {
-            args.iter().try_for_each(|arg| f(arg))
-        }
+        ExprKind::Call { args, .. } => match args {
+            CallArgs::Star => Ok(()),
+            CallArgs::List { args, .. } => args.iter().try_for_each(|arg| f(arg)),
+        },
     }
 }

@@ -18,8 +18,6 @@
 
 #![forbid(unsafe_code)]
 
-mod kept;
-
 use std::alloc::{Allocator, Global};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -854,47 +852,6 @@ pool!(Bytes, Leaf<PageRef>, NODES);
 pool!(Bytes, Mid<PageRef>, NODES);
 pool!(Bytes, Top<PageRef>, NODES);
 
-/// The buffer under a [`CowBytes`]: the one a full link wrote, or the bytes of a kept state
-/// ([`crate::keep`]) read in place in the mapping that holds them.
-#[derive(Clone)] // clone: a reference count
-pub(crate) enum Base {
-    Owned(Arc<Vec<u8>>),
-    /// `len` bytes at `at` of `map`.
-    Kept { map: blaze_core::Mapping, at: usize, len: usize },
-}
-
-impl Default for Base {
-    fn default() -> Base {
-        Base::Owned(Arc::default())
-    }
-}
-
-impl std::ops::Deref for Base {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        match self {
-            Base::Owned(it) => it,
-            Base::Kept { map, at, len } => &map.bytes()[*at..*at + *len],
-        }
-    }
-}
-
-impl Base {
-    /// Whether both are the one buffer, not just equal bytes: what lets
-    /// [`CowBytes::changed_since`] skip a page unread.
-    fn same(&self, other: &Base) -> bool {
-        match (self, other) {
-            (Base::Owned(a), Base::Owned(b)) => Arc::ptr_eq(a, b),
-            (Base::Kept { map: a, at: x, len: m }, Base::Kept { map: b, at: y, len: n }) => {
-                a.same(b) && x == y && m == n
-            }
-            _ => false,
-        }
-    }
-}
-
 /// A region's bytes: the buffer the last full link wrote, and the 16 KiB pages written since,
 /// each shared with the states it came from until written again. A stage that writes one
 /// function copies the page it is in, not the region; reading a range that lies in the
@@ -903,7 +860,7 @@ impl Base {
 /// the clone. At most 4 GiB.
 #[derive(Clone, Default)] // clone: two reference counts, as above
 pub(crate) struct CowBytes {
-    base: Base,
+    base: Arc<Vec<u8>>,
     /// How much of `base` is still the bytes there: a truncation shortens it, so growing
     /// again reads zeros.
     base_len: usize,
@@ -944,28 +901,7 @@ impl CowBytes {
         let len = bytes.len();
         assert!(len <= LONGEST_BYTES, "a region of {len} bytes: its page table indexes 4 GiB");
         // alloc: once per region per full link (the buffer's `Arc`)
-        CowBytes { base: Base::Owned(Arc::new(bytes)), base_len: len, pages: Tree::default(), len }
-    }
-
-    /// The `held` bytes at `at` of a kept state's mapping, read in place, then zeros to `len`
-    /// ([`crate::keep`]): no copy, and no page until a stage writes one.
-    pub fn kept(map: blaze_core::Mapping, at: usize, held: usize, len: usize) -> CowBytes {
-        assert!(held <= len && len <= LONGEST_BYTES, "a kept region of {len} bytes, {held} held");
-        assert!(at + held <= map.bytes().len(), "a kept region past its mapping's end");
-        CowBytes {
-            base: Base::Kept { map, at, len: held },
-            base_len: held,
-            pages: Tree::default(),
-            len,
-        }
-    }
-
-    /// Where the bytes past which every byte is zero end: the end of the last run
-    /// ([`CowBytes::runs`]). What [`crate::keep`] writes of a region; the room after it is zeros.
-    pub fn held(&self) -> usize {
-        let mut end = 0;
-        self.runs(|at, run| end = at + run.len());
-        end
+        CowBytes { base: Arc::new(bytes), base_len: len, pages: Tree::default(), len }
     }
 
     pub fn len(&self) -> usize {
@@ -1119,7 +1055,7 @@ impl CowBytes {
             leaf.and_then(|it| it[index & (FAN - 1)].as_ref())
         }
         out.clear();
-        let same_base = self.base.same(&old.base);
+        let same_base = Arc::ptr_eq(&self.base, &old.base);
         let (pages, old_pages) = (self.len.div_ceil(PAGE), old.len.div_ceil(PAGE));
         let mut index = 0;
         while index < pages {
@@ -1377,8 +1313,7 @@ impl Wire for CowBytes {
             return Err(format!("a region of {len} bytes with a buffer of {}", base.len()));
         }
         // alloc: the region's buffer, once per restore
-        let mut bytes =
-            CowBytes { base: Base::Owned(Arc::new(base.to_vec())), base_len: base.len(), pages: Tree::default(), len };
+        let mut bytes = CowBytes { base: Arc::new(base.to_vec()), base_len: base.len(), pages: Tree::default(), len };
         let written = count(r, 8 + PAGE)?;
         let mut last = None;
         for _ in 0..written {

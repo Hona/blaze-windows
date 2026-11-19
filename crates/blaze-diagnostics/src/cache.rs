@@ -37,7 +37,7 @@
 )]
 use std::sync::{Arc, OnceLock};
 
-use base_db::{Crate, CrateKey, Db};
+use base_db::{Crate, Db};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
@@ -556,21 +556,19 @@ pub fn decode(bytes: &[u8], paths: impl FnOnce() -> Paths, root: &str) -> Result
     Ok(Outcome { failed, items_broken, diags })
 }
 
-/// What [`serve`] found, over every call of a session: each adds to it. Every map is by the
-/// crate's key ([`CrateKey`]), never its id: it outlives the commits of the session, the one
-/// [`serve`] makes among them, and an id held across a commit is dead.
+/// What [`serve`] found, over every call of a session: each adds to it.
 #[derive(Default)]
 pub struct Served {
     /// The check key ([`bodies_key`] filed by its bodies' reads) of each crate asked whose
     /// bodies part was found: what its dependents' keys and its constants' values
     /// (`hir_ty::consteval::deps`) are made from. Its bodies were given to the database.
-    pub keys: HashMap<CrateKey, ContentId, Global>,
-    outcomes: HashMap<CrateKey, ImageBuf, Global>,
+    pub keys: HashMap<Crate, ContentId, Global>,
+    outcomes: HashMap<Crate, ImageBuf, Global>,
     /// The bodies part of each crate of `keys`: what the database was given.
-    parts: HashMap<CrateKey, ImageBuf, Global>,
+    parts: HashMap<Crate, ImageBuf, Global>,
     /// What each crate asked was looked up under: its base key ([`bodies_key`]) and its outcome's
     /// key, so asking it again under the same is no lookup.
-    asked: HashMap<CrateKey, (ContentId, Option<ContentId>), Global>,
+    asked: HashMap<Crate, (ContentId, Option<ContentId>), Global>,
     /// What the searches of the crates' read-filing slots came to, as `blaze_record` counted
     /// them (`hir_def::deps::find_by_reads`), added by every [`serve`] until the driver takes
     /// them to report: one lookup a crate fetched whose bodies part is not under its base key
@@ -580,8 +578,8 @@ pub struct Served {
 }
 
 impl Served {
-    /// Whether the outcome of the crate `krate` keys was found: a unit of it runs no check.
-    pub fn has(&self, krate: CrateKey) -> bool {
+    /// Whether `krate`'s outcome was found: a unit of it runs no check.
+    pub fn has(&self, krate: Crate) -> bool {
         self.outcomes.contains_key(&krate)
     }
 }
@@ -592,14 +590,14 @@ impl Served {
 fn layers(
     db: &Db,
     crates: impl Iterator<Item = Crate>,
-    known: &HashMap<CrateKey, ContentId, Global>,
+    known: &HashMap<Crate, ContentId, Global>,
 ) -> (Vec<Vec<Crate>>, Vec<(Crate, Crate)>) {
     fn depth(
         db: &Db,
         krate: Crate,
         asked: &HashSet<Crate, Global>,
         memo: &mut HashMap<Crate, Result<usize, Crate>, Global>,
-        known: &HashMap<CrateKey, ContentId, Global>,
+        known: &HashMap<Crate, ContentId, Global>,
     ) -> Result<usize, Crate> {
         if let Some(&it) = memo.get(&krate) {
             return it;
@@ -609,7 +607,7 @@ fn layers(
         for dep in &krate.data(db).dependencies {
             let dep = dep.crate_id;
             if !asked.contains(&dep) {
-                if !known.contains_key(&dep.key(db)) {
+                if !known.contains_key(&dep) {
                     missing = Some(dep);
                     break;
                 }
@@ -657,12 +655,10 @@ fn layers(
 fn dep_keys(
     db: &Db,
     krate: Crate,
-    keys: &HashMap<CrateKey, ContentId, Global>,
+    keys: &HashMap<Crate, ContentId, Global>,
 ) -> Option<Vec<ContentId>> {
     // alloc: once per crate per session
-    (krate.data(db).dependencies.iter())
-        .map(|dep| keys.get(&dep.crate_id.key(db)).copied())
-        .collect()
+    krate.data(db).dependencies.iter().map(|dep| keys.get(&dep.crate_id).copied()).collect()
 }
 
 /// What one task of [`serve`] found of a crate: its check key, its bodies part and its outcome.
@@ -679,10 +675,8 @@ type Fetched = Result<Option<(ContentId, ImageBuf, Option<ImageBuf>)>, String>;
 /// one of whose dependencies has no check key now, loses what it had too, so nothing served
 /// under an image a crate is no longer read from stays (rule 21). The
 /// bodies of every crate of `served` are given to the database
-/// ([`hir_ty::check_cache::set_served`]) when they changed, in a commit of its own, after which
-/// every crate id the caller took before (those of `crates` too) is to be taken again by its key
-/// (`Db::krate`); the check keys and outcomes are kept in `served`, by crate key, for [`read`]
-/// and [`store`].
+/// ([`hir_ty::check_cache::set_served`]) when they changed; the check keys and outcomes are kept
+/// in `served`, for [`read`] and [`store`].
 ///
 /// The driver asks a crate once its inputs are final, after its dependencies, as it serves
 /// images (`hir_def::deps::serve` a crate at a time), so a crate's dependencies' check keys are
@@ -711,26 +705,25 @@ pub fn serve(
     let mut changed = false;
     for &(krate, _) in crates {
         if !images.contains_key(&krate) {
-            changed |= forget(served, krate.key(db));
+            changed |= forget(served, krate);
         }
     }
     let (layers, left) = layers(db, images.keys().copied(), &served.keys);
     for (krate, _) in left {
-        changed |= forget(served, krate.key(db));
+        changed |= forget(served, krate);
     }
     for layer in layers {
         // alloc: setup: once per layer per serve
         let mut asked: Vec<(Crate, ContentId)> = Vec::with_capacity(layer.len());
         for krate in layer {
             let (image, inputs) = images[&krate];
-            let at = krate.key(db);
             let Some(deps) = dep_keys(db, krate, &served.keys) else {
-                changed |= forget(served, at);
+                changed |= forget(served, krate);
                 continue;
             };
             let base = bodies_key(image, &deps, inputs.borrowck);
-            let outcome_at = served.keys.get(&at).map(|&check| key(check, &inputs));
-            if served.asked.get(&at) == Some(&(base, outcome_at)) {
+            let outcome_at = served.keys.get(&krate).map(|&check| key(check, &inputs));
+            if served.asked.get(&krate) == Some(&(base, outcome_at)) {
                 continue;
             }
             asked.push((krate, base));
@@ -752,8 +745,6 @@ pub fn serve(
             let found = found.into_inner().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
             });
-            let inputs = &images[&krate].1;
-            let krate = krate.key(db);
             served.outcomes.remove(&krate);
             let Some((check, part, outcome)) = found? else {
                 changed |= served.parts.remove(&krate).is_some();
@@ -764,31 +755,22 @@ pub fn serve(
             served.keys.insert(krate, check);
             changed |= served.parts.get(&krate).is_none_or(|it| !Arc::ptr_eq(it, &part));
             served.parts.insert(krate, part);
-            served.asked.insert(krate, (base, Some(key(check, inputs))));
+            served.asked.insert(krate, (base, Some(key(check, &images[&krate].1))));
             if let Some(outcome) = outcome {
                 served.outcomes.insert(krate, outcome);
             }
         }
     }
     if changed {
-        // Each part to its crate of this snapshot: the crates of the world, so a key whose
-        // crate the world no longer has is given nothing, as `set_served` gives only those.
-        let mut parts = HashMap::new_in(Global);
-        for &krate in base_db::all_crates(db).iter() {
-            if let Some(part) = served.parts.get(&krate.key(db)) {
-                // clone: one handle a crate, once per serve that changed a part
-                parts.insert(krate, part.clone());
-            }
-        }
-        // A commit: every crate id taken before it, `crates`' too, is dead after it.
-        hir_ty::check_cache::set_served(db, parts);
+        // clone: one handle a crate, once per serve that changed a part
+        hir_ty::check_cache::set_served(db, served.parts.clone());
     }
     Ok(())
 }
 
-/// `served` with nothing of the crate `krate` keys: its check key, outcome, bodies part and
-/// what it was asked under. Whether the bodies the database is given change.
-fn forget(served: &mut Served, krate: CrateKey) -> bool {
+/// `served` with nothing of `krate`: its check key, outcome, bodies part and what it was asked
+/// under. Whether the bodies the database is given change.
+fn forget(served: &mut Served, krate: Crate) -> bool {
     served.keys.remove(&krate);
     served.outcomes.remove(&krate);
     served.asked.remove(&krate);
@@ -846,14 +828,13 @@ fn fetch(
 /// The outcome of `krate` [`serve`] found, its spans' files named from `root` ([`Files`]'s root
 /// of the unit's build); `None` when it found none, and the crate is checked.
 pub fn read(db: &Db, served: &Served, krate: Crate, root: &str) -> Option<Result<Outcome, String>> {
-    let at = krate.key(db);
-    let bytes = served.outcomes.get(&at)?;
+    let bytes = served.outcomes.get(&krate)?;
     Some(decode(bytes.bytes(), || Paths::of(db, krate), root).map_err(|why| {
         // alloc: error text
         format!(
             "the check outcome of crate {} (check key {:?}) does not read: {why}",
             krate.named(db),
-            served.keys.get(&at)
+            served.keys.get(&krate)
         )
     }))
 }
@@ -876,9 +857,8 @@ pub struct Checked<'a> {
 #[derive(Debug, Default)]
 pub struct Stored {
     /// The check key of each crate whose bodies part was kept, besides those [`Served::keys`]
-    /// has: what its constants' values are filed under. By the crate's key, as
-    /// [`Served::keys`] is, which the driver adds them to.
-    pub keys: HashMap<CrateKey, ContentId, Global>,
+    /// has: what its constants' values are filed under.
+    pub keys: HashMap<Crate, ContentId, Global>,
     /// Each crate with a value not kept, and why: with no key, nothing of it is kept; with one,
     /// its bodies part is, and the reason is its outcome's.
     pub refused: Vec<(Crate, Refused)>,
@@ -926,7 +906,7 @@ pub fn store(
                 Some(deps) => asked.push((by_crate[&krate], deps)),
                 None => {
                     let dep = (krate.data(db).dependencies.iter())
-                        .find(|dep| !keys.contains_key(&dep.crate_id.key(db)))
+                        .find(|dep| !keys.contains_key(&dep.crate_id))
                         // alloc: the refusal's crate name, on the refusal path
                         .map_or_else(String::new, |dep| dep.crate_id.named(db).to_string());
                     stored.refused.push((krate, Refused::Dependency { name: dep }));
@@ -948,8 +928,8 @@ pub fn store(
             });
             match made? {
                 Ok((key, outcome)) => {
-                    keys.insert(check.krate.key(db), key);
-                    stored.keys.insert(check.krate.key(db), key);
+                    keys.insert(check.krate, key);
+                    stored.keys.insert(check.krate, key);
                     if let Some(why) = outcome {
                         stored.refused.push((check.krate, why));
                     }

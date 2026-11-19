@@ -3,7 +3,6 @@
 //! be initialized, for the regions dropping it uses.
 
 use base_db::Db;
-use blaze_memo::Database as _;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
@@ -624,13 +623,13 @@ fn expand<'db>(
             }
             let interner = ctx.infcx.interner;
             let constraint = drop_constraint(ctx.db, adt);
-            for region in constraint.regions {
+            for region in &constraint.regions {
                 let region = rustc_type_ir::EarlyBinder::bind(interner, region.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip();
                 found.extend(super::regions::rv_of(region));
             }
-            for whole in constraint.whole {
+            for whole in &constraint.whole {
                 let whole = rustc_type_ir::EarlyBinder::bind(interner, whole.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip();
@@ -676,18 +675,18 @@ fn expand<'db>(
 /// the ADT is dropped, which is also what keeps two ADTs that hold each other from asking each
 /// other. Once per ADT, so a body that drops a `Value` instantiates what that leaves rather
 /// than every field of every variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct DropConstraint<'db> {
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+struct DropConstraint {
     /// The lifetimes its `Drop` impl uses.
-    regions: &'db [StoredRegion],
+    regions: Vec<StoredRegion>,
     /// Types all of whose regions dropping it uses: those its `Drop` impl uses, trait objects.
-    whole: &'db [StoredTy],
+    whole: Vec<StoredTy>,
     /// The types dropping it drops, taken apart where it is dropped.
-    tys: &'db [StoredTy],
+    tys: Vec<StoredTy>,
 }
 
-#[blaze_memo::tracked(returns(copy), cycle_result = drop_constraint_cycle)]
-fn drop_constraint<'db>(db: &'db Db, adt: AdtId) -> DropConstraint<'db> {
+#[blaze_query::tracked(returns(ref), cycle_result = drop_constraint_cycle)]
+fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
     let interner = DbInterner::new_no_crate(db);
     let mut regions = Vec::new();
     let mut whole = Vec::new();
@@ -720,16 +719,15 @@ fn drop_constraint<'db>(db: &'db Db, adt: AdtId) -> DropConstraint<'db> {
     }
     let mut seen = HashSet::new_in(Global);
     tys.retain(|it| seen.insert(*it));
-    let memo = db.memo();
     DropConstraint {
-        regions: blaze_memo::keep_iter(memo, regions.into_iter().map(|it| it.store())),
-        whole: blaze_memo::keep_iter(memo, whole.into_iter().map(|it| it.store())),
-        tys: blaze_memo::keep_iter(memo, tys.into_iter().map(|it| it.store())),
+        regions: regions.into_iter().map(|it| it.store()).collect(),
+        whole: whole.into_iter().map(|it| it.store()).collect(),
+        tys: tys.into_iter().map(|it| it.store()).collect(),
     }
 }
 
 /// An ADT that holds itself by value has no size and no answer.
-fn drop_constraint_cycle<'db>(_db: &'db Db, _adt: AdtId) -> DropConstraint<'db> {
+fn drop_constraint_cycle(_db: &Db, _: blaze_query::db::Id, _adt: AdtId) -> DropConstraint {
     DropConstraint::default()
 }
 

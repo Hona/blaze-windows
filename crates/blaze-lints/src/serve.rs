@@ -193,7 +193,7 @@ pub fn answer_with<P: AsRef<Path>>(
         }
     }
     let has_tests = |krate: Crate| {
-        blaze_memo::attach(db, || {
+        blaze_query::db::attach(db, || {
             hir::Crate::from(krate).cfg(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test))
         })
     };

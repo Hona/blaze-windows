@@ -6,7 +6,7 @@ use base_db::Db;
 use blaze_ids::ContentId;
 use hir_def::FunctionId;
 
-use super::fixture::{crate_named, db_with, give_build};
+use super::fixture::{crate_named, db_with};
 use crate::{Effects, Proof, Purity, ScriptProof, main_of, script_proof, script_purity};
 
 /// The `main` of the build script crate `build_script` of a fixture of the toolchain and
@@ -14,7 +14,7 @@ use crate::{Effects, Proof, Purity, ScriptProof, main_of, script_proof, script_p
 #[track_caller]
 fn script(crates: &str) -> (Db, FunctionId) {
     let mut db = db_with(crates);
-    give_build(&mut db);
+    blaze_item_hash::identity::set_build(&mut db, ContentId([7; 32]));
     let krate = crate_named(&db, "build_script");
     let main = main_of(&db, krate).expect("the script has a `main`");
     (db, main)
@@ -24,7 +24,7 @@ fn script(crates: &str) -> (Db, FunctionId) {
 #[track_caller]
 fn purity_of(crates: &str) -> Purity {
     let (db, main) = script(crates);
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         // Every fixture is a test of the summaries' keys: through its home or in the script,
         // each instance's summary is the same (hir_ty_mir::mir::home).
         super::share::keys_agree(&db, crate_named(&db, "build_script"));
@@ -92,16 +92,18 @@ fn bounded(
     db: &Db,
     main: FunctionId,
     steps: u64,
-) -> Result<(ScriptProof, u64), crate::OutOfSteps> {
+) -> Result<(ScriptProof, u64), blaze_query::db::OutOfSteps> {
     // clone: a test's answer
-    blaze_memo::attach(db, || crate::with_steps(steps, || script_proof(db, main).clone()))
+    blaze_query::db::attach(db, || {
+        blaze_query::db::with_steps(steps, || script_proof(db, main).clone())
+    })
 }
 
 /// The script in `crates` with every summary its walk reaches made first, under no bound: what
 /// a warm daemon has, or a busy one whose other tasks ran them.
 fn warmed(crates: &str) -> (Db, FunctionId) {
     let (db, main) = script(crates);
-    blaze_memo::attach(&db, || crate::walk::identity_parts(&db, main));
+    blaze_query::db::attach(&db, || crate::walk::identity_parts(&db, main));
     (db, main)
 }
 
@@ -648,7 +650,7 @@ fn main() {
 fn same_parts(a: &str, b: &str, how: &str) {
     let parts = |crates: &str| {
         let (db, main) = script(crates);
-        blaze_memo::attach(&db, || {
+        blaze_query::db::attach(&db, || {
             let main_body = blaze_item_hash::identity::early_parts(&db, main.into());
             (main_body, crate::walk::identity_parts(&db, main))
         })

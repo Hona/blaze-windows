@@ -910,6 +910,7 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
+    use blaze_query::db::Durability;
     let mut db = fixture::db(
         r#"
 //- /main.rs
@@ -929,9 +930,7 @@ mod __blaze_test_harness {
         crate
     "#]]
     .assert_eq(&crate_def_map(&db, krate).dump(&db));
-    // The crate by its key, taken again after each write: the write drops its arena.
-    let key = krate.key(&db);
-    _ = db.commit_with(|edit| _ = edit.set_appended_root_module(root, Some("__blaze_test_harness")));
+    db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW);
     expect![[r#"
         crate
         - __blaze_test_harness : type
@@ -939,12 +938,12 @@ mod __blaze_test_harness {
         crate::__blaze_test_harness
         - main : value
     "#]]
-    .assert_eq(&crate_def_map(&db, db.krate(key)).dump(&db));
-    _ = db.commit_with(|edit| _ = edit.set_appended_root_module(root, None));
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
+    db.set_appended_root_module(root, None, Durability::LOW);
     expect![[r#"
         crate
     "#]]
-    .assert_eq(&crate_def_map(&db, db.krate(key)).dump(&db));
+    .assert_eq(&crate_def_map(&db, krate).dump(&db));
 }
 
 #[test]
@@ -1161,8 +1160,6 @@ impl Tr for D {}
 
     let bytes = frozen::pages::encode(&db, krate).unwrap();
     frozen::serve_pages(&mut db, &[(krate, bytes)], Mode::Verify);
-    // The commit that gave the pages dropped the crate's arena: the crate is taken again.
-    let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert_eq!(scope.trait_impls_without_reservation().count(), 2);
@@ -1207,35 +1204,46 @@ enum Empty {}
 
 #[test]
 fn name_read_classifies_nameres_reads_with_host_file_separators() {
-    use crate::nameres::boundary::{self, NameRead};
+    use std::ops::ControlFlow;
 
-    let db = fixture::db_with_boundaries(
-        "struct S;",
-        |builder| {
-            for &kind in boundary::KINDS {
-                builder.mark_boundary(kind);
+    use base_db::{Crate, Db};
+    use blaze_query::db::Database as _;
+
+    use crate::nameres::{NameRead, name_read};
+
+    #[blaze_query::tracked(returns(ref))]
+    fn probe_nameres_reads(db: &Db, krate: Crate) -> Vec<(&'static str, Option<NameRead>)> {
+        let ((), reads) = blaze_query::db::capture_reads(db, || {
+            let def_map = crate_def_map(db, krate);
+            let _ = def_map.module(db, def_map.root).scope(db).get(&hir_expand::name::Name::new_symbol_root(
+                intern::Symbol::intern("S"),
+            ));
+        });
+        let reads = reads.expect("nameres reads are shareable");
+        let storage = db.storage();
+        let mut out = Vec::new();
+        reads.for_each_read(storage, |read| {
+            let name = storage.read_name(read.key, read.kind);
+            if matches!(
+                name,
+                "crate_local_def_map" | "DefMapPair" | "def_map" | "Modules::module" | "ModuleScope::name"
+            ) {
+                out.push((name, name_read(db, read.key, read.kind)));
             }
-        },
-        blaze_memo::Reads::Kept,
-    )
-    .into_db();
+            ControlFlow::<()>::Continue(())
+        });
+        out
+    }
+
+    let db = fixture::db("struct S;").into_db();
     let krate = db.fetch_test_crate();
-    let memo = blaze_memo::Database::memo(&db);
-    let ((), reads) = blaze_memo::record(memo, || {
-        let def_map = crate_def_map(&db, krate);
-        let _ = def_map.module(&db, def_map.root).scope(&db).get(
-            &hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("S")),
-        );
-    })
-    .expect("nameres reads are recorded");
-    let seen: Vec<(&'static str, Option<NameRead>)> = reads
-        .into_iter()
-        .filter(|read| boundary::KINDS.contains(&read.kind().name()))
-        .map(|read| (read.kind().name(), boundary::name_read(&db, read)))
-        .collect();
-    assert!(!seen.is_empty(), "expected at least one nameres boundary read");
+    let seen = probe_nameres_reads(&db, krate);
+    assert!(
+        seen.iter().any(|(name, read)| *name == "crate_local_def_map" && *read == Some(NameRead::Handle)),
+        "expected crate_local_def_map to classify as Handle on every host: {seen:#?}"
+    );
     assert!(
         seen.iter().all(|(_, read)| read.is_some()),
-        "nameres boundary reads must classify on every host: {seen:#?}"
+        "nameres reads must not return None due to host path separators: {seen:#?}"
     );
 }

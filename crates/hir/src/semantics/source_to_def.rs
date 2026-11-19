@@ -312,13 +312,11 @@ impl ChildContainer {
 }
 
 /// What a `Semantics` leaves to the next one made on its thread, at the database nonce and
-/// snapshot it was made at. A request's `Semantics` would otherwise grow every table from
+/// revision it was made at. A request's `Semantics` would otherwise grow every table from
 /// empty and rebuild every `DynMap` it reads.
 #[derive(Default)]
 struct Carry {
-    /// The snapshot the caches are of: its epoch, unique to it in the process, so it names
-    /// the database too.
-    at: Option<blaze_memo::Epoch>,
+    at: Option<(base_db::Nonce, blaze_query::db::View)>,
     dynmap_cache: HashMap<(ChildContainer, HirFileId), DynMap, Global>,
     expansion_at: HashMap<MacroCallId, u32, Global>,
     /// Always empty: its storage, for the next `Semantics`' expansions.
@@ -342,7 +340,7 @@ impl<'db> SourceToDefCache<'db> {
     pub(super) fn take(db: &'db Db) -> SourceToDefCache<'db> {
         let mut carry =
             CARRY.try_with(|it| it.borrow_mut().take()).ok().flatten().unwrap_or_default();
-        if carry.at != Some(blaze_memo::Database::memo(db).snapshot_epoch()) {
+        if carry.at != Some(db.nonce_and_revision()) {
             carry.dynmap_cache.clear();
             carry.file_to_def_cache.clear();
             carry.included_file_cache.clear();
@@ -369,7 +367,7 @@ impl<'db> SourceToDefCache<'db> {
         }
         self.expansion_at.clear();
         let carry = Carry {
-            at: Some(blaze_memo::Database::memo(db).snapshot_epoch()),
+            at: Some(db.nonce_and_revision()),
             dynmap_cache: self.dynmap_cache,
             expansion_at: self.expansion_at,
             expansions: crate::scratch::recycle(self.expansions),

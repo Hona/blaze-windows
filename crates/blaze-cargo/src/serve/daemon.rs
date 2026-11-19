@@ -41,7 +41,7 @@ use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, OpenError, Refused};
 use blaze_profile::{Plot, Watchdog, watchdog::Progress};
 use blaze_query::Database;
-use blaze_vfs::{DisksUnused, ImageUse, Ticket, Vfs};
+use blaze_vfs::{DisksUnused, ImageUse, Outside, Ticket, Vfs};
 
 use super::{
     heads::{Heads, Out},
@@ -68,6 +68,9 @@ const STORE: u64 = 4 << 32;
 const FLUSHES: u64 = 5 << 32;
 const JOBS: u64 = 6 << 32;
 const JOBS_END: u64 = 7 << 32;
+/// The watches of directories outside views ([`blaze_vfs::Outside`]).
+const OUTSIDE: u64 = 7 << 32;
+const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 /// The shared standard library's store ([`Options::std`]).
 const STD_STORE: u64 = 8 << 32;
 const STD_STORE_END: u64 = 9 << 32;
@@ -582,6 +585,9 @@ pub struct Options {
     /// What it was started with and keeps for its life ([`super::settings`]), which a client
     /// compares with its own environment before it sends a request.
     pub settings: Vec<blaze_api::Setting>,
+    /// The table of directories outside views that user code's checks read
+    /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
+    pub outside: &'static blaze_vfs::outside::Dirs,
     /// How long no span may close, no query complete and no task or unit's step end while the
     /// plane's tasks run before the build fails with the stall ([`Daemon::watch`]):
     /// [`Watchdog::BOUND`] unless `blaze serve --stall-bound SECS` says.
@@ -828,80 +834,6 @@ impl Woken {
             ),
         }
     }
-}
-
-/// The part of the daemon a completion goes to ([`Daemon::handler_of`]), which the turn's span
-/// of its dispatch names (`completion = ...`), so a turn stuck in one dispatch says whose
-/// completion it was in. Until 2026-11-14 the span said only `dispatch of one completion`: a
-/// stuck loop's line named the piece and not which of fourteen parts held it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Handler {
-    Images,
-    Pressure,
-    Server,
-    Vfs,
-    Db,
-    Places,
-    SoloRows,
-    Peers,
-    Store,
-    Std,
-    Heads,
-    Jobs,
-    LateRead,
-    /// A tag no part owns: nothing is done with it.
-    Unowned,
-}
-
-impl Handler {
-    /// The part's name, as the dispatch span's `completion` field says it: a static string, so
-    /// naming it allocates nothing on the loop's hot path.
-    pub(super) const fn name(self) -> &'static str {
-        match self {
-            Handler::Images => "images",
-            Handler::Pressure => "memory pressure",
-            Handler::Server => "server",
-            Handler::Vfs => "vfs",
-            Handler::Db => "db",
-            Handler::Places => "places",
-            Handler::SoloRows => "solo rows",
-            Handler::Peers => "peers",
-            Handler::Store => "store",
-            Handler::Std => "std store",
-            Handler::Heads => "heads",
-            Handler::Jobs => "jobs",
-            Handler::LateRead => "late store read",
-            Handler::Unowned => "unowned",
-        }
-    }
-}
-
-/// The stuck line ([`super::stop::stuck`]) as it reads from inside one dispatch, taken by a test
-/// that names the part ([`StuckAtDispatch::at`]): what a watchdog would print of a loop stuck
-/// there.
-#[cfg(test)]
-#[derive(Default)]
-pub(super) struct StuckAtDispatch {
-    /// The part whose first dispatch takes the line.
-    pub(super) at: Option<Handler>,
-    /// The line taken, once.
-    pub(super) said: Option<String>,
-}
-
-#[cfg(test)]
-impl StuckAtDispatch {
-    fn say(&mut self, handler: Handler) {
-        if self.at == Some(handler) && self.said.is_none() {
-            self.said = Some(super::stop::stuck(std::process::id(), 0, 0));
-        }
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// This thread's [`StuckAtDispatch`]: the loop runs on the test's thread in the simulation.
-    pub(super) static STUCK_AT_DISPATCH: std::cell::RefCell<StuckAtDispatch> =
-        std::cell::RefCell::new(StuckAtDispatch::default());
 }
 
 /// The daemon on driver `D`, building with `S`: `blaze serve`'s is `Daemon<Native, Real>`, the
@@ -1207,6 +1139,10 @@ pub struct MemoryLine<'a> {
     pub heap: u64,
     /// The chunks no owner holds ([`blaze_mem::chunks::cached`]).
     pub chunks: blaze_mem::chunks::Cached,
+    /// The most reads one query run held (and the run, `` `query` of key ``) and the most
+    /// pending rows one task held ([`blaze_query::db::stack_high_water`]), what the runaway
+    /// bounds are set against; not shown while both counts are 0.
+    pub stacks: blaze_query::db::StackHighWater,
 }
 
 impl MemoryLine<'_> {
@@ -1353,6 +1289,14 @@ impl fmt::Display for MemoryLine<'_> {
                 gib(self.chunks.warm),
                 gib(self.chunks.cold),
             )?;
+        }
+        let blaze_query::db::StackHighWater { run_reads, run, pending } = &self.stacks;
+        if (*run_reads, *pending) != (0, 0) {
+            write!(f, "; query stack most reads one run {run_reads}")?;
+            if !run.is_empty() {
+                write!(f, " ({run})")?;
+            }
+            write!(f, ", most pending rows one task {pending}")?;
         }
         let total = self.blocks.total();
         if total.carved == 0 {
@@ -1519,7 +1463,8 @@ pub(super) fn log_memory(memory: &blaze_mem::tag::Snapshot) {
     let heap = blaze_graph::arena::held();
     let blocks = blaze_mem::blocks::snapshot();
     let chunks = blaze_mem::chunks::cached();
-    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
+    let stacks = blaze_query::db::stack_high_water();
+    let said = MemoryLine { memory, blocks: &blocks, resident, heap, chunks, stacks }.to_string(); // alloc: one line each MEMORY_LOG_EVERY and at stop
     // logged: the info event below
     eprintln!("blaze serve: {said}");
     tracing::info!(target: "blaze", "{said}");
@@ -2161,7 +2106,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             std,
             plane,
             mounts,
-            heads: Heads::new(FLUSHES, WATCHERS, RUNS),
+            heads: Heads::new(FLUSHES, WATCHERS, RUNS, match options.outside_journaled {
+                // One reader of each volume's journal (Windows: its directory watch has no
+                // barrier, so nothing outside a checkout was ever vouched for).
+                true => Outside::journaled(options.outside, "/", OUTSIDE),
+                false => Outside::new(options.outside, "/", OUTSIDE),
+            }),
             images: Images::new(image, IMAGE, on_disk, texts, text_pin),
             jobs,
             steps,
@@ -2423,12 +2373,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     #[cfg(test)]
     pub(super) fn store_deadline(&self) -> Option<Duration> {
         self.jobs.next_deadline()
-    }
-
-    /// The key the jobs' record holds for the output at `path` ([`super::job::Jobs::placed_key`]).
-    #[cfg(test)]
-    pub(super) fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
-        self.jobs.placed_key(path)
     }
 
     /// Asks the store to place `key` at `to` as a build would: store traffic that is no step of
@@ -2783,19 +2727,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.tick();
         drop(tick);
         for completion in done.drain(..) {
-            // The piece names whose completion it is (`Handler::name`, a static string), so a
-            // turn stuck in one dispatch says which part of the daemon holds it.
-            let handler = self.handler_of(completion.tag);
-            let _dispatch = spanned.then(|| {
-                tracing::info_span!(
-                    target: "blaze",
-                    "loop turn: completions: a piece",
-                    piece = "dispatch of one completion",
-                    completion = handler.name()
-                )
-                .entered()
-            });
-            self.dispatch(handler, completion);
+            let _dispatch = piece("dispatch of one completion");
+            self.dispatch(completion);
         }
         // What the loop's own store reads were handed as they dispatched (`World::reads`) is
         // kept for the next turn, which takes it without a wait.
@@ -3004,6 +2937,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         for build in self.jobs.answered.drain(..) {
             self.observe.answered(build);
         }
+        // The run logs of builds whose front end was kept, named after their answers.
+        if !self.jobs.ran.is_empty() {
+            self.observe.ran(std::mem::take(&mut self.jobs.ran));
+        }
     }
 
     /// The stall watchdog's turn: once the plane's tasks run and none of its counts (the worker
@@ -3043,7 +2980,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         let progress = Progress {
             jobs: pool.ended(),
-            queries: blaze_memo::completed() + blaze_query::db::completed(),
+            queries: blaze_query::db::completed(),
             steps: self.settled + self.job_effects,
             working: self.working,
         };
@@ -3535,41 +3472,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
-    /// The part of the daemon a completion of `tag` goes to, by the block of tags it is in:
-    /// compares on the tag alone, no part asked and no lock taken. [`Daemon::dispatch`] hands
-    /// it there; the turn's span of that dispatch names it first ([`Handler::name`]).
-    fn handler_of(&self, tag: Tag) -> Handler {
-        match tag.0 {
-            _ if self.images.owns(tag) => Handler::Images,
-            _ if tag == PRESSURE => Handler::Pressure,
-            SERVER..VFS => Handler::Server,
-            VFS..DB => Handler::Vfs,
-            DB..STORE => Handler::Db,
-            PLACES..PLACES_END => Handler::Places,
-            SOLO_ROWS..SOLO_ROWS_END => Handler::SoloRows,
-            PEERS..PEERS_END => Handler::Peers,
-            STORE..FLUSHES | LOADS..STD_LOADS => Handler::Store,
-            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => Handler::Std,
-            FLUSHES..JOBS | WATCHERS..RUNS => Handler::Heads,
-            JOBS..JOBS_END | RUNS..RUNS_END => Handler::Jobs,
-            super::direct::HOME_TAGS.. => Handler::LateRead,
-            _ => Handler::Unowned,
-        }
-    }
-
-    /// A completion to `handler`, the part of the daemon [`Daemon::handler_of`] found for its
-    /// tag.
-    fn dispatch(&mut self, handler: Handler, completion: Completion) {
-        #[cfg(test)]
-        STUCK_AT_DISPATCH.with_borrow_mut(|it| it.say(handler));
-        match handler {
-            Handler::Images => {
+    /// A completion to its part, by the block of tags it is in: compares on the tag alone,
+    /// no part asked and no lock taken.
+    fn dispatch(&mut self, completion: Completion) {
+        match completion.tag.0 {
+            _ if self.images.owns(completion.tag) => {
                 let was = self.images.done();
                 self.images.complete(&mut self.vfs, completion, &mut self.effects);
                 self.images_ended(was);
             }
-            Handler::Pressure => self.pressure(completion),
-            Handler::Server => {
+            _ if completion.tag == PRESSURE => self.pressure(completion),
+            SERVER..VFS => {
                 let mut arrived = self.spare.arrived.pop().unwrap_or_default();
                 self.server.complete(completion, &mut self.effects, &mut arrived);
                 for it in arrived.drain(..) {
@@ -3583,17 +3496,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.fail(why);
                 }
             }
-            Handler::Vfs => {
+            VFS..DB => {
                 let tickets = self.vfs.complete(completion, &mut self.effects);
                 if !tickets.is_empty() {
                     self.durable(&tickets);
                 }
             }
-            Handler::Db => self.db.complete(completion, &mut self.effects),
-            Handler::Places => self.start_placed(completion),
-            Handler::SoloRows => self.solo_taken(completion),
+            DB..STORE => self.db.complete(completion, &mut self.effects),
+            PLACES..PLACES_END => self.start_placed(completion),
+            SOLO_ROWS..SOLO_ROWS_END => self.solo_taken(completion),
             // Lane packs-1112: a peer's request, answered from the store.
-            Handler::Peers => {
+            PEERS..PEERS_END => {
                 if let Some(peers) = &mut self.peers {
                     peers.complete(completion, &self.store, &mut self.effects);
                     if let Some(why) = peers.take_failed() {
@@ -3603,7 +3516,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             // The store's own effects, and its pool's loads (a commit loading the page a pack's
             // index is on, or one of the reads not yet on `direct`).
-            Handler::Store => {
+            STORE..FLUSHES | LOADS..STD_LOADS => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.job_effects += 1;
                 self.store.complete(completion, &mut self.effects);
@@ -3630,7 +3543,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 self.said(said);
             }
-            Handler::Std => {
+            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => {
                 debug_assert!(self.std.owns(completion.tag), "the shared store's tags are its");
                 self.std.complete(completion, &mut self.effects);
                 if let Some(broken) = self.std.broken()
@@ -3645,13 +3558,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.jobs.looked(&mut world!(self, said));
                 self.said(said);
             }
-            Handler::Heads => {
+            FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
                 debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
                 let mut out = self.spare.out.pop().unwrap_or_default();
                 self.heads.complete(&mut self.vfs, self.driver.wall_ns(), completion, &mut self.effects, &mut out);
                 self.outs(out);
             }
-            Handler::Jobs => {
+            JOBS..JOBS_END | RUNS..RUNS_END => {
                 debug_assert!(self.jobs.owns(completion.tag), "the jobs' tags are theirs");
                 self.job_effects += 1;
                 let mut said = self.spare.said.pop().unwrap_or_default();
@@ -3661,10 +3574,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // A task's store read on the lent driver (`direct::lend`) that ended after its
             // read gave up waiting: the read failed then (`direct::Failed::Stalled`), naming
             // the record, and gave its buffer up to the kernel; nothing waits for this.
-            Handler::LateRead => {
+            super::direct::HOME_TAGS.. => {
                 tracing::info!(target: "blaze", tag = completion.tag.0, "a store read's late completion, its read already failed as stalled");
             }
-            Handler::Unowned => {}
+            _ => {}
         }
     }
 
@@ -3782,9 +3695,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         }
                     }
                 }
-                // `blaze run` of a dev executable: the programs are the steps'. The launch
-                // writes no file: it starts the one the build placed, with the key the jobs'
-                // record holds for its path, or is refused naming the path and both keys.
+                // `blaze run` of a dev executable: the programs are the steps' (review: the
+                // file it may write is the launch's, once per run).
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
                     let placed = self.jobs.placed_key(&program);
                     let (response, ok) = match self.steps.launch(&program, pid, placed) {
@@ -4662,11 +4574,14 @@ mod tests {
             ..Default::default()
         };
         let chunks = blaze_mem::chunks::Cached { warm: 1 << 29, cold: 1 << 30 };
-        let said = MemoryLine { memory: &memory,
-        blocks: &blocks,
-        resident: Some(12 << 30),
-        heap: 6 << 30,
-        chunks }
+        let said = MemoryLine {
+            memory: &memory,
+            blocks: &blocks,
+            resident: Some(12 << 30),
+            heap: 6 << 30,
+            chunks,
+            stacks: blaze_query::db::StackHighWater::default(),
+        }
         .to_string();
         let infer = said
             .find(&format!(
@@ -4694,11 +4609,14 @@ mod tests {
         );
         // An allocator that keeps no tags says so, rather than show every tag holding none.
         let untagged = Snapshot { heap_by_tag: false, ..memory };
-        let said_untagged = MemoryLine { memory: &untagged,
-        blocks: &blocks,
-        resident: None,
-        heap: 6 << 30,
-        chunks }
+        let said_untagged = MemoryLine {
+            memory: &untagged,
+            blocks: &blocks,
+            resident: None,
+            heap: 6 << 30,
+            chunks,
+            stacks: blaze_query::db::StackHighWater::default(),
+        }
         .to_string();
         assert!(
             said_untagged
@@ -4716,11 +4634,14 @@ mod tests {
             "{said}"
         );
         let none = blaze_mem::blocks::Snapshot::default();
-        let unknown = MemoryLine { memory: &memory,
-        blocks: &none,
-        resident: None,
-        heap: 0,
-        chunks: blaze_mem::chunks::Cached::default() }
+        let unknown = MemoryLine {
+            memory: &memory,
+            blocks: &none,
+            resident: None,
+            heap: 0,
+            chunks: blaze_mem::chunks::Cached::default(),
+            stacks: blaze_query::db::StackHighWater::default(),
+        }
         .to_string();
         assert!(unknown.starts_with("memory: committed 5.00 GiB"), "{unknown}");
         assert!(!unknown.contains("blocks"), "{unknown}");

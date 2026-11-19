@@ -7,16 +7,7 @@ use hir_expand::fixture;
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::{MirOptLevel, MirOptions};
 
-use std::alloc::Global;
-
-use blaze_memo::testing::Ran;
-use hir_def::expr_store::body::{Body_of, Body_relative, Body_source_map};
-
-use crate::{
-    constant,
-    db::{TestDB, runs_of},
-    function,
-};
+use crate::{constant, db::TestDB, function};
 
 const PLAIN: &str = r#"
 macro_rules! twice {
@@ -47,22 +38,14 @@ const BOTH: &str = concat!(line!(), \":\",\tcolumn!());
 ";
 
 /// The queries that build a body's source map.
-const MAP_QUERIES: [&str; 2] = [Body_relative::KIND_NAME, Body_source_map::KIND_NAME];
-
-/// The queries of `runs`, in the order they ran: what a failed assertion prints.
-fn queries(runs: &[Ran]) -> Vec<&'static str, Global> {
-    let mut queries = Vec::with_capacity_in(runs.len(), Global);
-    queries.extend(runs.iter().map(|it| it.query));
-    queries
-}
+const MAP_QUERIES: [&str; 2] = ["Body::relative", "Body::source_map"];
 
 #[track_caller]
-fn assert_no_map(executed: &[Ran]) {
+fn assert_no_map(executed: &[String]) {
     for query in MAP_QUERIES {
         assert!(
-            !executed.iter().any(|it| it.query == query),
-            "`{query}` ran, so a source map was built: {:#?}",
-            queries(executed)
+            !executed.iter().any(|it| it == query),
+            "`{query}` ran, so a source map was built: {executed:#?}"
         );
     }
 }
@@ -104,14 +87,14 @@ fn lowering_a_body_builds_no_source_map() {
     let fx = fixture::db(PLAIN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         let func = function(&db, "add");
-        let executed = runs_of(&db, || {
+        let executed = db.log_executed(|| {
             db.mir_body(func.into()).unwrap_or_else(|error| panic!("the MIR of `add`: {error:?}"));
             db.optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
                 .unwrap_or_else(|error| panic!("the optimized MIR of `add`: {error:?}"));
         });
-        assert!(executed.iter().any(|it| it.query == Body_of::KIND_NAME), "{:#?}", queries(&executed));
+        assert!(executed.iter().any(|it| it == "Body::of"), "{executed:#?}");
         assert_no_map(&executed);
     });
 }
@@ -121,8 +104,8 @@ fn evaluating_a_constant_without_location_macros_builds_no_source_map() {
     let fx = fixture::db(PLAIN);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_memo::attach(&db, || {
-        let executed = runs_of(&db, || {
+    blaze_query::db::attach(&db, || {
+        let executed = db.log_executed(|| {
             assert_eq!(bytes(&db, "GOAL"), 6u32.to_le_bytes());
         });
         assert_no_map(&executed);
@@ -134,8 +117,8 @@ fn evaluating_line_and_column_builds_no_source_map() {
     let fx = fixture::db(PLACED);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_memo::attach(&db, || {
-        let executed = runs_of(&db, || {
+    blaze_query::db::attach(&db, || {
+        let executed = db.log_executed(|| {
             bytes(&db, "LINE");
             bytes(&db, "COLUMN");
         });
@@ -154,7 +137,7 @@ fn location_macros_are_where_they_are_written() {
     let (_, column) = place_of(&source, "column!();");
     let (both_line, _) = place_of(&source, "concat!(line!()");
     let (_, both_column) = place_of(&source, "column!())");
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         assert_eq!(bytes(&db, "LINE"), line.to_le_bytes());
         assert_eq!(bytes(&db, "COLUMN"), column.to_le_bytes());
         assert_eq!(text(&db, "BOTH"), format!("{both_line}:{both_column}"));

@@ -58,21 +58,12 @@ impl fmt::Display for Round {
 pub struct Text<'a>(pub &'a [u8]);
 
 impl<'a> Text<'a> {
-    #[blaze::pure]
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
     pub fn bytes(&self) -> &'a [u8] {
         self.0
     }
 
-    /// The text as a `str`: always `Ok` for text the connection checked, the error kept for
-    /// a `Text` made elsewhere.
-    #[blaze::pure]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
-    pub fn as_str(&self) -> Result<&'a str, core::str::Utf8Error> {
-        core::str::from_utf8(self.0)
+    pub fn as_str(&self) -> Option<&'a str> {
+        core::str::from_utf8(self.0).ok()
     }
 }
 
@@ -161,18 +152,7 @@ impl fmt::Display for State {
             State::AuthenticationOk => f.write_str("the connection awaits AuthenticationOk"),
             State::Starting => f.write_str("the connection awaits its first ReadyForQuery"),
             State::Idle => f.write_str("no query is in flight"),
-            State::Round {
-                round: round @ (Round::Prepare(..) | Round::Query(..) | Round::Close(..)),
-                stage:
-                    stage @ (Stage::ParseComplete
-                    | Stage::ParameterDescription
-                    | Stage::RowDescription
-                    | Stage::BindComplete
-                    | Stage::CloseComplete
-                    | Stage::Rows
-                    | Stage::ReadyForQuery
-                    | Stage::Skipping),
-            } => {
+            State::Round { round, stage } => {
                 let awaits = match stage {
                     Stage::ParseComplete => "awaits ParseComplete",
                     Stage::ParameterDescription => "awaits ParameterDescription",
@@ -259,17 +239,11 @@ impl fmt::Display for Tag {
     }
 }
 
-/// The name of an `ErrorResponse` field, written once: [`ServerError`]'s field has it too.
-const SEVERITY: &str = "severity";
-
-/// The name of an `ErrorResponse` field, written once: [`ServerError`]'s field has it too.
-const MESSAGE: &str = "message";
-
 fn field_name(field: u8) -> &'static str {
     match field {
-        b'S' => SEVERITY,
+        b'S' => "severity",
         b'C' => "SQLSTATE code",
-        b'M' => MESSAGE,
+        b'M' => "message",
         _ => "required",
     }
 }
@@ -448,13 +422,7 @@ impl fmt::Display for Refused {
             Refused::TooManyColumns { count } => {
                 write!(f, "it expects {count} columns, past the protocol's 65535")
             }
-            Refused::Param {
-                index,
-                why:
-                    why @ (EncodeError::TooLong { .. }
-                    | EncodeError::TextHasNul { .. }
-                    | EncodeError::ElementStorage { .. }),
-            } => write!(f, "parameter ${}: {why}", index + 1),
+            Refused::Param { index, why } => write!(f, "parameter ${}: {why}", index + 1),
             Refused::StatementExists { statement } => {
                 write!(f, "{statement} is held already: close it before preparing it again")
             }
@@ -551,10 +519,7 @@ impl fmt::Display for Error<'_> {
                 Oid(expected),
                 Oid(got)
             ),
-            Error::Returns {
-                expected: expected @ (Returns::Rows(..) | Returns::Count),
-                got: got @ (Returns::Rows(..) | Returns::Count),
-            } => {
+            Error::Returns { expected, got } => {
                 write!(f, "it expects {expected}, and the server describes {got}")
             }
             Error::ColumnCount { expected, got } => {
@@ -573,40 +538,13 @@ impl fmt::Display for Error<'_> {
             Error::RowWidth { expected, got } => {
                 write!(f, "a row has {got} values, and its description {expected} columns")
             }
-            Error::Value {
-                index,
-                name,
-                error:
-                    error @ (ValueError::Length { .. }
-                    | ValueError::Boolean { .. }
-                    | ValueError::NotUtf8 { .. }
-                    | ValueError::NegativeLength { .. }
-                    | ValueError::Dimensions { .. }
-                    | ValueError::NullFlag { .. }
-                    | ValueError::NullNotFlagged { .. }
-                    | ValueError::ElementOid { .. }
-                    | ValueError::LowerBound { .. }
-                    | ValueError::ArrayLength { .. }
-                    | ValueError::Truncated { .. }
-                    | ValueError::Trailing { .. }),
-            } => {
+            Error::Value { index, name, error } => {
                 write!(f, "column {index}, `{name}`: the server sent {error}")
             }
             Error::Deadline { deadline, now } => {
                 write!(f, "it did not end by its deadline {deadline}; the clock is at {now}")
             }
-            Error::Closed(
-                why @ (Fatal::Deadline { .. }
-                | Fatal::StartupDeadline { .. }
-                | Fatal::PeerClosed { .. }
-                | Fatal::Protocol(..)
-                | Fatal::Auth(..)
-                | Fatal::Server(..)
-                | Fatal::Nul { .. }
-                | Fatal::StartupTooLong { .. }
-                | Fatal::NotDrained { .. }
-                | Fatal::SentTooMuch { .. }),
-            ) => write!(f, "the connection closed before it ended: {why}"),
+            Error::Closed(why) => write!(f, "the connection closed before it ended: {why}"),
         }
     }
 }
@@ -657,11 +595,7 @@ pub enum Fatal<'a> {
 impl fmt::Display for Fatal<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Fatal::Deadline {
-                round: round @ (Round::Prepare(..) | Round::Query(..) | Round::Close(..)),
-                deadline,
-                now,
-            } => write!(
+            Fatal::Deadline { round, deadline, now } => write!(
                 f,
                 "{round} did not end by its deadline {deadline} (the clock is at {now}), so the \
                  connection, which may hold half its answer, closed"
@@ -675,19 +609,7 @@ impl fmt::Display for Fatal<'_> {
                 "the server closed the connection inside a message, {buffered} bytes of it received"
             ),
             Fatal::Protocol(error) => write!(f, "{error}"),
-            Fatal::Auth(
-                error @ (AuthError::Method { .. }
-                | AuthError::UnknownMethod { .. }
-                | AuthError::NoScram
-                | AuthError::ChannelBindingOnly
-                | AuthError::PasswordNotPrintable { .. }
-                | AuthError::ServerFirst { .. }
-                | AuthError::Nonce
-                | AuthError::Iterations { .. }
-                | AuthError::ServerFinal { .. }
-                | AuthError::ServerRefused
-                | AuthError::Signature),
-            ) => write!(f, "authentication failed: {error}"),
+            Fatal::Auth(error) => write!(f, "authentication failed: {error}"),
             Fatal::Server(error) => write!(f, "the server ended the connection: {error}"),
             Fatal::Nul { field } => {
                 write!(

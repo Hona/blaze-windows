@@ -1,4 +1,3 @@
-mod body_store;
 mod comptime;
 mod comptime_codec;
 mod comptime_parity;

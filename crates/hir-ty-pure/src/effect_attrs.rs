@@ -734,7 +734,7 @@ pub struct CrateRows {
 }
 
 /// [`ROWS`] resolved in `krate`, once per crate, through its def map (re-exports followed).
-#[blaze_memo::tracked(returns(ref), owns)]
+#[blaze_query::tracked(returns(ref))]
 pub fn crate_rows(db: &Db, krate: Crate) -> CrateRows {
     let mut by_fn = HashMap::new_in(Global);
     let Some(name) = registry_name(db, krate) else {

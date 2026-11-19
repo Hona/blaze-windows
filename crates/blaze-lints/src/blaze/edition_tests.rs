@@ -17,7 +17,7 @@ use crate::{
     conf::Conf,
     fix::fix,
     level::CommandLine,
-    tests::{lint, lint_with, main_crate_key},
+    tests::{lint, lint_with, main_crate},
 };
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, fn, cell, future, option, result, deref, builtin_impls, int_impl\n";
@@ -255,7 +255,7 @@ fn fixed(lints: &[&str], meta: &str, main: &str) -> String {
     let fx = fixture::db(&effects_fixture(meta, main));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let key = main_crate_key(&db);
+    let krate = blaze_query::db::attach(&db, || main_crate(&db));
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let flags: Vec<String> = warn_of(lints).split_whitespace().map(str::to_owned).collect();
@@ -263,10 +263,9 @@ fn fixed(lints: &[&str], meta: &str, main: &str) -> String {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let text = db.file_text(file).text(&db).to_string();
-    blaze_memo::attach(&db, || {
-        let krate = hir::Crate::from(db.krate(key));
+    blaze_query::db::attach(&db, || {
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found
             .iter()
@@ -960,7 +959,7 @@ fn fixed_mut_ref(main: &str) -> String {
     let fx = fixture::db(&text);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let key = crate::tests::main_crate_key(&db);
+    let krate = blaze_query::db::attach(&db, || crate::tests::main_crate(&db));
     let file = file.file_id(&db);
     let before = db.file_text(file).text(&db).to_string();
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
@@ -974,12 +973,11 @@ fn fixed_mut_ref(main: &str) -> String {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    let made = fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `mut_ref` changed the file");
     assert!(made.applied > 0, "the fix of `mut_ref` made a suggestion");
-    blaze_memo::attach(&db, || {
-        let krate = hir::Crate::from(db.krate(key));
+    blaze_query::db::attach(&db, || {
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found
             .iter()

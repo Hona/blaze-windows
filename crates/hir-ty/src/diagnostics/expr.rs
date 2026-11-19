@@ -112,12 +112,11 @@ impl<'db> ExprValidator<'db> {
             self.check_for_trailing_return(body.root_expr(), body);
         }
 
-        let table = crate::ctx_table(self.owner.krate(db));
         for (id, expr) in body.exprs() {
             // A struct expression with no `..` that leaves a field out is type checking's E0063
             // (`InferenceDiagnostic::RecordMissingFields`, which taints the body); here only
             // the forms of `..` with no base.
-            let missing = record_literal_defaults_missing_fields(db, body, table, self.infer, id, expr)
+            let missing = record_literal_defaults_missing_fields(db, body, self.infer, id, expr)
                 .or_else(|| Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new())));
             if let Some((variant, missed_fields)) = missing {
                 self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
@@ -430,12 +429,9 @@ impl<'db> FilterMapNextChecker<'db> {
 
 /// The fields without a default value a struct expression with `..` and no base
 /// (`S { a: 1, .. }`) leaves out. One with no `..` is type checking's (`check_record_expr_fields`).
-/// `table` is the table the store's syntax contexts are of ([`crate::ctx_table`] of its owner's
-/// crate).
 pub fn record_literal_defaults_missing_fields<'db>(
     db: &'db Db,
     store: &ExpressionStore,
-    table: blaze_memo::ArenaId,
     infer: &InferenceResult<'db>,
     id: ExprId,
     expr: Expr<'_>,
@@ -457,7 +453,7 @@ pub fn record_literal_defaults_missing_fields<'db>(
         .iter()
         .map(|f| {
             let hygiene = store.record_field_hygiene(f.expr);
-            VariantFields::name_written(db, table, variant_def, f.name, hygiene)
+            VariantFields::name_written(db, variant_def, f.name, hygiene)
         })
         .collect();
     // Those neither written nor with a default value.
@@ -485,11 +481,9 @@ fn record_literal_spread_only(
     infer.variant_resolution_for_expr(id).filter(|it| !matches!(it, VariantId::UnionId(_)))
 }
 
-/// `table` as for [`record_literal_defaults_missing_fields`].
 pub fn record_pattern_missing_fields<'db>(
     db: &'db Db,
     store: &ExpressionStore,
-    table: blaze_memo::ArenaId,
     infer: &InferenceResult<'db>,
     id: PatId,
     pat: Pat<'_>,
@@ -511,7 +505,7 @@ pub fn record_pattern_missing_fields<'db>(
         .iter()
         .map(|f| {
             let hygiene = store.record_field_hygiene(f.pat);
-            VariantFields::name_written(db, table, variant_def, f.name, hygiene)
+            VariantFields::name_written(db, variant_def, f.name, hygiene)
         })
         .collect();
     // don't show missing fields if:

@@ -81,7 +81,7 @@ fn fmaf128_for(target_tuple: &str) {
         lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None, sealed: &crate::unsealed(&units) })
             .unwrap();
     let db = lowered.db();
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         let mut module = crate_def_map(db, lowered.krate(1).unwrap()).root_module_id();
         for segment in ["math", "full_availability"] {
             let data = module.to_db(db).def_map(db).module(db, module);

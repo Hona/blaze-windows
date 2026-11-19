@@ -717,8 +717,7 @@ fn one_probe_per_segment() {
     let db = fixture::db(THREE_SEGMENTS).into_db();
     let (map, local, path) = three_segment_lookup(&db);
     let mut reads = Vec::new();
-    let res = map.resolve_path_written_in(
-        map.ctx_table(),
+    let res = map.resolve_path_fp_recording(
         local,
         &db,
         ResolveMode::Other,

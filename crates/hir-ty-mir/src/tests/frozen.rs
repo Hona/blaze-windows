@@ -100,7 +100,7 @@ struct Bytes {
 
 fn frozen() -> Bytes {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_memo::attach(&db, || {
+    blaze_query::db::attach(&db, || {
         let all = crates(&db);
         Bytes {
             def_maps: each(&db, &all, |it| frozen_def::pages::encode(&db, it)),
@@ -131,14 +131,13 @@ fn by_crate(
 /// with under [`Mode::Check`] and [`Mode::Verify`]. Under [`Mode::Check`] the crate is
 /// resolved and what it resolved to is written as pages and compared.
 fn give_def_maps(db: &mut TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) {
-    let maps = if mode != Mode::Serve { by_crate(db, mode, bytes) } else { HashMap::new_in(Global) };
-    let maps: Vec<(Crate, blaze_memo::Fact, Frozen), Global> = maps
-        .into_iter()
-        .map(|(krate, it)| (krate, frozen_def::frozen_fact(slot_id(db, krate), "def map", &it), it))
-        .collect();
-    let pages: Vec<(Crate, blaze_memo::Fact, Paged), Global> = if mode != Mode::Check {
+    if mode != Mode::Serve {
+        let maps = by_crate(db, mode, bytes);
+        frozen_def::set(db, maps);
+    }
+    if mode != Mode::Check {
         let crates = crates(db);
-        bytes
+        let maps: HashMap<Crate, Paged, Global> = bytes
             .iter()
             .map(|(name, bytes)| {
                 let krate = *crates.iter().find(|&&it| self::name(db, it) == *name).unwrap();
@@ -146,25 +145,11 @@ fn give_def_maps(db: &mut TestDB, mode: Mode, bytes: &[(String, Vec<u8>)]) {
                 let held = Arc::new(Aligned::copy_from(bytes));
                 // dyn: a test's holder of one record, one a crate
                 let source: Arc<dyn PageSource> = Arc::new(Whole(held));
-                let paged = Paged { key, source };
-                (krate, frozen_def::pages::pages_fact(slot_id(db, krate), &paged), paged)
+                (krate, Paged { key, source })
             })
-            .collect()
-    } else {
-        Vec::new_in(Global)
-    };
-    // One commit gives both, as `hir_def::deps::give_image` gives a crate's records: the ids
-    // above are of the snapshot before it.
-    let mut edit = db.edit();
-    frozen_def::give(&mut edit, maps);
-    frozen_def::pages::give(&mut edit, pages);
-    _ = edit.commit();
-}
-
-/// The stable id a crate's slots are named by: a test's crates have none of their own, so
-/// the crate's name stands for it (the names of a fixture's crates differ).
-fn slot_id(db: &TestDB, krate: Crate) -> blaze_ids::ContentId {
-    blaze_ids::ContentId::of("blaze test crate", name(db, krate).as_bytes())
+            .collect();
+        frozen_def::pages::set(db, maps);
+    }
 }
 
 /// A fresh database with the impls and lang items of [`Bytes`] in `mode`, and the def maps
@@ -174,29 +159,20 @@ fn with(mode: Mode, bytes: &Bytes, def_maps: bool) -> TestDB {
     if def_maps {
         give_def_maps(&mut db, mode, &bytes.def_maps);
     }
-    // Taken after the def maps' commit, which made the crates' arenas again.
-    let lang_items: Vec<(Crate, blaze_memo::Fact, Frozen), Global> = by_crate(&db, mode, &bytes.lang_items)
-        .into_iter()
-        .map(|(krate, it)| (krate, frozen_def::frozen_fact(slot_id(&db, krate), "lang items", &it), it))
-        .collect();
+    let lang_items = by_crate(&db, mode, &bytes.lang_items);
+    frozen_def::set_lang_items(&mut db, lang_items);
     // The impls are pages (`frozen_impls::pages`), given held whole in memory.
-    let impls: Vec<(Crate, blaze_memo::Fact, frozen_impls::Tables), Global> = by_crate(&db, mode, &bytes.impls)
+    let impls = by_crate(&db, mode, &bytes.impls)
         .into_iter()
-        .map(|(krate, it)| {
-            let tables = frozen_impls::Tables::whole(&it.bytes, mode);
-            (krate, frozen_impls::tables_fact(slot_id(&db, krate), &tables), tables)
-        })
+        .map(|(krate, it)| (krate, frozen_impls::Tables::whole(&it.bytes, mode)))
         .collect();
-    let mut edit = db.edit();
-    frozen_def::give_lang_items(&mut edit, lang_items);
-    frozen_impls::give(&mut edit, impls);
-    _ = edit.commit();
+    frozen_impls::set(&mut db, impls);
     db
 }
 
 /// The impls and lang items of every crate of `db`, written as they are now.
 fn written(db: &TestDB) -> Vec<(String, Vec<u8>, Vec<u8>)> {
-    blaze_memo::attach(db, || {
+    blaze_query::db::attach(db, || {
         crates(db)
             .into_iter()
             .map(|it| {
@@ -253,7 +229,7 @@ fn read_back_writes_the_same_bytes() {
     for def_maps in [false, true] {
         let db = with(Mode::Verify, &bytes, def_maps);
         assert_eq!(written(&db), expected(&bytes), "def maps frozen: {def_maps}");
-        blaze_memo::attach(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 frozen_impls::check(&db, krate);
                 frozen_def::check_lang_items(&db, krate);
@@ -293,7 +269,7 @@ pub use proc_macros::DeriveIdentity;
 fn def_maps_with_procedural_macros_read_back_as_resolved() {
     let _turn = TURN.lock();
     let db = fixture::db(PROC_MACROS).into_db();
-    let bytes: Vec<(String, Vec<u8>)> = blaze_memo::attach(&db, || {
+    let bytes: Vec<(String, Vec<u8>)> = blaze_query::db::attach(&db, || {
         let encoded = |it| {
             frozen_def::pages::encode(&db, it).map_err(|why| format!("{}: {why}", name(&db, it)))
         };
@@ -307,7 +283,7 @@ fn def_maps_with_procedural_macros_read_back_as_resolved() {
     for mode in [Mode::Check, Mode::Verify] {
         let mut db = fixture::db(PROC_MACROS).into_db();
         give_def_maps(&mut db, mode, &bytes);
-        blaze_memo::attach(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 _ = hir_def::nameres::crate_def_map(&db, krate);
             }
@@ -322,7 +298,7 @@ fn checking_finds_a_difference() {
     let mut bytes = frozen();
     let check = |bytes: &Bytes| {
         let db = with(Mode::Check, bytes, false);
-        blaze_memo::attach(&db, || {
+        blaze_query::db::attach(&db, || {
             for krate in crates(&db) {
                 assert!(!frozen_impls::served(&db, krate));
                 frozen_impls::check(&db, krate);

@@ -10,13 +10,12 @@ description: "How to find out why a blaze build did what it did from its profile
 ## ask-the-profile-first (rule 17)
 
 Every build already records its footprint and live bytes, each task's peak memory, its spans, its
-waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it,
-with a daemon or without; a path that writes none is unfinished: `slow-is-p0-traced`). A why
-question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze explain
-footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits` while
-admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and quotes
-the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the gap
-gets a span or counter.
+waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (the daemon writes it
+today). A why question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze
+explain footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits`
+while admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and
+quotes the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the
+gap gets a span or counter.
 
 ## claims-from-evidence (rule 61)
 
@@ -37,12 +36,7 @@ program itself prints, a generator's last line saying what it wrote; the absence
 evidence of nothing, and a check, a row or a gate step that can succeed having run nothing is a bug
 to fix where it is found (`blaze test` refuses a run of no test; a harness row goes through
 harness/v2/ran.py). When the evidence is lost or the tool could not run, say that, not the
-conclusion you expected. Read raw output before a filtered copy: save what a command printed to a
-file, filter only with patterns anchored to the lines they drop, and say that something is missing
-(a row, a step, a line) only after reading the raw file; an unanchored `grep -v` once deleted the
-rows it was then reported a tool had not printed. A date is a claim too: say when something will
-work only with the measured run that date rests on, and otherwise name the run that will give the
-number.
+conclusion you expected.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

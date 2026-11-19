@@ -809,7 +809,7 @@ impl<'db> Lints<'_, '_, 'db> {
         match file.macro_file() {
             None => self.cx.edition,
             Some(call) => {
-                call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition()
+                call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition(self.cx.db)
             }
         }
     }
@@ -1142,7 +1142,7 @@ mod tests {
             }
             let checked = crate::tests::checked(&fixture);
             let db = &checked.db;
-            blaze_memo::attach(db, || {
+            blaze_query::db::attach(db, || {
                 let krate = hir::check::workspace_crates(db)[0];
                 let frame = crate::tests::frame();
                 let cx = Cx::new(db, krate, checked.files(), &frame);

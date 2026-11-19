@@ -17,13 +17,9 @@
 //! names. A trait's method that only an instance resolves to a `#[track_caller]` impl method is
 //! not found (rustc's `default-trait-method.rs`).
 
-#![feature(allocator_api)]
 #![forbid(unsafe_code)]
 
-use std::alloc::Global;
-
 use base_db::Db;
-use blaze_memo::Database as _;
 use either::Either;
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, TraitId,
@@ -197,22 +193,21 @@ pub struct TrackCallerCall {
 }
 
 /// What [`tail_call_check`] finds in a body and the closures in it, in rustc's order.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct TailCallCheck<'db> {
-    /// Kept in the query's arena, as `track_caller`.
-    errors: &'db [TailCallError],
-    track_caller: &'db [TrackCallerCall],
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct TailCallCheck {
+    errors: Box<[TailCallError]>,
+    track_caller: Box<[TrackCallerCall]>,
 }
 
-impl<'db> TailCallCheck<'db> {
+impl TailCallCheck {
     #[inline]
-    pub fn errors(&self) -> &'db [TailCallError] {
-        self.errors
+    pub fn errors(&self) -> &[TailCallError] {
+        &self.errors
     }
 
     #[inline]
-    pub fn track_caller_calls(&self) -> &'db [TrackCallerCall] {
-        self.track_caller
+    pub fn track_caller_calls(&self) -> &[TrackCallerCall] {
+        &self.track_caller
     }
 
     /// Whether some tail call of the body or a closure in it is refused.
@@ -237,8 +232,8 @@ pub fn has_become(store: &ExpressionStore) -> bool {
 
 /// rustc's `check_tail_calls` of `def` and the closures in it, and its tail calls of
 /// `#[track_caller]` functions.
-#[blaze_memo::tracked(returns(ref))]
-pub fn tail_call_check<'db>(db: &'db Db, def: DefWithBodyId) -> TailCallCheck<'db> {
+#[blaze_query::tracked(returns(ref))]
+pub fn tail_call_check(db: &Db, def: DefWithBodyId) -> TailCallCheck {
     let body = Body::of(db, def);
     if !has_become(body) {
         return TailCallCheck::default();
@@ -267,15 +262,15 @@ pub fn tail_call_check<'db>(db: &'db Db, def: DefWithBodyId) -> TailCallCheck<'d
         caller,
         caller_sig: None,
         lang: lang_items(db, krate),
-        // Each grows only at its first entry, so takes nothing for a body without one; kept
-        // in the query's arena below and freed.
-        errors: Vec::new_in(Global),
-        track_caller: Vec::new_in(Global),
+        // alloc: only at the first refusal, so none for a body without one.
+        errors: Vec::new(),
+        // alloc: only at the first such call.
+        track_caller: Vec::new(),
     };
     checker.walk(body.root_expr());
     TailCallCheck {
-        errors: blaze_memo::keep_iter(db.memo(), checker.errors),
-        track_caller: blaze_memo::keep_slice(db.memo(), &checker.track_caller),
+        errors: checker.errors.into_boxed_slice(),
+        track_caller: checker.track_caller.into_boxed_slice(),
     }
 }
 

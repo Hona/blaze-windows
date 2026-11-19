@@ -54,16 +54,6 @@ impl ImageStore for Images {
             }
         }
     }
-
-    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn hir_def::deps::PageSource>>, String> {
-        // A test's store holds each value whole: no part of one is read alone.
-        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
-    }
-
-    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
-    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
-        (0..count).for_each(task);
-    }
 }
 
 /// The store, counting each read a walk makes of it.
@@ -118,33 +108,20 @@ fn kernel_of(db: &Db) -> base_db::Crate {
 fn imaged(text: &str, images: &Images) -> Db {
     let fresh = || {
         let mut db = fixture::db(text).into_db();
-        let mut edit = db.edit();
-        blaze_item_hash::identity::give_build(&mut edit, BUILD);
-        _ = edit.commit();
+        set_build(&mut db, BUILD);
         let crates: Vec<base_db::Crate> = base_db::all_crates(&db).iter().copied().collect();
-        let (served, found) = hir_def::deps::serve(&db, &crates, BUILD, images, Mode::Serve)
+        let served = hir_def::deps::serve(&mut db, &crates, BUILD, images, Mode::Serve)
             .unwrap_or_else(|why| panic!("serving the fixture's images: {why}"));
-        if !found.is_empty() {
-            let mut edit = db.edit();
-            for (krate, image) in found {
-                let krate_id = served.keys[&krate.key(edit.db())];
-                hir_def::deps::give_image(&mut edit, krate, krate_id, image);
-            }
-            _ = edit.commit();
-        }
         (db, served)
     };
     let (db, served) = fresh();
-    if served.hits.contains(&kernel_of(&db).key(&db)) {
+    if served.hits.contains(&kernel_of(&db)) {
         return db;
     }
     hir_def::deps::store(&db, &served, images, Which::Sealed)
-        .unwrap_or_else(|why| panic!("storing the fixture's images: {why:?}"));
+        .unwrap_or_else(|why| panic!("storing the fixture's images: {why}"));
     let (db, served) = fresh();
-    assert!(
-        served.hits.contains(&kernel_of(&db).key(&db)),
-        "premise: `kernel` is read from its image"
-    );
+    assert!(served.hits.contains(&kernel_of(&db)), "premise: `kernel` is read from its image");
     db
 }
 
