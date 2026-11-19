@@ -1838,9 +1838,22 @@ fn a_binary_run_whole_is_cut_where_its_names_pass_the_longest_command_line() {
         let line = effects
             .iter()
             .find_map(|it| match it {
-                Effect::Spawn { command, .. } => Some(
-                    blaze_core::create_process::command_line(&command.program, &command.args).unwrap(),
-                ),
+                Effect::Spawn { command, .. } => {
+                    let to_wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::ffi::OsStrExt as _;
+                            s.encode_wide().collect()
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            s.to_string_lossy().encode_utf16().collect()
+                        }
+                    };
+                    let program = to_wide(command.program.as_os_str());
+                    let args: Vec<Vec<u16>> = command.args.iter().map(|it| to_wide(it)).collect();
+                    Some(blaze_core::create_process::wide_command_line(&program, &args).unwrap())
+                }
                 _ => None,
             })
             .expect("the run is spawned");
