@@ -82,6 +82,9 @@ mod tests;
 // A daemon that exits once no connection holds it (`BLAZE_DAEMON_EXIT_UNHELD`).
 #[blaze::sans_io]
 mod unheld;
+// How edited outputs are placed on NTFS (`BLAZE_NTFS_EDIT`).
+#[blaze::sans_io]
+mod ntfs_edit;
 mod unit;
 pub mod why;
 mod work;
@@ -1230,8 +1233,14 @@ pub(crate) fn engine(
             unheld::VAR
         );
     }
+    let ntfs_edit = match std::env::var(ntfs_edit::VAR) {
+        Ok(text) => ntfs_edit::NtfsEdit::parse(Some(&text)).map_err(anyhow::Error::msg)?,
+        Err(std::env::VarError::NotPresent) => ntfs_edit::NtfsEdit::default(),
+        Err(error) => anyhow::bail!("the daemon's ${}: {error}", ntfs_edit::VAR),
+    };
     let options = Options {
         unheld: unheld.filter(|_| paths.socket.is_some()),
+        ntfs_edit,
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,

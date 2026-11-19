@@ -609,6 +609,8 @@ pub struct Options {
     /// `BLAZE_DAEMON_EXIT_UNHELD`): it stops itself once no client or launcher connection was
     /// open for this long. `None` exits only as [`super::idle::exit_due`] says, or when told.
     pub unheld: Option<Duration>,
+    /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
+    pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
@@ -2042,6 +2044,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             slots: format!("/{state}/slots"),
             premises: options.premises.clone(), // clone: the jobs' own copy, once a start
             stores: super::direct::Stores::new(store.reader(), std.reader(), options.reads.clone()), // clone: a path's refcount, once a start
+            ntfs_edit: options.ntfs_edit,
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
         // The front end's carry sessions the journal marks: each checkout's next build opens

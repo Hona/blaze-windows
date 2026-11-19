@@ -317,6 +317,8 @@ pub struct Setup {
     /// The daemon's two stores as its tasks read them, with no pool: each read is one direct
     /// read into the reading task's frame ([`super::direct`]). Every job's input lends it.
     pub stores: Arc<super::direct::Stores>,
+    /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
+    pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
 }
 
 /// Every fetch of a batch that failed (`failed`, places in `fetches`), as one error: each
@@ -4587,7 +4589,13 @@ enum Own {
     /// The file at a path looked at before a link's patch of it is placed there
     /// ([`Jobs::patching`]): the patch is written over a clone of it where it is as it was
     /// placed, and the whole file is written where it is not.
-    LookBase { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
+    LookBase {
+        job: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        destination: Option<blaze_core::Sharing>,
+    },
     /// A file placed, looked at for its [`Placement`] before its job is done: a file changed
     /// after the job's `Done` must not be recorded as the one placed.
     Record { job: JobId, path: u32, key: blaze_cas::Key },
@@ -9101,26 +9109,68 @@ impl<S: Steps> Jobs<S> {
         executable: bool,
         made: Arc<Made>,
     ) {
-        let based = match &*made {
-            Made::Patch { base, .. } => self.paths.placed[path as usize]
-                .as_ref()
-                .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
-            Made::Whole(_) => false,
+        let steps = w.steps;
+        self.place_made_with(w.store, w.effects, &|p| steps.destination_sharing(p), id, path, key, executable, made);
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "same arguments as place_made, decoupled from World for simulation tests")]
+    fn place_made_with(
+        &mut self,
+        store: &mut Store,
+        effects: &mut Vec<Effect>,
+        destination_sharing: &dyn Fn(&str) -> Result<Option<blaze_core::Sharing>, String>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: Arc<Made>,
+    ) {
+        let patch_len = match &*made {
+            Made::Patch { base, file, .. }
+                if self.paths.placed[path as usize].as_ref().is_some_and(|it| {
+                    it.key == *base && it.executable == executable && it.meta.is_some()
+                }) =>
+            {
+                Some(file.len)
+            }
+            _ => None,
         };
-        if !based {
-            self.place_made_as(w, id, path, key, executable, &made, false);
+        let Some(patch_len) = patch_len else {
+            self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, false, None);
+            return;
+        };
+        let destination = match destination_sharing(&self.paths.names[path as usize]) {
+            Ok(v) => v,
+            Err(why) => {
+                let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+                self.placing_failed(id, path, ApiError::new(why, Some(name)));
+                return;
+            }
+        };
+        // On NTFS, when the policy chooses new-file-plus-rename we write a fresh sparse file
+        // and rename it over the destination without opening the existing file at all, so the
+        // pre-patch `LookBase` stat round trip is unnecessary.
+        if destination == Some(blaze_core::Sharing::Unshared)
+            && self
+                .setup
+                .ntfs_edit
+                .choose(&self.paths.names[path as usize], executable, patch_len)
+                .route
+                == super::ntfs_edit::Route::Rename
+        {
+            self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, true, Some(destination));
             return;
         }
-        match self.own_tag(Own::LookBase { job: id, path, key, executable }) {
+        match self.own_tag(Own::LookBase { job: id, path, key, executable, destination }) {
             Ok(tag) => {
                 // clone: the driver's effect owns the file's name, once per output
                 let Some(file) = self.paths.files[path as usize].clone() else {
-                    self.place_made_as(w, id, path, key, executable, &made, false);
+                    self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, false, Some(destination));
                     return;
                 };
                 self.patching.insert(path, made);
                 self.begin_placing(id, path);
-                w.effects.push(Effect::Stat { file, tag });
+                effects.push(Effect::Stat { file, tag });
             }
             Err(error) => self.placing_failed(id, path, error),
         }
@@ -9143,6 +9193,25 @@ impl<S: Steps> Jobs<S> {
         executable: bool,
         made: &Arc<Made>,
         over: bool,
+        destination: Option<Option<blaze_core::Sharing>>,
+    ) {
+        let steps = w.steps;
+        self.place_made_as_with(w.store, w.effects, &|p| steps.destination_sharing(p), id, path, key, executable, made, over, destination);
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "a placement's parts, each its own")]
+    fn place_made_as_with(
+        &mut self,
+        store: &mut Store,
+        effects: &mut Vec<Effect>,
+        destination_sharing: &dyn Fn(&str) -> Result<Option<blaze_core::Sharing>, String>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: &Arc<Made>,
+        over: bool,
+        destination: Option<Option<blaze_core::Sharing>>,
     ) {
         // The store lets go of the whole file of the path's last value as this is answered.
         self.paths.placed[path as usize] = None;
@@ -9166,35 +9235,66 @@ impl<S: Steps> Jobs<S> {
         };
         // An executable is started from its path: its staged file gets its mode before its
         // look and rename, and a clone is prewarmed (`blaze_cas::Store::starts`).
-        w.store.starts(&file, executable);
+        store.starts(&file, executable);
         // A further path of a file whose place from its maker's bytes is in flight: another
         // name of that file, made beside its rename.
-        let destination = match w.steps.destination_sharing(&self.paths.names[path as usize]) {
-            Ok(v) => v,
-            Err(why) => { self.placing_failed(id, path, ApiError::new(why, Some(file.to_string()))); return; }
+        let destination = match destination {
+            Some(v) => v,
+            None => match destination_sharing(&self.paths.names[path as usize]) {
+                Ok(v) => v,
+                Err(why) => {
+                    self.placing_failed(id, path, ApiError::new(why, Some(file.to_string())));
+                    return;
+                }
+            },
         };
         // A custody patch needs a single-link base; never alias its output (including its
         // initial whole place). Across Windows volumes a second path is independent too.
         let first = destination.is_none().then(|| self.firsts.iter().find(|(it, _)| Arc::ptr_eq(it, made)).map(|(_, tag)| *tag)).flatten();
         if let Some(first) = first {
-            let tag = w.store.place_also(first, file);
+            let tag = store.place_also(first, file);
             self.placing.insert(tag, Placing { job: id, path, key, executable });
             self.begin_placing(id, path);
             return;
         }
         let tag = match (&**made, over) {
             (Made::Patch { file: patch, whole, .. }, true) if destination == Some(blaze_core::Sharing::Unshared) => {
-                w.store.place_edit(file, patch.clone(), whole(), w.effects)
+                let name = &*self.paths.names[path as usize];
+                let choice = self.setup.ntfs_edit.choose(name, executable, patch.len);
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "ntfs edit place",
+                    function = name,
+                    route = choice.route.as_str(),
+                    policy = choice.policy,
+                    reason = choice.reason,
+                    image = choice.image,
+                    file_bytes = patch.len,
+                    patch_bytes = patch.bytes(),
+                    written_bytes = tracing::field::Empty,
+                )
+                .entered();
+                let runs = whole();
+                match choice.route {
+                    super::ntfs_edit::Route::Rename => {
+                        span.record("written_bytes", runs.bytes());
+                        store.place_edit_rename(file, runs, effects)
+                    }
+                    super::ntfs_edit::Route::Patch => {
+                        span.record("written_bytes", patch.bytes());
+                        store.place_edit(file, patch.clone(), runs, effects)
+                    }
+                }
             }
             (Made::Patch { file: patch, .. }, true) if destination == Some(blaze_core::Sharing::Blocks) => {
-                w.store.place_cloned_patch(file, patch.clone(), executable, w.effects)
+                store.place_cloned_patch(file, patch.clone(), executable, effects)
             }
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
             // An executable is started from its path: its clone is prewarmed. A debug file
             // is not.
             (Made::Patch { file: patch, .. }, true) => {
-                w.store.place_patched(file, patch.clone(), executable, w.effects)
+                store.place_patched(file, patch.clone(), executable, effects)
             }
             (Made::Patch { whole, .. }, false) => {
                 let span = tracing::info_span!(
@@ -9206,11 +9306,11 @@ impl<S: Steps> Jobs<S> {
                 .entered();
                 let runs = whole();
                 span.record("bytes", runs.bytes());
-                w.store.place_made(file, runs, w.effects)
+                store.place_made(file, runs, effects)
             }
             // clone: the runs, which the path's writes own (an effect owns its bytes); once
             // per path
-            (Made::Whole(runs), _) => w.store.place_made(file, runs.clone(), w.effects),
+            (Made::Whole(runs), _) => store.place_made(file, runs.clone(), effects),
         };
         // clone: an Arc's count, held until the first is answered
         if destination.is_none() { self.firsts.push((Arc::clone(made), tag)); }
@@ -9514,7 +9614,7 @@ impl<S: Steps> Jobs<S> {
                     self.place(w, id, path, key, executable);
                 }
             }
-            Own::LookBase { job: id, path, key, executable } => {
+            Own::LookBase { job: id, path, key, executable, destination } => {
                 // The path's record is of the patch's base (checked as the look was
                 // asked): the file is that one where it is as it was placed.
                 let over = matches!(
@@ -9526,7 +9626,7 @@ impl<S: Steps> Jobs<S> {
                 if let Some(made) = made
                     && self.owned(id)
                 {
-                    self.place_made_as(w, id, path, key, executable, &made, over);
+                    self.place_made_as(w, id, path, key, executable, &made, over, Some(destination));
                 }
             }
             Own::Write { job: id, path } => {

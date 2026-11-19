@@ -231,8 +231,8 @@ fn aside(from: &Path, to: &Path) -> io::Result<()> {
         };
         match delete(&entry.path()) {
             Ok(()) => {}
-            // It still runs.
-            Err(error) if error.raw_os_error() == Some(5) => taken.push(left),
+            // It still runs (os error 5) or another opener holds it without delete sharing (32).
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => taken.push(left),
             Err(error) => return Err(error),
         }
     }
@@ -245,7 +245,7 @@ fn aside(from: &Path, to: &Path) -> io::Result<()> {
         return Err(error);
     }
     match delete(&old) {
-        Err(error) if error.raw_os_error() != Some(5) => Err(error),
+        Err(error) if !matches!(error.raw_os_error(), Some(5 | 32)) => Err(error),
         _ => Ok(()),
     }
 }
