@@ -618,28 +618,21 @@ pub(crate) fn rule_of(
     for &(_, at, rule) in same {
         let file =
             *file.get_or_insert_with(|| db.storage().ingredient_file(read.ingredient_index()));
-        if ends_with_path(file, at) {
+        if blaze_query::db::file_ends_with(file, at) {
             return Some(rule);
         }
     }
     None
 }
 
-/// Match the rule's source components against `file!()`, independently of the build host's
-/// separators. Never accept a same-named ingredient from a different file.
-fn ends_with_path(file: &str, at: &str) -> bool {
-    let mut actual = file.rsplit(['/', '\\']);
-    at.rsplit('/').all(|part| actual.next() == Some(part))
-}
-
 #[test]
 fn ingredient_files_match_whole_components_with_either_separator() {
     let at = "hir-def/src/expr_store/body.rs";
-    assert!(ends_with_path(at, at));
-    assert!(ends_with_path(r"C:\work\crates\hir-def\src\expr_store\body.rs", at));
-    assert!(ends_with_path(r"crates/hir-def\src/expr_store\body.rs", at));
-    assert!(!ends_with_path(r"crates\not-hir-def\src\expr_store\body.rs", at));
-    assert!(!ends_with_path(r"hir-def\src\other\body.rs", at));
+    assert!(blaze_query::db::file_ends_with(at, at));
+    assert!(blaze_query::db::file_ends_with(r"C:\work\crates\hir-def\src\expr_store\body.rs", at));
+    assert!(blaze_query::db::file_ends_with(r"crates/hir-def\src/expr_store\body.rs", at));
+    assert!(!blaze_query::db::file_ends_with(r"crates\not-hir-def\src\expr_store\body.rs", at));
+    assert!(!blaze_query::db::file_ends_with(r"hir-def\src\other\body.rs", at));
 }
 
 fn apply(

@@ -1955,7 +1955,7 @@ pub fn name_read(
     let name = storage.read_name(read, kind);
     let file = storage.ingredient_file(read.ingredient_index());
     let key = read.key_index();
-    let in_file = |tail: &str| file.ends_with(tail);
+    let in_file = |tail: &str| blaze_query::db::file_ends_with(file, tail);
     if in_file("nameres/delta/publish.rs") {
         return delta::name_read(db, name, kind, key);
     }

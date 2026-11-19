@@ -614,6 +614,12 @@ impl Storage {
         ingredient::vtable(ingredient).map_or("<unregistered>", |it| it.file)
     }
 
+    /// Whether `ingredient` is defined in a source file whose `file!()` path ends in the
+    /// `/`-separated path components `tail`, matching whole components on every host separator.
+    pub fn ingredient_in_file(&self, ingredient: u32, tail: &str) -> bool {
+        file_ends_with(self.ingredient_file(ingredient), tail)
+    }
+
     /// The IDs an interned row's fields name, pushed onto `out`; nothing for another row.
     pub fn ids_of(&self, id: Id, out: &mut Vec<Id>) {
         let Some(owner) = self.owner(id) else { return };
@@ -1512,6 +1518,14 @@ impl Drop for Storage {
             }
         }
     }
+}
+
+/// Whether a `file!()` path `file` ends in the `/`-separated path components `tail`,
+/// independently of the build host's path separator (`/` or `\`). Matches whole path
+/// components so `not-hir-def/src/nameres.rs` does not match `hir-def/src/nameres.rs`.
+pub fn file_ends_with(file: &str, tail: &str) -> bool {
+    let mut actual = file.rsplit(['/', '\\']);
+    tail.rsplit('/').all(|part| actual.next() == Some(part))
 }
 
 impl fmt::Debug for Storage {
