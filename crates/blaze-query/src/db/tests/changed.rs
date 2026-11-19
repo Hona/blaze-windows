@@ -603,6 +603,61 @@ fn a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk() {
     }
 }
 
+/// A wide level of 100 leaves and one hub, all readers of input 0: the hub (a `Mod3` of the
+/// input, which the write leaves at 1) has 50 readers of its own. Returns the walk's work and
+/// how many rows it named, the hub's and its readers' among them.
+fn a_wide_level_with_a_hub(plant: Plant) -> (crate::db::ChangedSetWork, usize, usize) {
+    const LEAVES: usize = 100;
+    const READERS: usize = 50;
+    let hub = LEAVES;
+    let mut flow: Vec<FlowNode> = (0..LEAVES).map(|_| sum(&[Dep::Input(0)])).collect();
+    flow.push(FlowNode { op: FlowOp::Mod3, deps: vec![Dep::Input(0)] });
+    flow.extend((0..READERS).map(|_| sum(&[Dep::Query(hub)])));
+    let rows = flow.len();
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..rows {
+        fetch::<Flow>(&db, node(&db, at));
+    }
+    let since = db.storage().view();
+    // 1 to 4: every leaf changes, the hub stays 1.
+    cells[0].set_a(&mut db, 4);
+    let changed = changed_since::<Flow>(&db, since);
+    let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
+    let hub_side: BTreeSet<u32> = (hub..rows).map(|at| node(&db, at).0.as_u32()).collect();
+    let named_hub_side = keys.iter().filter(|it| hub_side.contains(&it.0.as_u32())).count();
+    // Every answer is still the model's.
+    for at in 0..rows {
+        let want = if at < LEAVES { 4 } else { 1 };
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), want, "row {at}");
+    }
+    (db.storage().changed_set_work(), keys.len(), named_hub_side)
+}
+
+/// The invariant: a wide level verifies its hubs, the rows with [`super::super::frontier`]'s
+/// hub count of readers or more, and marks the rest. A body edit's second level is the
+/// file's outline beside a row a body; the outline's cutoff is what keeps the crate's
+/// signatures, def map and bodies out of the edit. Here the hub backdates: its 50 readers
+/// are not reached, and only the 100 leaves are named.
+#[test]
+fn a_wide_level_verifies_its_hub_and_stops_at_its_cutoff() {
+    let (work, named, hub_side) = a_wide_level_with_a_hub(Plant::None);
+    assert_eq!((work.hubs, work.marked), (1, 100), "{work:?}");
+    assert_eq!((named, hub_side), (100, 0), "the hub and its readers are not named: {work:?}");
+}
+
+/// The control of [`a_wide_level_verifies_its_hub_and_stops_at_its_cutoff`] (rule
+/// test-the-cause): with the hub marked like any row of its level, its cone is named too.
+#[test]
+fn the_oracle_catches_a_wide_level_that_marks_its_hub() {
+    let (work, named, hub_side) = a_wide_level_with_a_hub(Plant::MarksHubs);
+    assert_eq!(work.hubs, 0, "{work:?}");
+    assert_eq!((named, hub_side), (151, 51), "the hub and its 50 readers are named: {work:?}");
+}
+
 /// The control of [`a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk`]: a level
 /// under the bound is verified by the walk itself, so its rows do run in it, and the oracle
 /// tells a walk that marks from one that verifies.

@@ -154,6 +154,25 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
 /// too, which may be unchanged (a name too many costs its host one ask).
 const WIDE: usize = 64;
 
+/// The readers a row of a wide level has at least for the walk to verify it, not mark it: a
+/// hub. Marking a row names it and puts its readers in the next level unverified; a hub's
+/// readers are a wide level of their own, and their cone is what the hub's cutoff would have
+/// stopped.
+///
+/// Why. A body edit's second level is the file's outline beside one syntax row a body of the
+/// file. With 64 bodies or more the level is wide; marked, the outline (which a body edit
+/// leaves equal, its cuts position-free) marked every signature of the file, the item tree,
+/// the def map and every body of the crate: one leaf edit of opencode-desktop named all 9,035
+/// of its held bodies to the check's plan (2026-11-14, R28). Verified, the outline backdates
+/// and only the file's own body rows are marked.
+const HUB: u64 = 16;
+
+/// The hubs one walk verifies in wide levels ([`HUB`]): past it every row is marked, as
+/// before. Bounded (rule 18): a change the whole program reads has many hubs, each a
+/// verification on the walker's thread, and past this many the walk costs its reverse edges
+/// alone again.
+const HUBS_MOST: u64 = 64;
+
 /// The most rows a walk's reach holds ([`reach`]): past it the reach is let go, and rows are
 /// proved as without it. A set of this many rows is 2 MiB and a few milliseconds.
 const REACH_MOST: usize = 1 << 18;
@@ -239,6 +258,9 @@ pub struct ChangedSetWork {
     /// reached past it, or past the walk's most unwinds ([`UNWOUND_MOST`]). 0 for an edit
     /// whose every level is narrow and whose rows verify.
     pub marked: u64,
+    /// Rows of a wide level verified, not marked, because they have [`HUB`] readers or more:
+    /// at most [`HUBS_MOST`].
+    pub hubs: u64,
     /// Readers passed over because they are behind a seal ([`super::seal`]): a walk does not
     /// enter a sealed group.
     pub sealed_passed: u64,
@@ -357,6 +379,9 @@ pub(crate) enum Plant {
     /// ([`changed_keys_since`]'s second half taken out): a witnessed run that read only a
     /// field is not named when the field is written.
     ForgetsWrittenFields,
+    /// A wide level marks its hubs too ([`HUB`] taken out), as it did until 2026-11-19: a
+    /// hub that would have backdated names everything its cone reaches.
+    MarksHubs,
 }
 
 /// The storage's part of the changed set.
@@ -479,6 +504,14 @@ impl Storage {
     #[doc(hidden)]
     pub fn plant_forgotten_readers_of_written(&mut self) {
         self.frontier.plant = Plant::ForgetsReadersOfWritten;
+    }
+
+    /// Plants [`Plant::MarksHubs`] in this storage's changed set: for the control of a host's
+    /// test that a wide level's hub is verified (hir's body check of a large file), which
+    /// cannot name the engine's own plants. Never called outside a test.
+    #[doc(hidden)]
+    pub fn plant_marked_hubs(&mut self) {
+        self.frontier.plant = Plant::MarksHubs;
     }
 
     /// Whether [`Plant::EqualSetsWrite`] is planted: an input's setter asks before it
@@ -1356,6 +1389,29 @@ fn walk(db: *const (), storage: &Storage) {
                 if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
                     continue;
                 }
+                // A hub is verified, as a narrow level's row is, within the walk's bound
+                // ([`HUB`]): its cutoff stops the wide level its readers would be.
+                if plant != Plant::MarksHubs
+                    && work.hubs < HUBS_MOST
+                    && work.unwound < unwound_most
+                    && (Indexes { storage }).readers(node, |_| {}) >= HUB
+                {
+                    work.hubs += 1;
+                    let seen = verify(db, storage, node, plant);
+                    if seen == Seen1::Unsure || seen == Seen1::Unwound {
+                        changed.push((node, ASSUMED));
+                        found.push(node);
+                    }
+                    if seen == Seen1::Unwound {
+                        work.unwound += 1;
+                        if let Some((header, _, _)) = row_of(storage, node)
+                            && apart_now.insert(node)
+                        {
+                            unwound.push((node, header.verified.load(Ordering::Acquire))); // alloc: as above
+                        }
+                    }
+                    continue;
+                }
                 changed.push((node, ASSUMED));
                 found.push(node);
                 if apart_now.insert(node) {
@@ -1452,6 +1508,7 @@ fn walk(db: *const (), storage: &Storage) {
         changed = work.changed,
         unwound = work.unwound,
         marked = work.marked,
+        hubs = work.hubs,
         reach = work.reach,
         reach_edges = work.reach_edges,
         sealed_passed = work.sealed_passed,

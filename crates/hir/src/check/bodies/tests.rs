@@ -828,6 +828,11 @@ fn the_oracle_catches_a_reverse_edge_dropped() {
 /// outside `hot.rs` calls `base::hot::edited`: it reads that function's signature, never its
 /// body. `hot.rs` is the same at every size: what an edit of it costs is its own.
 fn workspace(functions: usize) -> Files {
+    workspace_with(functions, HOT)
+}
+
+/// [`workspace`] with `hot` as `hot.rs`.
+fn workspace_with(functions: usize, hot: &str) -> Files {
     let third = functions / 3;
     let many = |name: &str, count: usize, path: &str| {
         let mut text = String::new();
@@ -844,7 +849,7 @@ fn workspace(functions: usize) -> Files {
         ("/mid.rs crate:mid deps:base", "pub mod more;\n".to_owned()),
         ("/more.rs", many("mid", third.max(1), "base::hot::")),
         ("/base.rs crate:base", "pub mod hot;\npub mod cold;\n".to_owned()),
-        ("/hot.rs", HOT.to_owned()),
+        ("/hot.rs", hot.to_owned()),
         ("/cold.rs", many("base", third, "super::hot::")),
     ]
 }
@@ -878,7 +883,27 @@ struct EditCost {
 }
 
 fn cost_of_a_body_edit(functions: usize) -> EditCost {
-    let mut files = workspace(functions);
+    let (cost, on_caller) = cost_of_an_edit_of(functions, HOT, HOT_EDITED, false);
+    // The edit's own chain ran on the thread that asked for it: its file parsed again, its
+    // body checked again, with no job handed to the pool.
+    assert!(
+        on_caller,
+        "among {functions} functions a check of the edit's chain left its caller's thread"
+    );
+    cost
+}
+
+/// What the edit of `hot.rs` from `before` to `after` cost each stage, in a workspace of
+/// `functions` functions ([`workspace_with`]), and whether every check that ran, ran on the
+/// caller's thread; with `marks_hubs` the engine's walk marks a wide level's hubs as it did
+/// until 2026-11-19 (the control's plant).
+fn cost_of_an_edit_of(
+    functions: usize,
+    before: &str,
+    after: &str,
+    marks_hubs: bool,
+) -> (EditCost, bool) {
+    let mut files = workspace_with(functions, before);
     let fixture = fixture::db(&render(&files));
     let hot = fixture.file_at("/hot.rs").file_id(fixture.db());
     let mut db = fixture.into_db();
@@ -887,10 +912,13 @@ fn cost_of_a_body_edit(functions: usize) -> EditCost {
     let cold = take_checked(&db).len();
     assert!(cold > functions, "the first build checks every body: {cold} of {functions}");
     take_checked_on(&db);
+    if marks_hubs {
+        blaze_query::db::Database::storage_mut(&mut db).plant_marked_hubs();
+    }
 
     // The save: the file is written, and the engine pushes the change to what read it.
-    set(&mut files, "/hot.rs", HOT_EDITED);
-    db.set_file_text(hot, HOT_EDITED);
+    set(&mut files, "/hot.rs", after);
+    db.set_file_text(hot, after);
     let me = std::thread::current().id();
     let walk = blaze_query::db::attach(&db, || blaze_query::db::plumbing::walk_changed_set(&db));
     // The build: each crate's plan, from the check kept of it.
@@ -927,14 +955,8 @@ fn cost_of_a_body_edit(functions: usize) -> EditCost {
     // Byte for byte what a build from scratch of the edited workspace says.
     assert_eq!(kept, from_scratch(&files), "among {functions} functions");
     cost.checks_run = take_checked(&db).len();
-    // The edit's own chain ran on the thread that asked for it: its file parsed again, its
-    // body checked again, with no job handed to the pool.
     let on = take_checked_on(&db);
-    assert!(
-        on.iter().all(|thread| *thread == me),
-        "among {functions} functions a check of the edit's chain left its caller's thread"
-    );
-    cost
+    (cost, on.iter().all(|thread| *thread == me))
 }
 
 /// The invariant: a warm edit of one function's body costs every stage a constant that does
@@ -985,6 +1007,65 @@ fn the_oracle_catches_an_edit_that_reaches_every_caller() {
     let (small, large) = (visited(60), visited(600));
     assert!(small.1 >= 60 && large.1 >= 600, "every caller is checked again: {small:?}, {large:?}");
     assert!(large.0 > small.0 + 500, "the walk verifies every caller: {small:?}, {large:?}");
+}
+
+/// The functions beside `edited` and `beside` in a large `hot.rs`: past the 64 rows of a wide
+/// level of the engine's walk, as a real crate's leaf file is (opencode-desktop's
+/// `deep_links.rs`).
+const SIDES: usize = 100;
+
+/// A `hot.rs` of `SIDES + 2` functions, `edited`'s body the one of [`HOT_EDITED`] when
+/// `edited`: every other body and every signature the same.
+fn large_hot(edited: bool) -> String {
+    let mut text = String::from(match edited {
+        false => "pub fn edited() -> u32 { 1 }\n",
+        true => "pub fn edited() -> u32 {\n    let two = 2;\n    two\n}\n",
+    });
+    text.push_str("pub fn beside() -> u32 { edited() }\n");
+    for at in 0..SIDES {
+        text.push_str(&format!("pub fn side{at}() -> u32 {{ beside() }}\n"));
+    }
+    text
+}
+
+/// The invariant: a body edit in a file of more bodies than a wide level of the engine's walk
+/// costs that file, never the workspace. The walk meets the file's outline beside a syntax
+/// row a body: a wide level. It verifies the outline (a hub, which the edit leaves equal) and
+/// marks the rest, so what is named is the file's own bodies, the same among 200 functions and
+/// 2,000, and of them only the edited body's check runs again. Until 2026-11-19 the outline
+/// was marked too, and its cone (every signature, the def map, every body of the crate) was
+/// named: one leaf edit of opencode-desktop named all 9,035 of its held bodies (R28).
+#[test]
+fn a_body_edit_in_a_large_file_names_that_file_and_never_the_workspace() {
+    let (before, after) = (large_hot(false), large_hot(true));
+    let (small, _) = cost_of_an_edit_of(200, &before, &after, false);
+    let (large, _) = cost_of_an_edit_of(2_000, &before, &after, false);
+    assert_eq!(large.whole, 0, "every plan is from its kept check: {large:?}");
+    assert_eq!(
+        (small.named_bodies, small.visited_bodies, small.checks_run),
+        (large.named_bodies, large.visited_bodies, large.checks_run),
+        "the edit names, visits and runs the same among 200 functions and 2,000: {small:?} {large:?}"
+    );
+    let file = SIDES as u32 + 2;
+    assert!(large.named_bodies <= file, "at most the edited file's bodies: {large:?}");
+    assert!(large.visited_bodies <= file, "at most the edited file's bodies: {large:?}");
+    assert!((1..=2).contains(&large.checks_run), "the edited body's check ran, at most one more: {large:?}");
+}
+
+/// The control of [`a_body_edit_in_a_large_file_names_that_file_and_never_the_workspace`]
+/// (rule test-the-cause): with the walk's hubs marked like any row of their level, the same
+/// edit names bodies the workspace has, more among 2,000 functions than among 200. The
+/// answers stay a build from scratch's ([`cost_of_an_edit_of`] holds them to it): only the
+/// cost moves.
+#[test]
+fn the_oracle_catches_a_walk_that_marks_the_outline() {
+    let (before, after) = (large_hot(false), large_hot(true));
+    let (small, _) = cost_of_an_edit_of(200, &before, &after, true);
+    let (large, _) = cost_of_an_edit_of(2_000, &before, &after, true);
+    assert!(
+        large.named_bodies > small.named_bodies + 500,
+        "marked, the outline's cone names the workspace's bodies: {small:?} {large:?}"
+    );
 }
 
 /// A check kept of a crate whose changed set the engine cannot name is an error naming the
