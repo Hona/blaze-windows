@@ -39,7 +39,7 @@ use smallvec::SmallVec;
 use super::coff::ImportName;
 use super::{
     DEBUG, EDATA, GRANULE, IDATA, OBJ_PDATA, PAGE, PDATA, Pe, RELOC, RSRC, START_HOOK, Segment,
-    TLS_DIR, TLS_INDEX, error, place,
+    TLS_DIR, TLS_INDEX, error, own_pages_of, place_of,
 };
 use crate::cow::CowBytes;
 use crate::model::{
@@ -998,7 +998,7 @@ fn debug(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     out.put_u32(pe::IMAGE_DEBUG_TYPE_CODEVIEW.0);
     out.put_u32(size);
     out.put_u32(at);
-    // A region's file offset is its RVA.
+    // Placeholder; `image::file` overlays the actual file offset for compact PE images.
     out.put_u32(at);
     out.put_bytes(b"RSDS");
     out.put_bytes(&placed.id);
@@ -1865,8 +1865,12 @@ pub(super) struct Out {
     pub(super) name: [u8; 8],
     pub(super) start: u64,
     pub(super) end: u64,
-    /// The end of its bytes in the file: zeroed regions at its end are not.
+    /// The end of its used bytes in the file: zeroed regions and unused growth room are not.
     pub(super) file_end: u64,
+    /// Where its raw data starts in the file (0 when `raw_size == 0`).
+    pub(super) raw_offset: u64,
+    /// Its raw data's byte length in the file (0, or a multiple of [`PAGE`]).
+    pub(super) raw_size: u64,
     pub(super) prot: Prot,
     pub(super) discardable: bool,
     /// A dev run's reservation: no access, no raw data, a section of its own.
@@ -1875,11 +1879,7 @@ pub(super) struct Out {
 
 impl Out {
     fn raw(&self) -> u64 {
-        if self.file_end > self.start {
-            (self.file_end - self.start).next_multiple_of(PAGE)
-        } else {
-            0
-        }
+        self.raw_size
     }
 
     fn characteristics(&self) -> pe::SectionFlags {
@@ -1903,20 +1903,37 @@ impl Out {
     }
 }
 
+/// Whether `class` has bytes in the output PE file. Native objects' `.pdata` is only read in
+/// memory to synthesize the sorted exception directory (`PDATA`), so outside a dev run it takes
+/// no file bytes.
+pub(super) fn in_file(class: &Class, dev_run: bool) -> bool {
+    !zeroed(class) && (dev_run || !matches!(class, Class::Named { name, .. } if name == OBJ_PDATA))
+}
+
 fn default_prot(segment: Segment) -> Prot {
     match segment {
-        Segment::Text => Prot::RX,
-        Segment::Data | Segment::Tls => Prot::RW,
+        Segment::Text | Segment::Patch => Prot::RX,
+        Segment::Data | Segment::Tls | Segment::PatchData => Prot::RW,
         Segment::Rdata | Segment::Pdata | Segment::Rsrc | Segment::Reloc => Prot::R,
         Segment::Reserve(_) => Prot::NONE,
     }
 }
 
-fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
-    let name = match class {
-        Class::Named { name, .. } if prot != default_prot(segment) || super::own_section(class) => {
+fn section_name(class: &Class, segment: Segment, prot: Prot, own: bool) -> [u8; 8] {
+    let name: &[u8] = match class {
+        Class::Named { name, .. }
+            if prot != default_prot(segment) || super::own_section(class) || own =>
+        {
             name.as_bytes()
         }
+        Class::Got if own => b".iat",
+        Class::Synthetic(IDATA) if own => b".idata",
+        Class::Synthetic(EDATA) if own => b".edata",
+        Class::Synthetic(DEBUG) if own => b".bdebug",
+        Class::Synthetic(TLS_DIR) if own => b".btls",
+        Class::Synthetic(super::delay::DELAY) if own => b".didat",
+        Class::Synthetic(super::delay::DELAY_CODE) if own => b".dcode",
+        Class::Synthetic(super::delay::DELAY_DATA) if own => b".ddata",
         _ => segment.name(),
     };
     let mut out = [0; 8];
@@ -1926,14 +1943,50 @@ fn section_name(class: &Class, segment: Segment, prot: Prot) -> [u8; 8] {
     out
 }
 
+/// The file offset of `region` in the laid-out `sections` (`None` when the region has no bytes
+/// in the file).
+fn region_offset(sections: &[Out], region: &Region, dev_run: bool) -> Option<u64> {
+    if !in_file(&region.class, dev_run) {
+        return None;
+    }
+    if !dev_run && region.size == 0 {
+        return None;
+    }
+    let at = sections.partition_point(|it| it.start <= region.addr).checked_sub(1)?;
+    let section = &sections[at];
+    if region.addr >= section.end || section.raw_size == 0 {
+        return None;
+    }
+    Some(section.raw_offset + (region.addr - section.start))
+}
+
+/// Where `region` lies in the file ([`crate::model::Writer::offset`]).
+pub(super) fn offset(pe: &Pe, placed: &Placed<'_>, region: &Region) -> Option<u64> {
+    if pe.dev_run() {
+        return (!zeroed(&region.class)).then(|| region.addr - placed.plan.base);
+    }
+    if !in_file(&region.class, false) || region.size == 0 {
+        return None;
+    }
+    let sections = sections(placed).ok()?;
+    region_offset(&sections, region, false)
+}
+
 /// The image's sections: a new one at each page-aligned change of section or protection. A
 /// section whose regions the core placed right after another's of the same protection (no
-/// page boundary between them, as when `.tls` is absent and `.reloc` follows `.pdata`)
-/// joins it: the loader maps both alike, and the data directories find the tables in it.
-pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
-    let mut sections: Vec<Out> = Vec::with_capacity(8);
-    // The segment of the last section's first region, and whether that section is a named
-    // class's own ([`super::own_section`]), which nothing joins.
+/// page boundary between them, as when `.tls` is absent and `.reloc` follows `.pdata` in a
+/// non-incremental link) joins it: the loader maps both alike, and the data directories find
+/// the tables in it.
+///
+/// Outside a dev run, each section's raw size covers only its used file bytes rounded up to
+/// [`PAGE`] and raw offsets are packed contiguously from `SizeOfHeaders`, while `VirtualSize`
+/// carries the full virtual extent (including growth room, which the loader zero-fills).
+pub(super) fn sections(placed: &Placed<'_>) -> Result<SmallVec<[Out; 32]>, LinkError> {
+    let incremental = placed.output.incremental;
+    let dev_run = placed.output.dev_run.is_some();
+    let mut sections: SmallVec<[Out; 32]> = SmallVec::new();
+    // The segment of the last section's first region, and whether that section has pages of
+    // its own, which nothing joins.
     let mut last_segment = None;
     let mut last_own = false;
     for region in placed.regions {
@@ -1954,10 +2007,15 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         if end == region.addr {
             continue;
         }
-        let segment = place(&region.class).0;
-        let in_file = !zeroed(&region.class);
+        let segment = place_of(&region.class, incremental, dev_run).0;
+        let has_file_bytes = in_file(&region.class, dev_run);
+        let used_end = if has_file_bytes && (dev_run || region.size > 0) {
+            if dev_run { end } else { region.addr + region.size }
+        } else {
+            region.addr
+        };
         let aligned = region.addr.is_multiple_of(PAGE);
-        let own = super::own_section(&region.class);
+        let own = own_pages_of(&region.class, incremental, dev_run);
         let extend = match sections.last() {
             Some(last) if region.addr < last.end => {
                 return Err(error(format_args!(
@@ -1972,8 +2030,8 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         };
         if let Some(last) = sections.last_mut().filter(|_| extend) {
             last.end = end;
-            if in_file {
-                last.file_end = end;
+            if used_end > region.addr {
+                last.file_end = last.file_end.max(used_end);
             }
             continue;
         }
@@ -1986,10 +2044,12 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         last_segment = Some(segment);
         last_own = own;
         sections.push(Out {
-            name: section_name(&region.class, segment, region.prot),
+            name: section_name(&region.class, segment, region.prot, own),
             start: region.addr,
             end,
-            file_end: if in_file { end } else { region.addr },
+            file_end: used_end,
+            raw_offset: 0,
+            raw_size: 0,
             prot: region.prot,
             discardable: segment == Segment::Reloc,
             reserve: reserved(&region.class),
@@ -2005,8 +2065,31 @@ pub(super) fn sections(placed: &Placed<'_>) -> Result<Vec<Out>, LinkError> {
         }
         Some(_) => {}
     }
-    if placed.output.dev_run.is_some() {
+    if dev_run {
         dev_run_sections(placed.plan.base, &mut sections)?;
+        for section in &mut sections {
+            section.raw_size = if section.file_end > section.start {
+                (section.file_end - section.start).next_multiple_of(PAGE)
+            } else {
+                0
+            };
+            section.raw_offset = if section.raw_size > 0 { section.start - placed.plan.base } else { 0 };
+        }
+    } else {
+        let mut cursor = placed.plan.headers;
+        for section in &mut sections {
+            section.raw_size = if section.file_end > section.start {
+                (section.file_end - section.start).next_multiple_of(PAGE)
+            } else {
+                0
+            };
+            if section.raw_size > 0 {
+                section.raw_offset = cursor;
+                cursor += section.raw_size;
+            } else {
+                section.raw_offset = 0;
+            }
+        }
     }
     Ok(sections)
 }
@@ -2076,14 +2159,15 @@ fn dev_run_sections(base: u64, sections: &mut [Out]) -> Result<(), LinkError> {
         };
         if section.prot.exec {
             section.file_end = section.end;
-            if section.end - section.start > section.raw() {
+            let raw = (section.file_end - section.start).next_multiple_of(PAGE);
+            if section.end - section.start > raw {
                 return Err(error(format_args!(
                     "the code section {} at RVA {:#x} is {:#x} bytes with {:#x} of raw data: a dev run's code is all \
                      in the file",
                     name_of(section),
                     section.start - base,
                     section.end - section.start,
-                    section.raw()
+                    raw
                 )));
             }
         }
@@ -2190,7 +2274,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     out.put_u32(base_of_code);
     out.put_u64(base);
     out.put_u32(PAGE as u32);
-    // A region's file offset is its RVA, so the file is aligned as memory is.
+    // File alignment matches 4 KiB VM pages, NTFS clusters and Merkle digest blocks (`digest::BLOCK`).
     out.put_u32(PAGE as u32);
     let (image_major, image_minor) = args.image_version.unwrap_or((0, 0));
     let (system_major, system_minor) = args.subsystem_version.unwrap_or((WINDOWS_VERSION, 0));
@@ -2238,21 +2322,36 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     let mut len = size_of_headers;
     for section in &sections {
         let start = rva(placed, section.start, "a section")?;
-        let raw = section.raw();
+        let raw = section.raw_size;
+        let raw_at = if raw > 0 {
+            size(section.raw_offset, "a section's file offset")?
+        } else {
+            0
+        };
         out.put_bytes(&section.name);
         out.put_u32(size(section.end - section.start, "a section")?);
         out.put_u32(start);
         out.put_u32(size(raw, "a section")?);
-        out.put_u32(if raw > 0 { start } else { 0 });
+        out.put_u32(raw_at);
         out.put_u32(0);
         out.put_u32(0);
         out.put_u16(0);
         out.put_u16(0);
         out.put_u32(section.characteristics().0);
         if raw > 0 {
-            len = len.max(u64::from(start) + raw);
+            len = len.max(section.raw_offset + raw);
         }
     }
-    // alloc: once per link: the one part `File` holds, the headers, and its `Arc`
-    Ok(File { len, parts: vec![(0, CowBytes::from_vec(out.0))], debug: Vec::new() })
+    // alloc: once per link: the headers part (and, for a compact file, the 4-byte file offset
+    // of the CodeView record inside `IMAGE_DEBUG_DIRECTORY`).
+    let mut parts = vec![(0, CowBytes::from_vec(out.0))];
+    if !pe.dev_run()
+        && let Some((_, region)) = placed.region(&Class::Synthetic(DEBUG))
+        && region.size >= DEBUG_DIRECTORY
+        && let Some(at) = region_offset(&sections, region, false)
+    {
+        let raw_data = size(at + DEBUG_DIRECTORY, "the CodeView entry's file offset")?;
+        parts.push((at + 24, CowBytes::from_vec(raw_data.to_le_bytes().to_vec())));
+    }
+    Ok(File { len, parts, debug: Vec::new() })
 }

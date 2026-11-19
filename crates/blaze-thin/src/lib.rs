@@ -30,7 +30,7 @@
 //! lines ([`say`]), the color rule and the request ([`request`]), where a build is served
 //! ([`host`]), the reader of the kept pin
 //! lookup and `--version`'s sentences ([`pin`]), and the handover's layout ([`handover`]).
-//! It reads files in [`pin`] and, on Unix, [`solo`]: the client's own check of a build or a
+//! It reads files in [`pin`] and [`solo`]: the client's own check of a build or a
 //! run with nothing changed over the request slot the daemon wrote, which answers it with no
 //! daemon asked (/tmp/plan/10-no-daemon-run.md), and [`kept`]: such an answer's spans,
 //! written as a file the next daemon takes into its profile (the record and the take are
@@ -42,13 +42,13 @@
 pub mod answer;
 pub mod handover;
 pub mod host;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod kept;
 pub mod pin;
 pub mod request;
 pub mod route;
 pub mod say;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod solo;
 pub mod talk;
 

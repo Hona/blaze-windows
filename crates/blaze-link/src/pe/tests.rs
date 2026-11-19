@@ -120,13 +120,16 @@ impl Fixture {
         let mut contents = Vec::new();
         let mut addr = plan.base + plan.headers;
         let mut last = None;
+        let mut own_last = false;
         for class in classes {
             let data = &all.iter().find(|it| it.0 == class).unwrap().1;
             let prot = pe.prot(&class);
-            if last != Some(prot) {
+            let own = pe.own_pages(&class);
+            if last != Some(prot) || own || own_last {
                 addr = addr.next_multiple_of(plan.page);
                 last = Some(prot);
             }
+            own_last = own;
             addr = addr.next_multiple_of(16);
             let size = data.len();
             contents.push(match data.bytes(&[]).unwrap() {
@@ -229,14 +232,14 @@ impl Fixture {
         self.placed(|placed| {
             let file = self.pe.file(placed)?;
             let mut out = vec![0; file.len as usize];
-            for (at, bytes) in &file.parts {
-                bytes.copy_to(0, &mut out[*at as usize..][..bytes.len()]);
-            }
             for (index, region) in placed.regions.iter().enumerate() {
                 if let Some(offset) = self.pe.offset(placed, region) {
                     let bytes = placed.bytes(index);
                     out[offset as usize..][..bytes.len()].copy_from_slice(bytes);
                 }
+            }
+            for (at, bytes) in &file.parts {
+                bytes.copy_to(0, &mut out[*at as usize..][..bytes.len()]);
             }
             Ok(out)
         })
@@ -257,6 +260,29 @@ fn section_names(file: &PeFile64<'_>) -> Vec<String> {
 
 fn directory(file: &PeFile64<'_>, index: usize) -> (u32, u32) {
     file.data_directory(index).map_or((0, 0), |it| (it.virtual_address.get(LE), it.size.get(LE)))
+}
+
+/// The `len` bytes the loader maps at `rva` (from the section's raw data, zero-filled past
+/// `SizeOfRawData` within `VirtualSize`).
+fn rva_bytes(file: &PeFile64<'_>, image: &[u8], rva: u32, len: usize) -> Vec<u8> {
+    let section = file
+        .section_table()
+        .iter()
+        .find(|it| {
+            let va = it.virtual_address.get(LE);
+            let span = it.virtual_size.get(LE).max(it.size_of_raw_data.get(LE));
+            rva >= va && (rva - va) as usize + len <= span as usize
+        })
+        .unwrap_or_else(|| panic!("RVA {rva:#x}+{len:#x} is in no section"));
+    let within = (rva - section.virtual_address.get(LE)) as usize;
+    let raw_size = section.size_of_raw_data.get(LE) as usize;
+    let raw_at = section.pointer_to_raw_data.get(LE) as usize;
+    let mut out = vec![0u8; len];
+    if raw_size > 0 && within < raw_size {
+        let take = (raw_size - within).min(len);
+        out[..take].copy_from_slice(&image[raw_at + within..raw_at + within + take]);
+    }
+    out
 }
 
 /// An executable importing from two DLLs (one import by ordinal), with data, zeroed data,
@@ -351,17 +377,21 @@ fn executable_headers_and_sections() {
     assert_eq!(&image[0x40..0x4e], b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21");
 
     assert_eq!(section_names(&file), [".text", ".rdata", ".data", ".pdata", ".tls", ".reloc"]);
+    let mut cursor = optional.size_of_headers();
     for section in file.section_table().iter() {
         let va = section.virtual_address.get(LE);
+        let raw = section.size_of_raw_data.get(LE);
+        let at = section.pointer_to_raw_data.get(LE);
         assert_eq!(va % 0x1000, 0);
-        if section.size_of_raw_data.get(LE) > 0 {
-            assert_eq!(
-                section.pointer_to_raw_data.get(LE),
-                va,
-                "a section's file offset is its RVA"
-            );
+        assert_eq!(raw % 0x1000, 0);
+        if raw > 0 {
+            assert_eq!(at, cursor, "sections are packed contiguously on disk");
+            cursor += raw;
+        } else {
+            assert_eq!(at, 0);
         }
     }
+    assert_eq!(image.len() as u32, cursor);
     let flags: Vec<u32> =
         file.section_table().iter().map(|it| it.characteristics.get(LE).0).collect();
     assert_ne!(flags[0] & pe::IMAGE_SCN_MEM_EXECUTE.0, 0);
@@ -446,7 +476,7 @@ fn pdata_merges_functions_and_native_entries_sorted() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let (at, size) = directory(&file, pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     assert_eq!(at, f.rva(f.at(&Class::Synthetic(PDATA))));
-    let bytes = &image[at as usize..][..size as usize];
+    let bytes = rva_bytes(&file, &image, at, size as usize);
     let entries: Vec<(u32, u32, u32)> =
         bytes.chunks_exact(12).map(|it| (u32_at(it, 0), u32_at(it, 4), u32_at(it, 8))).collect();
     let text = f.rva(f.at(&Class::Text));
@@ -474,6 +504,9 @@ fn debug_directory_has_rsds() {
         directory(&file, pe::IMAGE_DIRECTORY_ENTRY_DEBUG),
         (f.rva(f.at(&Class::Synthetic(DEBUG))), 28)
     );
+    let debug_dir = rva_bytes(&file, &image, f.rva(f.at(&Class::Synthetic(DEBUG))), 28);
+    let raw_ptr = u32_at(&debug_dir, 24) as usize;
+    assert_eq!(&image[raw_ptr..raw_ptr + 4], b"RSDS", "PointerToRawData reaches the CodeView record");
 }
 
 #[test]
@@ -483,15 +516,15 @@ fn own_tls_directory_when_the_crt_has_none() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let dir = f.at(&Class::Synthetic(TLS_DIR));
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(dir), 40));
-    let bytes = &image[f.rva(dir) as usize..][..48];
+    let bytes = rva_bytes(&file, &image, f.rva(dir), 48);
     let tdata = f.at(&Class::Tdata);
-    assert_eq!(u64_at(bytes, 0), tdata);
-    assert_eq!(u64_at(bytes, 8), tdata + 8);
-    assert_eq!(u64_at(bytes, 16), f.at(&Class::Synthetic(TLS_INDEX)));
-    assert_eq!(u64_at(bytes, 24), dir + 40);
-    assert_eq!(u32_at(bytes, 32), 0);
-    assert_eq!(u32_at(bytes, 36), pe::IMAGE_SCN_ALIGN_8BYTES.0);
-    assert_eq!(u64_at(bytes, 40), 0, "the callback list is empty");
+    assert_eq!(u64_at(&bytes, 0), tdata);
+    assert_eq!(u64_at(&bytes, 8), tdata + 8);
+    assert_eq!(u64_at(&bytes, 16), f.at(&Class::Synthetic(TLS_INDEX)));
+    assert_eq!(u64_at(&bytes, 24), dir + 40);
+    assert_eq!(u32_at(&bytes, 32), 0);
+    assert_eq!(u32_at(&bytes, 36), pe::IMAGE_SCN_ALIGN_8BYTES.0);
+    assert_eq!(u64_at(&bytes, 40), 0, "the callback list is empty");
 }
 
 #[test]
@@ -624,8 +657,8 @@ fn crt_tls_directory_is_used_when_defined() {
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(rodata), 40));
-    let ours = f.rva(f.at(&Class::Synthetic(TLS_DIR))) as usize;
-    assert!(image[ours..ours + 48].iter().all(|it| *it == 0));
+    let ours = rva_bytes(&file, &image, f.rva(f.at(&Class::Synthetic(TLS_DIR))), 48);
+    assert!(ours.iter().all(|it| *it == 0));
 
     f.set(&Class::Rodata, crt(tdata + 8, tdata + 16));
     f.fails("_tls_used");
@@ -818,8 +851,8 @@ fn classes_in_link_exe_order() {
             Class::Named { name: ".CRT".into(), write: false, exec: false },
             Class::Data,
             Class::Bss,
-            pdata_class(),
             Class::Synthetic(PDATA),
+            pdata_class(),
             Class::Tdata,
             Class::Synthetic(RELOC),
         ]

@@ -367,7 +367,8 @@ mod native {
         timings.span(talk::ENGINE_FOUND, shown_ns, engine_ns);
         // Nothing changed since the daemon's last answer to this request: its slot says so,
         // and the client answers with no daemon asked (`solo`); anything else is the daemon's.
-        #[cfg(unix)]
+        // On Windows too since B22: until then every warm no-op there waited for the daemon's
+        // reply (60 of a 97 ms `check`, `lanes\perf.md`), which the slot makes unnecessary.
         {
         let solo_ns = kernel::mono_ns();
         let solo = blaze_thin::solo::solo(&spoken, &homes.state, &engine.path, || started.elapsed());
@@ -462,7 +463,6 @@ mod native {
     /// Where an answer the client's own check gave keeps the command's spans as it ends: a
     /// file in the daemon's state directory, which the next daemon takes into its profile
     /// ([`blaze_thin::kept`]).
-    #[cfg(unix)]
     struct Kept {
         state: PathBuf,
         timings: Timings,
@@ -473,7 +473,6 @@ mod native {
         command: String,
     }
 
-    #[cfg(unix)]
     impl Kept {
         /// The command's rows written as its kept file, its spans ended `ended_ns`. A write
         /// that fails is said and the command goes on, as [`Told::send`]'s.
@@ -499,7 +498,6 @@ mod native {
     /// next one when the client's own check answered.
     enum Rows {
         Told(Told),
-        #[cfg(unix)]
         Kept(Kept),
     }
 
@@ -507,7 +505,6 @@ mod native {
         fn timings(&mut self) -> &mut Timings {
             match self {
                 Rows::Told(told) => &mut told.timings,
-                #[cfg(unix)]
                 Rows::Kept(kept) => &mut kept.timings,
             }
         }
@@ -515,7 +512,6 @@ mod native {
         fn send(self, ended_ns: i64) {
             match self {
                 Rows::Told(told) => told.send(ended_ns),
-                #[cfg(unix)]
                 Rows::Kept(kept) => kept.keep(ended_ns),
             }
         }

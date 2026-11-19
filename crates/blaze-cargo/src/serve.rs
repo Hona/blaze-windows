@@ -1492,6 +1492,9 @@ fn begin(
     // Where a stop checkpoints the kept link images, which the next daemon's first links
     // restore and patch in place.
     unit::keep_link_checkpoints(state()?.join("link-images"), producer).map_err(anyhow::Error::msg)?;
+    // The MSVC tools and SDK this daemon finds are kept for the next one, which then starts
+    // no `vswhere` for its first link or build script while what was read stands.
+    blaze_core::platform::msvc::keep_across(state()?.join("msvc-found.txt")).map_err(anyhow::Error::msg)?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
     let root = builds()?

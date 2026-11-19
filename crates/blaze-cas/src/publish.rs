@@ -508,16 +508,19 @@ impl Writing {
                         Some(step_span(&self.to, "read ahead what its last file held in memory", 0));
                     effects.push(Effect::Prewarm { like, file, tag: ask(Step::Warm) });
                 }
-                // The file of holes: made at its length, so what no run writes reads as zeros
-                // and takes no block. A clone or a copy is cut to the length the same way.
+                // The file of holes: made new at its length ([`Effect::SparseFile`]: the cleared
+                // temporary is gone), so what no run writes reads as zeros and takes no block;
+                // the driver makes it so on its system (NTFS marks it sparse first). A clone or
+                // a copy is cut to the length. The effect is the same on every host: until
+                // 2026-11-19 it was chosen by `cfg!(windows)` here, so the same simulation asked
+                // other effects on Windows than on Linux and macOS.
                 // clone: the effect owns the name; once per place
                 let file = self.temp.clone();
                 self.span = step_span(&self.to, "cut it to its length", 0);
                 let tag = ask(Step::Cut);
-                effects.push(if self.base != Base::Holes || !cfg!(windows) {
-                    Effect::Truncate { file, len: self.len, tag }
-                } else {
-                    Effect::SparseFile { file, len: self.len, tag }
+                effects.push(match self.base {
+                    Base::Holes => Effect::SparseFile { file, len: self.len, tag },
+                    _ => Effect::Truncate { file, len: self.len, tag },
                 });
                 Next::Going
             }

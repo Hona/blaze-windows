@@ -115,11 +115,23 @@ fn directories(bytes: &[u8]) -> Vec<(u32, u32)> {
 /// loader's security cookie, the guard's fields), whose directory size is the size its first
 /// field states, and the exception directory.
 fn has_crt_directories(bytes: &[u8]) {
+    use object::LittleEndian as LE;
+    let file = object::read::pe::PeFile64::parse(bytes).unwrap();
     let dirs = directories(bytes);
     let (config, exceptions) =
         (dirs[object::pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG], dirs[object::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION]);
     assert!(config.0 != 0 && config.1 >= 0x94, "the load configuration: {config:x?}");
-    let stated = u32::from_le_bytes(bytes[config.0 as usize..][..4].try_into().unwrap());
+    let section = file
+        .section_table()
+        .iter()
+        .find(|it| {
+            let va = it.virtual_address.get(LE);
+            let raw = it.size_of_raw_data.get(LE);
+            config.0 >= va && config.0 + 4 <= va + raw
+        })
+        .expect("the load configuration lies in a file-backed section");
+    let offset = (section.pointer_to_raw_data.get(LE) + (config.0 - section.virtual_address.get(LE))) as usize;
+    let stated = u32::from_le_bytes(bytes[offset..][..4].try_into().unwrap());
     assert_eq!(stated, config.1, "the load configuration's own size");
     assert!(exceptions.1 > 0 && exceptions.1 % 12 == 0, "the exception directory: {exceptions:x?}");
 }
@@ -140,16 +152,168 @@ fn a_c_console_program_with_the_dynamic_crt_runs() {
     assert_eq!((code, printed.as_str()), (42, "hello from x, 2 args\npid set\nrelocated yes\n"));
 }
 
-/// An editable small native image has room for edits, not two 64 MiB reservations on disk.
+/// An editable small native image has room for edits in virtual space, not megabytes of slack on disk.
 #[test]
 fn a_small_incremental_executable_stays_small_and_runs() {
+    use object::LittleEndian as LE;
     let mut output = output(None, &["hello_md.obj"]);
     output.incremental = true;
     let bytes = link(output).unwrap();
-    assert!(bytes.len() < 4 << 20, "small C program: {} bytes", bytes.len());
+    has_crt_directories(&bytes);
+    assert!(bytes.len() < 512 << 10, "small C program: {} bytes", bytes.len());
+    let file = object::read::pe::PeFile64::parse(&bytes[..]).unwrap();
+    let patch = file
+        .section_table()
+        .iter()
+        .find(|it| it.name.starts_with(b".bpatch"))
+        .expect("incremental PE has a .bpatch section");
+    assert!(patch.virtual_size.get(LE) >= 64 << 10, "virtual room for edits");
+    assert_eq!(patch.size_of_raw_data.get(LE), 0, "unused patch room costs no disk bytes");
+    assert_eq!(patch.pointer_to_raw_data.get(LE), 0);
     let exe = scratch("small_edit").join("small_edit.exe");
     std::fs::write(&exe, bytes).unwrap();
     assert_eq!(run(&exe, &[]).0, 42);
+}
+
+/// An incremental PE executable edited in place: first link runs (0 raw bytes in `.bpatch`),
+/// edit within slack runs, edit past `.bpatch`'s raw size runs, and edit past virtual size
+/// refuses with `needs_scratch()` and runs after a fresh link.
+#[test]
+fn incremental_pe_edits_within_slack_past_raw_and_relink_run() {
+    use blaze_codegen::Target;
+    use object::LittleEndian as LE;
+    let mut out = output(None, &["pdb.obj"]);
+    out.incremental = true;
+    let crates = [crate::target::CrateLibs { name: "program", libs: &[], search: &[] }];
+    let located = crate::target::locate(&mut out, &crates, &[], Path::new("unused")).unwrap();
+    let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
+        .into_iter()
+        .map(|it| (it.name, it.made.map_or_else(|| std::fs::read(&it.path).unwrap().into(), |it| it.1), it.kind))
+        .collect();
+    let make_natives = || -> Vec<Native<'_>> {
+        read.iter()
+            .enumerate()
+            .map(|(at, (name, bytes, kind))| Native {
+                id: ContentId::of("blaze-link pe run", bytes),
+                name,
+                bytes,
+                kind: *kind,
+                order: at as u32,
+            })
+            .collect()
+    };
+    let make_fn = |id_byte: u8, nops: usize| {
+        // `nops` bytes of `nop`, then `lea rax, [rip - 7]; ret` (what `pdb.obj` calls).
+        let mut code = vec![0x90; nops];
+        code.extend_from_slice(&[0x48, 0x8d, 0x05, 0xf9, 0xff, 0xff, 0xff, 0xc3]);
+        super::function(id_byte, &code, Vec::new())
+    };
+    let f1 = make_fn(1, 0);
+    let mut image = Image::new(name("out/app.exe"), out.clone()).unwrap();
+    let staged = image
+        .stage(Change {
+            added: vec![&f1],
+            names: vec![("blaze_where".into(), Target::Function(f1.key))],
+            debug_names: vec![(f1.key, "blaze::where".into())],
+            natives: make_natives(),
+            ..Change::default()
+        })
+        .unwrap();
+    let p1 = image.patch(staged).unwrap();
+    let mut file = Vec::new();
+    p1.apply(&mut file);
+    has_crt_directories(&file);
+    let dir = scratch("compact_edit");
+    let exe = dir.join("app.exe");
+    std::fs::write(&exe, &file).unwrap();
+    assert_eq!(run(&exe, &[]).0, 0);
+
+    // Edit 1 (allocates first page in `.bpatch`) and Edit 2 (stays within that 4 KiB page).
+    let f2 = make_fn(2, 16);
+    let staged = image
+        .stage(Change {
+            added: vec![&f2],
+            removed: vec![f1.key],
+            slots: vec![(f1.key, f2.key)],
+            ..Change::default()
+        })
+        .unwrap();
+    let p2 = image.patch(staged).unwrap();
+    assert!(!p2.full);
+    p2.apply(&mut file);
+    let len_after_p2 = file.len();
+    std::fs::write(&exe, &file).unwrap();
+    assert_eq!(run(&exe, &[]).0, 0);
+
+    let f3 = make_fn(3, 256);
+    let staged = image
+        .stage(Change {
+            added: vec![&f3],
+            removed: vec![f2.key],
+            slots: vec![(f1.key, f3.key)],
+            ..Change::default()
+        })
+        .unwrap();
+    let p3 = image.patch(staged).unwrap();
+    assert!(!p3.full);
+    assert_eq!(p3.len as usize, len_after_p2, "edit within .bpatch's raw page keeps file length");
+    p3.apply(&mut file);
+    std::fs::write(&exe, &file).unwrap();
+    assert_eq!(run(&exe, &[]).0, 0);
+
+    // Edit 3: grow past `.bpatch`'s 4 KiB raw size (still inside its >= 64 KiB virtual room).
+    let f4 = make_fn(4, 12 * 1024);
+    let staged = image
+        .stage(Change {
+            added: vec![&f4],
+            removed: vec![f3.key],
+            slots: vec![(f1.key, f4.key)],
+            ..Change::default()
+        })
+        .unwrap();
+    let p4 = image.patch(staged).unwrap();
+    assert!(!p4.full);
+    assert!(p4.len as usize > len_after_p2, ".bpatch raw data grew on disk");
+    p4.apply(&mut file);
+    has_crt_directories(&file);
+    std::fs::write(&exe, &file).unwrap();
+    assert_eq!(run(&exe, &[]).0, 0);
+
+    // Edit 4: exceed `.bpatch`'s virtual size -> refused (`needs_scratch`), then full relink runs.
+    let pe_file = object::read::pe::PeFile64::parse(&file[..]).unwrap();
+    let bpatch_vsize = pe_file
+        .section_table()
+        .iter()
+        .find(|it| it.name.starts_with(b".bpatch"))
+        .unwrap()
+        .virtual_size
+        .get(LE) as usize;
+    let f5 = make_fn(5, bpatch_vsize + 4096);
+    let err = image
+        .stage(Change {
+            added: vec![&f5],
+            removed: vec![f4.key],
+            slots: vec![(f1.key, f5.key)],
+            ..Change::default()
+        })
+        .err()
+        .expect("exceeding .bpatch virtual room is refused");
+    assert!(err.no_room().is_some(), "{err}");
+
+    let mut fresh = Image::new(name("out/app.exe"), out).unwrap();
+    let staged = fresh
+        .stage(Change {
+            added: vec![&f5],
+            names: vec![("blaze_where".into(), Target::Function(f5.key))],
+            debug_names: vec![(f5.key, "blaze::where".into())],
+            natives: make_natives(),
+            ..Change::default()
+        })
+        .unwrap();
+    let bytes = fresh.bytes(staged).unwrap();
+    has_crt_directories(&bytes);
+    std::fs::write(&exe, &bytes).unwrap();
+    assert_eq!(run(&exe, &[]).0, 0);
 }
 
 #[test]

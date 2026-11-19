@@ -620,13 +620,27 @@ impl<'a> Stage<'a> {
             ranges.push((offset + end - space.region.addr, 4));
         }
         for (at, space) in self.new.spaces.iter().enumerate() {
-            let Some(offset) = space.offset else { continue };
             let old = self.old.spaces.get(at).filter(|it| it.region.class == space.region.class);
+            if let Some(old) = old
+                && let Some(old_offset) = old.offset
+                && space.offset != Some(old_offset)
+                && old.region.size > 0
+            {
+                let len = old.region.size.min(self.new.file_len.saturating_sub(old_offset));
+                if len > 0 {
+                    ranges.push((old_offset, len));
+                }
+            }
+            let Some(offset) = space.offset else { continue };
             let size = space.region.size;
             match old {
                 Some(old) if old.offset == Some(offset) => {
                     if old.region.size > size {
-                        ranges.push((offset + size, old.region.size - size));
+                        let start = offset + size;
+                        let len = (old.region.size - size).min(self.new.file_len.saturating_sub(start));
+                        if len > 0 {
+                            ranges.push((start, len));
+                        }
                     }
                     if matches!(space.region.class, Class::Synthetic(_)) {
                         let ranges = &mut ranges;
@@ -635,7 +649,11 @@ impl<'a> Stage<'a> {
                         });
                     }
                 }
-                _ => ranges.push((offset, size.max(old.map_or(0, |it| it.region.size)))),
+                _ => {
+                    if size > 0 {
+                        ranges.push((offset, size));
+                    }
+                }
             }
         }
         if !std::sync::Arc::ptr_eq(&self.old.encoded, &self.new.encoded) {
@@ -643,7 +661,9 @@ impl<'a> Stage<'a> {
         }
         let mut old_parts = collect_in(file_parts(self.old), self.arena);
         radix::sort_copy_by_key(&mut old_parts, |it| it.0);
-        for (offset, part) in file_parts(&self.new) {
+        let mut new_parts = collect_in(file_parts(&self.new), self.arena);
+        radix::sort_copy_by_key(&mut new_parts, |it| it.0);
+        for &(offset, part) in &new_parts {
             match (
                 old_parts.binary_search_by_key(&offset, |it| it.0).map(|at| old_parts[at].1),
                 part,
@@ -653,13 +673,34 @@ impl<'a> Stage<'a> {
                     new.changed_blocks(old, BLOCK, scratch, |at, len| {
                         narrowed_cow(offset, at, len, old, new, ranges)
                     });
+                    if old.len() > new.len() {
+                        let start = offset + new.len() as u64;
+                        let len = (old.len() - new.len()) as u64;
+                        ranges.push((start, len));
+                    }
                 }
                 (Ok(Part::Debug(old)), Part::Debug(new)) if same_bytes(old, new) => {}
                 (Ok(Part::Debug(old)), Part::Debug(new)) => {
-                    changed_blocks(offset, old, new, &mut ranges)
+                    changed_blocks(offset, old, new, &mut ranges);
+                    if old.len() > new.len() {
+                        let start = offset + new.len() as u64;
+                        let len = (old.len() - new.len()) as u64;
+                        ranges.push((start, len));
+                    }
                 }
                 _ => ranges.push((offset, part.len() as u64)),
             }
+        }
+        for &(offset, old_part) in &old_parts {
+            if new_parts.binary_search_by_key(&offset, |it| it.0).is_err() {
+                let len = (old_part.len() as u64).min(self.new.file_len.saturating_sub(offset));
+                if len > 0 {
+                    ranges.push((offset, len));
+                }
+            }
+        }
+        for (at, len) in &mut ranges {
+            *len = (*len).min(self.new.file_len.saturating_sub(*at));
         }
         fill(&Layout::of(&self.new), &merge(ranges, PATCH_GAP))
     }

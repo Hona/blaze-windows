@@ -3,23 +3,22 @@
 //! `/OPT:REF`, `/DEBUG` without the PDB).
 //!
 //! Sections in link.exe's order, each starting on a page: `.text` (code, the jump table's
-//! stubs, the import thunks), `.rdata` (read-only data, the import directory, the export
-//! directory, the debug directory, the TLS directory, `.CRT$X*`), `.data` (data, the jump
-//! table, the import address table, `.bss` last), `.pdata`, `.tls`, `.rsrc` and `.reloc`. A
-//! region's file offset is its RVA, so a region never moves in the file while its address
-//! stays.
-//!
-//! No PDB is written: the debug directory's CodeView entry names one by the image's GUID,
-//! and that PDB is the one thing a Windows debugger looks for that blaze does not make, so
-//! debuggers and `std`'s backtraces (dbghelp) show addresses, not names or lines.
+//! stubs, the import thunks), `.rdata` (read-only data, the import address table, the import
+//! directory, the export directory, the debug directory, the TLS directory, `.CRT$X*`), `.data`
+//! (data, the jump table, `.bss` last), `.pdata`, `.tls`, `.rsrc` and `.reloc`. Outside a dev
+//! run, each section's raw data is sized to what is used and packed from `SizeOfHeaders` at
+//! `FileAlignment` (4 KiB), while `VirtualSize` carries the growth room (the loader zero-fills
+//! past `SizeOfRawData`); in an incremental image, growing tables get their own sections and
+//! `.pdata`, `.reloc`, `.bdatap` (patch data) and `.bpatch` (patch code) sit at the tail so
+//! edits grow in place or append without shifting the base code and read-only data.
 //!
 //! A dev run ([`crate::DevRun`]) lays the image out on 64 KiB granules, the unit a view of the
 //! code memory maps at: the headers take the first granule, the code sections are one run from
-//! the second, every change of protection after them starts a granule, and the reservations
-//! (`.barena`, `.bcells`, `.bfixed`: no access, no raw data) come last. Each section's
-//! `VirtualSize` reaches the next section, as the NT loader wants them adjacent. The start hook
-//! is the first TLS callback (`.CRT$XLAB`, after the CRT's `__xl_a`), the TLS directory is
-//! always there, no base relocation lands in code and there is no CFG.
+//! the second, every change of protection after them starts a granule, raw offsets equal RVAs,
+//! and the reservations (`.barena`, `.bcells`, `.bfixed`: no access, no raw data) come last.
+//! Each section's `VirtualSize` reaches the next section, as the NT loader wants them adjacent.
+//! The start hook is the first TLS callback (`.CRT$XLAB`, after the CRT's `__xl_a`), the TLS
+//! directory is always there, no base relocation lands in code and there is no CFG.
 
 mod coff;
 pub(crate) mod delay;
@@ -40,7 +39,7 @@ use blaze_core::lock::Lock;
 
 use crate::model::{
     Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special,
-    Writer, zeroed,
+    Writer,
 };
 use crate::reset::{self, Reset};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
@@ -171,23 +170,45 @@ pub(crate) enum Segment {
     Tls,
     Rsrc,
     Reloc,
+    /// Incremental data and code patch regions, placed at the tail of a non-dev-run
+    /// editable image so unused growth room costs no file bytes and edits append at the end.
+    PatchData,
+    Patch,
     /// A dev run's reservations, one section each, in [`Reserve`]'s order.
     Reserve(Reserve),
 }
 
 impl Segment {
-    /// The section's place in address order: the declaration order, each reservation in
-    /// [`Reserve`]'s order.
-    const fn order(self) -> u8 {
-        match self {
-            Segment::Text => 0,
-            Segment::Rdata => 1,
-            Segment::Data => 2,
-            Segment::Pdata => 3,
-            Segment::Tls => 4,
-            Segment::Rsrc => 5,
-            Segment::Reloc => 6,
-            Segment::Reserve(reserve) => 7 + reserve as u8,
+    /// The section's place in address order: in an incremental non-dev-run image, `.tls` and
+    /// `.rsrc` precede the edit-growing tail (`.pdata`, `.reloc`, `.bdatap`, `.bpatch`);
+    /// otherwise link.exe's classic order. Reservations are always last.
+    const fn order(self, incremental: bool, dev_run: bool) -> u8 {
+        if incremental && !dev_run {
+            match self {
+                Segment::Text => 0,
+                Segment::Rdata => 1,
+                Segment::Data => 2,
+                Segment::Tls => 3,
+                Segment::Rsrc => 4,
+                Segment::Pdata => 5,
+                Segment::Reloc => 6,
+                Segment::PatchData => 7,
+                Segment::Patch => 8,
+                Segment::Reserve(reserve) => 9 + reserve as u8,
+            }
+        } else {
+            match self {
+                Segment::Text => 0,
+                Segment::Rdata => 1,
+                Segment::Data => 2,
+                Segment::Pdata => 3,
+                Segment::Tls => 4,
+                Segment::Rsrc => 5,
+                Segment::Reloc => 6,
+                Segment::PatchData => 7,
+                Segment::Patch => 8,
+                Segment::Reserve(reserve) => 9 + reserve as u8,
+            }
         }
     }
 
@@ -200,6 +221,8 @@ impl Segment {
             Segment::Tls => b".tls",
             Segment::Rsrc => b".rsrc",
             Segment::Reloc => b".reloc",
+            Segment::PatchData => b".bdatap",
+            Segment::Patch => b".bpatch",
             Segment::Reserve(Reserve::Arena) => b".barena",
             Segment::Reserve(Reserve::Cells) => b".bcells",
             Segment::Reserve(Reserve::Fixed) => b".bfixed",
@@ -208,51 +231,64 @@ impl Segment {
 }
 
 /// Where a class goes: its section, its place in it, and a name ordering the named ones.
-pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
+/// In an incremental non-dev-run image, fixed regions come first in `.text`/`.rdata`/`.data`
+/// and the patch regions sit at the tail (`.bdatap`, `.bpatch`) so slack is never trapped
+/// before fixed bytes in a section.
+pub(crate) fn place_of(class: &Class, incremental: bool, dev_run: bool) -> (Segment, u8, &str) {
+    let compact = incremental && !dev_run;
     match class {
         Class::Text => (Segment::Text, 0, ""),
-        Class::Patch => (Segment::Text, 1, ""),
-        Class::Stubs => (Segment::Text, 2, ""),
-        Class::Plt => (Segment::Text, 3, ""),
-        Class::Synthetic(delay::DELAY_CODE) => (Segment::Text, 4, ""),
-        Class::Named { name, exec: true, .. } => (Segment::Text, 5, name),
-        // The import address table, first in `.rdata` as link.exe lays it: once it has bound
-        // the cells, the loader makes the pages the IAT directory spans read-only, whatever
-        // section they are in, so nothing written may share them (seen on Windows 11 26100:
-        // the static CRT's first write to `.data` after an IAT there faulted).
-        Class::Got => (Segment::Rdata, 0, ""),
-        Class::Rodata => (Segment::Rdata, 1, ""),
+        Class::Patch if dev_run => (Segment::Text, 1, ""),
+        Class::Patch => (Segment::Patch, 0, ""),
+        Class::Stubs => (Segment::Text, if dev_run { 2 } else { 1 }, ""),
+        Class::Plt => (Segment::Text, if dev_run { 3 } else { 2 }, ""),
+        Class::Synthetic(delay::DELAY_CODE) => (Segment::Text, if dev_run { 4 } else { 3 }, ""),
+        Class::Named { name, exec: true, .. } => (Segment::Text, if dev_run { 5 } else { 4 }, name),
+        // The import address table is read-only (`.rdata`, or `.iat` when incremental): once
+        // the loader has bound the cells, it makes the pages the IAT directory spans read-only,
+        // so nothing written may share them (seen on Windows 11 26100).
+        Class::Got => (Segment::Rdata, if compact { 2 } else { 0 }, ""),
+        Class::Rodata => (Segment::Rdata, if compact { 0 } else { 1 }, ""),
         // The loader applies base relocations to read-only pages too: link.exe's `.rdata`
         // holds vtables.
-        Class::RelRo => (Segment::Rdata, 2, ""),
+        Class::RelRo => (Segment::Rdata, if compact { 1 } else { 2 }, ""),
         Class::EhFrame => (Segment::Rdata, 3, ""),
         Class::Synthetic(IDATA) => (Segment::Rdata, 4, ""),
         Class::Synthetic(EDATA) => (Segment::Rdata, 5, ""),
         Class::Synthetic(DEBUG) => (Segment::Rdata, 6, ""),
         Class::Synthetic(TLS_DIR) => (Segment::Rdata, 7, ""),
-        Class::Named { name, .. } if name == OBJ_PDATA => (Segment::Pdata, 0, name),
+        Class::Synthetic(delay::DELAY) => (Segment::Rdata, 8, ""),
+        Class::Named { name, .. } if name == OBJ_PDATA => {
+            (Segment::Pdata, if dev_run { 0 } else { 1 }, name)
+        }
         Class::Named { name, .. } if name == RSRC => (Segment::Rsrc, 0, name),
-        Class::Named { name, write: false, .. } => (Segment::Rdata, 8, name),
+        Class::Named { name, write: false, .. } => (Segment::Rdata, 9, name),
         Class::Data => (Segment::Data, 0, ""),
         Class::Table => (Segment::Data, 1, ""),
-        Class::Synthetic(delay::DELAY_DATA) => (Segment::Data, 2, ""),
-        Class::PatchData => (Segment::Data, 3, ""),
-        Class::InitArray => (Segment::Data, 4, ""),
+        Class::Synthetic(delay::DELAY_DATA) => (Segment::Data, if compact { 7 } else { 2 }, ""),
+        Class::PatchData if dev_run => (Segment::Data, 3, ""),
+        Class::PatchData => (Segment::PatchData, 0, ""),
+        Class::InitArray => (Segment::Data, if compact { 2 } else { 4 }, ""),
         // ELF's alone: `image::sections` refuses one.
-        Class::PreinitArray => (Segment::Data, 4, ""),
-        Class::FiniArray => (Segment::Data, 5, ""),
-        Class::Named { name, .. } => (Segment::Data, 6, name),
-        Class::Synthetic(TLS_INDEX) => (Segment::Data, 7, ""),
+        Class::PreinitArray => (Segment::Data, if compact { 2 } else { 4 }, ""),
+        Class::FiniArray => (Segment::Data, if compact { 3 } else { 5 }, ""),
+        Class::Synthetic(TLS_INDEX) => (Segment::Data, if compact { 4 } else { 7 }, ""),
         // Mach-O's alone (`Plan::tls_descriptors` is false): `image::file` refuses one.
-        Class::ThreadVars => (Segment::Data, 8, ""),
-        Class::Bss => (Segment::Data, 9, ""),
-        Class::Synthetic(PDATA) => (Segment::Pdata, 1, ""),
+        Class::ThreadVars => (Segment::Data, if compact { 5 } else { 8 }, ""),
+        Class::Bss => (Segment::Data, if compact { 6 } else { 9 }, ""),
+        Class::Named { name, .. } => (Segment::Data, if compact { 8 } else { 6 }, name),
+        Class::Synthetic(PDATA) => (Segment::Pdata, if dev_run { 1 } else { 0 }, ""),
         Class::Tdata => (Segment::Tls, 0, ""),
         Class::Tbss => (Segment::Tls, 1, ""),
         Class::Synthetic(RELOC) => (Segment::Reloc, 0, ""),
-        Class::Synthetic(name) => (Segment::Rdata, 9, name),
+        Class::Synthetic(name) => (Segment::Rdata, 10, name),
         Class::Reserve(reserve) => (Segment::Reserve(*reserve), 0, ""),
     }
+}
+
+/// Non-incremental placement, used where a class's default segment and protection are asked.
+pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
+    place_of(class, false, false)
 }
 
 /// The named sections link.exe lays into `.rdata` with the rest of the read-only data: the
@@ -261,15 +297,30 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
 /// itself).
 pub(crate) const MERGED: &[&str] = &[CRT, ".rtc", ".00cfg"];
 
-/// Whether `class` is a section of its own in the image, as link.exe keeps each section name
-/// no `/MERGE` folds into another: every named class but the tables the writer gathers
-/// (`.pdata`, `.rsrc`) and [`MERGED`]'s. Its pages are its own ([`Writer::own_pages`]).
+/// Whether `class` is a section of its own in a non-incremental or dev-run image, as link.exe
+/// keeps each section name no `/MERGE` folds into another: every named class but the tables
+/// the writer gathers (`.pdata`, `.rsrc`) and [`MERGED`]'s.
 pub(crate) fn own_section(class: &Class) -> bool {
     match class {
         Class::Named { name, .. } => {
             let name: &str = name;
             name != OBJ_PDATA && name != RSRC && !MERGED.contains(&name)
         }
+        _ => false,
+    }
+}
+
+/// Whether `class` gets pages (and a PE section) of its own. In an incremental non-dev-run
+/// image, every growing table and patch region gets its own section so its unused growth room
+/// sits at its section's tail (`VirtualSize > SizeOfRawData`) and costs zero bytes on disk.
+pub(crate) fn own_pages_of(class: &Class, incremental: bool, dev_run: bool) -> bool {
+    if !incremental || dev_run {
+        return own_section(class);
+    }
+    match class {
+        Class::Patch | Class::PatchData | Class::Got | Class::Tdata => true,
+        Class::Named { name, .. } => name.as_str() != OBJ_PDATA,
+        Class::Synthetic(name) => *name != TLS_INDEX && *name != PDATA,
         _ => false,
     }
 }
@@ -313,19 +364,22 @@ impl Writer for Pe {
     }
 
     fn order(&self, classes: &mut Vec<Class>) {
+        let (incremental, dev_run) = (self.output.incremental, self.dev_run());
         let rank = |class: &Class| {
-            let (segment, rank, _) = place(class);
-            radix::pack_32(u32::from(segment.order()), u32::from(rank))
+            let (segment, rank, _) = place_of(class, incremental, dev_run);
+            radix::pack_32(u32::from(segment.order(incremental, dev_run)), u32::from(rank))
         };
         radix::sort_by_key(classes, rank);
         for run in classes.chunk_by_mut(|a, b| rank(a) == rank(b)) {
-            run.sort_by(|a, b| place(a).2.cmp(place(b).2));
+            run.sort_by(|a, b| {
+                place_of(a, incremental, dev_run).2.cmp(place_of(b, incremental, dev_run).2)
+            });
         }
         classes.dedup();
     }
 
     fn own_pages(&self, class: &Class) -> bool {
-        own_section(class)
+        own_pages_of(class, self.output.incremental, self.dev_run())
     }
 
     fn searched_roots(&self) -> &'static [&'static str] {
@@ -337,8 +391,8 @@ impl Writer for Pe {
             return Prot { read: true, write: *write, exec: *exec };
         }
         match place(class).0 {
-            Segment::Text => Prot::RX,
-            Segment::Data | Segment::Tls => Prot::RW,
+            Segment::Text | Segment::Patch => Prot::RX,
+            Segment::Data | Segment::Tls | Segment::PatchData => Prot::RW,
             Segment::Rdata | Segment::Pdata | Segment::Rsrc | Segment::Reloc => Prot::R,
             Segment::Reserve(_) => Prot::NONE,
         }
@@ -430,7 +484,7 @@ impl Writer for Pe {
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {
-        if zeroed(&region.class) { None } else { Some(region.addr - placed.plan.base) }
+        image::offset(self, placed, region)
     }
 
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {

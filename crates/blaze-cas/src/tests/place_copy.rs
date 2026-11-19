@@ -207,7 +207,8 @@ fn patch_kept(
             | Effect::WriteUnsynced { file, .. }
             | Effect::WriteFrom { file, .. }
             | Effect::Append { file, .. }
-            | Effect::Truncate { file, .. } => file,
+            | Effect::Truncate { file, .. }
+            | Effect::SparseFile { file, .. } => file,
             _ => continue,
         };
         if file == to {

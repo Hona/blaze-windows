@@ -2393,6 +2393,8 @@ mod eh_frame_reach;
 
 mod tls_desc;
 
+mod pe_layout;
+
 #[cfg(windows)]
 mod pe_run;
 

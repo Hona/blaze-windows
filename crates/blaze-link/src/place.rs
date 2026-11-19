@@ -797,11 +797,16 @@ impl<'a> Stage<'a> {
                 Class::PatchData,
                 Class::Got,
                 Class::Plt,
-                Class::EhFrame,
                 Class::Tdata,
-                Class::Tbss,
             ] {
                 extra.push(self.new.class_id(&class).0);
+            }
+            // PE uses `.pdata`/`.xdata` for unwind info (never `.eh_frame`) and keeps all
+            // thread-locals in `Class::Tdata` (`pe::own`), so empty `EhFrame`/`Tbss` regions
+            // would only reserve unused address space.
+            if self.output.format != Format::Pe {
+                extra.push(self.new.class_id(&Class::EhFrame).0);
+                extra.push(self.new.class_id(&Class::Tbss).0);
             }
             if self.plan.tls_descriptors {
                 extra.push(self.new.class_id(&Class::ThreadVars).0);

@@ -1087,6 +1087,13 @@ pub(crate) trait Ask {
     /// run): the one loader known to be on this machine. `None` where there is none to read:
     /// a statically linked blaze, or a host that is not Linux.
     fn loader(&self) -> Result<Option<String>, LinkError>;
+    /// The machine's MSVC tools and Windows SDK, as the one discovery of them every user of
+    /// the daemon shares finds them ([`blaze_core::platform::msvc::found`]: kept while what it
+    /// read stands, and across daemons); `None` where this asker answers by its commands
+    /// instead (a test's, a host that is not Windows), which [`msvc`] then runs itself.
+    fn developer(&self) -> Option<Result<blaze_core::platform::msvc::Developer, String>> {
+        None
+    }
 }
 
 /// The `PT_INTERP` of the 64-bit little-endian ELF image `file`, read with three positioned
@@ -1131,6 +1138,11 @@ fn interpreter_of(file: &mut std::fs::File) -> std::io::Result<Option<String>> {
 pub(crate) struct System;
 
 impl Ask for System {
+    #[cfg(windows)]
+    fn developer(&self) -> Option<Result<blaze_core::platform::msvc::Developer, String>> {
+        Some(blaze_core::platform::msvc::found())
+    }
+
     fn var(&self, name: &str) -> Result<Option<String>, LinkError> {
         match std::env::var_os(name) {
             None => Ok(None),
@@ -1805,6 +1817,22 @@ fn msvc<A: Ask>(ask: &A, key: &Key) -> Result<Found, LinkError> {
              Developer Command Prompt sets it), and {what}"
         ))
     };
+    // The daemon's one discovery, which build scripts' developer prompts are made of too: the
+    // directories a prompt's `LIB` names, with no `vswhere` or `reg` run while what it read
+    // stands.
+    if let Some(found) = ask.developer() {
+        let developer = found.map_err(missing)?;
+        let lib = developer.kits.join("Lib").join(&developer.sdk);
+        return Ok(Found {
+            // alloc: once per toolchain asked, its directories
+            dirs: vec![
+                developer.vc_tools().join("lib").join("x64"),
+                lib.join("ucrt").join("x64"),
+                lib.join("um").join("x64"),
+            ],
+            ..Found::default()
+        });
+    }
     let Some(programs) = key.var(1) else {
         // alloc: error path
         return Err(missing("ProgramFiles(x86), where vswhere is, is not set".to_owned()));
