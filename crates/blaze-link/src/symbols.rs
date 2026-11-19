@@ -772,6 +772,168 @@ impl Symbols {
     pub fn split_id(id: IdNo) -> (usize, usize) {
         split(id.0)
     }
+
+    /// The symbol of shard `shard`'s entry `at`, as [`Symbols::intern`] gave it.
+    #[inline]
+    pub fn joined(shard: usize, at: usize) -> u32 {
+        join(shard, at as u32)
+    }
+}
+
+impl SymKey {
+    /// The key [`SymKey::words`] are of; `None` for words no key is.
+    fn from_words(w: [u32; 5]) -> Option<SymKey> {
+        use SymKey::*;
+        let id = IdNo;
+        let obj = |native: u32, member: u32| Obj { native: IdNo(native), member };
+        Some(match w[0] {
+            0 => Body(id(w[1])),
+            1 => Slot(id(w[1])),
+            2 => Data(id(w[1])),
+            3 => Static(id(w[1]), id(w[2])),
+            4 => Tlv(id(w[1]), id(w[2])),
+            5 => Name(NameId(w[1])),
+            6 => Local(obj(w[1], w[2]), w[3]),
+            7 => Section(obj(w[1], w[2]), w[3]),
+            8 => Position(id(w[1]), w[2]),
+            9 => FileName(NameId(w[1])),
+            10 => Cie(id(w[1])),
+            11 => Fde(id(w[1])),
+            12 => WinInfo(id(w[1])),
+            13 => Frame(obj(w[1], w[2]), w[3], w[4]),
+            14 => Got(*GotKind::ALL.get(w[1] as usize)?, Sym(w[2])),
+            15 => Plt(Sym(w[1])),
+            16 => IatEnd(NameId(w[1])),
+            17 => Common(NameId(w[1])),
+            18 => Generation,
+            19 => Cells,
+            20 => Stubs,
+            21 => Descriptor,
+            23 => Coverage(id(w[1]), w[2]),
+            24 => CoveragePcs(id(w[1])),
+            25 => StartHook,
+            26 => Counters,
+            27 => LazyStubs,
+            28 => LazyEntry(id(w[1])),
+            29 => StaticList(id(w[1]), id(w[2])),
+            30 => Thunk(Sym(w[1]), w[2], w[3] as i32),
+            _ => return None,
+        })
+    }
+}
+
+impl crate::checkpoint::Wire for NameId {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.put_u32(self.0);
+    }
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        Ok(NameId(r.u32().map_err(String::from)?))
+    }
+}
+
+impl crate::checkpoint::Wire for IdNo {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.put_u32(self.0);
+    }
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        Ok(IdNo(r.u32().map_err(String::from)?))
+    }
+}
+
+impl crate::checkpoint::Wire for Obj {
+    fn put(&self, out: &mut Vec<u8>) {
+        out.put_u32(self.native.0);
+        out.put_u32(self.member);
+    }
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        let native = IdNo(r.u32().map_err(String::from)?);
+        Ok(Obj { native, member: r.u32().map_err(String::from)? })
+    }
+}
+
+/// The tables in interning order, shard by shard: a restore interns each entry again in that
+/// order, which gives each the id it had (an entry's id is its shard, from its hash, and its
+/// place in the shard), and checks that it does. A name's place in its shard's index is keyed
+/// by this process's [`NAME_KEY`], so the index is made again, never read.
+impl crate::checkpoint::Wire for Symbols {
+    fn put(&self, out: &mut Vec<u8>) {
+        for shard in &self.names {
+            out.put_u64(shard.len() as u64);
+            for at in 0..shard.len() {
+                out.put_bytes_u64(shard.get(at).as_bytes());
+            }
+        }
+        for shard in &self.ids {
+            out.put_u64(shard.len() as u64);
+            for at in 0..shard.len() {
+                out.put_bytes(&shard.id(at).0);
+            }
+        }
+        for shard in &self.keys {
+            out.put_u64(shard.len() as u64);
+            for at in 0..shard.len() {
+                for word in shard.key(at).words() {
+                    out.put_u32(word);
+                }
+            }
+        }
+    }
+
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        let mut symbols = Symbols::new().map_err(|it| it.to_string())?;
+        let moved = |what: &str, shard: usize, at: usize, got: u32| {
+            // alloc: error path
+            format!("{what} {at} of shard {shard} interns at {got}: the tables are not of one image")
+        };
+        for shard in 0..SHARDS {
+            let len = crate::checkpoint::count(r, 8)?;
+            for at in 0..len {
+                let name = r.str_u64().map_err(String::from)?;
+                let hash = hash_name(name);
+                if shard_of(hash) != shard {
+                    return Err(moved("name", shard, at, u32::MAX));
+                }
+                let got = symbols.names[shard].get_or_insert(hash, name);
+                if got as usize != at {
+                    return Err(moved("name", shard, at, got));
+                }
+            }
+        }
+        for shard in 0..SHARDS {
+            let len = crate::checkpoint::count(r, 32)?;
+            for at in 0..len {
+                let id = ContentId(*r.array::<32>().map_err(String::from)?);
+                let hash = hash_id(&id);
+                if shard_of(hash) != shard {
+                    return Err(moved("id", shard, at, u32::MAX));
+                }
+                let got = symbols.ids[shard].get_or_insert(hash, &id);
+                if got as usize != at {
+                    return Err(moved("id", shard, at, got));
+                }
+            }
+        }
+        for shard in 0..SHARDS {
+            let len = crate::checkpoint::count(r, 20)?;
+            for at in 0..len {
+                let mut words = [0u32; 5];
+                for word in &mut words {
+                    *word = r.u32().map_err(String::from)?;
+                }
+                // alloc: error path
+                let key = SymKey::from_words(words).ok_or_else(|| format!("a symbol key of words {words:?}"))?;
+                let hash = hash_key(key);
+                if shard_of(hash) != shard {
+                    return Err(moved("key", shard, at, u32::MAX));
+                }
+                let got = symbols.keys[shard].get_or_insert(hash, key);
+                if got as usize != at {
+                    return Err(moved("key", shard, at, got));
+                }
+            }
+        }
+        Ok(symbols)
+    }
 }
 
 crate::keep::kept_enum!(SymKey {

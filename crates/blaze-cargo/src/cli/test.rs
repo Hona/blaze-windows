@@ -180,8 +180,8 @@ impl Programs for Spawned {
     }
 
     /// On Unix through [`super::run::TRAMPOLINE`], which the daemon launches the program as.
-    /// Elsewhere the launch is asked here, which a program the daemon runs on its code memory
-    /// refuses: a child's process ID is known only once it is spawned.
+    /// Elsewhere the launch is asked here and the program spawned as this process's child: the
+    /// daemon matches it to its launch by the start hook's token, not its process ID.
     fn started(&mut self, artifact: &Artifact, exec: &Exec) -> Result<Exec, String> {
         // clone: once per test executable run, its command
         let mut exec = exec.clone();

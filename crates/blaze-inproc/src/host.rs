@@ -445,6 +445,11 @@ impl Pending {
 /// A started run: its process, its slide, and what reads and answers its asks.
 pub struct Session {
     pub pid: u32,
+    /// The [`Program`]'s start this process is, set by the start's own wait: what a caller
+    /// that launched the process without knowing its ID matches it by (on Windows `blaze run`
+    /// asks before it spawns its program, a child of another ID). `None` for a session of a
+    /// launch no program made ([`Host::launch`] alone).
+    pub started: Option<Started>,
     /// What the process adds to a linked address ([`CodeMemory::linked`]).
     pub slide: u64,
     /// The thread that runs `main`.
@@ -619,7 +624,8 @@ impl Program {
             .name("blaze-inproc start".to_owned())
             .spawn(move || {
                 let _alive = alive;
-                let session = pending.wait(START).and_then(|session| {
+                let session = pending.wait(START).and_then(|mut session| {
+                    session.started = Some(started);
                     let mut starts = lock_starts(&starts);
                     match starts.starts.get(&started.0) {
                         Some(Start::Waiting) => {}
@@ -764,7 +770,7 @@ fn handshake(mut channel: Channel, peer: u32, waiting: &Table) {
             let _ = channel.set_timeout(None);
             let slide = hello.header.wrapping_sub(launch.grant.header);
             let run = Arc::new(ask::Run::new(launch.asks, bells, remote, peer));
-            Ok(Session { pid: peer, slide, thread, channel, run })
+            Ok(Session { pid: peer, started: None, slide, thread, channel, run })
         }
         Err(error) => {
             let mut body = Vec::new();

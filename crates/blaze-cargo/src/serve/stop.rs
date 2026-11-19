@@ -24,30 +24,23 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(unix)]
-use std::{io::Read as _, os::fd::AsFd as _, sync::Arc, thread::JoinHandle};
-use std::time::Duration;
+use std::{sync::Arc, thread::JoinHandle, time::Duration};
 
-use blaze_core::exit::Exit;
-#[cfg(unix)]
 use blaze_core::{
+    exit::Exit,
     lock::{
         graph,
         stall::{Stall, WaitRow},
     },
 };
-#[cfg(unix)]
 use blaze_profile::{Watchdog, watchdog::Progress};
-#[cfg(unix)]
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{
     flightrec,
-
-    signals,
+    pulse::{Look, LoopWatch, Pulse, StallWatch},
+    signals::{self, StopWait},
 };
-#[cfg(unix)]
-use super::pulse::{Look, LoopWatch, Pulse, StallWatch};
 
 /// How long a wait in the wait-for graph (a named lock, a signal, a kernel wait) lasts before
 /// the guard looks for the stall behind it. Far under the loop's own bounds (a stuck turn is
@@ -58,7 +51,6 @@ use super::pulse::{Look, LoopWatch, Pulse, StallWatch};
 /// microseconds) and than a fair queue behind one long hold, short enough that a person
 /// watching the build view sees the stall while it is the reason. A daemon run with a stall
 /// bound under 8 s takes a quarter of it instead, to stay under its report.
-#[cfg(unix)]
 const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long the guard waits for the scheduler's lock to read its waits: a deadlock may hold it.
@@ -71,13 +63,11 @@ pub const STALLED: &str = " stop stalled: ";
 pub const STUCK: &str = " loop stuck: ";
 
 /// The guard's thread, waiting for a stop, then watching it ([`arm`]).
-#[cfg(unix)]
 pub struct Guard {
     done: Sender<()>,
     thread: JoinHandle<()>,
 }
 
-#[cfg(unix)]
 impl Guard {
     /// The stop is over: the guard ends, unless the bound ended the process first.
     pub fn disarm(self) {
@@ -92,14 +82,13 @@ impl Guard {
 /// ([`watch_turns`]). Then it waits for SIGTERM or SIGINT, or for the daemon to begin a stop of
 /// its own ([`signals::stop_begun`]), and ends the process once neither the worker pool's jobs,
 /// the queries nor the loop's progress ([`Pulse::moved`]) moved for `bound`.
-#[cfg(unix)]
 pub fn arm(bound: Duration, pulse: Arc<Pulse>) -> anyhow::Result<Guard> {
     use anyhow::Context as _;
-    let pipe = signals::stop_pipe().context("making the pipe the stop's guard waits on")?;
+    let stop = signals::stop_wait().context("making what the stop's guard waits on")?;
     let (done, over) = crossbeam_channel::bounded(1);
     let thread = std::thread::Builder::new()
         .name("blaze-stop-guard".to_owned()) // alloc: once a daemon
-        .spawn(move || guard(pipe, bound, &pulse, &over))
+        .spawn(move || guard(stop, bound, &pulse, &over))
         .context("starting the stop's guard")?;
     Ok(Guard { done, thread })
 }
@@ -109,14 +98,12 @@ fn look_every(bound: Duration) -> Duration {
     (bound / 10).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
-#[cfg(unix)]
 fn now_ns() -> u64 {
     u64::try_from(blaze_profile::clock::mono_ns()).unwrap_or(0)
 }
 
-#[cfg(unix)]
-fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()>) {
-    if !watch_turns(pipe, bound, pulse, over) {
+fn guard(stop: StopWait, bound: Duration, pulse: &Pulse, over: &Receiver<()>) {
+    if !watch_turns(stop, bound, pulse, over) {
         return;
     }
     let mut watchdog = Watchdog::new(bound);
@@ -166,7 +153,6 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
 /// worker was working" of a daemon whose every worker was (2026-11-11). `working_now` is the
 /// workers inside a job's code as the stall is said (`blaze_graph::pool::Pool::working`): not
 /// counted as moving, because a job blocked on a lock is inside its code too.
-#[cfg(unix)]
 fn counted(at: &Progress, working_now: usize) -> String {
     // alloc: once, as the process ends
     format!(
@@ -177,17 +163,16 @@ fn counted(at: &Progress, working_now: usize) -> String {
     )
 }
 
-/// Watches the loop's turns until a stop: SIGTERM or SIGINT, or the daemon's own stop, as a
-/// byte on `pipe`. A turn that lasts half of `bound` is reported once ([`LoopWatch`]); a loop
+/// Watches the loop's turns until a stop: SIGTERM or SIGINT (a console's Ctrl-C, close or
+/// shutdown on Windows), or the daemon's own stop, as `stop` set. A turn that lasts half of `bound` is reported once ([`LoopWatch`]); a loop
 /// that has not turned while the worker pool's jobs and the queries stood still too, for the
 /// whole `bound` (the loop as a task of the task watchdog's core, [`loop_seen`]), is
 /// deadlocked, and the daemon ends ([`Exit::LoopStalled`])
 /// rather than leave its children unreaped and its clients waiting for ever. `true` once a stop
-/// began; `false` once the guard is disarmed ([`Guard::disarm`]) with no stop, or when the pipe
-/// can't be read, so no stop is bounded.
-#[cfg(unix)]
+/// began; `false` once the guard is disarmed ([`Guard::disarm`]) with no stop, or when `stop`
+/// can't be waited on, so no stop is bounded.
 fn watch_turns(
-    mut pipe: std::fs::File,
+    mut stop: StopWait,
     bound: Duration,
     pulse: &Pulse,
     over: &Receiver<()>,
@@ -243,18 +228,9 @@ fn watch_turns(
             awaits = "SIGTERM, SIGINT or the daemon's own stop, or the next look at the loop's turns"
         )
         .entered();
-        match crate::raw::process::readable_within(pipe.as_fd(), every) {
+        match stop.wait(every) {
             Ok(false) => {}
-            Ok(true) => {
-                // Readable: a byte is there (or the write end closed, which it never is), so
-                // the read does not wait.
-                let mut byte = [0u8; 1];
-                match pipe.read(&mut byte) {
-                    Ok(_) => return true,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => return unread(&error),
-                }
-            }
+            Ok(true) => return true,
             Err(error) => return unread(&error),
         }
     }
@@ -264,7 +240,6 @@ fn watch_turns(
 /// turns, the pool's jobs ended and the queries completed, so a turn, a job's end or a query
 /// moves it; no CPU of its own (a loop spinning inside a turn is as stuck as one parked); its
 /// bound the daemon's stall bound in place of its wait's.
-#[cfg(unix)]
 fn loop_seen(progress: &Progress, now_ns: u64, bound: Duration) -> blaze_profile::stuck::TaskSeen {
     use blaze_profile::stuck::{Task, TaskSeen, WaitsOn};
     let span = progress
@@ -290,7 +265,6 @@ fn loop_seen(progress: &Progress, now_ns: u64, bound: Duration) -> blaze_profile
 /// ([`graph::stalls`]), say each stall new since the last look ([`said`]) and put the top
 /// one's line in the pulse for the loop's live models.
 #[derive(Debug)]
-#[cfg(unix)]
 struct Stalls {
     watch: StallWatch,
     /// [`STALL_THRESHOLD`], or a quarter of a shorter stall bound.
@@ -301,7 +275,6 @@ struct Stalls {
     unprobed: bool,
 }
 
-#[cfg(unix)]
 impl Stalls {
     fn new(bound: Duration) -> Stalls {
         let threshold = STALL_THRESHOLD.min(bound / 4);
@@ -349,7 +322,6 @@ impl Stalls {
 }
 
 /// What a guard with no lock probe to time waits by says, once.
-#[cfg(unix)]
 const UNPROBED: &str = "no lock probe is installed (blaze-profile installs it), so the stop's guard \
      times no wait in the wait-for graph and names no deadlock or convoy";
 
@@ -359,7 +331,6 @@ const UNPROBED: &str = "no lock probe is installed (blaze-profile installs it), 
 /// deadlock's threads in its cycle), the `threads` by mark, comma-separated (a deadlock's
 /// cycle in its order; a convoy's head, then its oldest waiter) and `oldest_ns`, how long the
 /// oldest of its waits has waited, on the probe's clock.
-#[cfg(unix)]
 fn said(pid: u32, stall: &Stall, now_ns: u64) {
     use std::fmt::Write as _;
     let age = |row: &WaitRow| now_ns.saturating_sub(row.since_ns);
@@ -393,13 +364,12 @@ fn said(pid: u32, stall: &Stall, now_ns: u64) {
     eprintln!("blaze serve: pid {pid} stall: {line}");
 }
 
-/// Without its pipe the guard hears no stop: said, and the stop runs unbounded.
-#[cfg(unix)]
+/// Without its wait the guard hears no stop: said, and the stop runs unbounded.
 fn unread(error: &std::io::Error) -> bool {
-    tracing::error!(target: "blaze", "the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}");
+    tracing::error!(target: "blaze", "the stop's guard can't wait for a stop, so no stop of this daemon is bounded: {error}");
     // logged: the event above
     eprintln!(
-        "blaze serve: the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}"
+        "blaze serve: the stop's guard can't wait for a stop, so no stop of this daemon is bounded: {error}"
     );
     false
 }
@@ -421,7 +391,6 @@ fn stuck_line(pid: u32, why: &str) -> String {
 
 /// The line a stop that did not end says as it ends the daemon: `why` (how long nothing moved
 /// and where the counts stayed, or a second signal), then [`inside`].
-#[cfg(unix)]
 fn stalled(pid: u32, why: &str) -> String {
     // alloc: once, as the process ends
     format!(
@@ -484,7 +453,122 @@ fn waits(within: Duration) -> String {
     }
 }
 
-// The guard's own tests start it on Unix's signal pipe, which Windows has none of yet.
+// The guard on Windows, its stop asked by Ctrl+Break where Unix sends SIGTERM.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::{
+        os::windows::process::CommandExt as _,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    const CHILD: &str = "BLAZE_TEST_STOP_GUARD_WINDOWS";
+    const NAME: &str = "serve::stop::windows_tests::a_deadlocked_daemon_ends_on_ctrl_break_within_its_bound_naming_what_it_waits_on";
+    /// `CREATE_NEW_PROCESS_GROUP`: the child's id is its group's, which Ctrl+Break is sent to,
+    /// so the test's own process is not sent it.
+    const NEW_GROUP: u32 = 0x0000_0200;
+
+    /// The daemon of the test, in a child process, as Unix's: its guard armed with the bound
+    /// `CHILD` says (in ms), the loop turning with its progress never moving, and a worker
+    /// inside a span it never leaves.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's deadlocked worker, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after its event"
+    )]
+    fn deadlocked(bound_ms: u64) -> ! {
+        blaze_profile::install();
+        signals::catch();
+        let pulse = Arc::new(Pulse::default()); // alloc: once, the test's
+        let guard = arm(Duration::from_millis(bound_ms), Arc::clone(&pulse)).unwrap(); // clone: a handle
+        let entered = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("worker deadlocked".to_owned())
+                .spawn_scoped(scope, || {
+                    let _held = tracing::info_span!(target: "blaze", "hold the test's lock", awaits = "the lock no one lets go").entered();
+                    entered.wait();
+                    loop {
+                        std::thread::park();
+                    }
+                })
+                .unwrap();
+            entered.wait();
+            println!("ready");
+            loop {
+                pulse.turned(0);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        guard.disarm();
+        unreachable!("the deadlocked daemon's threads never end");
+    }
+
+    /// Runs the child with `bound_ms`, sends it `breaks` Ctrl+Breaks, and gives what it said on
+    /// stderr and its exit code, waiting at most `within` from the first.
+    fn broken(bound_ms: u64, breaks: usize, within: Duration) -> (String, Option<i32>, Duration) {
+        use std::io::BufRead as _;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD, bound_ms.to_string())
+            .creation_flags(NEW_GROUP)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(stdx::JodChild)
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("ready") {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0, "the child ended before it was ready");
+        }
+        let sent = Instant::now();
+        for _ in 0..breaks {
+            signals::send_break(child.id()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if sent.elapsed() > within {
+                _ = child.kill();
+                panic!("the deadlocked daemon did not end within {within:?} of Ctrl+Break");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let took = sent.elapsed();
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
+        (said, status.code(), took)
+    }
+
+    /// The invariant of Unix's test on Windows, end to end through the console control
+    /// handler: a daemon whose workers are deadlocked ends once nothing moved for its bound
+    /// after Ctrl+Break, or at a second one at once, saying first which thread is inside what.
+    /// Control: with `signals::catch` a no-op (the stub before B1), Ctrl+Break ends the child
+    /// at once with `STATUS_CONTROL_C_EXIT` and no report.
+    #[test]
+    fn a_deadlocked_daemon_ends_on_ctrl_break_within_its_bound_naming_what_it_waits_on() {
+        if let Some(bound) = std::env::var_os(CHILD) {
+            deadlocked(bound.to_str().unwrap().parse().unwrap());
+        }
+        let (said, code, took) = broken(500, 1, Duration::from_secs(30));
+        assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
+        assert!(took >= Duration::from_millis(500), "it waited for its bound: {took:?}");
+        for named in [STALLED, "nothing moved for", "worker deadlocked", "hold the test's lock"] {
+            assert!(said.contains(named), "it says {named:?}:\n{said}");
+        }
+        let (said, code, took) = broken(600_000, 2, Duration::from_secs(30));
+        assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert!(said.contains("asked to stop again") && said.contains("worker deadlocked"), "{said}");
+    }
+}
+
+// The guard's own tests start it on Unix's signal pipe.
 #[cfg(all(test, unix))]
 mod tests {
     use std::{

@@ -1600,3 +1600,344 @@ mod tests {
         assert!(!new.same_bytes(&old, 2));
     }
 }
+
+mod wire {
+    use std::sync::Arc;
+
+    use blaze_format::cursor::{Put as _, Reader};
+    use blaze_hash::HashMap;
+    use std::alloc::Global;
+
+    use super::*;
+    use crate::checkpoint::{NativeBytes, Wire, put_array, take_array, wire_enum, wire_struct};
+    use crate::model::{Formats, Writer as _};
+
+    impl Wire for ClassId {
+        fn put(&self, out: &mut Vec<u8>) {
+            out.put_u16(self.0);
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(ClassId(r.u16().map_err(String::from)?))
+        }
+    }
+
+    wire_enum!(Def {
+        0 => None,
+        1 => Piece { piece, offset },
+        2 => Import(import),
+        3 => Absolute(value),
+        4 => TlsOffset(offset),
+        5 => TpOff(offset),
+        6 => Alias(sym),
+        7 => Special(at),
+    });
+
+    wire_struct!(Hot { addr, size, sym, region, class, align_log2, flags });
+
+    wire_enum!(What {
+        0 => Function(id),
+        1 => Shared,
+        2 => Static { thread_local },
+        3 => Native { obj, section, unwind },
+        4 => NativeFrame { obj, section, fde },
+        5 => Common,
+        6 => Got { kind, target },
+        7 => Plt { target },
+        8 => Thunk { target, island },
+        9 => Fde,
+        10 => WinInfo,
+        11 => Tlv,
+        12 => Fixed,
+        13 => Cells,
+    });
+
+    wire_struct!(Sort { rank, order });
+    wire_struct!(Lists { fixups, weak, defines, wasm });
+    wire_struct!(Loader { rebase, binds });
+    wire_struct!(FunctionInfo { key, id, fde, windows, lines, made });
+    wire_struct!(SymCold { refs, room, slot, seen });
+    wire_struct!(IdCold { debug_name, spans });
+    wire_struct!(RustName { target, weak });
+    wire_struct!(Space { region, bytes, zero, offset });
+
+    impl Wire for Pairs {
+        fn put(&self, out: &mut Vec<u8>) {
+            let Pairs { given, placed, of } = self;
+            given.put(out);
+            placed.put(out);
+            put_array(of, out);
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(Pairs { given: Wire::take(r)?, placed: Wire::take(r)?, of: take_array(r)? })
+        }
+    }
+
+    impl State {
+        /// The state as [`crate::Image::checkpoint`] records it: every column but what a
+        /// restore makes again (each native input's file, read from its bytes; the writer's
+        /// specials, by the names they define; what the last stage told the debug side file).
+        /// An error naming what no checkpoint holds.
+        pub(crate) fn put_checkpoint(&self, symbols: &Symbols, out: &mut Vec<u8>) -> Result<(), String> {
+            let State {
+                generation,
+                specials,
+                spaces,
+                names,
+                wasm_imports,
+                inputs,
+                resolved,
+                slots,
+                slot_syms,
+                capacity,
+                pairs,
+                tls,
+                tls_at,
+                file_len,
+                parts,
+                debug,
+                exports,
+                synthesis: _,
+                encoded,
+                lists,
+                lineage,
+                given,
+                debug_delta: _,
+                laid_out,
+                islands,
+                makes,
+                hot,
+                what,
+                sort,
+                piece_lists,
+                loader,
+                users,
+                fixups,
+                syms,
+                wasm_names,
+                wasm_declarers,
+                rebase,
+                binds,
+                defs,
+                cold,
+                ref_items,
+                seen,
+                classes,
+                functions,
+                lines,
+                ids,
+                cells,
+                slot_next,
+                removals,
+                texts,
+            } = self;
+            if !wasm_imports.is_empty() {
+                return Err("wasm imports, which no checkpoint holds".into());
+            }
+            if !texts.is_empty() {
+                return Err("composed texts (`State::texts`), which no checkpoint holds".into());
+            }
+            if !Arc::ptr_eq(resolved.inputs_of(), inputs)
+                && !(resolved.inputs_of().is_empty() && inputs.is_empty())
+            {
+                return Err("a resolution of other native inputs than the state's: no stage left one so".into());
+            }
+            generation.put(out);
+            // The native inputs, by content: the caller hands their bytes back.
+            out.put_u64(inputs.len() as u64);
+            for it in inputs.iter() {
+                let Input { id, name, kind, order, bytes, file: _ } = it;
+                id.put(out);
+                name.put(out);
+                kind.put(out);
+                order.put(out);
+                out.put_u64(bytes.len() as u64);
+            }
+            // Each special with the symbol that is defined as it: a placed one is its writer's
+            // function, given again by the symbol's name.
+            let mut by_special: Vec<Option<Sym>> = vec![Option::None; specials.len()];
+            for (shard, column) in defs.iter().enumerate() {
+                for (at, def) in column.iter().enumerate() {
+                    if let Def::Special(index) = def
+                        && let Some(slot) = by_special.get_mut(*index as usize)
+                    {
+                        *slot = Some(Sym(Symbols::joined(shard, at)));
+                    }
+                }
+            }
+            out.put_u64(specials.len() as u64);
+            for (special, sym) in specials.iter().zip(&by_special) {
+                sym.put(out);
+                special.put(out);
+                if matches!(special, Special::Placed(_)) {
+                    let name = sym
+                        .and_then(|it| symbols.name_of(it))
+                        .ok_or("a placed special no named symbol is defined as")?;
+                    out.put_bytes_u64(name.as_bytes());
+                }
+            }
+            spaces.put(out);
+            names.put(out);
+            resolved.put_checkpoint(inputs, names, out)?;
+            slots.put(out);
+            slot_syms.put(out);
+            capacity.put(out);
+            pairs.put(out);
+            tls.put(out);
+            tls_at.put(out);
+            file_len.put(out);
+            parts.put(out);
+            debug.put(out);
+            exports.put(out);
+            encoded.put(out);
+            lists.put(out);
+            lineage.put(out);
+            given.put(out);
+            laid_out.put(out);
+            islands.put(out);
+            makes.put(out);
+            hot.put(out);
+            what.put(out);
+            sort.put(out);
+            piece_lists.put(out);
+            loader.put(out);
+            users.put(out);
+            fixups.put(out);
+            syms.put(out);
+            wasm_names.put(out);
+            put_array(wasm_declarers, out);
+            rebase.put(out);
+            binds.put(out);
+            put_array(defs, out);
+            put_array(cold, out);
+            ref_items.put(out);
+            seen.put(out);
+            classes.put(out);
+            functions.put(out);
+            lines.put(out);
+            put_array(ids, out);
+            cells.put(out);
+            slot_next.put(out);
+            removals.put(out);
+            Ok(())
+        }
+
+        /// What [`State::put_checkpoint`] wrote, its native inputs read again from `natives`
+        /// through `writer` (and the objects its resolution loaded, into `objects`), its symbols
+        /// in `symbols`.
+        pub(crate) fn take_checkpoint(
+            r: &mut Reader<'_>,
+            writer: &Formats,
+            symbols: &mut Symbols,
+            objects: &mut HashMap<Obj, crate::native::Read, Global>,
+            natives: &mut NativeBytes<'_>,
+        ) -> Result<State, String> {
+            let mut state = State::new();
+            state.generation = Wire::take(r)?;
+            let count = crate::checkpoint::count(r, 32 + 8 + 1 + 4 + 8)?;
+            // alloc: the image's native inputs, once per restore
+            let mut inputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let id: ContentId = Wire::take(r)?;
+                let name: Arc<str> = Wire::take(r)?;
+                let kind: NativeKind = Wire::take(r)?;
+                let order: u32 = Wire::take(r)?;
+                let len = r.u64().map_err(String::from)?;
+                let bytes = natives(id, &name).map_err(|what| format!("the native input {name}: {what}"))?;
+                if bytes.len() as u64 != len {
+                    // alloc: error path
+                    return Err(format!(
+                        "the native input {name} is {} bytes where the image's was {len}",
+                        bytes.len()
+                    ));
+                }
+                inputs.push(crate::native::reread_input(writer, id, name, kind, order, bytes)?);
+            }
+            state.inputs = Arc::new(inputs);
+            let count = crate::checkpoint::count(r, 2)?;
+            // alloc: the image's specials, once per restore
+            let mut specials = Vec::with_capacity(count);
+            for _ in 0..count {
+                let sym: Option<Sym> = Wire::take(r)?;
+                let tag = r.remaining().first().copied();
+                if tag == Some(5) {
+                    r.u8().map_err(String::from)?;
+                    let name = r.str_u64().map_err(String::from)?;
+                    match writer.special(name) {
+                        Some(special @ Special::Placed(_)) => specials.push(special),
+                        // alloc: error path
+                        _ => return Err(format!("the writer has no placed special `{name}`")),
+                    }
+                    if sym.and_then(|it| symbols.name_of(it)) != Some(name) {
+                        // alloc: error path
+                        return Err(format!("a placed special `{name}` of another symbol"));
+                    }
+                    continue;
+                }
+                specials.push(Wire::take(r)?);
+            }
+            state.specials = Arc::new(specials);
+            state.spaces = Wire::take(r)?;
+            state.names = Wire::take(r)?;
+            state.resolved = Arc::new(crate::native::Resolved::take_checkpoint(
+                r,
+                writer,
+                symbols,
+                &state.inputs,
+                &state.names,
+                &state.wasm_imports,
+                objects,
+            )?);
+            state.slots = Wire::take(r)?;
+            state.slot_syms = Wire::take(r)?;
+            state.capacity = Wire::take(r)?;
+            state.pairs = Wire::take(r)?;
+            state.tls = Wire::take(r)?;
+            state.tls_at = Wire::take(r)?;
+            state.file_len = Wire::take(r)?;
+            state.parts = Wire::take(r)?;
+            state.debug = Wire::take(r)?;
+            state.exports = Wire::take(r)?;
+            // No synthesis of this process made the restored tables: the writer builds its
+            // next ones whole.
+            state.synthesis = 0;
+            state.encoded = Wire::take(r)?;
+            state.lists = Wire::take(r)?;
+            state.lineage = Wire::take(r)?;
+            state.given = Wire::take(r)?;
+            state.laid_out = Wire::take(r)?;
+            state.islands = Wire::take(r)?;
+            state.makes = Wire::take(r)?;
+            state.hot = Wire::take(r)?;
+            state.what = Wire::take(r)?;
+            state.sort = Wire::take(r)?;
+            state.piece_lists = Wire::take(r)?;
+            state.loader = Wire::take(r)?;
+            state.users = Wire::take(r)?;
+            state.fixups = Wire::take(r)?;
+            state.syms = Wire::take(r)?;
+            state.wasm_names = Wire::take(r)?;
+            state.wasm_declarers = take_array(r)?;
+            state.rebase = Wire::take(r)?;
+            state.binds = Wire::take(r)?;
+            state.defs = take_array(r)?;
+            state.cold = take_array(r)?;
+            state.ref_items = Wire::take(r)?;
+            state.seen = Wire::take(r)?;
+            state.classes = Wire::take(r)?;
+            state.functions = Wire::take(r)?;
+            state.lines = Wire::take(r)?;
+            state.ids = take_array(r)?;
+            state.cells = Wire::take(r)?;
+            state.slot_next = Wire::take(r)?;
+            state.removals = Wire::take(r)?;
+            let pieces = state.hot.len();
+            if [state.what.len(), state.sort.len(), state.piece_lists.len(), state.loader.len()]
+                .iter()
+                .any(|it| *it != pieces)
+            {
+                return Err("a state whose piece columns are of different lengths".into());
+            }
+            Ok(state)
+        }
+    }
+}

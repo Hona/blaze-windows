@@ -9,6 +9,7 @@ fn developer() -> Developer {
     }
 }
 
+#[cfg(windows)]
 fn get<'a>(vars: &'a [(OsString, OsString)], name: &str) -> &'a str {
     vars.iter().find(|(it, _)| it == name).unwrap_or_else(|| panic!("{name}")).1.to_str().unwrap()
 }

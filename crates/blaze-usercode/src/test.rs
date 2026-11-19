@@ -66,6 +66,7 @@ const RECORDED: &str = concat!(
     include_str!("test/wire.rs"),
     std_prelude!(),
     include_str!("test/fork_server.rs"),
+    include_str!("test/fork_server/windows.rs"),
     include_str!("test/fork_server/recorded.rs"),
     "    }\n"
 );
@@ -75,6 +76,7 @@ const UNRECORDED: &str = concat!(
     include_str!("test/wire.rs"),
     std_prelude!(),
     include_str!("test/fork_server.rs"),
+    include_str!("test/fork_server/windows.rs"),
     include_str!("test/fork_server/unrecorded.rs"),
     "    }\n"
 );

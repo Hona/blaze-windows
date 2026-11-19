@@ -1263,6 +1263,14 @@ impl Frontend for HirFrontend<'_> {
         self.with(|db| self.reach_records_in(db, shared));
     }
 
+    /// A sealed home's code that names no file by the build's name for it: what a describe
+    /// record of it may be kept for, and so what its templates may be shared by.
+    fn shares(&self, instance: &HirInstance) -> bool {
+        // On the session memo no describe reads what the build calls a file (a `file!()` is a
+        // span, item-relative), so every sealed home's code may be shared.
+        self.with(|db| HirFrontend::sealed(db, instance).is_some())
+    }
+
     fn describe_static(
         &self,
         value: &HirStatic,

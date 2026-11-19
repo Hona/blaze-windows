@@ -60,7 +60,7 @@ pub mod stuck;
 pub mod supervise;
 mod symbols;
 pub mod tables;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod tasks;
 pub mod time;
 pub mod views;

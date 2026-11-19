@@ -815,12 +815,14 @@ fn held(
     Ok(Loaded { program, patch, failures, launched, lineage, name: name.to_owned() })
 }
 
-/// The runs a `blaze run` started by process ID ([`Loaded::launch`]): each one's start, which
-/// the program is told has exited when its channel hangs up, and when it was launched (for
-/// the `dev run attached` span). One whose start hook never attached is taken out when its
-/// start's wait ends ([`sessions_of`]), so an entry lives no longer than its process, or
-/// than the start's 60 s for a process that never attached.
-type Launched = Arc<SharedMap<u32, (Started, std::time::Instant)>>;
+/// The runs a `blaze run` started ([`Loaded::launch`]), by their start, which the program is
+/// told has exited when its channel hangs up: the process that asked (on Unix the program
+/// itself, which it execs; on Windows its parent, as a child's ID is known only once it is
+/// spawned) and when it was launched (for the `dev run attached` span). Matched to a session
+/// by its start ([`host::Session::started`]), never by process ID. One whose start hook never
+/// attached is taken out when its start's wait ends ([`sessions_of`]), so an entry lives no
+/// longer than its process, or than the start's 60 s for a process that never attached.
+type Launched = Arc<SharedMap<Started, (u32, std::time::Instant)>>;
 
 /// What the thread that serves a program's runs holds of it: the program itself only weakly,
 /// so dropping the program ends the thread.
@@ -942,12 +944,14 @@ impl Loaded {
         self.program.command(command, forks, placed).map_err(|it| it.to_string())
     }
 
-    /// What `blaze run` adds to the environment of process `pid`, which runs the executable at
-    /// `path` once it execs it: the start hook's variable, which names this host's socket and
-    /// a launch waiting for that process. The file at `path` is the build's: started only
-    /// where `placed`, the key the build's record holds for `path`, is the memory's file's key,
-    /// and refused otherwise ([`Program::command`]). The run is the CLI's process, outside any
-    /// sandbox, as a `run` of a file is.
+    /// What `blaze run` (process `pid`) adds to the environment of the process that runs the
+    /// executable at `path`: itself once it execs it on Unix, the child it spawns on Windows.
+    /// The start hook's variable, which names this host's socket and a launch waiting for
+    /// that process; the launch is matched to its process by its token, so `pid` names only
+    /// who asked. The file at `path` is the build's: started only where `placed`, the key the
+    /// build's record holds for `path`, is the memory's file's key, and refused otherwise
+    /// ([`Program::command`]). The run is the CLI's process, outside any sandbox, as a `run`
+    /// of a file is.
     pub(crate) fn launch(
         &self,
         path: &str,
@@ -966,7 +970,7 @@ impl Loaded {
         };
         let (command, started) =
             self.program.command(command, false, placed).map_err(|it| it.to_string())?;
-        self.launched.pin().insert(pid, (started, std::time::Instant::now()));
+        self.launched.pin().insert(started, (pid, std::time::Instant::now()));
         let env = command
             .env
             .into_iter()
@@ -1006,15 +1010,16 @@ fn sessions_of(
     for session in started {
         match session {
             Ok(session) => {
-                let pid = session.pid;
+                let (pid, start) = (session.pid, session.started);
                 // How long the program's start took from the daemon's side: from the launch
-                // answered to its start hook attached (the CLI's exec, the loader, and the
-                // handshake that lays the code memory over the image before `main`).
-                if let Some((_, at)) = served.launched.pin().get(&pid) {
+                // answered to its start hook attached (the CLI's exec or spawn, the loader, and
+                // the handshake that lays the code memory over the image before `main`).
+                if let Some((asker, at)) = start.and_then(|it| served.launched.pin().get(&it).copied()) {
                     tracing::info_span!(
                         target: "blaze",
                         "dev run attached",
                         pid,
+                        asker,
                         after_us = at.elapsed().as_micros() as u64,
                     )
                     .in_scope(|| {});
@@ -1030,7 +1035,7 @@ fn sessions_of(
                     .name("blaze dev run asks".to_owned())
                     .spawn(move || {
                         serve(session, &patch, &failures);
-                        let started = launched.pin().remove(&pid).map(|(started, _)| *started);
+                        let started = start.filter(|it| launched.pin().remove(it).is_some());
                         if let (Some(started), Some(program)) = (started, program.upgrade()) {
                             program.exited(started);
                         }
@@ -1045,9 +1050,9 @@ fn sessions_of(
                 // ended unattached is forgotten, here and by the program.
                 if let Some(program) = served.program.upgrade() {
                     let launched = served.launched.pin();
-                    for (pid, (started, _)) in launched.iter() {
+                    for (started, _) in launched.iter() {
                         if program.forget_ended(*started) {
-                            launched.remove(pid);
+                            launched.remove(started);
                         }
                     }
                 }

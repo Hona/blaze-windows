@@ -47,5 +47,8 @@ blaze-v2-proof.workspace = true
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [lints]
 workspace = true

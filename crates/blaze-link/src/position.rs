@@ -570,3 +570,15 @@ mod tests {
         assert!(position_in(&bytes[..bytes.len() - 1], 4).is_err(), "a base cut off");
     }
 }
+
+/// A span table as the bytes it was checked from: a restore checks them again
+/// ([`Spans::new`]), which makes its index of file names.
+impl crate::checkpoint::Wire for Spans {
+    fn put(&self, out: &mut Vec<u8>) {
+        let index = self.files as usize * 4;
+        blaze_format::cursor::Put::put_bytes_u64(out, &self.buf[index..]);
+    }
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        Spans::new(r.bytes_u64().map_err(String::from)?)
+    }
+}

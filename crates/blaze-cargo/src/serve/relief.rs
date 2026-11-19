@@ -104,6 +104,98 @@ impl Ladder {
     }
 }
 
+/// The share of the ceiling at or past which the daemon is pressed: its value caps bite and a
+/// running build lets go of finished work at its writes ([`pressed`]). Below it nothing is
+/// evicted for memory, so an edit loop on a machine with room never makes anything again
+/// because of a cap.
+pub(crate) const PRESS_AT: (u64, u64) = (3, 4);
+
+/// The share of the ceiling at or under which a pressed daemon is pressed no more: lower than
+/// [`PRESS_AT`], so a footprint that hovers at the line does not flip the caps on every look.
+pub(crate) const EASE_AT: (u64, u64) = (5, 8);
+
+/// Whether the footprint is near enough the ceiling for the caps to bite, with hysteresis
+/// ([`PRESS_AT`], [`EASE_AT`]). A core: no clock, no IO.
+#[derive(Default, Debug)]
+pub(crate) struct Pressure {
+    on: bool,
+}
+
+impl Pressure {
+    /// `Some(true)` when this look presses the daemon, `Some(false)` when it eases it, `None`
+    /// when nothing changes.
+    #[blaze::pure]
+    pub(crate) fn look(&mut self, footprint: u64, ceiling: u64) -> Option<bool> {
+        let share = |(of, parts): (u64, u64)| (u128::from(ceiling) * u128::from(of) / u128::from(parts)) as u64;
+        if ceiling == 0 {
+            return None;
+        }
+        if !self.on && footprint >= share(PRESS_AT) {
+            self.on = true;
+            return Some(true);
+        }
+        if self.on && footprint <= share(EASE_AT) {
+            self.on = false;
+            return Some(false);
+        }
+        None
+    }
+}
+
+/// Whether the daemon is pressed now ([`Pressure`], set by the ceiling guard on Windows; never
+/// elsewhere, where no cap is set).
+static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What give-backs below the ceiling did over the daemon's life, for its peak table: times
+/// pressed, dependency crates whose inference a running build let go, MIR values it let go,
+/// and edges it let go mid-build.
+static PRESSES: AtomicU64 = AtomicU64::new(0);
+static CRATES_RELEASED: AtomicU64 = AtomicU64::new(0);
+static MIR_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the daemon is pressed: the caps bite only then.
+pub(crate) fn pressed() -> bool {
+    PRESSED.load(Ordering::Acquire)
+}
+
+/// The guard pressed (`true`) or eased (`false`) the daemon.
+pub(crate) fn set_pressed(on: bool) {
+    if on {
+        PRESSES.fetch_add(1, Ordering::Relaxed);
+    }
+    PRESSED.store(on, Ordering::Release);
+}
+
+/// A running build let go of the inference of `crates` dependency crates and of `mir` MIR
+/// values while pressed.
+pub(crate) fn note_released(crates: usize, mir: usize) {
+    CRATES_RELEASED.fetch_add(crates as u64, Ordering::Relaxed);
+    MIR_DROPPED.fetch_add(mir as u64, Ordering::Relaxed);
+}
+
+/// What eviction did and cost over the daemon's life, one clause for its peak table: how
+/// often it was pressed, what caps and give-backs let go, how much of it was made again, and
+/// the edges let go by durability with the rows a write later made run again.
+pub(crate) fn cost_clause() -> String {
+    let (evicted, dropped, asked) = blaze_query::db::eviction_totals();
+    let (rows, edges, assumed) = blaze_query::db::durable_let_go_totals();
+    let mib = blaze_query::db::lru_freed_bytes() as f64 / f64::from(1u32 << 20);
+    // alloc: once at daemon stop
+    format!(
+        "give-back cost: pressed {} times (caps at {}/{} of the ceiling, lifted at {}/{}); caps evicted {evicted} values \
+         ({mib:.0} MiB), drops let go {dropped}, {asked} evicted values made again; running builds let go of \
+         {} dependency crates' inference and {} MIR values; {rows} rows let go of {edges} edges by durability, \
+         {assumed} of them assumed changed by a write",
+        PRESSES.load(Ordering::Relaxed),
+        PRESS_AT.0,
+        PRESS_AT.1,
+        EASE_AT.0,
+        EASE_AT.1,
+        CRATES_RELEASED.load(Ordering::Relaxed),
+        MIR_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
 impl Given {
     /// Both gives summed: one rung over every kept front end.
     pub(crate) fn add(&mut self, other: Given) {
@@ -280,6 +372,23 @@ mod tests {
         assert_eq!(ladder.given(), &Rung::ALL);
         assert_eq!(over(&mut ladder), Step::Exit, "still over after every rung: the daemon ends");
         assert_eq!(over(&mut ladder), Step::Exit);
+    }
+
+    /// The rule: nothing is pressed below three quarters of the ceiling; at it the caps bite,
+    /// and they lift only at five eighths, so a footprint between the two keeps what it is.
+    /// Control: an edit loop on a machine with room (at half the ceiling throughout) is never
+    /// pressed.
+    #[test]
+    fn the_caps_bite_from_three_quarters_of_the_ceiling_and_lift_at_five_eighths() {
+        let mut pressure = Pressure::default();
+        assert_eq!(pressure.look(7 * GIB, 10 * GIB), None, "70% is room");
+        assert_eq!(pressure.look(15 * GIB / 2, 10 * GIB), Some(true), "75% presses");
+        assert_eq!(pressure.look(7 * GIB, 10 * GIB), None, "70% stays pressed");
+        assert_eq!(pressure.look(13 * GIB / 2, 10 * GIB), None, "65% stays pressed");
+        assert_eq!(pressure.look(6 * GIB, 10 * GIB), Some(false), "60% eases");
+        assert_eq!(pressure.look(7 * GIB, 10 * GIB), None, "70% is room again");
+        let mut roomy = Pressure::default();
+        assert!((0..1000).all(|_| roomy.look(5 * GIB, 10 * GIB).is_none()));
     }
 
     /// A rung that brings the footprint under the ceiling stops the ladder there: no exit, no

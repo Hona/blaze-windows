@@ -25,6 +25,10 @@
 //!   the commit that lists the row consumed it. A file whose process recorded nothing (it ended
 //!   cleanly, or was killed) is deleted at once.
 //!
+//! On Windows the same page records an unhandled exception ([`install`]'s filter): its code in
+//! place of the signal, an access violation's kind and address, and the stack unwound by the
+//! images' unwind tables from the exception's registers.
+//!
 //! The record is one fixed page so it can live in any mapping: the flight recorder's rings may
 //! move into mapped files of their own per process, and the record is then a region of that
 //! file, with the same layout and the same recovery.
@@ -137,7 +141,7 @@ pub enum CrashError {
         path: PathBuf,
         error: io::Error,
     },
-    /// No crash record on this system (no POSIX signals).
+    /// No crash record on this system (neither POSIX signals nor Windows exceptions).
     Unsupported,
 }
 
@@ -178,7 +182,7 @@ impl fmt::Display for CrashError {
                 path.display()
             ),
             CrashError::Unsupported => {
-                write!(f, "this system has no POSIX signals, so blaze keeps no crash record")
+                write!(f, "this system has neither POSIX signals nor Windows exceptions, so blaze keeps no crash record")
             }
         }
     }
@@ -211,7 +215,8 @@ pub struct Crash {
     pub cut: bool,
 }
 
-/// The name of each fatal signal the handler records.
+/// The name of each fatal signal the handler records; on Windows, of each exception
+/// ([`EXCEPTIONS`]), whose code a record keeps in place of a signal.
 pub fn signal_name(signal: i32) -> Option<&'static str> {
     #[cfg(unix)]
     {
@@ -224,24 +229,81 @@ pub fn signal_name(signal: i32) -> Option<&'static str> {
             _ => return None,
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        EXCEPTIONS.iter().find(|it| it.0 == signal as u32).map(|it| it.1)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         _ = signal;
         None
     }
 }
 
+/// The exceptions a Windows record names: its code, its name and what it says. A code not
+/// here is said by its number. A Rust abort (`__fastfail`, as a panic that aborts and
+/// `std::process::abort` end) and a stack buffer overrun end the process with no handler
+/// run, so no record holds them: the daemon's log and Windows Error Reporting do.
+#[cfg(windows)]
+const EXCEPTIONS: [(u32, &str, &str); 13] = [
+    (0xC000_0005, "EXCEPTION_ACCESS_VIOLATION", "access violation"),
+    (0xC000_0006, "EXCEPTION_IN_PAGE_ERROR", "in-page error: a mapped file's page could not be read"),
+    (0xC000_00FD, "EXCEPTION_STACK_OVERFLOW", "stack overflow"),
+    (0xC000_001D, "EXCEPTION_ILLEGAL_INSTRUCTION", "illegal instruction"),
+    (0xC000_0096, "EXCEPTION_PRIV_INSTRUCTION", "privileged instruction"),
+    (0xC000_0094, "EXCEPTION_INT_DIVIDE_BY_ZERO", "integer division by zero"),
+    (0xC000_0095, "EXCEPTION_INT_OVERFLOW", "integer overflow"),
+    (0xC000_008C, "EXCEPTION_ARRAY_BOUNDS_EXCEEDED", "array bounds exceeded"),
+    (0x8000_0002, "EXCEPTION_DATATYPE_MISALIGNMENT", "misaligned data"),
+    (0x8000_0003, "EXCEPTION_BREAKPOINT", "breakpoint"),
+    (0xC000_0374, "STATUS_HEAP_CORRUPTION", "heap corruption"),
+    (0xC000_0025, "EXCEPTION_NONCONTINUABLE_EXCEPTION", "an exception continued that may not be"),
+    (0xE06D_7363, "MSVC_CPP_EXCEPTION", "an unhandled C++ exception"),
+];
+
+/// What a record's signal (an exception's code on Windows) says, with no leading comma: empty
+/// for one not named.
+fn said_of(signal: i32) -> &'static str {
+    #[cfg(windows)]
+    {
+        EXCEPTIONS.iter().find(|it| it.0 == signal as u32).map_or("", |it| it.2)
+    }
+    #[cfg(not(windows))]
+    {
+        blaze_core::signal::described(signal).trim_start_matches(", ")
+    }
+}
+
+/// Whether a record's fault address is the memory it touched, said in its message: a SIGSEGV
+/// or SIGBUS, an access violation or an in-page error.
+fn touched_memory(signal: i32) -> bool {
+    matches!(
+        signal_name(signal),
+        Some("SIGSEGV" | "SIGBUS" | "EXCEPTION_ACCESS_VIOLATION" | "EXCEPTION_IN_PAGE_ERROR")
+    )
+}
+
 impl Crash {
     /// Its `panics` row: its addresses named by this executable's symbols and DWARF at its
     /// slide ([`crate::symbols::stack_slid`]), which [`read`] checked is the same executable.
     pub fn row(&self) -> PanicRow {
-        let said = blaze_core::signal::described(self.signal).trim_start_matches(", ");
+        let said = said_of(self.signal);
         // alloc: a row of a crash, once a file recovered
-        let mut message = match said.is_empty() {
-            true => format!("signal {}", self.signal),
-            false => said.to_owned(),
+        let mut message = match (said.is_empty(), signal_name(self.signal)) {
+            (true, _) if cfg!(windows) => format!("exception {:#010x}", self.signal as u32),
+            (true, _) => format!("signal {}", self.signal),
+            (false, Some(name)) if cfg!(windows) => format!("{name}: {said}"),
+            (false, _) => said.to_owned(),
         };
-        if matches!(signal_name(self.signal), Some("SIGSEGV" | "SIGBUS")) {
+        if touched_memory(self.signal) {
+            // An access violation's first parameter: what the instruction did to the address.
+            #[cfg(windows)]
+            message.push_str(match self.code {
+                0 => " reading",
+                1 => " writing",
+                8 => " executing",
+                _ => "",
+            });
             // alloc: as above
             message.push_str(&format!(" at {:#x}", self.addr));
         }
@@ -546,7 +608,7 @@ impl Page {
             depth < PCS
         };
         if push(fault.pc & crate::stack::ADDRESS) {
-            crate::stack::walk(fault.fp, &mut crate::stack::probed, &mut push);
+            walk_from(fault, &mut push);
         }
         let mut opened = 0;
         let innermost = crate::flight::open_of_thread(tid as u32, &mut |_, span| {
@@ -582,6 +644,93 @@ struct Fault {
     addr: u64,
     pc: u64,
     fp: u64,
+    /// The faulting thread's registers as the exception saved them, null for none: what the
+    /// walk unwinds from on Windows, whose code keeps no frame pointers to follow.
+    #[cfg(windows)]
+    context: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+}
+
+/// Gives `push` each return address above the faulting PC: up the frame pointers from `fp`,
+/// each record probed readable first; on Windows by the unwind tables from the exception's
+/// saved registers ([`unwind`]).
+fn walk_from(fault: &Fault, push: &mut dyn FnMut(u64) -> bool) {
+    #[cfg(windows)]
+    {
+        // SAFETY: a fault's context is null or the live record of the exception being handled.
+        unsafe { unwind(fault.context, push) };
+    }
+    #[cfg(not(windows))]
+    crate::stack::walk(fault.fp, &mut crate::stack::probed, push);
+}
+
+/// Each return address up the faulting thread's stack, from `context`, by the unwind tables
+/// of the images its code is in (`RtlLookupFunctionEntry`, `RtlVirtualUnwind`: what the
+/// system's own dispatch of the exception used, lock-free on the tables of loaded images); a
+/// function with no entry is a leaf, whose return address is at its stack pointer. A stack too
+/// broken to read faults inside the filter, which ends the process with the record holding
+/// the words written so far (each counted as it is).
+///
+/// # Safety
+///
+/// `context` is null or the live `CONTEXT` of the exception being handled on this thread.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn unwind(
+    context: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    push: &mut dyn FnMut(u64) -> bool,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER,
+    };
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: as this function's own `# Safety` says; a copy, so the record is not changed.
+    let mut at = unsafe { *context };
+    for _ in 0..PCS {
+        let mut base = 0u64;
+        // SAFETY: reads the loaded images' tables; a null history is allowed.
+        let entry = unsafe { RtlLookupFunctionEntry(at.Rip, &mut base, std::ptr::null_mut()) };
+        if entry.is_null() {
+            if at.Rsp == 0 || at.Rsp % 8 != 0 {
+                return;
+            }
+            // SAFETY: a leaf's return address is the word at its stack pointer, on the stack
+            // of the thread handling its own exception; see above for a broken one.
+            at.Rip = unsafe { (at.Rsp as *const u64).read_volatile() };
+            at.Rsp += 8;
+        } else {
+            let (mut data, mut frame) = (std::ptr::null_mut(), 0u64);
+            // SAFETY: `entry` is the table entry of the function at `at.Rip` in the image at
+            // `base`; `at`, `data` and `frame` are live locals; null context pointers are allowed.
+            unsafe {
+                RtlVirtualUnwind(
+                    UNW_FLAG_NHANDLER,
+                    base,
+                    at.Rip,
+                    entry,
+                    &mut at,
+                    &mut data,
+                    &mut frame,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+        if at.Rip == 0 || !push(at.Rip) {
+            return;
+        }
+    }
+}
+
+/// Elsewhere on Windows the stack is not unwound: a record holds the faulting PC alone.
+///
+/// # Safety
+///
+/// None needed.
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+unsafe fn unwind(
+    _context: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    _push: &mut dyn FnMut(u64) -> bool,
+) {
 }
 
 /// The page [`arm`] mapped, null before: what the handler writes to.
@@ -652,7 +801,84 @@ pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
     Ok(path)
 }
 
-#[cfg(not(unix))]
+/// [`arm`] on Windows: the page is a view of the file's mapping, which the system writes back
+/// to the file whether the process ends cleanly or not, as a shared mapping is on unix.
+#[cfg(windows)]
+pub fn arm(dir: &Path) -> Result<PathBuf, CrashError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        },
+    };
+
+    let pid = std::process::id();
+    let path = dir.join(file_name(pid));
+    if !PAGE.load(Ordering::Acquire).is_null() {
+        return Ok(path);
+    }
+    // alloc: an error
+    let error = |doing: &'static str| {
+        move |error: io::Error| CrashError::Io { path: dir.join(file_name(pid)), doing, error }
+    };
+    let hash = crate::identity::binary_hash()
+        .map_err(|error| CrashError::OursUnhashed { path: path.clone(), error })?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(error("making"))?;
+    file.set_len(SIZE as u64).map_err(error("sizing"))?;
+    // SAFETY: the file's handle is open for the call; no attributes and no name. The mapping
+    // holds the file, so it outlives the handle, which closes as `file` drops.
+    let mapping = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            SIZE as u32,
+            std::ptr::null(),
+        )
+    };
+    if mapping.is_null() {
+        return Err(error("mapping")(io::Error::last_os_error()));
+    }
+    // SAFETY: `mapping` was just made, `SIZE` bytes long and writable.
+    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, SIZE) };
+    let mapped = io::Error::last_os_error();
+    // SAFETY: made above and closed once; a view keeps its mapping.
+    unsafe { CloseHandle(mapping) };
+    if view.Value.is_null() {
+        return Err(error("mapping a view of")(mapped));
+    }
+    let page = Page(view.Value.cast());
+    // SAFETY: the view is `SIZE` writable bytes, never unmapped once published, and no filter
+    // has it yet (it is published below).
+    unsafe {
+        page.header(
+            pid,
+            &hash,
+            ix_prof::symbols::own_slide().unwrap_or(0),
+            ix_prof::symbols::own_load_base().unwrap_or(0),
+        )
+    };
+    if PAGE
+        .compare_exchange(std::ptr::null_mut(), page.0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Another thread armed first: this view is let go, its file is the same path.
+        // SAFETY: the view made above, never published, unmapped once.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value }) };
+    }
+    Ok(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn arm(_dir: &Path) -> Result<PathBuf, CrashError> {
     Err(CrashError::Unsupported)
 }
@@ -711,7 +937,121 @@ pub fn install() {
     });
 }
 
-#[cfg(not(unix))]
+/// The unhandled-exception filter that was there before [`install`], null for none: what the
+/// filter hands each exception to after recording it.
+#[cfg(windows)]
+static BEFORE_FILTER: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// [`install`] on Windows: the recording filter goes in as the process's unhandled-exception
+/// filter, in front of what was there (which it hands each exception to after recording),
+/// and so sees only an exception no handler of the faulting thread took: never one a library
+/// raised and caught. It runs on the faulting thread (a stack overflow's in the room std's
+/// `SetThreadStackGuarantee` keeps on every thread it starts), and a debugger attached takes
+/// the exception before it. Records nothing until [`arm`].
+#[cfg(windows)]
+pub fn install() {
+    use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: `on_exception` is a function for the life of the process; it writes the
+        // mapped page through atomics and plain stores and reads the exception's own records.
+        let before = unsafe { SetUnhandledExceptionFilter(Some(on_exception)) };
+        if let Some(before) = before {
+            BEFORE_FILTER.store(before as *mut core::ffi::c_void, Ordering::Release);
+        }
+    });
+}
+
+/// The filter: records the exception when armed, then hands it to the filter before, or lets
+/// the system end the process with it (`EXCEPTION_CONTINUE_SEARCH`), as it would have.
+#[cfg(windows)]
+unsafe extern "system" fn on_exception(
+    info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    let page = PAGE.load(Ordering::Acquire);
+    if !page.is_null() && !info.is_null() {
+        // SAFETY: the system passes a filter the live records of the exception it handles.
+        let fault = unsafe { fault_of_exception(info) };
+        Page(page).record(&fault);
+    }
+    let before = BEFORE_FILTER.load(Ordering::Acquire);
+    if before.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: `before` was the filter `SetUnhandledExceptionFilter` returned, of this type.
+    let before: unsafe extern "system" fn(
+        *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    ) -> i32 = unsafe { std::mem::transmute(before) };
+    // SAFETY: called as the system would have called it, with the same records.
+    unsafe { before(info) }
+}
+
+/// The fault the exception `info` describes: its code in place of a signal, an access
+/// violation's kind and address (else where it was raised), and the faulting PC, frame
+/// pointer and registers.
+///
+/// # Safety
+///
+/// `info` is the live, non-null argument of an unhandled-exception filter.
+#[cfg(windows)]
+unsafe fn fault_of_exception(
+    info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> Fault {
+    // SAFETY: as this function's own `# Safety` says; either record may be null.
+    let (record, context) = unsafe { ((*info).ExceptionRecord, (*info).ContextRecord) };
+    let (signal, code, addr) = match record.is_null() {
+        true => (0, 0, 0),
+        false => {
+            // SAFETY: as above, a live `EXCEPTION_RECORD`.
+            let record = unsafe { &*record };
+            let signal = record.ExceptionCode;
+            let touched = matches!(signal as u32, 0xC000_0005 | 0xC000_0006);
+            match touched && record.NumberParameters >= 2 {
+                true => (
+                    signal,
+                    record.ExceptionInformation[0] as i32,
+                    record.ExceptionInformation[1] as u64,
+                ),
+                false => (signal, 0, record.ExceptionAddress as u64),
+            }
+        }
+    };
+    let (pc, fp) = match context.is_null() {
+        true => (0, 0),
+        // SAFETY: as above, a live `CONTEXT`.
+        false => unsafe { registers_of(context) },
+    };
+    Fault { signal, code, addr, pc, fp, context }
+}
+
+/// The faulting PC and frame pointer of a Windows `CONTEXT`.
+///
+/// # Safety
+///
+/// `context` is a live, non-null `CONTEXT`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn registers_of(
+    context: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> (u64, u64) {
+    // SAFETY: as this function's own `# Safety` says.
+    unsafe { ((*context).Rip, (*context).Rbp) }
+}
+
+/// As above.
+///
+/// # Safety
+///
+/// As above.
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn registers_of(
+    context: *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> (u64, u64) {
+    // SAFETY: as this function's own `# Safety` says.
+    unsafe { ((*context).Pc, (*context).Anonymous.Anonymous.Fp) }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn install() {}
 
 /// Gives the calling thread an alternate signal stack when it has none: std gives each thread
@@ -895,6 +1235,106 @@ unsafe fn registers(context: *const libc::c_void) -> (u64, u64) {
 ))]
 unsafe fn registers(_context: *const libc::c_void) -> (u64, u64) {
     (0, 0)
+}
+
+// The record on Windows (B1: until 2026-11-19 "this system has no POSIX signals, so blaze
+// keeps no crash record", and a daemon that died of an access violation left nothing).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A page of a file of its own, mapped as `arm` maps the process's.
+    fn page_in(path: &Path, pid: u32) -> Page {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        file.set_len(SIZE as u64).unwrap();
+        // SAFETY: as in `arm`; the view is kept for the test process's life.
+        let view = unsafe {
+            let mapping = CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!mapping.is_null());
+            MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, SIZE)
+        };
+        assert!(!view.Value.is_null());
+        let page = Page(view.Value.cast());
+        let hash = crate::identity::binary_hash().unwrap();
+        // SAFETY: the view above, no filter has it.
+        unsafe { page.header(pid, &hash, 0, 0) };
+        page
+    }
+
+    /// An access violation's record round-trips through [`read`], named, with what the
+    /// instruction did and where, and a stack unwound from the registers by the unwind tables
+    /// (no frame pointers on Windows): the faulting PC, then more than one return address.
+    /// Make the walk follow frame pointers instead and the stack is the faulting PC alone.
+    #[test]
+    #[inline(never)]
+    fn an_access_violation_round_trips_with_a_stack_unwound_by_the_tables() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, RtlCaptureContext};
+        let dir = blaze_core::temp::TempDir::for_test("blaze-crash-windows-");
+        let path = dir.join(file_name(0x7fff_fff0));
+        let page = page_in(&path, 0x7fff_fff0);
+        // SAFETY: zeroed is a valid `CONTEXT` to fill; the call fills it with this thread's.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        // SAFETY: `context` is live and aligned (its type's own alignment).
+        unsafe { RtlCaptureContext(&mut context) };
+        #[cfg(target_arch = "x86_64")]
+        let pc = context.Rip;
+        #[cfg(not(target_arch = "x86_64"))]
+        let pc = 0;
+        let fault = Fault { signal: 0xC000_0005_u32 as i32, code: 1, addr: 0x10, pc, fp: 0, context: &context };
+        page.record(&fault);
+        let ours = crate::identity::binary_hash().unwrap();
+        let crash = read(&path, &fs::read(&path).unwrap(), &ours).unwrap().expect("recorded");
+        let row = crash.row();
+        assert_eq!(row.signal, Some("EXCEPTION_ACCESS_VIOLATION"));
+        assert_eq!(row.fault_addr, Some(0x10));
+        let message = row.message.unwrap();
+        assert!(message.contains("access violation writing at 0x10"), "{message}");
+        #[cfg(target_arch = "x86_64")]
+        assert!(crash.pcs.len() >= 3, "unwound: {:x?}", crash.pcs);
+        drop(dir);
+    }
+
+    /// An exception no table names is said by its code.
+    #[test]
+    fn an_unnamed_exception_is_said_by_its_code() {
+        let crash = Crash {
+            pid: 1,
+            hash: [1; 32],
+            slide: 0,
+            base: 0,
+            signal: 0xC000_0420_u32 as i32,
+            code: 0,
+            addr: 0,
+            t_ns: 0,
+            tid: 1,
+            build: 0,
+            span: 0,
+            pcs: Vec::new(),
+            thread: String::new(),
+            open: Vec::new(),
+            panic: None,
+            cut: false,
+        };
+        assert_eq!(crash.row().message.as_deref(), Some("exception 0xc0000420"));
+        assert_eq!(signal_name(0xC000_00FD_u32 as i32), Some("EXCEPTION_STACK_OVERFLOW"));
+    }
 }
 
 #[cfg(all(test, unix))]

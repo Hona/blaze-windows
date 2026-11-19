@@ -472,8 +472,25 @@ impl<D: Driver> Driven<D> {
 
 /// Lowers the calling thread for background work: utility QoS on macOS
 /// (`pthread_set_qos_class_self_np`); nice 19 and the idle IO class on Linux, both per thread
-/// there. One way: an unprivileged thread cannot raise itself again.
+/// there; on Windows the thread's background mode (`THREAD_MODE_BACKGROUND_BEGIN`: lowest CPU
+/// priority, very-low IO priority and low memory priority, the thread's alone), Linux's pair
+/// in one call. One way: an unprivileged thread cannot raise itself again (Windows could, with
+/// `THREAD_MODE_BACKGROUND_END`, which nothing calls).
 pub fn lower_this_thread() -> Result<(), StoreError> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        // SAFETY: the calling thread's pseudo handle, which needs no closing; no memory passed.
+        if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } == 0 {
+            let error = std::io::Error::last_os_error();
+            // A thread already in background mode is refused so (ERROR_THREAD_MODE_ALREADY_BACKGROUND).
+            if error.raw_os_error() != Some(400) {
+                return Err(os("SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN)", "the calling thread", &error));
+            }
+        }
+    }
     #[cfg(target_vendor = "apple")]
     {
         // SAFETY: one call about the calling thread, no memory passed.

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicI32, AtomicUsize};
 /// [`ENDED_BY`], the signal's number and its name: `blaze serve: pid 7 ended by signal 6,
 /// SIGABRT: process abort signal`. The client quotes it from the log.
 const PID_SAYS: &str = "blaze serve: pid ";
+#[cfg(unix)]
 const ENDED_BY: &str = " ended by signal ";
 
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
@@ -50,7 +51,7 @@ pub fn stopped_by() -> Option<String> {
     Some(format!("{name} from pid {pid} (uid {uid})")) // alloc: once, as the daemon stops
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn stopped_by() -> Option<String> {
     signalled().then(|| "a stop signal".to_owned()) // alloc: once, as the daemon stops
 }
@@ -184,13 +185,230 @@ fn catch_dump() {
     unsafe { libc::signal(libc::SIGUSR1, dump) };
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn catch() {}
 
-/// windows: nothing blocks on a stop pipe (no `serve::stop` guard is armed off unix), so there
-/// is nothing to wake.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn stop_begun() {}
+
+/// The console's event that asked the first stop ([`CTRL_C_EVENT`] and the rest), `u32::MAX`
+/// before one.
+///
+/// [`CTRL_C_EVENT`]: windows_sys::Win32::System::Console::CTRL_C_EVENT
+#[cfg(windows)]
+static CTRL: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The event [`stop_wait`] made, null before one: [`catch`]'s handler and [`stop_begun`] set
+/// it, as unix's write a byte to the stop pipe.
+#[cfg(windows)]
+static STOP_EVENT: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The event [`stop_ended`] sets once the loop's stop is over, null before [`catch`]: a
+/// console's close, logoff or shutdown waits for it in the handler, as the system ends the
+/// process once the handler returns.
+#[cfg(windows)]
+static ENDED_EVENT: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// How long a console's close waits in the handler for the stop to end: under the 5 s the
+/// system gives a close before it ends the process itself, so the stop's image gets what time
+/// there is and the end is still this process's.
+#[cfg(windows)]
+const CLOSE_GRACE_MS: u32 = 4_500;
+/// As [`CLOSE_GRACE_MS`], for a logoff or shutdown, which the system gives 20 s (a service's
+/// `WaitToKillServiceTimeout` default; a desktop's `HungAppTimeout` is 5 s, after which it
+/// offers to end the process, which ends the wait no earlier than the close's).
+#[cfg(windows)]
+const SHUTDOWN_GRACE_MS: u32 = 19_000;
+
+/// The first stop's console event, as the daemon's log says it: `Ctrl-C from the console`.
+#[cfg(windows)]
+pub fn stopped_by() -> Option<String> {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    if !signalled() {
+        return None;
+    }
+    let what = match CTRL.load(Ordering::Relaxed) {
+        CTRL_C_EVENT => "Ctrl-C from the console",
+        CTRL_BREAK_EVENT => "Ctrl-Break from the console",
+        CTRL_CLOSE_EVENT => "the console's close",
+        CTRL_LOGOFF_EVENT => "the user's logoff",
+        CTRL_SHUTDOWN_EVENT => "the system's shutdown",
+        _ => "a console event",
+    };
+    Some(what.to_owned()) // alloc: once, as the daemon stops
+}
+
+/// Turns the console's Ctrl-C, Ctrl-Break, close, logoff and shutdown into [`signalled`] for
+/// the rest of the process, as unix's SIGTERM and SIGINT are, and wakes the stop's guard
+/// ([`stop_wait`]). A close, logoff or shutdown, after which the system ends the process once
+/// the handler returns, holds the handler until the loop's stop ends ([`stop_ended`]) or its
+/// grace is over. A daemon with no console hears none of them: a client's Stop stops it.
+#[cfg(windows)]
+pub fn catch() {
+    use windows_sys::{
+        Win32::System::{
+            Console::{
+                CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
+            },
+            Threading::{CreateEventW, SetEvent, WaitForSingleObject},
+        },
+        core::BOOL,
+    };
+    unsafe extern "system" fn on(ctrl: u32) -> BOOL {
+        _ = CTRL.compare_exchange(u32::MAX, ctrl, Ordering::Relaxed, Ordering::Relaxed);
+        SIGNALLED.store(true, Ordering::Release);
+        STOPS_ASKED.fetch_add(1, Ordering::AcqRel);
+        let stop = STOP_EVENT.load(Ordering::Acquire);
+        if !stop.is_null() {
+            // SAFETY: the stop event is never closed once made ([`stop_wait`]).
+            unsafe { SetEvent(stop) };
+        }
+        let grace = match ctrl {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => return 1,
+            CTRL_CLOSE_EVENT => CLOSE_GRACE_MS,
+            _ => SHUTDOWN_GRACE_MS,
+        };
+        let ended = ENDED_EVENT.load(Ordering::Acquire);
+        if !ended.is_null() {
+            // SAFETY: as for the stop event: made in `catch`, never closed. The handler runs on
+            // a thread the system starts for it, so its wait holds no thread of the daemon.
+            unsafe { WaitForSingleObject(ended, grace) };
+        }
+        1
+    }
+    // SAFETY: no attributes and no name; a manual-reset event, unset. Never closed: the
+    // handler may wait on it for the life of the process.
+    let ended = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if ended.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::error!(target: "blaze", "blaze serve: a console's close ends the daemon without its stop: its event: {error}");
+        // logged: the event above
+        eprintln!("blaze serve: a console's close ends the daemon without its stop: its event: {error}");
+    }
+    ENDED_EVENT.store(ended, Ordering::Release);
+    // SAFETY: `on` is a function for the life of the process, as the handler must be; it does
+    // atomic operations and sets and waits on events that are never closed.
+    if unsafe { SetConsoleCtrlHandler(Some(on), 1) } == 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::error!(target: "blaze", "blaze serve: Ctrl-C and the console's close are not heard: {error}");
+        // logged: the event above
+        eprintln!("blaze serve: Ctrl-C and the console's close are not heard: {error}");
+    }
+}
+
+/// Wakes the stop's guard ([`stop_wait`]): the daemon began a stop no console event asked for
+/// (a client's Stop, or its own end). Nothing before the event is made.
+#[cfg(windows)]
+pub fn stop_begun() {
+    let stop = STOP_EVENT.load(Ordering::Acquire);
+    if !stop.is_null() {
+        // SAFETY: the stop event is never closed once made.
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(stop) };
+    }
+}
+
+/// The loop's stop is over: a console's close waiting in [`catch`]'s handler lets the system
+/// end the process. Nothing off Windows, where no handler waits.
+pub fn stop_ended() {
+    #[cfg(windows)]
+    {
+        let ended = ENDED_EVENT.load(Ordering::Acquire);
+        if !ended.is_null() {
+            // SAFETY: made in `catch` and never closed.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(ended) };
+        }
+    }
+}
+
+/// What the stop's guard (`serve::stop`) blocks on until a stop: a byte on the stop pipe
+/// ([`stop_pipe`], unix) or the stop event (Windows), set by a signal or console event, or by
+/// [`stop_begun`]. Once a process.
+pub struct StopWait {
+    #[cfg(unix)]
+    pipe: std::fs::File,
+    /// The stop event: never closed, as the handler may set it at any time.
+    #[cfg(windows)]
+    event: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the event's handle is a number the kernel resolves for any thread of the process.
+#[cfg(windows)]
+unsafe impl Send for StopWait {}
+
+/// The [`StopWait`] of this process: set at once if a stop was asked before it.
+#[cfg(unix)]
+pub fn stop_wait() -> std::io::Result<StopWait> {
+    stop_pipe().map(|pipe| StopWait { pipe })
+}
+
+/// The [`StopWait`] of this process: set at once if a stop was asked before it. A second
+/// call's event takes the first's place, which is left open, as the handler may be setting it.
+#[cfg(windows)]
+pub fn stop_wait() -> std::io::Result<StopWait> {
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+    // SAFETY: no attributes and no name; a manual-reset event, unset, so a stop asked before
+    // the guard waits is seen by its first wait.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    STOP_EVENT.store(event, Ordering::Release);
+    if signalled() {
+        // SAFETY: just made, and never closed.
+        unsafe { SetEvent(event) };
+    }
+    Ok(StopWait { event })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn stop_wait() -> std::io::Result<StopWait> {
+    Err(std::io::Error::other("this system has no stop for a guard to wait on"))
+}
+
+impl StopWait {
+    /// Whether a stop was asked within `within`; an error where the wait itself failed, after
+    /// which no stop is heard.
+    pub fn wait(&mut self, within: std::time::Duration) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::{io::Read as _, os::fd::AsFd as _};
+            if !crate::raw::process::readable_within(self.pipe.as_fd(), within)? {
+                return Ok(false);
+            }
+            // Readable: a byte is there (or the write end closed, which it never is), so the
+            // read does not wait.
+            let mut byte = [0u8; 1];
+            match self.pipe.read(&mut byte) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::{
+                Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+                System::Threading::WaitForSingleObject,
+            };
+            let ms = u32::try_from(within.as_millis()).unwrap_or(u32::MAX - 1);
+            // SAFETY: the event is open for the life of the process.
+            match unsafe { WaitForSingleObject(self.event, ms) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            _ = within;
+            Ok(false)
+        }
+    }
+}
 
 /// The signals that end a process by default and that a handler sees: SIGKILL and SIGSTOP
 /// can't be caught, std ignores SIGPIPE, [`catch`] has SIGTERM, SIGINT and SIGUSR1, and SIGSEGV
@@ -404,17 +622,113 @@ fn thread_id() -> u64 {
     }
 }
 
-#[cfg(not(unix))]
+/// What the line an exception that ends the daemon writes says after its pid, then the
+/// exception's code: `blaze serve: pid 7 ended by exception 0xc0000005 at 0x10 on thread
+/// (tid 4242)`. Windows ends a process with no signal; its crash record names the exception
+/// (`blaze_profile::crash`).
+#[cfg(windows)]
+const ENDED_BY_EXCEPTION: &str = " ended by exception 0x";
+
+/// The unhandled-exception filter that was there before [`record_ends`]'s, null for none.
+#[cfg(windows)]
+static BEFORE_FILTER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// [`record_ends`] on Windows: an unhandled-exception filter that writes `blaze serve: pid N
+/// ended by exception 0xCODE at 0xADDR on thread (tid I)` to stderr (the daemon's log), on the
+/// stack with no allocation and one `WriteFile`, then hands the exception to the filter that
+/// was there, or lets the system end the process with it. `blaze_profile::crash::install`,
+/// called after this, goes in front of it, records the exception and hands it here. Until
+/// this, a daemon that died of an exception left its log with no last line, and the client a
+/// daemon hung up on could quote nothing of how it ended.
+#[cfg(windows)]
+pub fn record_ends() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
+    };
+    unsafe extern "system" fn ended(info: *const EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::{
+            Storage::FileSystem::WriteFile,
+            System::{
+                Console::{GetStdHandle, STD_ERROR_HANDLE},
+                Threading::{GetCurrentProcessId, GetCurrentThreadId},
+            },
+        };
+        /// `EXCEPTION_CONTINUE_SEARCH`.
+        const CONTINUE_SEARCH: i32 = 0;
+        let mut line = Line { bytes: [0; 160], len: 0 };
+        line.put(PID_SAYS.as_bytes());
+        // SAFETY: takes nothing.
+        line.number(u64::from(unsafe { GetCurrentProcessId() }));
+        line.put(ENDED_BY_EXCEPTION.as_bytes());
+        // SAFETY: the system passes a filter live exception pointers (either may be null).
+        let record = if info.is_null() { std::ptr::null() } else { unsafe { (*info).ExceptionRecord } };
+        if record.is_null() {
+            line.put(b"? (no record)");
+        } else {
+            // SAFETY: as above, a live `EXCEPTION_RECORD`.
+            let record = unsafe { &*record };
+            line.hex(u64::from(record.ExceptionCode as u32));
+            line.put(b" at 0x");
+            // An access violation's address is the one it touched; else where it happened.
+            let touched = matches!(record.ExceptionCode as u32, 0xC000_0005 | 0xC000_0006)
+                && record.NumberParameters >= 2;
+            match touched {
+                true => line.hex(record.ExceptionInformation[1] as u64),
+                false => line.hex(record.ExceptionAddress as u64),
+            }
+        }
+        line.put(b" on thread (tid ");
+        // SAFETY: takes nothing.
+        line.number(u64::from(unsafe { GetCurrentThreadId() }));
+        line.put(b")\n");
+        let mut wrote = 0u32;
+        // SAFETY: the process's stderr handle, which may be null or invalid (then the write
+        // fails and loses the line, nothing else); `line.bytes` is live and `line.len` of it
+        // written.
+        unsafe {
+            WriteFile(
+                GetStdHandle(STD_ERROR_HANDLE),
+                line.bytes.as_ptr(),
+                line.len as u32,
+                &mut wrote,
+                std::ptr::null_mut(),
+            )
+        };
+        let before = BEFORE_FILTER.load(Ordering::Acquire);
+        if before.is_null() {
+            return CONTINUE_SEARCH;
+        }
+        // SAFETY: `before` was the filter `SetUnhandledExceptionFilter` returned, so it is an
+        // `unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32`, called as it would be.
+        let before: unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32 =
+            unsafe { std::mem::transmute(before) };
+        // SAFETY: as above, with the pointers the system gave.
+        unsafe { before(info) }
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: `ended` is a function of this module, which lives as long as the process; it
+        // writes from its own stack and calls the filter before it, as it was set.
+        let before = unsafe { SetUnhandledExceptionFilter(Some(ended)) };
+        if let Some(before) = before {
+            BEFORE_FILTER.store(before as *mut (), Ordering::Release);
+        }
+    });
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn record_ends() {}
 
-/// A line built in a signal handler: on the stack, cut at its room, never allocated.
-#[cfg(unix)]
+/// A line built in a signal handler (on Windows an exception filter): on the stack, cut at its
+/// room, never allocated.
+#[cfg(any(unix, windows))]
 struct Line {
     bytes: [u8; 160],
     len: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Line {
     fn put(&mut self, bytes: &[u8]) {
         let room = &mut self.bytes[self.len..];
@@ -450,6 +764,86 @@ impl Line {
             }
         }
         self.put(&digits[at..]);
+    }
+}
+
+// One test of the stop's wait on every system: the stop's guard on Windows had none until
+// 2026-11-19 (B1), so a stuck stop there ran unbounded and a console's Ctrl-C ended the daemon
+// mid-image.
+#[cfg(all(test, any(unix, windows)))]
+mod stop_wait_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// The stop's wait times out quiet, and wakes once the daemon begins a stop of its own.
+    /// Remove the wake from `stop_begun` and the second wait times out.
+    #[test]
+    fn the_stop_wait_wakes_on_a_stop_begun_and_is_quiet_before() {
+        let mut stop = stop_wait().unwrap();
+        let start = Instant::now();
+        assert!(!stop.wait(Duration::from_millis(50)).unwrap(), "quiet before a stop");
+        assert!(start.elapsed() >= Duration::from_millis(40), "it waited: {:?}", start.elapsed());
+        let begun = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            stop_begun();
+        });
+        assert!(stop.wait(Duration::from_secs(10)).unwrap(), "woken by the stop begun");
+        begun.join().unwrap();
+    }
+}
+
+/// Sends Ctrl+Break to the process group `group` (a process started with
+/// `CREATE_NEW_PROCESS_GROUP`, whose id is its group's) on this process's console: what a
+/// test of the stop's guard sends where Unix sends SIGTERM.
+#[cfg(all(test, windows))]
+pub fn send_break(group: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: takes integers and reads no memory of this process.
+    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::process::Command;
+
+    use super::*;
+
+    const CHILD: &str = "BLAZE_TEST_ENDED_BY_EXCEPTION";
+    const NAME: &str =
+        "serve::signals::windows_tests::an_access_violation_ends_the_daemon_with_a_line_naming_it";
+
+    /// The invariant of `record_ends` on Windows: a daemon that dies of an exception writes a
+    /// line naming it, the address it touched and its thread, then ends with the exception's
+    /// code, as the system would have ended it. Control: with `record_ends` the no-op it was,
+    /// the child ends with the same code and its stderr holds no such line.
+    #[test]
+    fn an_access_violation_ends_the_daemon_with_a_line_naming_it() {
+        if std::env::var_os(CHILD).is_some() {
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+            };
+            // SAFETY: takes flags: no error report window for the fault below.
+            unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+            record_ends();
+            let at = std::hint::black_box(16usize) as *mut u8;
+            // SAFETY: none: the write faults on purpose, at an address nothing maps, to end
+            // this child process with an access violation.
+            unsafe { at.write_volatile(1) };
+            unreachable!("the write to address 16 faulted");
+        }
+        let ran = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(ran.status.code(), Some(0xC000_0005_u32 as i32), "{said}");
+        assert!(said.contains(" ended by exception 0xc0000005 at 0x10 on thread (tid "), "{said}");
+        assert!(said.contains(PID_SAYS), "{said}");
     }
 }
 

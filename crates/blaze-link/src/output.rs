@@ -264,3 +264,5 @@ pub enum NativeKind {
         as_needed: bool,
     },
 }
+
+crate::checkpoint::wire_enum!(NativeKind { 0 => Object, 1 => Archive { whole }, 2 => Shared { as_needed } });

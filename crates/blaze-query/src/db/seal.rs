@@ -115,7 +115,8 @@ use super::{
     reverse::{Reverse, Seen},
     row::{CYCLE, DURABILITY, HEAD, PROVISIONAL, RUNNING, STORED, UNTRACKED, VIEW_MASK, span},
     storage::{
-        FIELD, LOOSE, NODES, NodeRow, Restamp, Storage, Summary, input_bits, key_parts, loose, or,
+        Durability, FIELD, LOOSE, NODES, NodeRow, Restamp, Storage, Summary, input_bits, key_parts,
+        loose, or,
     },
     verify,
 };
@@ -277,6 +278,10 @@ struct Group {
     /// Whether the reverse index names every row behind its seal as a reader. False once the
     /// index was made without them.
     indexed: bool,
+    /// Rows of it, open or not, that let go of their edges while their durability proved
+    /// them ([`Storage::let_go_durable_edges`]), not yet assumed changed by a write that
+    /// reaches the group ([`Storage::assume_durable`]). May name a row that ran since.
+    durable: Vec<u32>,
     /// While its seal is broken: the rows behind it as readers of what they read, made from
     /// their own edges by the walk that first met the seal broken ([`Seals::index_broken`]);
     /// null otherwise. Freed when the group opens (the storage's index names the rows then)
@@ -307,6 +312,7 @@ impl Group {
             edges: 0,
             let_go: 0,
             indexed: true,
+            durable: Vec::new(),
             overlay: AtomicPtr::new(std::ptr::null_mut()),
             shadow: AtomicBool::new(false),
         }
@@ -363,6 +369,42 @@ pub(crate) struct Seals {
     /// [`Plant::LetGoRowsNotAssumed`]: a group that stops holding queues none of its rows
     /// without edges. False outside that control.
     forgets_assumed: bool,
+    /// Rows in the groups' `durable` lists ([`Storage::let_go_durable_edges`]): 0 lets a write
+    /// pass over the groups.
+    durable_rows: u64,
+    /// The let-go edges no reverse-index rebuild has dropped yet: past half the index, the
+    /// next durable pass makes it again without them.
+    durable_unshed: u64,
+    /// The live edges the last durable pass left ([`Storage::durable_pass_due`]).
+    durable_mark: u64,
+}
+
+/// What [`Storage::let_go_durable_edges`] let go, and what writes later assumed changed of
+/// it, over the process's life: the cost a memory report names.
+static DURABLE_EDGES: AtomicU64 = AtomicU64::new(0);
+static DURABLE_ROWS: AtomicU64 = AtomicU64::new(0);
+static DURABLE_ASSUMED: AtomicU64 = AtomicU64::new(0);
+
+/// Over the process's life: rows that let go of their edges by durability, the edges they let
+/// go, and the rows a write later assumed changed (each runs again when asked).
+pub fn durable_let_go_totals() -> (u64, u64, u64) {
+    (
+        DURABLE_ROWS.load(Ordering::Relaxed),
+        DURABLE_EDGES.load(Ordering::Relaxed),
+        DURABLE_ASSUMED.load(Ordering::Relaxed),
+    )
+}
+
+/// What [`Storage::let_go_durable_edges`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct DurableLetGo {
+    /// Rows that let go of their forward edges.
+    pub rows: u64,
+    /// The edges they let go.
+    pub edges: u64,
+    /// Whether it made the reverse index again without them, and the readers the index held
+    /// before and after.
+    pub shed: Option<(u64, u64)>,
 }
 
 impl Drop for Seals {
@@ -391,6 +433,9 @@ impl Seals {
             breaks: AtomicU64::new(0),
             opens: 0,
             let_go_rows: 0,
+            durable_rows: 0,
+            durable_unshed: 0,
+            durable_mark: 0,
             assumed: SegQueue::new(),
             forgets_assumed: false,
         }
@@ -1168,6 +1213,9 @@ impl Storage {
                 let with = self.seals.groups[own].with[at] as usize;
                 self.seals.groups[with].written = true;
             }
+            if self.seals.durable_rows != 0 {
+                self.assume_durable(own);
+            }
         }
         if self.seals.sealed == 0 || plant == Plant::SealSurvivesAWrite {
             return;
@@ -1331,6 +1379,137 @@ impl Storage {
                 self.seal_open(at as u16, "an import of it gained an input");
             }
         }
+    }
+
+    /// A write to an input of group `own`: every row that let go of its edges by durability in
+    /// `own`, in a group that opens with it or in a group that depends on it is assumed
+    /// changed, for the next walk to start from ([`Seals::assume`]'s queue). No other such row
+    /// can have read what was written: it is not loose, so it reads, at any depth, only inputs
+    /// of its group and of the groups below it (the module's rule).
+    fn assume_durable(&mut self, own: usize) {
+        if self.seals.forgets_assumed {
+            return;
+        }
+        let seals = &mut self.seals;
+        for at in 1..seals.groups.len() {
+            if seals.groups[at].durable.is_empty() {
+                continue;
+            }
+            let reached = at == own
+                || seals.groups[own].with.contains(&(at as u16))
+                || has(&seals.groups[at].below, own);
+            if !reached {
+                continue;
+            }
+            let rows = std::mem::take(&mut seals.groups[at].durable);
+            seals.durable_rows -= rows.len() as u64;
+            let mut assumed = 0u64;
+            for node in rows {
+                if seals.word(node) & LET_GO != 0 {
+                    seals.assumed.push(node); // alloc: a word a row without edges a write reached
+                    assumed += 1;
+                }
+            }
+            DURABLE_ASSUMED.fetch_add(assumed, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the live edges grew by `growth` or more since the last durable pass
+    /// ([`Storage::let_go_durable_edges`]): a pass reads every node, so a host runs one only
+    /// when there may be that much to let go, never on each edit.
+    pub fn durable_pass_due(&self, growth: u64) -> bool {
+        self.seals.declared() && self.live_edges() >= self.seals.durable_mark.saturating_add(growth)
+    }
+
+    /// Lets go of the forward edges of every row of a library's group that its durability
+    /// proves now (memory.md 4.4: a library's rows are most of a build's, and its inputs are
+    /// written almost never), with no seal: what a host calls at a build's end, and between
+    /// two views of a cold build once the edges have grown, with `&mut`.
+    ///
+    /// A row qualifies when it is current or proved by its durability (`HIGH`, no input of
+    /// that kind written since it was verified), of a group whose kind lets go of edges
+    /// ([`SealKind::lets_go_edges`]), not loose and not poisoned (so it reads, at any depth,
+    /// only inputs of its group and of the groups below it), and not a cycle's, stored or
+    /// untracked row. It is marked [`LET_GO`]: proved by its durability or its summary
+    /// (neither reads an edge), and run again otherwise. A write to an input of its group or
+    /// of one below it assumes it changed ([`Storage::assume_durable`]), so the walk starts
+    /// from it and finds its readers by their own edges. An edit of a workspace crate writes
+    /// no input of a library's group: the edit loop never runs such a row again.
+    ///
+    /// Once the edges let go are half of the reverse index, the index is made again without
+    /// them ([`Storage::shed_sealed_readers`]).
+    pub fn let_go_durable_edges(&mut self) -> DurableLetGo {
+        let mut out = DurableLetGo::default();
+        if !self.seals.declared() || self.frontier.plant == Plant::WalkEntersSealedGroups {
+            return out;
+        }
+        let span = tracing::info_span!(
+            target: "blaze",
+            "query edges let go of durable library rows",
+            rows = tracing::field::Empty,
+            edges = tracing::field::Empty,
+            shed = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        // The spans runs replaced are folded first: the fold reads them, and a row that lets
+        // go here names none.
+        self.fold_reverse();
+        // A row that ran since it was listed has edges again, and its word no LET_GO.
+        let mut listed = 0u64;
+        for at in 1..self.seals.groups.len() {
+            let mut rows = std::mem::take(&mut self.seals.groups[at].durable);
+            rows.retain(|&node| self.seals.word(node) & LET_GO != 0);
+            listed += rows.len() as u64;
+            self.seals.groups[at].durable = rows;
+        }
+        self.seals.durable_rows = listed;
+        let high = Durability::HIGH.0;
+        for node in 1..self.nodes_made() {
+            let Some((header, _, _)) = frontier::row_of(self, node) else { continue };
+            let word = header.verified.load(Ordering::Relaxed);
+            let meta = header.meta.load(Ordering::Relaxed);
+            if word & (RUNNING | PROVISIONAL) != 0
+                || word & VIEW_MASK == 0
+                || meta & (CYCLE | HEAD | STORED | UNTRACKED) != 0
+                || (meta & DURABILITY) as u8 != high
+                || !self.unchanged_since(high, word & VIEW_MASK)
+            {
+                continue;
+            }
+            let seal = self.seals.word(node);
+            let group = (seal & GROUP) as usize;
+            if group == 0
+                || seal & (LET_GO | POISONED | SEALED) != 0
+                || !self.seals.groups[group].kind.lets_go_edges()
+                || loose(self.summary_of(node))
+            {
+                continue;
+            }
+            let kept = header.edges.load(Ordering::Relaxed);
+            if span::len(kept) == 0 {
+                continue;
+            }
+            header.edges.store(0, Ordering::Relaxed);
+            self.forget_edges(kept);
+            self.seals.set_word(node, seal | LET_GO);
+            self.seals.let_go_rows += 1;
+            self.seals.groups[group].durable.push(node); // alloc: a word a row that let go
+            self.seals.durable_rows += 1;
+            out.rows += 1;
+            out.edges += span::len(kept);
+        }
+        self.seals.durable_unshed += out.edges;
+        if self.seals.durable_unshed >= SHED_AT && self.seals.durable_unshed * 2 >= self.frontier.held() {
+            out.shed = Some(self.shed_sealed_readers());
+            self.seals.durable_unshed = 0;
+        }
+        self.seals.durable_mark = self.live_edges();
+        DURABLE_ROWS.fetch_add(out.rows, Ordering::Relaxed);
+        DURABLE_EDGES.fetch_add(out.edges, Ordering::Relaxed);
+        span.record("rows", out.rows);
+        span.record("edges", out.edges);
+        span.record("shed", out.shed.is_some());
+        out
     }
 
     /// Whether the row of `node` may go behind a seal now: it ran, made no untracked read,

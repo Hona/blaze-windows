@@ -13,7 +13,10 @@
 //! and rewritten for it; the temporary directory is removed as the run ends, grant and all. There
 //! is no network without the internet and
 //! private-network capabilities, which only a spec with `network` is given. What is read is not
-//! traced on Windows: the caller says so in the record.
+//! traced on Windows: a traced run's processes tell what they read on a pipe the launcher hands
+//! them ([`hear`], [`crate::sandbox::told`]), and the record is whole only when every process
+//! of the run's job told; one that told nothing (the program, until blaze observes it) is the
+//! record's `X` line.
 //!
 //! A run is started by `blaze sandbox --v2`, one process a run, or by the warm launcher
 //! (`blaze sandbox --v2-serve`, [`serve`]), one process a daemon, which runs each on a thread of
@@ -31,8 +34,11 @@
 //!
 //! [#1390]: https://github.com/indexable-inc/blaze/issues/1390
 
+mod hear;
 mod reads;
 pub mod serve;
+
+pub(crate) use hear::{console_host, tell};
 
 use std::{
     ffi::{OsStr, c_void},
@@ -45,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_usercode::confine::Spec;
+use blaze_usercode::{confine::Spec, trace};
 use windows_sys::{
     Win32::{
         Foundation::{
@@ -193,6 +199,13 @@ impl Given {
 /// `given` says: what it ends with, its exit code. `Err(why)` when no sandbox could be made, and
 /// then nothing ran.
 pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
+    run_told(spec, given).map(|(code, _)| code)
+}
+
+/// [`run`], and, when `spec.trace`, the lines of the run's record of what its processes told
+/// ([`crate::sandbox::told`]): each one's reads, and an `X` line unless every process of the
+/// run's job told or hosts a teller's console.
+pub fn run_told(spec: &Spec, given: Given) -> Result<(i32, Option<Vec<trace::Line>>), String> {
     let _running = Running::start();
     on_interrupt()?;
     let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
@@ -201,7 +214,16 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     roots.sort_unstable();
     roots.dedup();
     let capabilities = roots.iter().map(|path| Capability::read(path)).collect::<Result<Vec<_>, _>>()?;
-    let mut made = make_with(spec.network, given, capabilities)?;
+    let (server, client) = match spec.trace {
+        true => {
+            let (server, client) = hear::pipe()?;
+            (Some(server), Some(client))
+        }
+        false => (None, None),
+    };
+    // alloc: once a traced run, the variable naming the pipe's handle.
+    let told_var = client.as_ref().map(|it| format!("{:#x}", it.0 as usize));
+    let mut made = make_with(spec.network, given, capabilities, client)?;
     let temp = temporary(spec)?;
     let writable = Inheritable::new(made.run.sid(), WRITE)?;
     match writable.make_dir(&temp) {
@@ -292,11 +314,14 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     }
 
     // The program's environment, once per sandbox, for the kernel.
-    let mut env = Vec::with_capacity(spec.env.len() + 3);
+    let mut env = Vec::with_capacity(spec.env.len() + 4);
     env.extend(spec.env.iter().cloned());
     // clone: as above.
     env.push(("TMP".into(), temp.clone().into_os_string()));
     env.push(("TEMP".into(), temp.into_os_string()));
+    if let Some(value) = told_var {
+        env.push((crate::sandbox::told::VAR.into(), value.into()));
+    }
     // Windows makes an AppContainer's process only with `LOCALAPPDATA` in its environment,
     // which it points at the container's own folder (`Packages\<profile>\AC`): without it
     // CreateProcessW fails with ERROR_ENVVAR_NOT_FOUND (203). What the program sees is that
@@ -325,6 +350,8 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     startup.lpAttributeList = made.attributes.list();
     let inherit = BOOL::from(!made.inherited.is_empty());
     let mut process = PROCESS_INFORMATION::default();
+    // Heard from before the program runs, so no process of it waits on a full pipe.
+    let hearing = server.map(hear::Hearing::start).transpose()?;
     // Before the process exists, so an interrupt while it is made ends it too.
     let _registered = Registered::new(&made.job);
     // SAFETY: `program` and `dir` end in NUL (`wide`), `line` ends in NUL and is this frame's
@@ -358,6 +385,8 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     }
     let child = Handle(process.hProcess);
     drop(Handle(process.hThread));
+    // The program holds its own copy: the pipe ends once every process of the run has.
+    made.told = None;
     // SAFETY: `child` owns the process handle until `run` returns, so the wait is on this
     // process and no other object that took its number.
     #[expect(
@@ -379,7 +408,19 @@ pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
         return Err(why);
     }
     end(&made.job, code);
-    Ok(code as i32)
+    let told = match hearing {
+        Some(hearing) => {
+            let heard = hearing.heard();
+            let failed = heard.failed.as_deref();
+            Some(match hear::total(&made.job) {
+                Ok(total) => crate::sandbox::told::lines(total, &heard.told, &heard.refused, failed),
+                // The program ran: not counted, the run is not whole, never a sandbox not made.
+                Err(why) => vec![trace::Line::new(trace::Seen::Incomplete, "", &why)],
+            })
+        }
+        None => None,
+    };
+    Ok((code as i32, told))
 }
 
 /// Makes a sandbox around nothing (no program run): `Ok` when one can be made here, why not
@@ -405,6 +446,9 @@ struct Made {
     run: Capability,
     job: Handle,
     standard: [Option<Handle>; 3],
+    /// The client end of the pipe the run's processes tell on ([`hear`]), until the program is
+    /// made with it.
+    told: Option<Handle>,
     inherited: Vec<HANDLE>,
 }
 
@@ -446,10 +490,15 @@ fn kept() -> Result<&'static Kept, String> {
 
 
 fn make(network: bool, given: Given) -> Result<Made, String> {
-    make_with(network, given, Vec::new())
+    make_with(network, given, Vec::new(), None)
 }
 
-fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made, String> {
+fn make_with(
+    network: bool,
+    given: Given,
+    reads: Vec<Capability>,
+    told: Option<Handle>,
+) -> Result<Made, String> {
     let kept = kept()?;
     let container = Container::new()?;
     let run = Capability::new()?;
@@ -478,8 +527,8 @@ fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made
     };
     // alloc: as `capabilities` is.
     let jobs = Box::new([job.0]);
-    let mut inherited: Vec<HANDLE> = Vec::with_capacity(3);
-    inherited.extend(standard.iter().flatten().map(|it| it.0));
+    let mut inherited: Vec<HANDLE> = Vec::with_capacity(4);
+    inherited.extend(standard.iter().flatten().chain(&told).map(|it| it.0));
     let mut attributes = Attributes::new(if inherited.is_empty() { 2 } else { 3 })?;
     // SAFETY: `capabilities` is one SECURITY_CAPABILITIES in a box, which `Made` keeps beside
     // `attributes` (moving `Made` leaves it where it is), and what it points to is kept there
@@ -513,7 +562,7 @@ fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                 inherited.as_ptr().cast(),
                 inherited.len() * size_of::<HANDLE>(),
-                "passing the program its standard handles and no other",
+                "passing the program its standard handles, the pipe it tells on and no other",
             )
         }?;
     }
@@ -528,6 +577,7 @@ fn make_with(network: bool, given: Given, reads: Vec<Capability>) -> Result<Made
         run,
         job,
         standard,
+        told,
         inherited,
     })
 }
@@ -586,7 +636,8 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             // SAFETY: every `Handle` is made from a handle a call just returned to this module
-            // (CreateProcessW, DuplicateHandle, CreateJobObjectW, CreateFileW, OpenProcess), never copied
+            // (CreateProcessW, DuplicateHandle, CreateJobObjectW, CreateFileW, CreateNamedPipeW,
+            // OpenProcess), never copied
             // into another `Handle`, so this is its one close; closing it twice could close
             // whatever reused its number.
             unsafe { CloseHandle(self.0) };
@@ -1832,6 +1883,75 @@ mod tests {
             !temporary(&exit).unwrap().exists(),
             "the run's temporary directory was left behind"
         );
+        _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The variable that has [`a_process_in_the_sandbox_tells`] tell, run as a sandbox's program.
+    const TELLS: &str = "BLAZE_TEST_TELLS";
+
+    /// What the program run by [`a_traced_run_is_whole_only_when_every_process_of_its_job_told`]
+    /// does: tells one read, as the rustc stand-in tells its own. Does nothing run by the harness.
+    #[test]
+    fn a_process_in_the_sandbox_tells() {
+        let Some(path) = std::env::var_os(TELLS) else { return };
+        let reads = crate::sandbox::told::Reads::default();
+        reads.read(Path::new(&path));
+        assert_eq!(reads.tell(), Ok(true));
+    }
+
+    #[test]
+    fn a_traced_run_is_whole_only_when_every_process_of_its_job_told() {
+        if let Err(why) = probe() {
+            eprintln!("no sandbox can be made here, so this is not run: {why}");
+            return;
+        }
+        let root = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let tmp = blaze_core::temp::TempDir::for_test("blaze-windows-told-test-");
+        let base = tmp.path().to_path_buf();
+        let told = base.join("probe.rs");
+        let spec = |program: PathBuf, args: &[&str]| Spec {
+            program: program.clone(),
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            env: vec![
+                ("SystemRoot".into(), root.clone().into_os_string()),
+                (TELLS.into(), told.clone().into_os_string()),
+            ],
+            dir: base.clone(),
+            read: vec![base.clone()],
+            write: Vec::new(),
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: base.join("live"),
+            report: base.join("report"),
+            not_inputs: vec![program],
+            given: None,
+        };
+        let x = |lines: &[trace::Line]| {
+            lines.iter().filter(|it| it.seen == trace::Seen::Incomplete).count()
+        };
+
+        // The program tells: it, and its console's host, which it names, are the whole job.
+        let me = std::env::current_exe().unwrap();
+        let tells = spec(me, &["--exact", "sandbox::windows::tests::a_process_in_the_sandbox_tells", "--test-threads=1"]);
+        let (code, lines) = run_told(&tells, Given::own()).unwrap();
+        let lines = lines.expect("a traced run has the lines of what its processes told");
+        assert_eq!(code, 0, "{lines:?}");
+        assert!(lines.contains(&trace::Line::new(trace::Seen::Read, "", told.to_str().unwrap())), "{lines:?}");
+        assert_eq!(x(&lines), 0, "{lines:?}");
+
+        // A program that tells nothing is a process of the job no message accounts for.
+        let cmd = root.join("System32").join("cmd.exe");
+        let (code, lines) = run_told(&spec(cmd.clone(), &["/c", "exit", "0"]), Given::own()).unwrap();
+        let lines = lines.unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(x(&lines), 1, "{lines:?}");
+
+        // Untraced, nothing is heard and the program is handed no pipe.
+        let mut quiet = spec(cmd, &["/c", "if", "defined", crate::sandbox::told::VAR, "exit", "3"]);
+        quiet.trace = false;
+        assert_eq!(run_told(&quiet, Given::own()), Ok((0, None)));
         _ = std::fs::remove_dir_all(&base);
     }
 

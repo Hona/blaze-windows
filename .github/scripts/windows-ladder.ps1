@@ -1,6 +1,7 @@
 # The small end-to-end ladder on a Windows runner (a VM): hello world, a crate with dependencies,
 # rune-cstr, one-luau (12 packages) and r28-ops (17 packages), each checked, built, run/tested (for
-# binary fixtures) with the blaze this run built, then a no-op build and a one-line edit, each timed,
+# binary fixtures) with the blaze this run built, then a no-op build and a one-line edit (for hello
+# and withdeps, another after `blaze stop` and a new daemon), each timed,
 # with the build-script runs and peak memory by owner read from the profile. Continues past
 # independent step failures (when -ContinueOnFailure is set) and writes ladder-result.json so the
 # batch summary reports every step's status, time, error and memory peaks in one place.
@@ -109,6 +110,38 @@ function Step([string] $project, [string] $step, [string] $dir, [string[]] $word
     }
 
     Record-Step $step $cmdStr 'ok' $code $seconds '' ''
+    return $true
+}
+
+# Stops the daemon (`blaze stop`, which checkpoints its kept link images) and starts another in
+# the same home, as a developer's next session does: the first edit after it is timed against
+# the warm one. `$script:server` is the new daemon, which the run's `finally` stops.
+function Restart-Serve {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $stop = Start-Process -FilePath $Blaze -ArgumentList 'stop' -NoNewWindow -PassThru `
+        -RedirectStandardError (Join-Path $Out 'restart-stop.stderr.log') -RedirectStandardOutput (Join-Path $Out 'restart-stop.log')
+    $stopped = $stop.WaitForExit(60000) -and $script:server.WaitForExit(30000)
+    if (!$stop.HasExited) { $stop.Kill() }
+    $stop.Dispose()
+    if (!$stopped -or $script:server.ExitCode -ne 0) {
+        Record-Step 'restart' 'blaze stop; blaze serve' 'FAILED' 1 ([math]::Round($watch.Elapsed.TotalSeconds, 3)) 'the daemon did not stop cleanly for the restart' (Get-TailSnippet @($serverLog) 25)
+        return $false
+    }
+    $script:server.Dispose()
+    $log = Join-Path $Out 'serve-restarted.stderr.log'
+    $script:server = Start-Process -FilePath $Blaze -ArgumentList 'serve' -NoNewWindow -PassThru `
+        -RedirectStandardError $log -RedirectStandardOutput (Join-Path $Out 'serve-restarted.stdout.log')
+    $deadline = [datetime]::UtcNow.AddMinutes(4)
+    do {
+        $listening = Select-String -LiteralPath $log -SimpleMatch 'blaze serve: listening on ' -Quiet -ErrorAction SilentlyContinue
+        if (!$listening) { Start-Sleep -Milliseconds 200 }
+    } until ($listening -or $script:server.HasExited -or [datetime]::UtcNow -ge $deadline)
+    $seconds = [math]::Round($watch.Elapsed.TotalSeconds, 3)
+    if (!$listening) {
+        Record-Step 'restart' 'blaze stop; blaze serve' 'FAILED' 1 $seconds 'the restarted daemon did not announce its listener' (Get-TailSnippet @($log) 25)
+        return $false
+    }
+    Record-Step 'restart' 'blaze stop; blaze serve' 'ok' 0 $seconds '' ''
     return $true
 }
 
@@ -247,7 +280,7 @@ try {
             if ($name -ne $Fixture) { continue }
             $locked = Step $name 'lock' $dir @('lock') ''
             if (-not $locked) {
-                foreach ($sk in @('check', 'build', 'run', 'test', 'noop', 'edit', 'run-edited')) {
+                foreach ($sk in @('check', 'build', 'run', 'test', 'noop', 'edit', 'run-edited', 'restart', 'restart-edit', 'run-restarted')) {
                     Record-Step $sk "blaze $sk" 'skipped' 0 0 'lock failed' ''
                 }
                 continue
@@ -263,11 +296,28 @@ try {
                 $edited = Step $name 'edit' $dir @('build') ''
                 if ($edited) {
                     [void](Step $name 'run-edited' $dir @('run', '-q') "$said, edited")
+                    # The first edit after a restart: stop the daemon, edit one function, build.
+                    # Its compiled functions come back from their records and its link image from
+                    # the stop's checkpoint, so the link patches the file (timings.csv beside `edit`).
+                    if (Restart-Serve) {
+                        (Get-Content $file -Raw).Replace("`"$said, edited`"", "`"$said, restarted`"") | Set-Content $file -NoNewline
+                        if (Step $name 'restart-edit' $dir @('build') '') {
+                            [void](Step $name 'run-restarted' $dir @('run', '-q') "$said, restarted")
+                        } else {
+                            Record-Step 'run-restarted' 'blaze run -q' 'skipped' 0 0 'restart edit build failed' ''
+                        }
+                    } else {
+                        foreach ($sk in @('restart-edit', 'run-restarted')) {
+                            Record-Step $sk "blaze $sk" 'skipped' 0 0 'restart failed' ''
+                        }
+                    }
                 } else {
-                    Record-Step 'run-edited' 'blaze run -q' 'skipped' 0 0 'edit build failed' ''
+                    foreach ($sk in @('run-edited', 'restart', 'restart-edit', 'run-restarted')) {
+                        Record-Step $sk "blaze $sk" 'skipped' 0 0 'edit build failed' ''
+                    }
                 }
             } else {
-                foreach ($sk in @('run', 'test', 'noop', 'edit', 'run-edited')) {
+                foreach ($sk in @('run', 'test', 'noop', 'edit', 'run-edited', 'restart', 'restart-edit', 'run-restarted')) {
                     Record-Step $sk "blaze $sk" 'skipped' 0 0 'build failed' ''
                 }
             }
@@ -365,17 +415,21 @@ order by started_unix_ns
 
             $builds = @(Import-Csv $counts | Where-Object { $_.command -eq 'build' -and $_.outcome -eq 'ok' })
             if ($Fixture -ne 'rune-cstr') {
-                # The three standalone `build` requests in execution order: cold, no-op, edit.
+                # The standalone `build` requests in execution order: cold, no-op, edit, and for
+                # hello and withdeps the edit after the restart (its daemon's profile beside).
+                $wantBuilds = if ($Fixture -in @('hello', 'withdeps')) { 4 } else { 3 }
                 $scriptRunsInfo = [ordered]@{
                     completed_builds = $builds.Count
                     build = if ($builds.Count -ge 1) { [int]$builds[0].script_runs } else { $null }
                     noop = if ($builds.Count -ge 2) { [int]$builds[1].script_runs } else { $null }
                     edit = if ($builds.Count -ge 3) { [int]$builds[2].script_runs } else { $null }
+                    restart_edit = if ($builds.Count -ge 4) { [int]$builds[3].script_runs } else { $null }
                 }
                 $profErr = ''
-                if ($builds.Count -ne 3) { $profErr = "expected three completed build profiles; got $($builds.Count)" }
+                if ($builds.Count -ne $wantBuilds) { $profErr = "expected $wantBuilds completed build profiles; got $($builds.Count)" }
                 elseif ([int]$builds[1].script_runs -ne 0) { $profErr = "the no-op ran $($builds[1].script_runs) build script(s)" }
                 elseif ([int]$builds[2].script_runs -ne 0) { $profErr = "the one-line edit ran $($builds[2].script_runs) build script(s)" }
+                elseif ($wantBuilds -eq 4 -and [int]$builds[3].script_runs -ne 0) { $profErr = "the edit after the restart ran $($builds[3].script_runs) build script(s)" }
                 else {
                     Write-Host "build-script runs: build=$($builds[0].script_runs) noop=$($builds[1].script_runs) edit=$($builds[2].script_runs)"
                 }

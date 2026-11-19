@@ -189,9 +189,8 @@ mod unix {
     use crate::{
         Completion, Dgram, Done, Effect, IoError, RECV_MOST, Stream, Tag,
         dgram::{self, Batch, Ecn, Options, Slots},
-        lock::Lock,
         net::udp::{self, At},
-        wait::{self, Deadline, Monotonic, Parker, Waited},
+        wait::{self, Monotonic, Parker, Waited},
     };
 
     /// Where the host tells a completion: the driver's mailbox, waking its wait. Called from

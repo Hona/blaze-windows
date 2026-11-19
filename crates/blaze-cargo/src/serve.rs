@@ -45,7 +45,7 @@ mod local;
 // Track 7, task A: the sealed layer, installed once a machine and read in place by every home.
 #[blaze::sans_io]
 pub(crate) mod sealed;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 pub(crate) mod inspect;
 mod job;
 /// cargo's words as a load's config keeps them: the daemon's jobs and `check --no-daemon`
@@ -79,7 +79,7 @@ mod still;
 mod commit;
 #[cfg(feature = "native")]
 mod stop;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 mod stuck;
 #[cfg(test)]
 mod tests;
@@ -188,8 +188,21 @@ fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
 /// The directory every daemon of the user shares (`blaze_core::platform::home`'s `machine`:
 /// `blaze` in the user's cache directory, `%LOCALAPPDATA%\blaze` on Windows), absolute.
 fn user_shared() -> anyhow::Result<Option<PathBuf>> {
-    let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
-    let Some(dir) = found.machine else { return Ok(None) };
+    #[cfg(windows)]
+    let dir = {
+        let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
+        let Some(dir) = found.machine else { return Ok(None) };
+        dir
+    };
+    // `~` is `blaze_core::home::user`: `HOME`, else the system's record of the user, as the
+    // root's is (`blaze_manifest::home::root`); `platform::home::homes` reads `HOME` alone.
+    #[cfg(not(windows))]
+    let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
+        Some(caches) => PathBuf::from(caches).join("blaze"),
+        None => blaze_core::home::user()
+            .context("no XDG_CACHE_HOME says where this machine's daemons share the standard library")?
+            .join(".cache/blaze"),
+    };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
     std::path::absolute(&dir).map(Some).with_context(|| {
@@ -1089,8 +1102,6 @@ pub(crate) fn engine(
 ) -> anyhow::Result<Engine> {
     #[cfg(windows)]
     let commit = commit::Guard::arm()?;
-    #[cfg(windows)]
-    commit::set_value_budgets().context("capping the front end's weighed values")?;
     let state = state()?;
     std::fs::create_dir_all(&state)
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
@@ -1478,6 +1489,9 @@ fn begin(
         None => record_code().map_err(anyhow::Error::msg)?.0,
     };
     blaze_link::target::keep_coff_requests(store, producer).map_err(anyhow::Error::msg)?;
+    // Where a stop checkpoints the kept link images, which the next daemon's first links
+    // restore and patch in place.
+    unit::keep_link_checkpoints(state()?.join("link-images"), producer).map_err(anyhow::Error::msg)?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
     let root = builds()?
@@ -1529,15 +1543,12 @@ fn listen(
     // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
-    #[cfg(unix)]
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     // The task watchdog: a task that makes no progress for its bound is named, with what it
     // waits on and who holds it, and its job fails (`stuck`).
-    #[cfg(unix)]
     let tasks_watch = stuck::arm(daemon.pulse(), blaze_graph::exec::shared().workers())?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
-    #[cfg(unix)]
     {
         let inspector = inspect::Inspector { pulse: daemon.pulse(), tasks: daemon.tasks() };
         if let Err(why) = socket()
@@ -1577,8 +1588,9 @@ fn listen(
             break;
         }
     }
-    #[cfg(unix)]
-    { tasks_watch.disarm(); guard.disarm(); }
+    tasks_watch.disarm();
+    guard.disarm();
+    signals::stop_ended();
     match daemon.failed() {
         Some(why) => bail!("{why}"),
         None if daemon.ended_unheld() => {

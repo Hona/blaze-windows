@@ -3408,6 +3408,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         let mut built = built?;
         if !shared.is_empty() {
+            shared.append(&mut built.shared);
             built.shared = records::sorted(shared).map_err(|why| vec![why])?;
         }
         if made.is_empty() {
@@ -3862,16 +3863,37 @@ impl<'a, B: Prepare> Build<'a, B> {
             (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
         });
         out.used.extend(lazily.shapes.values().copied());
+        // What a function of sealed code put (its templates, its side tables): the machine's
+        // layer's, every home reading it there ([`Frontend::shares`]), in a build that reads
+        // records as the daemon's do.
+        // alloc: per build that reads records, a key per put of sealed code
+        let mut sealed_keys = blaze_hash::HashSet::new_in(Global);
+        if self.records.is_some() {
+            for (by, put) in &out.puts {
+                if let Of::Function(node) = by.of
+                    && let Some(node) = nodes.get(&node)
+                    && self.frontend.shares(&node.instance)
+                {
+                    sealed_keys.insert(put.key);
+                }
+            }
+        }
         let Finished {
             functions,
             statics: compiled_statics,
-            puts,
+            mut puts,
             stats,
             errors,
             used,
             kernel,
             misses,
         } = out.finish(names_of::<_, _, B>(&nodes, Some(&statics)));
+        // alloc: per build that reads records, the puts of sealed code moved out
+        let mut shared = Vec::new();
+        if !sealed_keys.is_empty() {
+            let (layer, home) = puts.into_iter().partition(|it| sealed_keys.contains(&it.key));
+            (shared, puts) = (layer, home);
+        }
         // alloc: once per build, the walk its `Later` and the kept walk share
         let nodes = Arc::new(nodes);
         // clone: a reference count, once per build
@@ -3890,7 +3912,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             tiered,
             deduped,
             puts,
-            shared: Vec::new(),
+            shared,
             stats,
             inputs,
             items,

@@ -1313,3 +1313,5 @@ mod tests {
         );
     }
 }
+
+crate::checkpoint::wire_struct!(Totals { absolute, image, got, functions, function_names, fdes, unwind });

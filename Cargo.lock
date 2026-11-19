@@ -698,6 +698,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -1501,7 +1502,6 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "parking_lot",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -204,6 +204,31 @@ fn entry_key(kind: u8, parts: &[&[u8; 32]]) -> [u8; 32] {
 }
 
 impl Rows {
+    /// The rows a checkpointed image held ([`super::checkpoint`]), of no build: the next link
+    /// brings them to its build from the build's whole lists, against what the image holds.
+    pub(crate) fn restored(
+        functions: BTreeMap<InstanceKey, ContentId>,
+        statics: BTreeMap<StaticId, ContentId>,
+        spans: BTreeMap<ContentId, ContentId>,
+    ) -> Rows {
+        // alloc: once per restore, an entry a row
+        let mut entries = Vec::with_capacity(functions.len() + statics.len() + spans.len());
+        entries.extend(functions.iter().map(|(key, row)| (entry_key(FUNCTION, &[&key.0.0]), row.0)));
+        entries.extend(
+            statics.iter().map(|(id, row)| (entry_key(STATIC, &[&id.0.0.0, &id.1.0]), row.0)),
+        );
+        entries.extend(spans.iter().map(|(anchor, id)| (entry_key(SPANS, &[&anchor.0]), id.0)));
+        Rows {
+            built: None,
+            inputs: 0,
+            functions,
+            statics,
+            spans,
+            digest: Keyed::of(entries),
+            ..Rows::default()
+        }
+    }
+
     /// Whether the rows can take `built` as its delta (`Ok(false)`), are of `built` already
     /// (`Ok(true)`), or have to be made again from its whole lists, and why.
     pub(crate) fn takes(&self, built: &Built) -> Result<bool, &'static str> {

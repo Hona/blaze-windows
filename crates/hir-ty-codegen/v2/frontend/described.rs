@@ -597,7 +597,7 @@ impl<'db> HirFrontend<'db> {
     /// crates above them have image keys that hash dependency `surface`s, which exclude
     /// `#[inline]` bodies, so they use traced describe records in [`traced`] instead), has no
     /// image, or is worked out in an environment that is not empty.
-    fn sealed(db: &'db Db, instance: &HirInstance) -> Option<(ContentId, Closure<'db>)> {
+    pub(super) fn sealed(db: &'db Db, instance: &HirInstance) -> Option<(ContentId, Closure<'db>)> {
         let Kind::Code(_, env) = &instance.0 else { return None };
         if env.param_env(db) != ParamEnv::empty() {
             return None;

@@ -35,6 +35,7 @@ fn config(jobs: usize) -> Config {
         fail_fast: false,
         kill_grace: Duration::from_secs(5),
         tags: 1 << 40,
+        records_each_test: true,
     }
 }
 
@@ -478,6 +479,33 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     // The deadlines went with their tests: the timer still in flight does nothing.
     fake.advance(Duration::from_secs(120));
     assert!(fake.frames(conn).is_empty() && fake.kills.is_empty());
+}
+
+/// Where the sandbox records nothing of one test (Windows, `Config::records_each_test` false),
+/// a test of a fork server passes with its reads unknown, never with the empty lines its record
+/// holds, which would say it read nothing and keep its pass on nothing. Control: the same lines
+/// with a recording sandbox are the test's.
+#[test]
+fn a_test_whose_sandbox_records_nothing_of_it_is_not_traced() {
+    for records in [true, false] {
+        let mut fake =
+            Fake::new(Config { records_each_test: records, ..config(1) }, vec![binary("lib", vec![job("a", 10)])]);
+        let conn = fake.hello(0, &["a"]);
+        let a = fake.runs(conn)[0].0;
+        if records {
+            fake.append(0, &[Line::new(Seen::Read, "a", "/ws/a.txt")]);
+        }
+        fake.end(conn, a, End::Exited(0), b"");
+        let result = fake.result("a");
+        assert_eq!(result.outcome, Outcome::Passed);
+        match records {
+            true => assert_eq!(result.trace, lines(&[(Seen::Read, "/ws/a.txt")])),
+            false => assert!(
+                matches!(&result.trace, Trace::Unknown(why) if why.contains("records nothing of one test")),
+                "{result:?}"
+            ),
+        }
+    }
 }
 
 #[test]

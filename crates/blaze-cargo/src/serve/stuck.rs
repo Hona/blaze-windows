@@ -300,12 +300,17 @@ fn ended(fate: Fate, still_ns: u64) -> String {
                 "its job ended before it could be failed"
             }
         }
+        #[cfg(unix)]
         Fate::Kill { pid } => match i32::try_from(pid) {
             Ok(pid) if blaze_core::children::kill_listed(pid) => {
                 "it is killed, so the job waiting for it fails"
             }
             _ => "it was reaped before it could be killed",
         },
+        // The IOCP driver keeps each child in a job object of its own and lists none here, so
+        // none is killed by pid: its job's own deadline ends it.
+        #[cfg(not(unix))]
+        Fate::Kill { .. } => "children are not listed on Windows, so it is left to its job's own deadline",
         Fate::Behind => "it moves once what it waits behind is failed",
         Fate::Loop => "the loop's own guard ends the daemon",
         Fate::Lost { .. } => "it is lost",

@@ -540,7 +540,7 @@ pub fn serve(socket: &Path, inspector: Inspector) -> Result<(), String> {
 
 /// One request read from `stream` and answered on it.
 fn answer_one(
-    mut stream: &std::os::unix::net::UnixStream,
+    mut stream: &crate::socket::Stream,
     inspector: &Inspector,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(crate::socket::REQUEST_TIMEOUT))?;

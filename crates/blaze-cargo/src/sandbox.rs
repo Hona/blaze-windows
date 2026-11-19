@@ -63,6 +63,7 @@ pub use signal::pass_signals_to;
 )]
 pub mod windows;
 
+pub mod told;
 pub mod v2;
 
 /// The subcommand of `blaze` that runs a program in a sandbox.

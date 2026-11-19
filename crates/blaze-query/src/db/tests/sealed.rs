@@ -76,6 +76,23 @@ impl Shop {
         self.inputs.len() - 1
     }
 
+    /// A new input of `group` holding `value`, of durability `HIGH`: a library's file.
+    fn library_input(&mut self, value: u64, group: SealGroup) -> usize {
+        self.input_of(value, Some(group), Durability::HIGH)
+    }
+
+    /// A new input holding `value`, of `durability`, an input of `group` if one is given.
+    fn input_of(&mut self, value: u64, group: Option<SealGroup>, durability: Durability) -> usize {
+        let cell = Cell::of(&self.db, value, 0, durability);
+        if let Some(group) = group {
+            input_seal_group::<Cells>(self.db.storage_mut(), cell.0, group);
+        }
+        self.db.cells.lock().push(cell.0);
+        self.cells.push(cell);
+        self.inputs.push(value);
+        self.inputs.len() - 1
+    }
+
     fn row(&mut self, node: FlowNode) -> usize {
         self.db.flow.lock().push(node.clone());
         self.flow.push(node);
@@ -662,6 +679,9 @@ enum Step {
     Shed,
     /// Asks for the changed set since the last ask, then for every row made.
     Ask,
+    /// A build's end with no seal: fold, settle and, in the database that has groups, the
+    /// durable pass (`Storage::let_go_durable_edges`).
+    Durable,
 }
 
 #[derive(Clone, Debug)]
@@ -670,13 +690,18 @@ struct Program {
     groups: Vec<Vec<usize>>,
     /// Whether each group is a library's, whose rows let go of their edges behind its seal.
     libraries: Vec<bool>,
+    /// Whether a library's inputs are of durability `HIGH` (in both databases), as a host's
+    /// are: what the durable pass needs to let a row go.
+    high: bool,
     /// Each input's group, if it has one.
     inputs: Vec<Option<usize>>,
     flow: Vec<FlowNode>,
     steps: Vec<Step>,
 }
 
-fn program(tape: &Tape) -> Program {
+/// A drawn program; `durable`: the libraries' inputs are `HIGH` and a build's end runs the
+/// durable pass where it would run the seal pass (no group is ever sealed), as the daemon does.
+fn program(tape: &Tape, durable: bool) -> Program {
     let int = |low: usize, high: usize, label: &'static str| tape.int_in(low..=high, label);
     let groups: Vec<Vec<usize>> = (0..int(1, 4, "groups"))
         .map(|at| (0..at).filter(|_| tape.bool("group dependency")).collect())
@@ -709,6 +734,7 @@ fn program(tape: &Tape) -> Program {
             4 => Step::World(tape.int_in(0..=3u64, "world")),
             5 => Step::Evict,
             6 | 7 => Step::Pull((0..int(1, 3, "pulls")).map(|_| int(0, nodes - 1, "node pulled")).collect()),
+            8 | 9 if durable => Step::Durable,
             8 | 9 => Step::Seal,
             10 => Step::Unwind(int(1, 3, "claims before the unwind") as u32),
             11 => Step::Shed,
@@ -716,7 +742,7 @@ fn program(tape: &Tape) -> Program {
         });
     }
     steps.push(Step::Ask);
-    Program { groups, libraries, inputs, flow, steps }
+    Program { groups, libraries, high: durable, inputs, flow, steps }
 }
 
 /// One of the simulation's two databases: `sealed` gives it the program's groups.
@@ -734,7 +760,11 @@ fn made(program: &Program, sealed: bool, plant: Plant) -> Shop {
         }
     }
     for (at, group) in program.inputs.iter().enumerate() {
-        shop.input(at as u64, group.filter(|_| sealed).map(|group| groups[group]));
+        let durability = match group {
+            Some(group) if program.high && program.libraries[*group] => Durability::HIGH,
+            _ => Durability::LOW,
+        };
+        shop.input_of(at as u64, group.filter(|_| sealed).map(|group| groups[group]), durability);
     }
     for node in &program.flow {
         shop.row(node.clone());
@@ -784,6 +814,13 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
                 Step::Shed => {
                     if which == 0 {
                         shop.db.storage_mut().shed_sealed_readers();
+                    }
+                }
+                Step::Durable => {
+                    shop.db.storage_mut().pack_reverse();
+                    shop.db.storage_mut().settle_changed_set();
+                    if which == 0 {
+                        shop.db.storage_mut().let_go_durable_edges();
                     }
                 }
                 Step::Ask => {
@@ -843,11 +880,54 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
 #[test]
 fn a_sealed_database_answers_as_an_unsealed_one_under_random_writes() {
     blaze_sim::check(blaze_sim::Config::cases(10000), |tape| {
-        let program = program(tape);
+        let program = program(tape, false);
         if let Err(why) = simulate(&program, Plant::None) {
             panic!("{why}\n{program:#?}");
         }
     })
+}
+
+/// The refinement for rows that let go of their edges by durability, with no seal
+/// ([`crate::db::Storage::let_go_durable_edges`]): the same programs, the libraries' inputs
+/// `HIGH`, a build's end running the durable pass, and the reverse index made again without
+/// the let-go rows among the steps; both databases answer every query alike and as a run from
+/// scratch, and the changed set names every row whose value differs since its last ask.
+#[test]
+fn a_database_whose_library_rows_let_go_by_durability_answers_as_one_that_keeps_them() {
+    blaze_sim::check(blaze_sim::Config::cases(10000), |tape| {
+        let program = program(tape, true);
+        if let Err(why) = simulate(&program, Plant::None) {
+            panic!("{why}\n{program:#?}");
+        }
+    })
+}
+
+/// The control of
+/// [`a_database_whose_library_rows_let_go_by_durability_answers_as_one_that_keeps_them`]: a
+/// library and a crate over it, the durable pass and the index made again without the rows
+/// that let go, then a write of the library's input. As the engine is, it passes; with the
+/// write assuming none of the library's rows changed, the oracle sees the crate's stale row.
+#[test]
+fn the_durable_simulations_oracle_catches_rows_a_write_does_not_assume() {
+    let program = Program {
+        groups: vec![vec![], vec![0]],
+        libraries: vec![true, false],
+        high: true,
+        inputs: vec![Some(0), Some(1)],
+        flow: vec![sum(&[Dep::Input(0)]), sum(&[Dep::Input(1), Dep::Query(0)]), sum(&[Dep::Query(1)])],
+        steps: vec![
+            Step::Pull(vec![0, 1, 2]),
+            Step::Ask,
+            Step::Durable,
+            Step::Shed,
+            Step::Write(0, 9),
+            Step::Pull(vec![2]),
+            Step::Ask,
+        ],
+    };
+    assert_eq!(simulate(&program, Plant::None), Ok(()), "the engine as it is must pass");
+    let why = simulate(&program, Plant::LetGoRowsNotAssumed).expect_err("the oracle missed the planted bug");
+    assert!(why.contains("from scratch") || why.contains("does not name it"), "{why}");
 }
 
 /// A directed program for the simulation's controls: a library and a crate over it, both
@@ -857,6 +937,7 @@ fn directed() -> Program {
     Program {
         groups: vec![vec![], vec![0]],
         libraries: vec![false, false],
+        high: false,
         inputs: vec![Some(0), Some(1)],
         flow: vec![sum(&[Dep::Input(0)]), sum(&[Dep::Input(1), Dep::Query(0)]), sum(&[Dep::Query(1)])],
         steps: vec![
@@ -1032,6 +1113,7 @@ fn a_row_ran_again_by_a_pull_before_the_walk() -> Program {
     Program {
         groups: vec![vec![]],
         libraries: vec![false],
+        high: false,
         inputs: vec![None, Some(0), None],
         flow: vec![
             sum(&[Dep::Input(0), Dep::Input(1)]),
@@ -1074,6 +1156,7 @@ fn a_settle_before_an_untracked_row_ran() -> Program {
     Program {
         groups: vec![vec![]],
         libraries: vec![false],
+        high: false,
         inputs: vec![None],
         flow: vec![
             FlowNode { op: FlowOp::World, deps: vec![Dep::Input(0)] },
@@ -1115,6 +1198,7 @@ fn a_row_made_after_the_seal_of_a_group_that_breaks() -> Program {
     Program {
         groups: vec![vec![], vec![0]],
         libraries: vec![false, false],
+        high: false,
         inputs: vec![Some(0), Some(1)],
         flow: vec![
             sum(&[Dep::Input(0)]),
@@ -1220,5 +1304,93 @@ fn a_librarys_rows_let_go_of_their_edges_and_run_again_when_it_opens() {
 fn the_oracle_catches_rows_without_edges_left_out_of_the_walk() {
     let left = a_library_without_edges_written(Plant::LetGoRowsNotAssumed);
     let why = left.said.expect_err("the oracle missed a row over a library's rows without edges");
+    assert!(why.contains("from scratch"), "{why}");
+}
+
+/// What [`a_dependency_lets_go_by_durability`] saw.
+#[derive(Debug)]
+struct Durable {
+    /// Edges the rows held before the pass, and after it.
+    edges: (u64, u64),
+    /// The pass's own count.
+    pass: crate::db::DurableLetGo,
+    /// Runs of the flow's query that an edit of the application cost, and that a write of
+    /// the library cost.
+    runs: (usize, usize),
+    /// What the oracle said after the application's edit, and after the library's write.
+    said: (Result<(), String>, Result<(), String>),
+}
+
+/// A small workspace: a library of `rows` rows (a chain over its two `HIGH` inputs, every row
+/// reading the one before and an input) and an application above it of two rows, one over the
+/// library's last row and its own `LOW` input, one over its own input alone. Built, then the
+/// build's end (fold, settle, the durable pass); the application's input is edited and every
+/// row pulled; then the library's first input is written and every row pulled. No seal pass
+/// runs: no group is sealed.
+fn a_dependency_lets_go_by_durability(rows: usize, plant: Plant) -> Durable {
+    let mut shop = Shop::new(plant);
+    let lib = shop.library("lib", &[]);
+    let app = shop.group("app", &[lib]);
+    let inputs = [shop.library_input(1, lib), shop.library_input(2, lib)];
+    let of_app = shop.input(10, Some(app));
+    let mut last = shop.row(sum(&[Dep::Input(inputs[0])]));
+    for at in 1..rows {
+        last = shop.row(sum(&[Dep::Query(last), Dep::Input(inputs[at % 2])]));
+    }
+    let over = shop.row(sum(&[Dep::Query(last), Dep::Input(of_app)]));
+    let own = shop.row(sum(&[Dep::Input(of_app)]));
+    shop.pull_all().unwrap();
+    assert_eq!(shop.state(lib), SealState::Open);
+    let before = shop.db.storage().live_edges();
+    let pass = {
+        let storage = shop.db.storage_mut();
+        storage.pack_reverse();
+        storage.settle_changed_set();
+        storage.let_go_durable_edges()
+    };
+    let after = shop.db.storage().live_edges();
+    let ran = shop.db.runs("Crated");
+    shop.write(of_app, 13);
+    let edited = shop.pull_all();
+    let edit_runs = shop.db.runs("Crated") - ran;
+    let ran = shop.db.runs("Crated");
+    shop.write(inputs[0], 5);
+    let written = shop.pull(&[over, own]).and_then(|()| shop.pull_all());
+    Durable {
+        edges: (before, after),
+        pass,
+        runs: (edit_runs, shop.db.runs("Crated") - ran),
+        said: (edited, written),
+    }
+}
+
+/// The invariant (memory.md 4.4, by durability with no seal): every row of the library lets go
+/// of its edges at the build's end, so the edges held fall to the application's three, at 10
+/// library rows and at 1,000; an edit of the application runs its two rows and no library row;
+/// a write of the library's input assumes its rows changed, so the row over them is found and
+/// every row answers as from scratch.
+#[test]
+fn a_dependencys_rows_let_go_of_their_edges_by_durability_and_an_edit_never_runs_them() {
+    for rows in [10, 1000] {
+        let seen = a_dependency_lets_go_by_durability(rows, Plant::None);
+        // The library's chain: one edge for its first row, two for each after it.
+        let library = 2 * rows as u64 - 1;
+        assert_eq!(seen.edges, (library + 3, 3), "{seen:?}");
+        assert_eq!((seen.pass.rows, seen.pass.edges), (rows as u64, library), "{seen:?}");
+        assert_eq!(seen.said, (Ok(()), Ok(())), "{seen:?}");
+        assert_eq!(seen.runs.0, 2, "an edit of the application ran a library row: {seen:?}");
+        assert!(seen.runs.1 > rows, "the library's write ran its rows again: {seen:?}");
+    }
+}
+
+/// The control of
+/// [`a_dependencys_rows_let_go_of_their_edges_by_durability_and_an_edit_never_runs_them`]: a
+/// write of the library that assumes none of its rows changed leaves the row over them to the
+/// walk's end with its old value, and the oracle sees it.
+#[test]
+fn the_oracle_catches_durable_rows_a_write_does_not_assume() {
+    let seen = a_dependency_lets_go_by_durability(10, Plant::LetGoRowsNotAssumed);
+    assert_eq!(seen.said.0, Ok(()), "{seen:?}");
+    let why = seen.said.1.expect_err("the oracle missed a row over rows without edges");
     assert!(why.contains("from scratch"), "{why}");
 }

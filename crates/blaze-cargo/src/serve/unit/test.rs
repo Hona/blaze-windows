@@ -1318,12 +1318,14 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         write: Vec::new(),
         network: false,
         memory: None,
-        // Windows has no fork, so no fork server: a binary's tests run whole, as libtest's
-        // threads in one process, each result the binary's.
-        mode: if cfg!(windows) {
-            TestMode::Threads { args: Vec::new(), timeout: TIMEOUT }
-        } else {
-            TestMode::Process
+        // A test a process unless the package says otherwise (`test-processes`); by default on
+        // Windows, which has no fork, a binary's tests run whole, as libtest's threads in one
+        // process, each result the binary's. Asked for there, each test runs in a warm process of
+        // the binary started ahead of it (`blaze_usercode`'s Windows fork server), with a timeout
+        // of its own and its job killed whole.
+        mode: match package.tests.processes.unwrap_or(!cfg!(windows)) {
+            true => TestMode::Process,
+            false => TestMode::Threads { args: Vec::new(), timeout: TIMEOUT },
         },
         jobs: Vec::new(),
         loaded: loaded.clone(),
@@ -1711,6 +1713,8 @@ impl Runs<Real> for TestRun {
             fail_fast: false,
             kill_grace: KILL_GRACE,
             tags: self.tags,
+            // Windows' sandbox records nothing of one test (`Config::records_each_test`).
+            records_each_test: cfg!(unix),
         };
         let now = self.now();
         let queue = Queue::new(config, binaries, now, effects);

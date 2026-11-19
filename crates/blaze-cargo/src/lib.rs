@@ -14,8 +14,32 @@
 // `#[blaze::nonblocking]` on the daemon's loop turn (`serve::daemon`, docs/v2/plan/design/effects.md).
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+// libtest, for `harness_text`: the fork server's harness text compiled against it on Windows.
+#![cfg_attr(all(test, windows), feature(test))]
 
 use std::path::{Path, PathBuf};
+
+/// The fork server's harness text (`blaze_usercode::test::fork_server`), which blaze compiles
+/// only into the test binaries it writes, compiled here too on Windows against libtest, so
+/// `cargo check --tests` catches a mistake in the Windows server (`fork_server/windows.rs`)
+/// before a test binary does.
+#[cfg(all(test, windows))]
+#[allow(unsafe_code, dead_code, unused_imports, unused_unsafe, reason = "the harness's text as a test binary has it")]
+mod harness_text {
+    extern crate std;
+    extern crate test;
+
+    pub mod fork_server {
+        pub use blaze_usercode::test::wire::*;
+        use super::std;
+        #[allow(unused_imports)]
+        use self::std::prelude::rust_2021::*;
+        #[allow(unused_imports)]
+        use self::std::{eprintln, format, vec};
+        include!("../../blaze-usercode/src/test/fork_server.rs");
+        include!("../../blaze-usercode/src/test/fork_server/windows.rs");
+    }
+}
 
 pub mod answers;
 pub mod as_rustc;

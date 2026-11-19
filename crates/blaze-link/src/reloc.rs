@@ -820,3 +820,5 @@ mod tests {
         assert_eq!(no_tls, Err(Bad::NoTls));
     }
 }
+
+crate::checkpoint::wire_enum!(GotKind { 0 => Address, 1 => TpOff, 2 => TlsGd, 3 => TlsDesc });

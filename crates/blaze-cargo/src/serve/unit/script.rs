@@ -277,11 +277,25 @@ fn native_env(
                 input.name, input.env
             )
         })?;
-        let value = laid.dir.to_str().ok_or_else(|| {
+        let given = laid.given();
+        // A file the pin names is one of the layout's, which its mark holds whole: one not
+        // there is the pin's mistake, said before the script runs on a path to nothing.
+        if let Some(file) = &input.file
+            && !given.is_file()
+        {
+            return Err(format!(
+                "pinned native input `{}` for target `{target}` names `{file}` (`file` in {}), \
+                 which its archive, laid out at {}, has no file at",
+                input.name,
+                input.pin,
+                laid.dir.display()
+            ));
+        }
+        let value = given.to_str().ok_or_else(|| {
             format!(
                 "pinned native input `{}` is laid out at {}, which is not UTF-8",
                 input.name,
-                laid.dir.display()
+                given.display()
             )
         })?;
         // clone: the run's own variable, once an input a run
@@ -1410,12 +1424,16 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         mutable.push(tool.clone()); // clone: a path, once a tool a run
         read.push(tool);
     }
-    // Each pinned native input it is given is read where it is laid out, and its digest is
-    // part of the run's key ([`Place::pinned`]).
+    // Each pinned native input it is given is read where it is laid out, and its digest (and
+    // the file of it its variable names) is part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
         .map(|it| {
             read.push(it.dir.clone());
-            (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
+            let named = match &it.input.file {
+                None => format!("sha256:{}", it.input.sha256),
+                Some(file) => format!("sha256:{}/{file}", it.input.sha256),
+            };
+            (it.input.env.clone(), named) // clone: the run's own, once an input a run
         })
         .collect();
     read.sort_unstable();
@@ -1451,8 +1469,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let prepared = script::prepare(&unit, &env, &place, &job.input.looks)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
-    // The variable the script reads is the layout, whatever else set it (a check, not a
-    // fallback: `native_env` forces it).
+    // The variable the script reads is the layout (or its file), whatever else set it (a
+    // check, not a fallback: `native_env` forces it).
     for laid in given(&job.input.native, &unit) {
         let set = prepared
             .spec
@@ -1460,13 +1478,14 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             .env
             .iter()
             .find(|(name, _)| name.as_os_str() == laid.input.env.as_str());
-        if set.is_none_or(|(_, value)| Path::new(value) != laid.dir) {
+        let named = laid.given();
+        if set.is_none_or(|(_, value)| Path::new(value) != named) {
             return Err(ApiError::new(
                 format!(
                     "the build script of `{}` is not started with `{}` set to {}, where pinned native input `{}` is laid out",
                     unit.package.descr(),
                     laid.input.env,
-                    laid.dir.display(),
+                    named.display(),
                     laid.input.name
                 ),
                 Some(laid.input.pin.clone()), // clone: an error's place, once

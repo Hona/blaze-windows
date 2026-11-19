@@ -30,6 +30,7 @@ use blaze_units::{
     schema::Mode as UnitMode,
     stdlib,
 };
+use blaze_cargo::sandbox::told::Reads;
 use blaze_core::lock::Lock;
 use blaze_vfs::{Bytes, Corrupt, Mode, View};
 use cfg::{CfgAtom, CfgOptions};
@@ -59,16 +60,21 @@ const EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
 pub(super) struct Library {
     pub(super) dir: PathBuf,
     pub(super) commit: String,
+    /// What the probe read of the disk, its own file and the library's, for its launcher
+    /// ([`blaze_cargo::sandbox::told`]).
+    pub(super) reads: Arc<Reads>,
 }
 
 impl Library {
     /// The library at `dir`, refused unless it is a copy of the rustc blaze is.
     pub(super) fn at(dir: PathBuf) -> anyhow::Result<Library> {
+        let reads = Arc::new(Reads::default());
         let upstream = dir.join("UPSTREAM");
+        reads.read(&upstream);
         let upstream = std::fs::read_to_string(&upstream)
             .with_context(|| format!("reading {}", upstream.display()))?;
         let commit = stdlib::library_commit(&upstream).map_err(anyhow::Error::msg)?;
-        Ok(Library { dir, commit })
+        Ok(Library { dir, commit, reads })
     }
 }
 
@@ -241,6 +247,7 @@ fn std_script(
     let root = blaze_core::platform::path::daemon(&library.dir.join("std/build.rs"))?;
     let read = |name: &str| {
         let path = blaze_core::platform::path::host(name);
+        library.reads.read(&path);
         std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))
     };
     let script = stdlib::scripts::identify("std", &root, read).map_err(anyhow::Error::msg)?;
@@ -316,7 +323,11 @@ fn written(
             false => name
                 .strip_prefix(named.as_str())
                 .and_then(|rest| rest.strip_prefix('/'))
-                .and_then(|rest| std::fs::read_to_string(library.dir.join(rest)).ok()),
+                .and_then(|rest| {
+                    let path = library.dir.join(rest);
+                    library.reads.read(&path);
+                    std::fs::read_to_string(path).ok()
+                }),
         };
         sources.add(name, text);
     }
@@ -380,6 +391,7 @@ struct ProbeFiles {
     package: [(&'static str, ContentId, Bytes); 2],
     library: ContentId,
     dir: PathBuf,
+    reads: Arc<Reads>,
     failed: Lock<Option<String>>,
 }
 
@@ -401,6 +413,7 @@ impl ProbeFiles {
             ],
             library: ContentId::of(LIBRARY_DOMAIN, library.commit.as_bytes()),
             dir: library.dir.clone(),
+            reads: Arc::clone(&library.reads),
             failed: Lock::new("engine.probe.failed", None),
         }
     }
@@ -425,12 +438,17 @@ impl ProbeFiles {
         let at = self.dir.join(path);
         let meta = match std::fs::symlink_metadata(&at) {
             Ok(meta) => meta,
-            Err(error) if gone(&error) => return None,
+            Err(error) if gone(&error) => {
+                self.reads.looked(&at);
+                return None;
+            }
             Err(error) => {
                 self.fail(&at, &error);
                 return None;
             }
         };
+        // What it is, and what is in it when it is a file or a link.
+        self.reads.read(&at);
         let (mode, bytes) = if meta.file_type().is_symlink() {
             match std::fs::read_link(&at) {
                 Ok(to) => {
@@ -462,8 +480,14 @@ impl ProbeFiles {
     fn library_names(&self, path: &str) -> Option<Vec<(String, bool)>> {
         let at = self.dir.join(path);
         let entries = match std::fs::read_dir(&at) {
-            Ok(entries) => entries,
-            Err(error) if gone(&error) => return None,
+            Ok(entries) => {
+                self.reads.listed(&at);
+                entries
+            }
+            Err(error) if gone(&error) => {
+                self.reads.looked(&at);
+                return None;
+            }
             Err(error) => {
                 self.fail(&at, &error);
                 return None;
@@ -492,6 +516,7 @@ impl ProbeFiles {
             if path.is_empty() && !stdlib::in_library(&name) {
                 continue;
             }
+            self.reads.looked(&entry.path());
             let dir = match std::fs::metadata(entry.path()) {
                 Ok(meta) => meta.is_dir(),
                 Err(error) => {

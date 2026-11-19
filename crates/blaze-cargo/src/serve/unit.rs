@@ -404,7 +404,10 @@ impl Steps for Real {
         // them, and whatever was refused before is tried once more. An edited member's pages
         // written at the build's end would be paid by the next edit and thrown away by it.
         let (which, later, deps) = match kept.stored {
-            Stored::All => return Ok(Vec::new()), // alloc: none
+            Stored::All => {
+                // Nothing to store (the session memo keeps no edges to let go of).
+                return Ok(Vec::new()); // alloc: none
+            }
             Stored::No => {
                 // The outcomes of the sealed crates now; a member's waits for its image,
                 // which the second store writes.
@@ -1542,8 +1545,8 @@ impl BuildEnd {
 const MIR_VALUE_BYTES: u64 = 6 << 10;
 
 /// Whether `values` MIR values, at [`MIR_VALUE_BYTES`] each, are past the `mir` tag's cap
-/// (`blaze_mem::tag::budget`, set on Windows by `serve::commit::set_value_budgets`; none
-/// elsewhere, so never).
+/// (`blaze_mem::tag::budget`, set on Windows only while the daemon is pressed, by
+/// `serve::commit`'s `press`; none otherwise, so never).
 fn mir_past_cap(values: usize, cap: u64) -> bool {
     cap != u64::MAX && (values as u64).saturating_mul(MIR_VALUE_BYTES) > cap
 }
@@ -1551,9 +1554,10 @@ fn mir_past_cap(values: usize, cap: u64) -> bool {
 /// On a write a build asked anyway: under `blaze-memo`, MIR values live in their crate's
 /// arena and are reclaimed on arena drop rather than evicted per-query (`hir::evict`).
 /// Kept as a hook for future arena-level MIR trimming; `mir_past_cap` holds the cap predicate.
-#[cfg_attr(not(test), expect(dead_code, reason = "kept for tests and future arena-level MIR cap"))]
-fn release_mir_past_cap(_lowered: &mut Lowered, end: &BuildEnd) {
+/// How many MIR values went: none.
+fn release_mir_past_cap(_lowered: &mut Lowered, end: &BuildEnd) -> usize {
     let _ = (end.compiles, mir_past_cap(0, blaze_mem::tag::budget(blaze_mem::Tag::Mir)));
+    0
 }
 
 /// Of `finished`, the crates that are not `local` and not in `released` (sorted), each added to
@@ -1571,14 +1575,25 @@ fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, releas
 }
 
 /// With the front end exclusive for a write that was asked anyway (a build script's run, a
-/// proc macro's load), lets go of the solver caches and retired intern tables of every
-/// dependency crate that finished compiling since the last such write ([`BuildEnd::newly_finished`]).
+/// proc macro's load), and only while the daemon is pressed (its footprint at or past
+/// [`crate::serve::relief::PRESS_AT`] of its ceiling; never on a machine with room): lets go
+/// of MIR past its cap, of the edges of the library rows their durability proves, and of the
+/// inference and solver caches of every dependency crate that finished compiling since the
+/// last such write ([`BuildEnd::newly_finished`]). Never a write of its own: a write stops
+/// every reader, so this only rides on one. A value read again is made again from its memo
+/// and backdated, so nothing read can differ; what a later crate's codegen still reads of a
+/// finished one (a generic's body) is made again on demand.
 fn release_finished(lowered: &mut Lowered, end: &mut BuildEnd) {
-    release_mir_past_cap(lowered, end);
+    if !crate::serve::relief::pressed() {
+        return;
+    }
+    // The session memo keeps no edges to let go of: a library row's reads go with its arena.
+    let mir = release_mir_past_cap(lowered, end);
     let crates = {
         let db: &base_db::Db = &*lowered.served_db();
         end.newly_finished(db)
     };
+    crate::serve::relief::note_released(crates.len(), mir);
     if crates.is_empty() {
         return;
     }
@@ -2483,6 +2498,13 @@ pub(crate) struct Job {
     /// developer prompt's variables for ([`script::started_in`]), found the first time one runs.
     #[cfg(windows)]
     pub(crate) msvc: OnceLock<Result<blaze_core::platform::msvc::Developer, String>>,
+    /// The stamps of the machine's tools the job's build scripts are keyed by
+    /// (`script::declared::given`): each candidate path's size and times, `None` where there is
+    /// no file, by path. The job's view of the machine: taken once, read by every script of the
+    /// job, so a request stats each candidate once and not once a script (59 scripts of
+    /// opencode-desktop, each every `PATH` directory times 8 names).
+    #[cfg(windows)]
+    pub(crate) tool_stamps: Lock<blaze_hash::HashMap<PathBuf, Option<[u64; 3]>, std::alloc::Global>>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
     /// The dependency crates checked this build, kept with the front end until the head's next
@@ -2552,6 +2574,8 @@ impl Job {
             ub: Default::default(),
             #[cfg(windows)]
             msvc: Default::default(),
+            #[cfg(windows)]
+            tool_stamps: Lock::new("serve.unit.tool_stamps", blaze_hash::HashMap::new_in(std::alloc::Global)),
             began: Instant::now(),
             later: Lock::new("serve.unit.later", Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Lock::new("serve.unit.seeds", Vec::new()),
@@ -3034,6 +3058,12 @@ impl Front<Real> for JobFront {
     }
 }
 
+/// Kept link images are checkpointed under `dir` at a stop and restored by the next daemon's
+/// first link of each path, for blaze of code identity `producer` ([`codegen::checkpoint`]).
+pub(crate) fn keep_link_checkpoints(dir: std::path::PathBuf, producer: ContentId) -> Result<(), String> {
+    codegen::checkpoint::keep(dir, producer)
+}
+
 impl Kept for codegen::Linked {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         codegen::Linked::tables(self)
@@ -3053,6 +3083,10 @@ impl Kept for codegen::Linked {
 
     fn rest(&mut self) {
         codegen::Linked::rest(self);
+    }
+
+    fn checkpoint(&mut self, path: &str) -> bool {
+        codegen::checkpoint::put(self, path)
     }
 }
 

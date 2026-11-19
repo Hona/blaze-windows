@@ -329,9 +329,16 @@ pub(crate) fn package(
                 out.build_script_outside =
                     !value.as_bool().ok_or_else(|| wrong("`build-script` is true or false"))?;
             }
+            // `true`: each test in a process of its own, the binary's tests as libtest's
+            // threads otherwise; the host's default unsaid (`TestSandbox::processes`).
+            "test-processes" => {
+                out.tests.processes =
+                    Some(value.as_bool().ok_or_else(|| wrong("`test-processes` is true or false"))?);
+            }
             other => {
                 return Err(wrong(&format!(
-                    "`{other}` is not known (`tests`, `unsandboxed-tests` and `build-script` are)"
+                    "`{other}` is not known (`tests`, `unsandboxed-tests`, `test-processes` and \
+                     `build-script` are)"
                 )));
             }
         }
@@ -580,6 +587,11 @@ mod tests {
                 .unwrap()
                 .tests;
         assert_eq!(only_named, TestSandbox { tests: vec!["t".to_owned()], ..TestSandbox::default() });
+        let processes = |text: &str| package(Some(&metadata(text)), member).map(|it| it.tests.processes);
+        assert_eq!(processes("[blaze.sandbox]\ntest-processes = true\n").unwrap(), Some(true));
+        assert_eq!(processes("[blaze.sandbox]\ntest-processes = false\n").unwrap(), Some(false));
+        assert_eq!(processes("[blaze.sandbox]\ntests = true\n").unwrap(), None, "unsaid: the host's");
+        assert!(processes("[blaze.sandbox]\ntest-processes = \"yes\"\n").is_err());
     }
 
     /// The invariant: on a host that sandboxes tests by default a member's tests run sandboxed

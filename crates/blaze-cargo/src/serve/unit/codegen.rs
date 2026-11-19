@@ -33,6 +33,7 @@ use crate::serve::work::{Full, Linking, Made, OutputFields};
 
 type KeptImage = crate::serve::work::Image<Real>;
 
+pub(crate) mod checkpoint;
 mod kept;
 #[cfg(test)]
 mod tests;
@@ -2305,8 +2306,15 @@ fn link_at(
     let weights = profiles.and_then(|it| it.weights(path));
     let heat = weights.map(|it| it.heat(&built.identities));
 
-    let (mut linked, changed, relaid) =
-        kept_image(images, path, &output, weights.map(super::layout::Weights::id))?;
+    // A path this daemon keeps no image at may have one its last stop checkpointed: restored,
+    // the link patches the file it left rather than laying the image out from scratch.
+    let layout = weights.map(super::layout::Weights::id);
+    if !images.iter().any(|it| it.path == path)
+        && let Some(restored) = checkpoint::restore(job, path, &output, layout, &assembled, &located)
+    {
+        images.push(KeptImage { path: path.to_owned(), kept: restored });
+    }
+    let (mut linked, changed, relaid) = kept_image(images, path, &output, layout)?;
     // The image goes back whether the link is made or not: one that fails leaves it as it
     // was, and the next link is a change of it.
     let mut made = relink(

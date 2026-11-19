@@ -197,7 +197,7 @@ fn inspect(words: Vec<OsString>) -> Result<(), Refusal> {
     }
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 fn inspect_daemon(record: bool) -> Result<(), Refusal> {
     use crate::serve::inspect::{self, Answer, Asked};
     let daemon = blaze_api::client::socket().map_err(|why| Refusal::Failed(why.to_string()))?;
@@ -214,11 +214,11 @@ fn inspect_daemon(record: bool) -> Result<(), Refusal> {
     }
 }
 
-#[cfg(not(all(unix, feature = "native")))]
+#[cfg(not(feature = "native"))]
 fn inspect_daemon(_record: bool) -> Result<(), Refusal> {
     Err(Refusal::Failed(
-        "`blaze debug inspect` asks a daemon over a Unix socket, and this blaze has none (it is \
-         not a Unix build with the `native` feature)"
+        "`blaze debug inspect` asks a daemon over its socket, and this blaze has none (it is \
+         not a build with the `native` feature)"
             .to_owned(),
     ))
 }

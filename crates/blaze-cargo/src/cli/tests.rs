@@ -33,12 +33,6 @@ const WN: &str = "/C:/w";
 #[cfg(not(windows))]
 const WN: &str = "/w";
 
-/// `rel`, a path from the workspace written with `/`, as this system shows it (cargo shows
-/// `target\debug\foo` on Windows).
-fn shown(rel: &str) -> String {
-    rel.split('/').collect::<PathBuf>().display().to_string()
-}
-
 fn place() -> Place {
     Place { cwd: PathBuf::from(W), manifest: PathBuf::from(W).join("Cargo.toml"), root: PathBuf::from(W) }
 }

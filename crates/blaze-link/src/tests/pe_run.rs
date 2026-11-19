@@ -617,3 +617,67 @@ fn an_executable_runs_with_the_dll_it_imports_from() {
     let ran = run(&dir.join("usedll.exe"), &[]);
     assert_eq!(ran, (0, "dll 42 found\n".into()));
 }
+
+/// An incremental image of `inputs` linked with the CRT, the natives it was given by content id,
+/// and the output as located.
+fn kept_image(inputs: &[&str]) -> (Image, Vec<(ContentId, Arc<[u8]>)>) {
+    let mut output = output(None, inputs);
+    output.incremental = true;
+    let crates = [crate::target::CrateLibs { name: "program", libs: &[], search: &[] }];
+    let located = crate::target::locate(&mut output, &crates, &[], Path::new("unused")).unwrap();
+    let read: Vec<(String, Arc<[u8]>, crate::NativeKind)> = located
+        .into_iter()
+        .map(|it| {
+            let bytes: Arc<[u8]> = match it.made {
+                Some((_, made)) => made,
+                None => std::fs::read(&it.path).unwrap().into(),
+            };
+            (it.name, bytes, it.kind)
+        })
+        .collect();
+    let natives = read
+        .iter()
+        .enumerate()
+        .map(|(at, (name, bytes, kind))| Native {
+            id: ContentId::of("blaze-link pe run", bytes),
+            name,
+            bytes,
+            kind: *kind,
+            order: at as u32,
+        })
+        .collect();
+    let mut image = Image::new(name("out/app.exe"), output).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, Change { natives, ..Change::default() }).unwrap();
+    let by_id = read.iter().map(|(_, bytes, _)| (ContentId::of("blaze-link pe run", bytes), bytes.clone())).collect();
+    (image, by_id)
+}
+
+/// A PE image with the CRT's objects and import libraries, checkpointed and restored with its
+/// natives handed back by content, is the image it was: the same file, and the same file again
+/// after one more stage of each; its file runs.
+#[test]
+fn a_restored_pe_image_with_the_crt_is_the_kept_one_and_runs() {
+    let (mut image, natives) = kept_image(&["hello_md.obj"]);
+    let checkpoint = image.checkpoint().unwrap();
+    let mut handed = |id: ContentId, name: &str| -> Result<Arc<[u8]>, String> {
+        natives
+            .iter()
+            .find(|it| it.0 == id)
+            .map(|it| it.1.clone())
+            .ok_or_else(|| format!("no native {name}"))
+    };
+    let mut restored =
+        Image::restore(name("out/app.exe"), image.output.clone(), &checkpoint, &mut handed).unwrap();
+    assert_eq!(restored.generation(), image.generation());
+    assert_eq!(restored.file().unwrap(), image.file().unwrap());
+    let again = |image: &mut Image| {
+        let staged = image.stage(Change::default()).unwrap();
+        image.bytes(staged).unwrap()
+    };
+    let (kept, made) = (again(&mut image), again(&mut restored));
+    assert!(kept == made, "one more stage of each gives two files");
+    let exe = scratch("restored").join("restored.exe");
+    std::fs::write(&exe, &made).unwrap();
+    assert_eq!(run(&exe, &[]).0, 42);
+}

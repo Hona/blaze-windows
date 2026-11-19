@@ -2307,6 +2307,21 @@ impl<S: Steps> Paths<S> {
         (count, bytes)
     }
 
+    /// At a stop: each kept image's checkpoint put, for the next daemon's first link of its
+    /// path to restore and patch ([`Kept::checkpoint`]). How many were put.
+    fn checkpoint_images(&mut self) -> usize {
+        while let Some(image) = self.back.pop() {
+            self.keep_one(&[], image);
+        }
+        let mut put = 0;
+        for image in self.images.iter_mut().flatten() {
+            if image.kept.checkpoint(&image.path) {
+                put += 1;
+            }
+        }
+        put
+    }
+
     /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
     /// Used under memory pressure: the next link lays the image out from scratch.
     fn evict_images(&mut self) -> (usize, u64) {
@@ -6426,6 +6441,11 @@ impl<S: Steps> Jobs<S> {
     /// Number of kept linker images and their summed held bytes.
     pub fn kept_images_summary(&self) -> (usize, u64) {
         self.paths.kept_summary()
+    }
+
+    /// At a stop: every kept linker image's checkpoint put; how many.
+    pub fn checkpoint_kept_images(&mut self) -> usize {
+        self.paths.checkpoint_images()
     }
 
     /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
