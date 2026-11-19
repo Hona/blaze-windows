@@ -301,7 +301,12 @@ pub(crate) fn os_tid() -> u64 {
         unsafe { libc::pthread_threadid_np(0 as libc::pthread_t, &mut tid) };
         tid
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(windows)]
+    {
+        // SAFETY: takes nothing and reads the calling thread's own record.
+        u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", windows)))]
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);

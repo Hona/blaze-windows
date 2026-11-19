@@ -453,7 +453,122 @@ fn waits(within: Duration) -> String {
     }
 }
 
-// The guard's own tests start it on Unix's signal pipe, which Windows has none of yet.
+// The guard on Windows, its stop asked by Ctrl+Break where Unix sends SIGTERM.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::{
+        os::windows::process::CommandExt as _,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    const CHILD: &str = "BLAZE_TEST_STOP_GUARD_WINDOWS";
+    const NAME: &str = "serve::stop::windows_tests::a_deadlocked_daemon_ends_on_ctrl_break_within_its_bound_naming_what_it_waits_on";
+    /// `CREATE_NEW_PROCESS_GROUP`: the child's id is its group's, which Ctrl+Break is sent to,
+    /// so the test's own process is not sent it.
+    const NEW_GROUP: u32 = 0x0000_0200;
+
+    /// The daemon of the test, in a child process, as Unix's: its guard armed with the bound
+    /// `CHILD` says (in ms), the loop turning with its progress never moving, and a worker
+    /// inside a span it never leaves.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's deadlocked worker, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after its event"
+    )]
+    fn deadlocked(bound_ms: u64) -> ! {
+        blaze_profile::install();
+        signals::catch();
+        let pulse = Arc::new(Pulse::default()); // alloc: once, the test's
+        let guard = arm(Duration::from_millis(bound_ms), Arc::clone(&pulse)).unwrap(); // clone: a handle
+        let entered = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("worker deadlocked".to_owned())
+                .spawn_scoped(scope, || {
+                    let _held = tracing::info_span!(target: "blaze", "hold the test's lock", awaits = "the lock no one lets go").entered();
+                    entered.wait();
+                    loop {
+                        std::thread::park();
+                    }
+                })
+                .unwrap();
+            entered.wait();
+            println!("ready");
+            loop {
+                pulse.turned(0);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        guard.disarm();
+        unreachable!("the deadlocked daemon's threads never end");
+    }
+
+    /// Runs the child with `bound_ms`, sends it `breaks` Ctrl+Breaks, and gives what it said on
+    /// stderr and its exit code, waiting at most `within` from the first.
+    fn broken(bound_ms: u64, breaks: usize, within: Duration) -> (String, Option<i32>, Duration) {
+        use std::io::BufRead as _;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD, bound_ms.to_string())
+            .creation_flags(NEW_GROUP)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map(stdx::JodChild)
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("ready") {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0, "the child ended before it was ready");
+        }
+        let sent = Instant::now();
+        for _ in 0..breaks {
+            signals::send_break(child.id()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if sent.elapsed() > within {
+                _ = child.kill();
+                panic!("the deadlocked daemon did not end within {within:?} of Ctrl+Break");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let took = sent.elapsed();
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
+        (said, status.code(), took)
+    }
+
+    /// The invariant of Unix's test on Windows, end to end through the console control
+    /// handler: a daemon whose workers are deadlocked ends once nothing moved for its bound
+    /// after Ctrl+Break, or at a second one at once, saying first which thread is inside what.
+    /// Control: with `signals::catch` a no-op (the stub before B1), Ctrl+Break ends the child
+    /// at once with `STATUS_CONTROL_C_EXIT` and no report.
+    #[test]
+    fn a_deadlocked_daemon_ends_on_ctrl_break_within_its_bound_naming_what_it_waits_on() {
+        if let Some(bound) = std::env::var_os(CHILD) {
+            deadlocked(bound.to_str().unwrap().parse().unwrap());
+        }
+        let (said, code, took) = broken(500, 1, Duration::from_secs(30));
+        assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
+        assert!(took >= Duration::from_millis(500), "it waited for its bound: {took:?}");
+        for named in [STALLED, "nothing moved for", "worker deadlocked", "hold the test's lock"] {
+            assert!(said.contains(named), "it says {named:?}:\n{said}");
+        }
+        let (said, code, took) = broken(600_000, 2, Duration::from_secs(30));
+        assert_eq!(code, Some(Exit::StopStalled.code()), "{said}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert!(said.contains("asked to stop again") && said.contains("worker deadlocked"), "{said}");
+    }
+}
+
+// The guard's own tests start it on Unix's signal pipe.
 #[cfg(all(test, unix))]
 mod tests {
     use std::{

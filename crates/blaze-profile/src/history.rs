@@ -282,9 +282,43 @@ pub fn alive(pid: u32) -> bool {
     sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+/// [`alive`] on Windows: a process that can be opened and has not ended, or one this user may
+/// not open (access denied: it is there). One the system names no process by is gone. Until
+/// this, every pid was alive here, so a dead daemon's rows and its crash record
+/// (`crate::crash`) were never recovered.
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    // SAFETY: takes integers; a handle it opens is closed below, once.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    }
+    // SAFETY: the handle just opened, waited on for no time.
+    let waited = unsafe { WaitForSingleObject(process, 0) };
+    // SAFETY: the handle opened above, closed once.
+    unsafe { CloseHandle(process) };
+    waited == WAIT_TIMEOUT
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn alive(_pid: u32) -> bool {
     true
+}
+
+/// The process this runs in is alive; one that ended is not.
+#[cfg(all(test, windows))]
+#[test]
+fn a_process_that_ended_is_not_alive() {
+    assert!(alive(std::process::id()));
+    let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    drop(child);
+    assert!(!alive(pid), "pid {pid} ended");
 }
 
 /// How long a daemon starting over a history waits for a reader that holds its [`OWNER`]

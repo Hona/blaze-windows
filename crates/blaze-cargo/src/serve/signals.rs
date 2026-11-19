@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicI32, AtomicUsize};
 /// [`ENDED_BY`], the signal's number and its name: `blaze serve: pid 7 ended by signal 6,
 /// SIGABRT: process abort signal`. The client quotes it from the log.
 const PID_SAYS: &str = "blaze serve: pid ";
+#[cfg(unix)]
 const ENDED_BY: &str = " ended by signal ";
 
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
@@ -621,17 +622,113 @@ fn thread_id() -> u64 {
     }
 }
 
-#[cfg(not(unix))]
+/// What the line an exception that ends the daemon writes says after its pid, then the
+/// exception's code: `blaze serve: pid 7 ended by exception 0xc0000005 at 0x10 on thread
+/// (tid 4242)`. Windows ends a process with no signal; its crash record names the exception
+/// (`blaze_profile::crash`).
+#[cfg(windows)]
+const ENDED_BY_EXCEPTION: &str = " ended by exception 0x";
+
+/// The unhandled-exception filter that was there before [`record_ends`]'s, null for none.
+#[cfg(windows)]
+static BEFORE_FILTER: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// [`record_ends`] on Windows: an unhandled-exception filter that writes `blaze serve: pid N
+/// ended by exception 0xCODE at 0xADDR on thread (tid I)` to stderr (the daemon's log), on the
+/// stack with no allocation and one `WriteFile`, then hands the exception to the filter that
+/// was there, or lets the system end the process with it. `blaze_profile::crash::install`,
+/// called after this, goes in front of it, records the exception and hands it here. Until
+/// this, a daemon that died of an exception left its log with no last line, and the client a
+/// daemon hung up on could quote nothing of how it ended.
+#[cfg(windows)]
+pub fn record_ends() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
+    };
+    unsafe extern "system" fn ended(info: *const EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::{
+            Storage::FileSystem::WriteFile,
+            System::{
+                Console::{GetStdHandle, STD_ERROR_HANDLE},
+                Threading::{GetCurrentProcessId, GetCurrentThreadId},
+            },
+        };
+        /// `EXCEPTION_CONTINUE_SEARCH`.
+        const CONTINUE_SEARCH: i32 = 0;
+        let mut line = Line { bytes: [0; 160], len: 0 };
+        line.put(PID_SAYS.as_bytes());
+        // SAFETY: takes nothing.
+        line.number(u64::from(unsafe { GetCurrentProcessId() }));
+        line.put(ENDED_BY_EXCEPTION.as_bytes());
+        // SAFETY: the system passes a filter live exception pointers (either may be null).
+        let record = if info.is_null() { std::ptr::null() } else { unsafe { (*info).ExceptionRecord } };
+        if record.is_null() {
+            line.put(b"? (no record)");
+        } else {
+            // SAFETY: as above, a live `EXCEPTION_RECORD`.
+            let record = unsafe { &*record };
+            line.hex(u64::from(record.ExceptionCode as u32));
+            line.put(b" at 0x");
+            // An access violation's address is the one it touched; else where it happened.
+            let touched = matches!(record.ExceptionCode as u32, 0xC000_0005 | 0xC000_0006)
+                && record.NumberParameters >= 2;
+            match touched {
+                true => line.hex(record.ExceptionInformation[1] as u64),
+                false => line.hex(record.ExceptionAddress as u64),
+            }
+        }
+        line.put(b" on thread (tid ");
+        // SAFETY: takes nothing.
+        line.number(u64::from(unsafe { GetCurrentThreadId() }));
+        line.put(b")\n");
+        let mut wrote = 0u32;
+        // SAFETY: the process's stderr handle, which may be null or invalid (then the write
+        // fails and loses the line, nothing else); `line.bytes` is live and `line.len` of it
+        // written.
+        unsafe {
+            WriteFile(
+                GetStdHandle(STD_ERROR_HANDLE),
+                line.bytes.as_ptr(),
+                line.len as u32,
+                &mut wrote,
+                std::ptr::null_mut(),
+            )
+        };
+        let before = BEFORE_FILTER.load(Ordering::Acquire);
+        if before.is_null() {
+            return CONTINUE_SEARCH;
+        }
+        // SAFETY: `before` was the filter `SetUnhandledExceptionFilter` returned, so it is an
+        // `unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32`, called as it would be.
+        let before: unsafe extern "system" fn(*const EXCEPTION_POINTERS) -> i32 =
+            unsafe { std::mem::transmute(before) };
+        // SAFETY: as above, with the pointers the system gave.
+        unsafe { before(info) }
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: `ended` is a function of this module, which lives as long as the process; it
+        // writes from its own stack and calls the filter before it, as it was set.
+        let before = unsafe { SetUnhandledExceptionFilter(Some(ended)) };
+        if let Some(before) = before {
+            BEFORE_FILTER.store(before as *mut (), Ordering::Release);
+        }
+    });
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn record_ends() {}
 
-/// A line built in a signal handler: on the stack, cut at its room, never allocated.
-#[cfg(unix)]
+/// A line built in a signal handler (on Windows an exception filter): on the stack, cut at its
+/// room, never allocated.
+#[cfg(any(unix, windows))]
 struct Line {
     bytes: [u8; 160],
     len: usize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Line {
     fn put(&mut self, bytes: &[u8]) {
         let room = &mut self.bytes[self.len..];
@@ -693,6 +790,60 @@ mod stop_wait_tests {
         });
         assert!(stop.wait(Duration::from_secs(10)).unwrap(), "woken by the stop begun");
         begun.join().unwrap();
+    }
+}
+
+/// Sends Ctrl+Break to the process group `group` (a process started with
+/// `CREATE_NEW_PROCESS_GROUP`, whose id is its group's) on this process's console: what a
+/// test of the stop's guard sends where Unix sends SIGTERM.
+#[cfg(all(test, windows))]
+pub fn send_break(group: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: takes integers and reads no memory of this process.
+    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::process::Command;
+
+    use super::*;
+
+    const CHILD: &str = "BLAZE_TEST_ENDED_BY_EXCEPTION";
+    const NAME: &str =
+        "serve::signals::windows_tests::an_access_violation_ends_the_daemon_with_a_line_naming_it";
+
+    /// The invariant of `record_ends` on Windows: a daemon that dies of an exception writes a
+    /// line naming it, the address it touched and its thread, then ends with the exception's
+    /// code, as the system would have ended it. Control: with `record_ends` the no-op it was,
+    /// the child ends with the same code and its stderr holds no such line.
+    #[test]
+    fn an_access_violation_ends_the_daemon_with_a_line_naming_it() {
+        if std::env::var_os(CHILD).is_some() {
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+            };
+            // SAFETY: takes flags: no error report window for the fault below.
+            unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+            record_ends();
+            let at = std::hint::black_box(16usize) as *mut u8;
+            // SAFETY: none: the write faults on purpose, at an address nothing maps, to end
+            // this child process with an access violation.
+            unsafe { at.write_volatile(1) };
+            unreachable!("the write to address 16 faulted");
+        }
+        let ran = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(ran.status.code(), Some(0xC000_0005_u32 as i32), "{said}");
+        assert!(said.contains(" ended by exception 0xc0000005 at 0x10 on thread (tid "), "{said}");
+        assert!(said.contains(PID_SAYS), "{said}");
     }
 }
 
