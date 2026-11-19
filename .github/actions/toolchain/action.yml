@@ -21,17 +21,41 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/rustup
+    - name: Resolve pinned toolchain (Windows)
+      if: runner.os == 'Windows'
+      id: win-tc
+      shell: bash
+      run: |
+        tc=$(tr -d '\r\n' < harness/toolchain)
+        rustup_home=$(rustup show home | tr -d '\r\n')
+        tc_dir="${rustup_home}\\toolchains\\${tc}-x86_64-pc-windows-msvc"
+        extra=$(printf '%s_%s' "${{ inputs.components }}" "${{ inputs.targets }}" | tr -s '[:space:]' '_' | sed 's/[^A-Za-z0-9._-]/_/g; s/^_*//; s/_*$//')
+        [ -n "$extra" ] || extra="base"
+        echo "tc=$tc" >> "$GITHUB_OUTPUT"
+        echo "tc_dir=$tc_dir" >> "$GITHUB_OUTPUT"
+        echo "key=rustup-win-v1-${tc}-${extra}" >> "$GITHUB_OUTPUT"
+    - if: runner.os == 'Windows'
+      id: rustup-windows
+      uses: actions/cache@v6
+      with:
+        path: ${{ steps.win-tc.outputs.tc_dir }}
+        key: ${{ steps.win-tc.outputs.key }}
     - name: Rust (the nightly in harness/toolchain)
       shell: bash
       run: |
-        tc=$(cat harness/toolchain)
+        tc=$(tr -d '\r\n' < harness/toolchain)
         # No rust-src: blaze compiles the standard library only from its own library/
         # (docs/toolchain.md) and reads no toolchain's rust-src.
-        components=""
-        for c in ${{ inputs.components }}; do components="$components -c $c"; done
-        rustup toolchain install "$tc" --profile minimal $components
-        rustup default "$tc"
-        for t in ${{ inputs.targets }}; do rustup target add "$t"; done
+        if [ "${{ runner.os }}" = "Windows" ] && [ "${{ steps.rustup-windows.outputs.cache-hit }}" = "true" ] && [ -x "$(cygpath -u "${{ steps.win-tc.outputs.tc_dir }}")/bin/rustc.exe" ] && rustup default "$tc"; then
+          rustc -V
+        else
+          components=""
+          for c in ${{ inputs.components }}; do components="$components -c $c"; done
+          rustup toolchain install "$tc" --profile minimal $components
+          rustup default "$tc"
+          for t in ${{ inputs.targets }}; do rustup target add "$t"; done
+          rustc -V
+        fi
 
     # `blaze test` runs every test in a sandbox made of namespaces a user makes, which
     # Ubuntu's AppArmor keeps users from making unless told otherwise.

@@ -37,7 +37,7 @@ permissions:
 
 concurrency:
   group: xplat-${{ github.ref }}-${{ inputs.mode || 'branch' }}-${{ inputs.revision || 'head' }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CONTROL_REV: e41ed591da1d4dac6cee0f9da6179a651c82ff8d
@@ -129,7 +129,16 @@ jobs:
 
   engine:
     name: engine + hello (${{ matrix.platform }})
-    if: inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    if: >-
+      inputs.mode != 'preflight' && (
+        github.event_name != 'push' || (
+          !contains(github.event.head_commit.message, '[skip ci]') &&
+          !contains(github.event.head_commit.message, '[ci skip]') &&
+          !contains(github.event.head_commit.message, '[no ci]') &&
+          !contains(github.event.head_commit.message, '[skip actions]') &&
+          !contains(github.event.head_commit.message, '[actions skip]')
+        )
+      )
     runs-on: ${{ matrix.os }}
     timeout-minutes: 210
     strategy:
@@ -265,7 +274,16 @@ jobs:
 
   units:
     name: units-${{ matrix.group }} (${{ matrix.platform }})
-    if: inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    if: >-
+      inputs.mode != 'preflight' && (
+        github.event_name != 'push' || (
+          !contains(github.event.head_commit.message, '[skip ci]') &&
+          !contains(github.event.head_commit.message, '[ci skip]') &&
+          !contains(github.event.head_commit.message, '[no ci]') &&
+          !contains(github.event.head_commit.message, '[skip actions]') &&
+          !contains(github.event.head_commit.message, '[actions skip]')
+        )
+      )
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -388,7 +406,16 @@ jobs:
   summary:
     name: summary
     needs: [engine, units]
-    if: always() && inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    if: >-
+      always() && !cancelled() && inputs.mode != 'preflight' && (
+        github.event_name != 'push' || (
+          !contains(github.event.head_commit.message, '[skip ci]') &&
+          !contains(github.event.head_commit.message, '[ci skip]') &&
+          !contains(github.event.head_commit.message, '[no ci]') &&
+          !contains(github.event.head_commit.message, '[skip actions]') &&
+          !contains(github.event.head_commit.message, '[actions skip]')
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -406,8 +433,17 @@ jobs:
           XPLAT_REV: ${{ inputs.revision || (inputs.mode == 'control' && 'e41ed591d' || github.sha) }}
         run: |
           set -o pipefail
+          mkdir -p summary-out
           chmod +x .github/scripts/xplat-gate.sh
-          .github/scripts/xplat-gate.sh summary "$RUNNER_TEMP/all-results" | tee -a "$GITHUB_STEP_SUMMARY"
+          .github/scripts/xplat-gate.sh summary "$RUNNER_TEMP/all-results" | tee summary-out/xplat-summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload xplat-batch-summary artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xplat-batch-summary
+          path: summary-out/xplat-summary.md
+          retention-days: 14
+          if-no-files-found: warn
       - name: Reflect combined gate status
         env:
           ENGINE: ${{ needs.engine.result }}

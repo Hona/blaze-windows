@@ -1,0 +1,79 @@
+# Restore Cargo's registry/git downloads and compiled external+vendored dependency artifacts
+# for a Windows build job. Pair with `./.github/actions/windows-cargo-cache-save` after the build
+# (which prunes workspace crates from target/<profile> before saving on a primary-key miss).
+#
+# Callers should set `CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'` so Cargo validates vendored path
+# dependencies (vendor/cranelift-codegen, vendor/wasmtime, vendor/llvm-sys, ...) by content hash
+# rather than checkout mtime across fresh runner VMs.
+name: windows-cargo-cache
+description: Restore Cargo registry and compiled Windows dependency cache
+inputs:
+  profile:
+    description: Cargo target profile directory (debug or release)
+    required: true
+  slot:
+    description: Cache namespace for this build graph (e.g. units, engine, regressions)
+    required: true
+outputs:
+  reg-cache-hit:
+    description: "'true' when the Cargo registry cache hit its primary key"
+    value: ${{ steps.reg-cache.outputs.cache-hit }}
+  deps-cache-hit:
+    description: "'true' when the dependency build cache hit its exact primary key"
+    value: ${{ steps.deps-cache.outputs.cache-hit }}
+  deps-cache-key:
+    description: Primary key to pass to windows-cargo-cache-save on miss
+    value: ${{ steps.key.outputs.deps_key }}
+runs:
+  using: composite
+  steps:
+    - name: Cargo registry and git cache
+      id: reg-cache
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-reg-win-v1-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cargo-reg-win-v1-
+    - name: Compute dependency cache key
+      id: key
+      shell: pwsh
+      env:
+        PROFILE: ${{ inputs.profile }}
+        SLOT: ${{ inputs.slot }}
+        LOCK_HASH: ${{ hashFiles('Cargo.lock') }}
+        CFG_HASH: ${{ hashFiles('.cargo/config.toml') }}
+        TC_HASH: ${{ hashFiles('harness/toolchain') }}
+        LLVM_HASH: ${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}
+        VENDOR_HASH: ${{ hashFiles('vendor/**') }}
+      run: |
+        function ShortHash([string] $s, [int] $n = 12) {
+          if ([string]::IsNullOrEmpty($s)) { return 'none' }
+          if ($s.Length -le $n) { return $s }
+          return $s.Substring(0, $n)
+        }
+        $vctools = ($env:VCToolsVersion -replace '[^0-9.]', '')
+        $vcmajor = if ($vctools -match '^(\d+\.\d+)') { $Matches[1] } else { 'unknown' }
+        $prefix = "cargo-deps-win-v1-$($env:PROFILE)-$($env:SLOT)-msvc$vcmajor-$(ShortHash $env:TC_HASH)-$(ShortHash $env:LLVM_HASH)-$(ShortHash $env:CFG_HASH 8)"
+        $lockPrefix = "$prefix-$(ShortHash $env:LOCK_HASH)"
+        $fullKey = "$lockPrefix-$(ShortHash $env:VENDOR_HASH)"
+        "deps_key=$fullKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "lock_prefix=$lockPrefix-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "base_prefix=$prefix-" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        Write-Host "Dependency cache key: $fullKey"
+    - name: Restore compiled dependency builds
+      id: deps-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          target/${{ inputs.profile }}/build
+          target/${{ inputs.profile }}/deps
+          target/${{ inputs.profile }}/.fingerprint
+          target/.rustc_info.json
+        key: ${{ steps.key.outputs.deps_key }}
+        restore-keys: |
+          ${{ steps.key.outputs.lock_prefix }}
+          ${{ steps.key.outputs.base_prefix }}

@@ -1,33 +1,47 @@
-name: Windows host
+# One entry point for the Windows batch gate on GitHub's hosted runners.
+# Triggered ONLY by a deliberate push to `windows/batch` (never on pushes to `windows/int` or pull
+# requests; `workflow_dispatch` is not usable while workflow files are off the default branch).
+# Builds the 15 test executables (7 unit suites + 8 compiler regression crates) once and the
+# release engine once in parallel, fans out to isolated test and ladder VMs, continues past every
+# failure, and emits one complete Markdown + JSON summary (both in the GitHub step summary and as
+# the `windows-batch-summary` artifact).
+name: Windows batch gate
+
 on:
-  pull_request:
-  workflow_dispatch:
   push:
-    branches: [windows/host, windows/int, windows/int-host-trial, windows/int-sync, windows/sync-units]
+    branches: [windows/batch]
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-host-${{ github.ref }}
+  group: windows-batch-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  RUST_BACKTRACE: '0'
+
 jobs:
-  bootstrap:
-    # The engine and unit graph build different sets of crate features. Give each a
-    # fresh disk instead of keeping two copies of LLVM-linked targets on a single VM.
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [engine, units]
+  build-units:
+    name: build (units + regressions)
+    if: >-
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[ci skip]') &&
+      !contains(github.event.head_commit.message, '[no ci]') &&
+      !contains(github.event.head_commit.message, '[skip actions]') &&
+      !contains(github.event.head_commit.message, '[actions skip]')
     runs-on: windows-2025
-    timeout-minutes: 180
+    timeout-minutes: 150
+    outputs:
+      units_ready: ${{ steps.compile.outputs.units_ready }}
+      astlog_ok: ${{ steps.astlog.outputs.astlog_ok }}
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '4'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
-      RUST_BACKTRACE: '0'
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
@@ -47,58 +61,343 @@ jobs:
             throw "LLVM needs MSVC 14.5x; selected '$env:VCToolsVersion'"
           }
           cl 2>&1 | Select-Object -First 1
-      - name: Bootstrap the engine
-        if: matrix.suite == 'engine'
-        run: cargo build --locked -p blaze-engine --bin blaze
-      - name: Check the bootstrap binary
-        if: matrix.suite == 'engine'
-        run: |
-          ./target/debug/blaze.exe --version
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $headers = dumpbin /nologo /headers target/debug/blaze.exe
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          if (-not ($headers -match '^\s*800000 size of stack reserve\s*$')) {
-           throw 'blaze.exe does not reserve an 8 MiB main-thread stack'
-           }
-      - if: matrix.suite == 'engine'
-        uses: actions/upload-artifact@v4
+      - id: cache
+        uses: ./.github/actions/windows-cargo-cache
         with:
-          name: windows-engine-${{ github.sha }}
-          path: target/debug/blaze.exe
-          retention-days: 3
-          if-no-files-found: error
-      - name: Compile unit executables without starting them
-        if: matrix.suite == 'units'
+          profile: debug
+          slot: units
+      - name: Compile all unit and regression test executables once
+        id: compile
         run: |
+          New-Item -ItemType Directory -Force build-units-out | Out-Null
           Get-PSDrive C,D | Format-Table Name,Used,Free
-          $p = Start-Process cargo -ArgumentList 'test --locked --no-run --message-format=json-render-diagnostics --lib -p blaze-core -p blaze-cargo -p blaze-usercode -p blaze-mem -p blaze-cas -p blaze-vfs -p blaze-link' -NoNewWindow -PassThru -RedirectStandardOutput artifacts.jsonl
-          while (-not $p.WaitForExit(30000)) {
-            $os = Get-CimInstance Win32_OperatingSystem
-            Write-Host "free MiB: RAM $([int]($os.FreePhysicalMemory/1024)), commit $([int]($os.FreeVirtualMemory/1024)), disk C $([int]((Get-PSDrive C).Free/1MB)), disk D $([int]((Get-PSDrive D).Free/1MB))"
+          . ./.github/scripts/windows-memory.ps1
+          $args = @(
+            'test', '--locked', '--no-run', '--message-format=json-render-diagnostics', '--lib',
+            '-p', 'blaze-core', '-p', 'blaze-cargo', '-p', 'blaze-usercode', '-p', 'blaze-mem',
+            '-p', 'blaze-cas', '-p', 'blaze-vfs', '-p', 'blaze-link',
+            '-p', 'blaze-graph', '-p', 'blaze-query', '-p', 'blaze-item-hash', '-p', 'blaze-items',
+            '-p', 'hir-def', '-p', 'hir-ty', '-p', 'hir-ty-mir', '-p', 'hir-ty-pure'
+          )
+          $p = Start-Process cargo -ArgumentList $args -NoNewWindow -PassThru `
+            -RedirectStandardOutput 'artifacts.jsonl' -RedirectStandardError 'build-units-out/compile.stderr.log'
+          $metrics = Wait-WithHeadroom -Process $p -IntervalMs 30000 -LogDisk -MetricsPath 'build-units-out/metrics.json' -NoThrow
+          $code = if ($p.HasExited) { $p.ExitCode } else { 137 }
+          if ($metrics.guard_tripped -and $code -eq 0) { $code = 137 }
+          $p.Dispose()
+          "compile_seconds=$($metrics.elapsed_seconds)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($code -ne 0) {
+            Write-Warning "cargo test --no-run exited $code"
+            if (Test-Path -LiteralPath 'build-units-out/compile.stderr.log') {
+              Get-Content -LiteralPath 'build-units-out/compile.stderr.log' -Tail 80
+            }
+            "units_ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
           }
-          if ($p.ExitCode) { exit $p.ExitCode }
-          New-Item -ItemType Directory bundle | Out-Null
-          $crates = 'blaze-cargo','blaze-cas','blaze-core','blaze-link','blaze-mem','blaze-usercode','blaze-vfs'
-          foreach ($item in (Get-Content artifacts.jsonl | ConvertFrom-Json)) {
-            if ($item.reason -eq 'compiler-artifact' -and $item.profile.test -and $item.executable) {
-              $name = $item.target.name.Replace('_','-')
-              if ($name -in $crates) { Copy-Item -LiteralPath $item.executable "bundle/$name.exe" }
+
+          $unitCrates = @('blaze-cargo', 'blaze-cas', 'blaze-core', 'blaze-link', 'blaze-mem', 'blaze-usercode', 'blaze-vfs')
+          $regCrates = @('blaze-graph', 'blaze-query', 'blaze-item-hash', 'blaze-items', 'hir-def', 'hir-ty', 'hir-ty-mir', 'hir-ty-pure')
+          New-Item -ItemType Directory -Force bundle/regressions | Out-Null
+          foreach ($c in $unitCrates) { New-Item -ItemType Directory -Force "bundle/units/$c" | Out-Null }
+
+          if (Test-Path -LiteralPath 'artifacts.jsonl') {
+            foreach ($line in (Get-Content -LiteralPath 'artifacts.jsonl')) {
+              if (-not $line -or -not $line.StartsWith('{')) { continue }
+              $item = $line | ConvertFrom-Json
+              if ($item.reason -eq 'compiler-artifact' -and $item.profile.test -and $item.executable) {
+                $name = $item.target.name.Replace('_', '-')
+                if ($name -in $unitCrates) { Copy-Item -LiteralPath $item.executable "bundle/units/$name/$name.exe" }
+                if ($name -in $regCrates) { Copy-Item -LiteralPath $item.executable "bundle/regressions/$name.exe" }
+              }
             }
           }
-          foreach ($name in $crates) { Get-Item "bundle/$name.exe" }
-      - if: matrix.suite == 'units'
-        uses: actions/upload-artifact@v4
+          foreach ($c in $unitCrates) { Get-Item "bundle/units/$c/$c.exe" }
+          foreach ($c in $regCrates) { Get-Item "bundle/regressions/$c.exe" }
+          "units_ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
         with:
-          name: windows-units-${{ github.sha }}
-          path: bundle/*.exe
-          retention-days: 3
+          name: bin-unit-blaze-cargo
+          path: bundle/units/blaze-cargo/blaze-cargo.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-cas
+          path: bundle/units/blaze-cas/blaze-cas.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-core
+          path: bundle/units/blaze-core/blaze-core.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-link
+          path: bundle/units/blaze-link/blaze-link.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-mem
+          path: bundle/units/blaze-mem/blaze-mem.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-usercode
+          path: bundle/units/blaze-usercode/blaze-usercode.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-unit-blaze-vfs
+          path: bundle/units/blaze-vfs/blaze-vfs.exe
+          retention-days: 1
+          if-no-files-found: error
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-regressions
+          path: bundle/regressions/*.exe
+          retention-days: 1
           if-no-files-found: error
       - name: Portable tool call sites and planted regressions
-        if: '!cancelled() && matrix.suite == ''engine'''
-        run: cargo test --locked -p astlog-core --test rules
+        id: astlog
+        if: success()
+        run: |
+          New-Item -ItemType Directory -Force build-units-out | Out-Null
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process cargo -ArgumentList @('test', '--locked', '-p', 'astlog-core', '--test', 'rules') -NoNewWindow -PassThru `
+            -RedirectStandardOutput 'build-units-out/astlog.stdout.log' -RedirectStandardError 'build-units-out/astlog.stderr.log'
+          if ($p.WaitForExit(600000)) {
+            $code = $p.ExitCode
+          } else {
+            try { $p.Kill($true) } catch {}
+            Write-Warning 'astlog-core --test rules timed out after 600s'
+            $code = 124
+          }
+          $p.Dispose()
+          $watch.Stop()
+          if (Test-Path -LiteralPath 'build-units-out/astlog.stdout.log') {
+            Get-Content -LiteralPath 'build-units-out/astlog.stdout.log' -Tail 40
+          }
+          if ($code -ne 0 -and (Test-Path -LiteralPath 'build-units-out/astlog.stderr.log')) {
+            Get-Content -LiteralPath 'build-units-out/astlog.stderr.log' -Tail 40
+          }
+          $ok = if ($code -eq 0) { 'true' } else { 'false' }
+          "astlog_ok=$ok" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "astlog_seconds=$([math]::Round($watch.Elapsed.TotalSeconds, 2))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - if: steps.compile.outputs.units_ready == 'true'
+        uses: ./.github/actions/windows-cargo-cache-save
+        with:
+          profile: debug
+          cache-hit: ${{ steps.cache.outputs.deps-cache-hit }}
+          cache-key: ${{ steps.cache.outputs.deps-cache-key }}
+      - name: Write build-units metadata
+        if: always()
+        env:
+          UNITS_READY: ${{ steps.compile.outputs.units_ready }}
+          COMPILE_SECONDS: ${{ steps.compile.outputs.compile_seconds }}
+          ASTLOG_OK: ${{ steps.astlog.outputs.astlog_ok }}
+          ASTLOG_SECONDS: ${{ steps.astlog.outputs.astlog_seconds }}
+          REG_HIT: ${{ steps.cache.outputs.reg-cache-hit }}
+          DEPS_HIT: ${{ steps.cache.outputs.deps-cache-hit }}
+        run: |
+          New-Item -ItemType Directory -Force build-units-out | Out-Null
+          $metrics = if (Test-Path -LiteralPath 'build-units-out/metrics.json') {
+            Get-Content -LiteralPath 'build-units-out/metrics.json' -Raw | ConvertFrom-Json
+          } else { $null }
+          $info = [ordered]@{
+            kind = 'build-units'
+            compile_ok = ($env:UNITS_READY -eq 'true')
+            compile_seconds = if ($env:COMPILE_SECONDS) { [double]$env:COMPILE_SECONDS } else { $null }
+            astlog_ok = ($env:ASTLOG_OK -eq 'true')
+            astlog_seconds = if ($env:ASTLOG_SECONDS) { [double]$env:ASTLOG_SECONDS } else { $null }
+            reg_cache_hit = if ($env:REG_HIT -eq 'true') { 'hit' } else { 'miss' }
+            deps_cache_hit = if ($env:DEPS_HIT -eq 'true') { 'hit' } else { 'miss' }
+            metrics = $metrics
+          }
+          $info | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath 'build-units-out/build-units.json' -Encoding utf8
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-build-units
+          path: build-units-out/**
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Reflect build-units status
+        if: steps.compile.outputs.units_ready != 'true' || steps.astlog.outputs.astlog_ok != 'true'
+        run: |
+          throw "build-units failed (units_ready=${{ steps.compile.outputs.units_ready }}, astlog_ok=${{ steps.astlog.outputs.astlog_ok }})"
+
+  build-release:
+    name: build (release engine)
+    if: >-
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[ci skip]') &&
+      !contains(github.event.head_commit.message, '[no ci]') &&
+      !contains(github.event.head_commit.message, '[skip actions]') &&
+      !contains(github.event.head_commit.message, '[actions skip]')
+    runs-on: windows-2025
+    timeout-minutes: 150
+    outputs:
+      engine_ready: ${{ steps.build.outputs.engine_ready }}
+    env:
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - name: Check the selected CRT
+        run: |
+          if ($env:VCToolsVersion -notmatch '^14\.5\d\.') {
+            throw "LLVM needs MSVC 14.5x; selected '$env:VCToolsVersion'"
+          }
+          cl 2>&1 | Select-Object -First 1
+      - id: cache
+        uses: ./.github/actions/windows-cargo-cache
+        with:
+          profile: release
+          slot: engine
+      - name: Build release blaze.exe once
+        id: build
+        run: |
+          New-Item -ItemType Directory -Force build-release-out | Out-Null
+          Get-PSDrive C,D | Format-Table Name,Used,Free
+          . ./.github/scripts/windows-memory.ps1
+          $p = Start-Process cargo -ArgumentList @('build', '--locked', '--release', '-p', 'blaze-engine', '--bin', 'blaze') -NoNewWindow -PassThru `
+            -RedirectStandardOutput 'build-release-out/build-release.stdout.log' -RedirectStandardError 'build-release-out/build-release.stderr.log'
+          $metrics = Wait-WithHeadroom -Process $p -IntervalMs 30000 -LogDisk -MetricsPath 'build-release-out/metrics.json' -NoThrow
+          $code = if ($p.HasExited) { $p.ExitCode } else { 137 }
+          if ($metrics.guard_tripped -and $code -eq 0) { $code = 137 }
+          $p.Dispose()
+          "build_seconds=$($metrics.elapsed_seconds)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($code -ne 0 -or -not (Test-Path -LiteralPath 'target/release/blaze.exe')) {
+            Write-Warning "cargo build --release exited $code"
+            if (Test-Path -LiteralPath 'build-release-out/build-release.stderr.log') {
+              Get-Content -LiteralPath 'build-release-out/build-release.stderr.log' -Tail 80
+            }
+            "engine_ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          "engine_ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Check the release binary (--version and 8 MiB stack)
+        id: check
+        if: steps.build.outputs.engine_ready == 'true'
+        run: |
+          $versionOk = 'false'
+          $stackOk = 'false'
+          $versionLine = ''
+          $err = ''
+          try {
+            $ver = & ./target/release/blaze.exe --version 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              $versionOk = 'true'
+              $versionLine = (($ver | Select-Object -First 1) -as [string]).Trim()
+              Write-Host "blaze --version: $versionLine"
+            } else {
+              $err = "blaze --version exited $LASTEXITCODE"
+              Write-Warning $err
+            }
+          } catch {
+            $err = "blaze --version failed: $($_.Exception.Message)"
+            Write-Warning $err
+          }
+          try {
+            $headers = dumpbin /nologo /headers target/release/blaze.exe
+            if ($LASTEXITCODE -eq 0 -and ($headers -match '^\s*800000 size of stack reserve\s*$')) {
+              $stackOk = 'true'
+            } else {
+              $msg = 'blaze.exe does not reserve an 8 MiB main-thread stack'
+              $err = if ($err) { "$err; $msg" } else { $msg }
+              Write-Warning $msg
+            }
+          } catch {
+            $msg = "dumpbin failed: $($_.Exception.Message)"
+            $err = if ($err) { "$err; $msg" } else { $msg }
+            Write-Warning $msg
+          }
+          $versionLine = ($versionLine -replace '[\r\n]+', ' ').Trim()
+          $err = ($err -replace '[\r\n]+', ' ').Trim()
+          "version_ok=$versionOk" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "stack_ok=$stackOk" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version_line=$versionLine" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "check_error=$err" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - if: steps.build.outputs.engine_ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bin-release-engine
+          path: target/release/blaze.exe
+          retention-days: 3
+          if-no-files-found: error
+      - if: steps.build.outputs.engine_ready == 'true'
+        uses: ./.github/actions/windows-cargo-cache-save
+        with:
+          profile: release
+          cache-hit: ${{ steps.cache.outputs.deps-cache-hit }}
+          cache-key: ${{ steps.cache.outputs.deps-cache-key }}
+      - name: Write build-release metadata
+        if: always()
+        env:
+          ENGINE_READY: ${{ steps.build.outputs.engine_ready }}
+          BUILD_SECONDS: ${{ steps.build.outputs.build_seconds }}
+          VERSION_OK: ${{ steps.check.outputs.version_ok }}
+          STACK_OK: ${{ steps.check.outputs.stack_ok }}
+          VERSION_LINE: ${{ steps.check.outputs.version_line }}
+          CHECK_ERROR: ${{ steps.check.outputs.check_error }}
+          REG_HIT: ${{ steps.cache.outputs.reg-cache-hit }}
+          DEPS_HIT: ${{ steps.cache.outputs.deps-cache-hit }}
+        run: |
+          New-Item -ItemType Directory -Force build-release-out | Out-Null
+          $metrics = if (Test-Path -LiteralPath 'build-release-out/metrics.json') {
+            Get-Content -LiteralPath 'build-release-out/metrics.json' -Raw | ConvertFrom-Json
+          } else { $null }
+          $info = [ordered]@{
+            kind = 'build-release'
+            build_ok = ($env:ENGINE_READY -eq 'true')
+            build_seconds = if ($env:BUILD_SECONDS) { [double]$env:BUILD_SECONDS } else { $null }
+            version_ok = ($env:VERSION_OK -eq 'true')
+            stack_ok = ($env:STACK_OK -eq 'true')
+            version_line = $env:VERSION_LINE
+            error = $env:CHECK_ERROR
+            reg_cache_hit = if ($env:REG_HIT -eq 'true') { 'hit' } else { 'miss' }
+            deps_cache_hit = if ($env:DEPS_HIT -eq 'true') { 'hit' } else { 'miss' }
+            metrics = $metrics
+          }
+          $info | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath 'build-release-out/build-release.json' -Encoding utf8
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-build-release
+          path: build-release-out/**
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Reflect build-release status
+        if: steps.build.outputs.engine_ready != 'true' || steps.check.outputs.version_ok != 'true' || steps.check.outputs.stack_ok != 'true'
+        run: |
+          throw "build-release failed (engine_ready=${{ steps.build.outputs.engine_ready }}, version_ok=${{ steps.check.outputs.version_ok }}, stack_ok=${{ steps.check.outputs.stack_ok }})"
 
   units:
-    needs: bootstrap
+    name: units (${{ matrix.crate }})
+    needs: build-units
+    if: always() && !cancelled() && needs.build-units.outputs.units_ready == 'true'
     runs-on: windows-2025
     timeout-minutes: 75
     strategy:
@@ -110,24 +409,186 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           toolset: '14.5'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: windows-units-${{ github.sha }}
+          name: bin-unit-${{ matrix.crate }}
           path: target/debug/deps
       - name: Run the suite with runner headroom
-        run: ./.github/scripts/windows-suite.ps1 '${{ matrix.crate }}'
-      - name: Preserve the full diagnostics for a failed suite
-        if: failure()
-        uses: actions/upload-artifact@v4
+        id: suite
+        continue-on-error: true
+        run: ./.github/scripts/windows-suite.ps1 -Crate '${{ matrix.crate }}' -OutDir 'unit-out'
+      - name: Upload suite logs and telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: windows-${{ matrix.crate }}-logs-${{ github.sha }}
-          path: ${{ matrix.crate }}.*.log
-          retention-days: 3
+          name: result-unit-${{ matrix.crate }}
+          path: unit-out/**
+          retention-days: 7
           if-no-files-found: warn
+      - name: Reflect suite status
+        if: steps.suite.outcome == 'failure'
+        run: exit 1
+
+  regressions:
+    name: compiler regressions
+    needs: build-units
+    if: always() && !cancelled() && needs.build-units.outputs.units_ready == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v8
+        with:
+          name: bin-regressions
+          path: target/debug/deps
+      - name: Run all compiler regressions (continuing past failures)
+        id: regs
+        continue-on-error: true
+        run: ./.github/scripts/windows-regressions.ps1 -BinDir 'target/debug/deps' -OutDir 'regressions-out'
+      - name: Upload regression logs and telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-regressions
+          path: regressions-out/**
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Reflect regressions status
+        if: steps.regs.outcome == 'failure'
+        run: exit 1
+
+  ladder:
+    name: ladder (${{ matrix.fixture }})
+    needs: build-release
+    if: always() && !cancelled() && needs.build-release.outputs.engine_ready == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [hello, withdeps, rune-cstr, one-luau, r28-ops]
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v8
+        with:
+          name: bin-release-engine
+          path: target/release
+      - name: Provision the scratch volume change journal
+        run: |
+          $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
+          fsutil usn queryjournal $volume
+          if ($LASTEXITCODE) { fsutil usn createjournal m=33554432 a=4194304 $volume }
+      - name: Run the ladder with runner memory telemetry
+        id: run_ladder
+        continue-on-error: true
+        env:
+          FIXTURE: ${{ matrix.fixture }}
+        run: |
+          . ./.github/scripts/windows-memory.ps1
+          $outDir = Join-Path $env:RUNNER_TEMP 'ladder'
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          $p = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList @(
+            '-NoProfile', '-File', '.github/scripts/windows-ladder.ps1',
+            '-Blaze', "$PWD/target/release/blaze.exe",
+            '-Out', $outDir,
+            '-Fixture', $env:FIXTURE,
+            '-ContinueOnFailure'
+          )
+          $metrics = Wait-WithHeadroom -Process $p -MetricsPath (Join-Path $outDir 'metrics.json') -NoThrow
+          $code = if ($p.HasExited) { $p.ExitCode } else { 137 }
+          if ($metrics.guard_tripped -and $code -eq 0) { $code = 137 }
+          $p.Dispose()
+          exit $code
+      - name: Upload ladder logs, timings and telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-ladder-${{ matrix.fixture }}
+          path: |
+            ${{ runner.temp }}/ladder/*.log
+            ${{ runner.temp }}/ladder/*.csv
+            ${{ runner.temp }}/ladder/*.json
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Reflect ladder status
+        if: steps.run_ladder.outcome == 'failure'
+        run: exit 1
+
+  summary:
+    name: batch summary
+    needs: [build-units, build-release, units, regressions, ladder]
+    if: >-
+      always() && !cancelled() &&
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[ci skip]') &&
+      !contains(github.event.head_commit.message, '[no ci]') &&
+      !contains(github.event.head_commit.message, '[skip actions]') &&
+      !contains(github.event.head_commit.message, '[actions skip]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: result-*
+          path: ${{ runner.temp }}/batch-results
+      - name: Build unified Markdown and JSON batch summary
+        id: summarize
+        continue-on-error: true
+        shell: pwsh
+        env:
+          BUILD_UNITS_RES: ${{ needs.build-units.result }}
+          BUILD_RELEASE_RES: ${{ needs.build-release.result }}
+          UNITS_RES: ${{ needs.units.result }}
+          REGRESSIONS_RES: ${{ needs.regressions.result }}
+          LADDER_RES: ${{ needs.ladder.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $jobs = [ordered]@{
+            build_units = $env:BUILD_UNITS_RES
+            build_release = $env:BUILD_RELEASE_RES
+            units = $env:UNITS_RES
+            regressions = $env:REGRESSIONS_RES
+            ladder = $env:LADDER_RES
+          } | ConvertTo-Json -Compress
+          ./.github/scripts/windows-batch-summary.ps1 `
+            -ArtifactsDir "$env:RUNNER_TEMP/batch-results" `
+            -OutDir 'summary-out' `
+            -Commit '${{ github.sha }}' `
+            -RefName '${{ github.ref_name }}' `
+            -RunUrl $env:RUN_URL `
+            -JobResultsJson $jobs
+      - name: Upload windows-batch-summary artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-batch-summary
+          path: summary-out/**
+          retention-days: 14
+          if-no-files-found: error
+      - name: Reflect overall batch verdict
+        if: steps.summarize.outcome == 'failure'
+        shell: pwsh
+        run: throw 'Windows batch gate failed; see job summary or download artifact windows-batch-summary'
