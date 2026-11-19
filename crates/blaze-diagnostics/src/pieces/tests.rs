@@ -356,6 +356,65 @@ fn probed_after_a_body_edit(n: usize, plant_it: Option<Plant>) -> usize {
     take_probed(&db)
 }
 
+/// Each syntax pieces sweep, by the database it ran in: how many memos it asked and whether
+/// nothing was kept ([`crate::kept::sweep`]).
+pub(super) static SWEPT: blaze_core::lock::Lock<Vec<(base_db::Nonce, usize, bool)>> =
+    blaze_core::lock::Lock::new("test.diagnostics.pieces.swept", Vec::new());
+
+/// The memos the piece sweeps of `db` asked since the last take, and whether one had nothing
+/// kept.
+fn take_swept(db: &Db) -> (usize, bool) {
+    let nonce = db.nonce_and_revision().0;
+    let (mut asked, mut whole) = (0, false);
+    SWEPT.lock().retain(|&(of, count, all)| {
+        if of == nonce {
+            asked += count;
+            whole |= all;
+        }
+        of != nonce
+    });
+    (asked, whole)
+}
+
+/// How many piece memos the check after a body edit of `f7` in [`many_bodies`]`(n)` asked;
+/// with `forget` nothing the first check's sweep kept is left to it (the control).
+fn asked_after_a_body_edit(n: usize, forget: bool) -> (usize, bool) {
+    let fixture = many_bodies(n);
+    let (mut db, names, _) = fixture_db(&fixture, "");
+    let options = Options::default();
+    check_all(&db, &names, &options);
+    let (first, whole) = take_swept(&db);
+    assert!(whole && first >= n, "the first sweep asks every piece: {first} of {n}");
+    let a = *names.iter().find(|(_, name)| *name == "a.rs").expect("the fixture has a.rs").0;
+    let text = db.file_text(a).text(&db).as_str().to_owned();
+    db.set_file_text(a, &text.replacen("let x = 7; x", "let x = 7; x + 1", 1));
+    if forget {
+        crate::kept::forget(db.nonce_and_revision().0);
+    }
+    check_all(&db, &names, &options);
+    take_swept(&db)
+}
+
+/// The invariant: after a body edit the syntax group's sweep asks the memos the edit reached
+/// and no other piece's, the same among 20 functions and 200: the pieces' memos are kept
+/// answers, never asked again one by one (until 2026-11-19 every check asked each).
+#[test]
+fn a_body_edit_asks_the_piece_memos_it_reached_and_no_other() {
+    let (small, small_whole) = asked_after_a_body_edit(20, false);
+    let (large, large_whole) = asked_after_a_body_edit(200, false);
+    assert!(!small_whole && !large_whole, "the second sweep starts from the kept one");
+    assert!(small <= 2, "at most the edited piece and its file's outline: {small}");
+    assert_eq!(small, large, "the same among 20 functions and 200");
+}
+
+/// The control of [`a_body_edit_asks_the_piece_memos_it_reached_and_no_other`]: with nothing
+/// kept, the sweep asks every piece, and the oracle tells it apart.
+#[test]
+fn the_oracle_catches_a_piece_sweep_with_nothing_kept() {
+    let (large, whole) = asked_after_a_body_edit(200, true);
+    assert!(whole && large >= 200, "{large}");
+}
+
 /// The invariant: after a body edit of one function in a 200-function file whose bodies call
 /// no macro, `piece_clean` of the syntax group executes once, for the edited body, and
 /// verifies the rest: the outline backdates, and no other body's own syntax changed. Control:

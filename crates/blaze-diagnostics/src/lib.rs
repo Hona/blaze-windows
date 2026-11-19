@@ -34,6 +34,7 @@ pub mod check;
 mod checks;
 pub mod cx;
 pub mod emit;
+mod kept;
 pub mod lints;
 mod lower;
 pub mod model;

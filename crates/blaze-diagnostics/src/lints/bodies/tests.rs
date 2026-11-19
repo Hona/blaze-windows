@@ -21,6 +21,27 @@ use crate::{
 pub(super) static LINTED: blaze_core::lock::Lock<Vec<(base_db::Nonce, DefWithBodyId, bool)>> =
     blaze_core::lock::Lock::new("test.diagnostics.lints.linted", Vec::new());
 
+/// Each body lints sweep, by the database it ran in: whether of the late passes, how many
+/// memos it asked and whether nothing was kept ([`crate::kept::sweep`]).
+pub(super) static SWEPT: blaze_core::lock::Lock<Vec<(base_db::Nonce, bool, usize, bool)>> =
+    blaze_core::lock::Lock::new("test.diagnostics.lints.swept", Vec::new());
+
+/// The memos the sweeps of `db` asked since the last take, over both sets of passes, and
+/// whether any sweep had nothing kept.
+fn take_asked(db: &base_db::Db) -> (usize, bool) {
+    let nonce = db.nonce_and_revision().0;
+    let mut swept = SWEPT.lock();
+    let (mut asked, mut whole) = (0, false);
+    swept.retain(|&(of, _, count, all)| {
+        if of == nonce {
+            asked += count;
+            whole |= all;
+        }
+        of != nonce
+    });
+    (asked, whole)
+}
+
 /// The bodies whose lints ran in `db` since the last take, once for each of the passes
 /// before the abort and the late passes, in no order.
 fn take_linted(db: &base_db::Db) -> Vec<DefWithBodyId> {
@@ -155,6 +176,12 @@ fn edited_main(near: usize) -> String {
 /// and the late passes of another set of lints), which is the planted bug: a check that
 /// lints every body again.
 fn linted_after_an_edit(near: usize, functions: usize, kept: bool) -> usize {
+    edit_cost(near, functions, kept).0
+}
+
+/// [`linted_after_an_edit`], with the memos the second check's sweeps asked and whether one of
+/// them had nothing kept.
+fn edit_cost(near: usize, functions: usize, kept: bool) -> (usize, usize, bool) {
     let fixture = fx::db(&two_files(near, functions));
     let main = fixture.file_at("/main.rs").file_id(fixture.db());
     let mut db = fixture.into_db();
@@ -173,12 +200,39 @@ fn linted_after_an_edit(near: usize, functions: usize, kept: bool) -> usize {
     run(&db, true, &[]);
     let first = take_linted(&db).len();
     assert!(first >= 2 * functions, "the first check lints every body: {first} of {functions}");
+    let (asked, whole) = take_asked(&db);
+    assert!(whole && asked >= 2 * functions, "the first sweeps ask every memo: {asked}");
     db.set_file_text(main, &edited_main(near));
     match kept {
         true => run(&db, true, &[]),
         false => run(&db, false, &["-A", "unused-comparisons"]),
     }
-    take_linted(&db).len()
+    let (asked, whole) = take_asked(&db);
+    (take_linted(&db).len(), asked, whole)
+}
+
+/// The invariant: after a body-only edit of one function, the sweeps of the body lints ask
+/// the memos the edit reached (the edited file's bodies at most), never every body's: the
+/// same among 20 bodies and 200. Until 2026-11-19 each sweep asked every memo on every check
+/// (11,368 of opencode-desktop's binary, a verification each).
+#[test]
+fn an_edit_of_one_body_asks_the_memos_it_reached_and_no_other() {
+    let near = 4;
+    let (_, small, small_whole) = edit_cost(near, 20, true);
+    let (_, large, large_whole) = edit_cost(near, 200, true);
+    assert!(!small_whole && !large_whole, "the second sweeps start from the kept ones");
+    assert!(small <= 2 * (near + 1), "{small} memos asked for one edited body and {near} after it");
+    assert_eq!(large, small, "the sweeps of an edit ask the same among 20 bodies and 200");
+}
+
+/// The control of [`an_edit_of_one_body_asks_the_memos_it_reached_and_no_other`]: a sweep of
+/// another key has nothing kept and asks every memo, and the oracle tells it apart.
+#[test]
+fn the_oracle_catches_a_sweep_that_asks_every_memo() {
+    let near = 4;
+    let (_, small, _) = edit_cost(near, 20, false);
+    let (_, large, whole) = edit_cost(near, 200, false);
+    assert!(whole && small >= 2 * 20 && large >= 2 * 200, "{small}, {large}");
 }
 
 /// The invariant: after a body-only edit of one function, the bodies linted again are at

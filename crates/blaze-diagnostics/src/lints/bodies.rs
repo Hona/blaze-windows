@@ -256,19 +256,27 @@ fn sweep(cx: &Cx<'_, '_>, owners: &[DefWithBodyId], gate: Gate) -> Vec<DefWithBo
         "body lints sweep",
         function = phase,
         linted_bodies = owners.len(),
+        asked = tracing::field::Empty,
+        named = tracing::field::Empty,
+        whole = tracing::field::Empty,
     )
     .entered();
     let db = cx.db;
-    db.run_all(Tag::Diagnostics, owners.len(), |db, at| {
-        body_lints_clean(db, owners[at], gate);
-    });
-    // alloc: the bodies a lint is found in, empty for a crate with none
-    let mut found_in = Vec::new();
-    for &owner in owners {
-        if !body_lints_clean(db, owner, gate) {
-            found_in.push(owner);
-        }
-    }
+    // From the sweep kept of this crate and gate: only the memos an edit reached are asked.
+    let swept = crate::kept::sweep(
+        db,
+        (cx.krate.base(), gate),
+        owners,
+        |since| body_lints_clean::changed_since(db, since),
+        |id| body_lints_clean::arguments(db, id).filter(|it| it.1 == gate).map(|it| it.0),
+        |db, owner| body_lints_clean(db, owner, gate),
+    );
+    sweeping.record("asked", swept.asked);
+    sweeping.record("named", swept.named);
+    sweeping.record("whole", swept.whole);
+    #[cfg(test)]
+    tests::SWEPT.lock().push((db.nonce_and_revision().0, gate.late, swept.asked, swept.whole));
+    let found_in = swept.unclean;
     drop(sweeping);
     tracing::info_span!(
         target: "blaze",
