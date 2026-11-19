@@ -13,12 +13,9 @@
 //! The driver of a sans-IO core: [`Solo`]'s looks are answered here, each one batch, and
 //! the decision is the machine's.
 
-use std::{
-    io::Read as _,
-    os::unix::fs::MetadataExt as _,
-    path::Path,
-    time::Duration,
-};
+use std::{io::Read as _, path::Path, time::Duration};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 use blaze_api::{Request, Response, ViewRef};
 use blaze_certify::{
@@ -185,8 +182,29 @@ fn look_at(look: Look) -> Result<Seen, String> {
 }
 
 /// The stamp of the name at `path`, not followed through a link, as the daemon's sweep of a
+/// column takes it (blaze-core's `iocp::stamp_name`: the same open and queries, through
+/// `blaze_core::fs::stamp`): `Stamp::GONE` where nothing is there, by the errors the sweep
+/// reads as gone, `Stamp::UNKNOWN` where the system would not say. A slot names its paths as
+/// the daemon does (`/C:/w/src/main.rs`); each is looked at by its host path.
+#[cfg(windows)]
+fn stamp(path: &Path) -> Stamp {
+    /// `ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`, `ERROR_INVALID_NAME`,
+    /// `ERROR_BAD_PATHNAME` and `ERROR_DIRECTORY`: what the sweep reads as nothing there.
+    const GONE: [i32; 5] = [2, 3, 123, 161, 267];
+    let host = blaze_core::platform::path::host_if_daemon(path);
+    match blaze_core::fs::stamp(&host) {
+        Ok(stamp) => stamp,
+        Err(error) => match error.raw_os_error() {
+            Some(code) if GONE.contains(&code) => Stamp::GONE,
+            _ => Stamp::UNKNOWN,
+        },
+    }
+}
+
+/// The stamp of the name at `path`, not followed through a link, as the daemon's sweep of a
 /// column takes it (blaze-core's `fs::stamp_of` of an `lstat`): `Stamp::GONE` where nothing
 /// is there, `Stamp::UNKNOWN` where the system would not say.
+#[cfg(unix)]
 fn stamp(path: &Path) -> Stamp {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
@@ -210,7 +228,8 @@ fn stamp(path: &Path) -> Stamp {
 /// shorter, `None` where no file is there.
 fn head(path: &Path, len: usize) -> Result<Option<Vec<u8>>, String> {
     let what = |error: std::io::Error| format!("reading the head of {}: {error}", path.display());
-    let file = match std::fs::File::open(path) {
+    // A slot names its paths as the daemon does; on Windows that is `/C:/...`.
+    let file = match std::fs::File::open(blaze_core::platform::path::host_if_daemon(path)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(what(error)),
@@ -218,4 +237,29 @@ fn head(path: &Path, len: usize) -> Result<Option<Vec<u8>>, String> {
     let mut bytes = Vec::with_capacity(len); // alloc: a start file's head, once a check
     file.take(len as u64).read_to_end(&mut bytes).map_err(what)?;
     Ok(Some(bytes))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The client stamps a slot's names as the daemon's sweep does: by its daemon name
+    /// (`/C:/...`) or its host path alike, the same stamp `blaze_core::fs::stamp` gives; a name
+    /// nothing is at, or under a file, is gone. Control: a stamp taken through a followed link
+    /// or `std::fs::metadata` has no file index, so it would never equal the sweep's.
+    #[test]
+    fn a_slot_name_is_stamped_as_the_sweep_stamps_it() {
+        let held = blaze_core::temp::TempDir::for_test("blaze-thin-solo-");
+        let file = held.path().join("main.rs");
+        std::fs::write(&file, b"fn main() {}\n").unwrap();
+        let host = stamp(&file);
+        assert!(!host.is_gone() && !host.is_unknown(), "{host:?}");
+        assert_eq!(host, blaze_core::fs::stamp(&file).unwrap());
+        assert_ne!(host.ino, 0, "the file's index, as the sweep's open gives it");
+        let daemon = blaze_core::platform::path::daemon(&file).unwrap();
+        assert!(daemon.starts_with('/'), "{daemon}");
+        assert_eq!(stamp(Path::new(&daemon)), host, "by its daemon name");
+        assert!(stamp(&held.path().join("absent.rs")).is_gone());
+        assert!(stamp(&file.join("under-a-file")).is_gone());
+    }
 }

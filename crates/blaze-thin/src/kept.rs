@@ -5,15 +5,20 @@ use blaze_certify::kept::{DIR, Kept, names};
 
 /// `kept` written to `<state>/solo-rows/<pid>`: whole under its `.part` name, then renamed,
 /// so a reader sees the record whole or not at all. The directory is made (this user's alone)
-/// when it is not there. An error names the path and the step.
+/// when it is not there. An error names the path and the step. On Windows the directory and
+/// the file take the state directory's ACL, which only its user opens
+/// (`blaze_core::platform::identity::only_the_user_opens`), so no mode is set.
 pub fn keep(state: &std::path::Path, kept: &Kept) -> Result<std::path::PathBuf, String> {
-    use std::{
-        io::Write as _,
-        os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _},
-    };
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let bytes = kept.write()?;
     let dir = state.join(DIR); // alloc: the directory's path, once a solo answer
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only Unix sets a mode"))]
+    let mut made = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    made.mode(0o700);
+    match made.create(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("making {}: {error}", dir.display())),
@@ -23,13 +28,11 @@ pub fn keep(state: &std::path::Path, kept: &Kept) -> Result<std::path::PathBuf, 
     let io = |what: &str, at: &std::path::Path, error: std::io::Error| format!("{what} {}: {error}", at.display());
     // `truncate`: a `.part` of this pid is an earlier process's of the same id, which died
     // before its rename; it is this process's to write over.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&part)
-        .map_err(|error| io("making", &part, error))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&part).map_err(|error| io("making", &part, error))?;
     file.write_all(&bytes).map_err(|error| io("writing", &part, error))?;
     drop(file);
     std::fs::rename(&part, &path).map_err(|error| io("renaming into place", &path, error))?;
