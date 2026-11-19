@@ -20,6 +20,10 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 #[cfg(windows)]
 use uds_windows::{UnixListener, UnixStream};
 
+/// A connection on a socket of this module's, on every system: std's on unix, `uds_windows`'
+/// on Windows (`AF_UNIX`, which std has no type for there).
+pub type Stream = UnixStream;
+
 #[cfg(unix)]
 #[allow(unsafe_code, reason = "who a peer is: system calls std has no wrapper for")]
 mod unix;

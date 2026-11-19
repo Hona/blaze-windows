@@ -45,7 +45,7 @@ mod local;
 // Track 7, task A: the sealed layer, installed once a machine and read in place by every home.
 #[blaze::sans_io]
 pub(crate) mod sealed;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 pub(crate) mod inspect;
 mod job;
 #[cfg(unix)]
@@ -1529,7 +1529,6 @@ fn listen(
     let tasks_watch = stuck::arm(daemon.pulse(), blaze_graph::exec::shared().workers())?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
-    #[cfg(unix)]
     {
         let inspector = inspect::Inspector { pulse: daemon.pulse(), tasks: daemon.tasks() };
         if let Err(why) = socket()
