@@ -928,11 +928,11 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
             // Every input the kept run is checked against is asked through this: what a
             // hit read by its bytes is noted for the no-op lane ([`ReadBytes`]).
             let units = job.units();
-            let roots = [
-                Path::new(units.target_dir.as_str()),
-                Path::new(units.build_dir.as_str()),
-                Path::new(job.input.config.std.as_str()),
-            ];
+            // The traced reads are host paths: the build's directories as the host names them.
+            let host = blaze_core::platform::path::host;
+            let (target, build, std) =
+                (host(&units.target_dir), host(&units.build_dir), host(&job.input.config.std));
+            let roots = [target.as_path(), build.as_path(), std.as_path()];
             let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default(), roots };
             let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut noting);
             let hit = matches!(
@@ -1250,12 +1250,15 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// ([`crate::serve::work::JobInput::looks`]).
 pub(crate) fn build_roots(job: &Job) -> RootMap {
     let looks = &job.input.looks;
+    // A build script's roots are where it runs: host paths. The plan names the target
+    // directory, the workspace and the sources by their daemon names (`/C:/a` on Windows).
+    let host = blaze_core::platform::path::host;
     RootMap::default()
-        .with(Role::Target, &blaze_core::platform::path::host(&job.units().target_dir), looks)
-        .with(Role::Workspace, Path::new(&job.input.config.invocation.root), looks)
+        .with(Role::Target, &host(&job.units().target_dir), looks)
+        .with(Role::Workspace, &host(&job.input.config.invocation.root), looks)
         .with(Role::Tools, &job.shared.tools, looks)
         .with(Role::Launcher, &job.shared.launcher, looks)
-        .with_sources(Path::new(&job.input.config.sources))
+        .with_sources(&host(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
@@ -1404,7 +1407,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let declared_inputs = if outside(job, run) || crate::sandbox::v2::OBSERVES_READS { None } else {
         let why = |what| ApiError::new(what, Some(unit.package.descr()));
         let roots = declared::roots(&read).map_err(why)?;
-        let host = declared::given(job, run, &unit, &env, &roots, mutable).map_err(why)?;
+        let portable = run_roots(job, &unit);
+        let host = declared::given(job, run, &unit, &env, &roots, mutable, &portable.view()).map_err(why)?;
         Some((host, roots))
     };
     #[cfg(windows)]
@@ -2116,7 +2120,7 @@ impl ScriptRun {
             return Some(false);
         };
         #[cfg(windows)]
-        let mut result = declared::result(&value);
+        let mut result = declared::result(&value, &run_roots(&job, &start.unit).view());
         let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {

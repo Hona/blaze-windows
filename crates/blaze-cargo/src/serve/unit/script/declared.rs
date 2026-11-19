@@ -1,9 +1,13 @@
 //! Inputs of the Windows Cargo-rule cache that are known before a script runs. Never a
 //! permission source: the executable search and link directories here grant no access.
+//!
+//! Every path hashed here is written against the run's roots ([`Roots::ported`]), and every
+//! dependency's package id against the build's directories ([`portable::Places::text`]), so the
+//! same project in another checkout makes the same key and finds the run another checkout kept.
 
 use super::*;
 use blaze_ids::{ContentId, Hasher};
-use blaze_usercode::{inputs::{Disk, granted}, trace::Inputs as _};
+use blaze_usercode::{inputs::{Disk, granted}, roots::Roots, trace::Inputs as _};
 
 /// Capture the actual roots once per inspection. Resolving the saved root name again at
 /// each lookup would let a moved junction change the boundary of the lookup itself.
@@ -11,18 +15,33 @@ pub(super) fn roots(read: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     read.iter().map(|p| std::fs::canonicalize(p).map_err(|e| format!("resolving script grant {}: {e}", p.display()))).collect()
 }
 
-pub(super) fn result(value: &Value) -> ContentId {
-    let mut h = Hasher::new("blaze Windows build dependency outputs 1");
-    h.part(&value.stdout).part(&value.stderr);
+/// `path`'s bytes as a key holds them: its text written against `roots`.
+fn ported<'p>(roots: &Roots<'_>, path: &'p Path) -> std::borrow::Cow<'p, [u8]> {
+    match path.to_str() {
+        Some(text) => match roots.ported(text.as_bytes()) {
+            std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(text.as_bytes()),
+            std::borrow::Cow::Owned(it) => std::borrow::Cow::Owned(it),
+        },
+        None => std::borrow::Cow::Borrowed(path.as_os_str().as_encoded_bytes()),
+    }
+}
+
+/// What a dependency's run gave, as the runs after it are keyed by: what it printed and the
+/// files it wrote, written against its roots, so the same run in another checkout gives the
+/// same id.
+pub(super) fn result(value: &Value, roots: &Roots<'_>) -> ContentId {
+    let mut h = Hasher::new("blaze Windows build dependency outputs 2");
+    h.part(&roots.ported(&value.stdout)).part(&roots.ported(&value.stderr));
     for file in &value.files {
         h.part(file.path.as_bytes())
             .update(&[u8::from(file.executable)])
-            .opt_part(file.link.as_deref().map(str::as_bytes))
+            .opt_part(file.link.as_deref().map(|it| roots.ported(it.as_bytes())).as_deref())
             .opt_part(file.bytes.as_deref());
     }
     h.finish()
 }
 
+#[expect(clippy::too_many_arguments, reason = "the parts of one run's declared key, each of another type")]
 pub(super) fn given(
     job: &Job,
     run: usize,
@@ -30,14 +49,16 @@ pub(super) fn given(
     inherited: &[(OsString, OsString)],
     roots: &[PathBuf],
     mut mutable: Vec<PathBuf>,
+    portable: &Roots<'_>,
 ) -> Result<ContentId, String> {
     let env = script::script_env(unit, inherited).map_err(|it| it.0)?;
     let get = |n: &str| env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v);
-    let mut h = Hasher::new("blaze Windows confined Cargo rules 1");
+    let mut h = Hasher::new("blaze Windows confined Cargo rules 2");
     h.part(crate::toolchain::library::found()?.digest.as_bytes());
+    let places = crate::serve::unit::portable::Places::of(job);
     for dep in &job.unit(run).map_err(|it| it.what)?.dependencies {
         if let Some(output) = job.scripts[dep.index].get() {
-            h.part(output.package_id.as_bytes()).id(&output.result);
+            h.part(&places.text(output.package_id.as_bytes())).id(&output.result);
         }
     }
     // Explicitly configured link search paths, not the whole machine library search path.
@@ -45,7 +66,7 @@ pub(super) fn given(
     let mut links = crate::directives::link_dirs(&job.units().link_dirs, inherited)?;
     links.extend(crate::directives::machine_link_dirs(inherited)?);
     for dir in links {
-        h.part(dir.as_os_str().as_encoded_bytes());
+        h.part(&ported(portable, &dir));
         if granted(&dir, roots).map_err(|e| e.to_string())? {
             mutable.push(dir);
         }
@@ -54,7 +75,7 @@ pub(super) fn given(
     mutable.dedup();
     let mut disk = Disk::new(Vec::new(), &job.input.looks).declared_inputs(roots.to_vec());
     for path in mutable {
-        h.part(path.as_os_str().as_encoded_bytes());
+        h.part(&ported(portable, &path));
         if path.parent().is_none() || !path.is_absolute() {
             return Err(format!(
                 "declared script input {} is not below a volume root",
@@ -90,7 +111,7 @@ pub(super) fn given(
         use std::os::windows::fs::MetadataExt;
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() => {
-                h.part(path.as_os_str().as_encoded_bytes())
+                h.part(&ported(portable, path))
                     .update(&m.file_size().to_le_bytes())
                     .update(&m.last_write_time().to_le_bytes())
                     .update(&m.creation_time().to_le_bytes());

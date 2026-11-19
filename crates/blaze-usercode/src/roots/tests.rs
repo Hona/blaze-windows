@@ -1086,13 +1086,21 @@ mod daemon_roots_tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_host_namespace_root_map_stays_empty_for_utf16_build_scripts() {
+    fn windows_host_root_maps_take_drive_paths_and_refuse_volume_roots() {
         use super::super::RootMap;
         use blaze_vfs::outside::Looks;
         let map = RootMap::default()
             .with(Role::Workspace, Path::new(r"C:\Users\a\w"), &Looks::none())
-            .with(Role::Target, Path::new(r"C:\Users\a\w\target"), &Looks::none());
-        assert!(map.view().is_empty(), "native build-script Host RootMap stays empty on Windows");
+            .with(Role::Target, Path::new(r"C:\Users\a\w\target\"), &Looks::none())
+            .with(Role::Tools, Path::new(r"C:\"), &Looks::none())
+            .with(Role::Launcher, Path::new(r"\\srv\share"), &Looks::none())
+            .with(Role::Package, Path::new(r"relative\p"), &Looks::none());
+        let view = map.view();
+        assert_eq!(view.get(Role::Workspace), Some(r"C:\Users\a\w"));
+        assert_eq!(view.get(Role::Target), Some(r"C:\Users\a\w\target"), "trailing `\\` trimmed");
+        assert_eq!(view.get(Role::Tools), None, "a drive's root is no root");
+        assert_eq!(view.get(Role::Launcher), None, "a share's root is no root");
+        assert_eq!(view.get(Role::Package), None, "a relative path is no root");
     }
 
     #[cfg(windows)]
@@ -1219,5 +1227,215 @@ mod daemon_roots_tests {
         assert!(!view.outside(&reg_file), "registry file under daemon-converted sources must be machine-wide");
         let stray = PathBuf::from("/C:/other/stray.txt");
         assert!(view.outside(&stray), "stray path outside roots and sources must be outside");
+    }
+}
+
+/// The Unix module's portable-key tests (`host_tests`) on Windows host paths: a build script's
+/// roots there are native (`C:\Users\a\ws\p`), its key ports their UTF-8 text, and what it
+/// traced and printed is written against them.
+#[cfg(windows)]
+mod windows_host_tests {
+    use std::collections::BTreeMap;
+
+    use blaze_cas::Key;
+
+    use super::super::*;
+    use crate::{
+        Given, RunKey, RunKind,
+        index::{self, Found, Shape},
+        trace::{DIRECTORY, listing},
+    };
+
+    fn checkout(home: &str) -> RootMap {
+        RootMap::default()
+            .with(Role::Package, Path::new(&format!(r"{home}\ws\p")), &Looks::none())
+            .with(Role::OutDir, Path::new(&format!(r"{home}\ws\target\debug\build\p-1\out")), &Looks::none())
+            .with(Role::Target, Path::new(&format!(r"{home}\ws\target")), &Looks::none())
+            .with(Role::Workspace, Path::new(&format!(r"{home}\ws")), &Looks::none())
+    }
+
+    struct Disk {
+        files: BTreeMap<PathBuf, [u8; 32]>,
+        env: Vec<(OsString, OsString)>,
+    }
+
+    impl Disk {
+        fn of(home: &str, source: &[u8]) -> Disk {
+            let mut files = BTreeMap::new();
+            files.insert(PathBuf::from(format!(r"{home}\ws\p\build.rs")), ContentId::of("test file", b"fn main() {}").0);
+            files.insert(PathBuf::from(format!(r"{home}\ws\p\src\lib.c")), ContentId::of("test file", source).0);
+            let env = vec![
+                ("CARGO_MANIFEST_DIR".into(), format!(r"{home}\ws\p").into()),
+                ("OUT_DIR".into(), format!(r"{home}\ws\target\debug\build\p-1\out").into()),
+                ("PATH".into(), r"C:\Windows\System32".into()),
+            ];
+            Disk { files, env }
+        }
+    }
+
+    impl Inputs for Disk {
+        type Error = String;
+        fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
+            Ok(self
+                .files
+                .get(path)
+                .copied()
+                .or_else(|| self.files.keys().any(|it| it.starts_with(path)).then_some(DIRECTORY)))
+        }
+        fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
+            let names: Vec<&OsStr> =
+                self.files.keys().filter_map(|it| it.strip_prefix(path).ok()?.iter().next()).collect();
+            Ok((!names.is_empty()).then(|| listing(names)))
+        }
+        fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+            self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
+        }
+        fn env_all(&mut self) -> &[(OsString, OsString)] {
+            self.env.sort();
+            &self.env
+        }
+        fn names(&mut self, _: &Path, _: &mut Names<'_>) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn entry(&mut self, _: &Path) -> Result<Entry, String> {
+            Ok(Entry::Missing)
+        }
+    }
+
+    /// The key a build script in `home`'s checkout is given, as `script::prepare` makes it:
+    /// its paths as `script::path_part` gives them.
+    fn key(home: &str, map: &RootMap) -> RunKey {
+        let roots = map.view();
+        let mut given = Given::new(RunKind::BuildScript);
+        for (name, value) in [
+            ("CARGO_MANIFEST_DIR", format!(r"{home}\ws\p")),
+            ("OUT_DIR", format!(r"{home}\ws\target\debug\build\p-1\out")),
+        ] {
+            given.env(name, roots.os(OsStr::new(&value)).into_owned());
+        }
+        given.roots(&roots);
+        let program = format!(r"{home}\ws\target\debug\build\p-0\build-script-build.exe");
+        given.ported("program", &crate::script::path_part(OsStr::new(&program)), &roots);
+        given.ported("dir", &crate::script::path_part(OsStr::new(&format!(r"{home}\ws\p"))), &roots);
+        RunKey { code: ContentId::of("test code", b"script"), given: given.finish() }
+    }
+
+    fn read(home: &str, disk: &Disk) -> Traced {
+        let mut traced = Traced {
+            files: disk.files.iter().map(|(path, hash)| (path.clone(), Some(*hash))).collect(),
+            dirs: Vec::new(),
+            env: vec![("OUT_DIR".into(), Some(format!(r"{home}\ws\target\debug\build\p-1\out").into()))],
+            untraceable: Vec::new(),
+        };
+        trace::normalize(&mut traced);
+        traced
+    }
+
+    fn kept(run: &RunKey, traced: &Traced, value: &[u8]) -> BTreeMap<Key, Vec<u8>> {
+        let mut store = BTreeMap::new();
+        store.insert(index::slot(run, 0), Shape::of(traced).encode());
+        store.insert(index::result_key(run, traced), value.to_vec());
+        store
+    }
+
+    fn found(store: &BTreeMap<Key, Vec<u8>>, run: &RunKey, map: &RootMap, disk: &mut Disk) -> Option<Vec<u8>> {
+        let found =
+            index::search(|key| Ok(store.get(key).map(Vec::as_slice)), run, &mut Rooted::new(map.view(), disk));
+        match found.expect("the check reads the disk") {
+            Found::Hit { value, .. } => Some(value.to_vec()),
+            Found::Miss { .. } => None,
+        }
+    }
+
+    fn printed(stdout: &[u8]) -> Value {
+        Value { code: Some(0), signal: None, stdout: stdout.to_vec(), stderr: Vec::new(), files: Vec::new() }
+    }
+
+    #[test]
+    fn two_windows_checkouts_at_different_paths_give_one_key() {
+        let (a, b) = (checkout(r"C:\Users\a"), checkout(r"D:\ci\b\c"));
+        assert_eq!(key(r"C:\Users\a", &a), key(r"D:\ci\b\c", &b));
+        let (disk_a, mut disk_b) = (Disk::of(r"C:\Users\a", b"int x;"), Disk::of(r"D:\ci\b\c", b"int x;"));
+        let (ported_a, ported_b) =
+            (a.view().traced(&read(r"C:\Users\a", &disk_a)), b.view().traced(&read(r"D:\ci\b\c", &disk_b)));
+        assert_eq!(ported_a, ported_b, "both traces written against their roots are one");
+        let run = key(r"C:\Users\a", &a);
+        let store = kept(&run, &ported_a, b"value");
+        assert_eq!(found(&store, &key(r"D:\ci\b\c", &b), &b, &mut disk_b), Some(b"value".to_vec()));
+        // Another file under a root changes the key.
+        let mut changed = Disk::of(r"D:\ci\b\c", b"int y;");
+        assert_eq!(found(&store, &key(r"D:\ci\b\c", &b), &b, &mut changed), None);
+        // Without roots, each checkout keys by its own paths.
+        assert_ne!(key(r"C:\Users\a", &RootMap::default()), key(r"D:\ci\b\c", &RootMap::default()));
+    }
+
+    #[test]
+    fn a_windows_value_that_embeds_a_root_is_found_only_where_that_root_is() {
+        let (a, b) = (checkout(r"C:\Users\a"), checkout(r"D:\ci\b"));
+        let value = printed(
+            b"cargo:rustc-link-search=native=C:\\Users\\a\\ws\\target\\debug\\build\\p-1\\out\ncargo:warning=xC:\\Users\\a\\ws\\p\\x.rs\n",
+        );
+        let roots = a.view();
+        let (stored, embedded) = roots.stored(&value).unwrap();
+        assert!(embedded.contains(Role::Package) && !embedded.contains(Role::OutDir), "{embedded:?}");
+        assert_eq!(
+            stored.stdout,
+            b"cargo:rustc-link-search=native=\0o\ncargo:warning=xC:\\Users\\a\\ws\\p\\x.rs\n".to_vec()
+        );
+        let restored = b.view().restored(stored).unwrap();
+        assert!(restored.stdout.starts_with(b"cargo:rustc-link-search=native=D:\\ci\\b\\ws\\target\\debug\\build\\p-1\\out\n"));
+    }
+
+    #[test]
+    fn a_windows_root_in_another_spelling_is_embedded() {
+        let map = checkout(r"C:\Users\a b");
+        let roots = map.view();
+        let wide: Vec<u8> = r"C:\Users\a b\ws".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let wide_slash: Vec<u8> = "C:/Users/a b/ws".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        for spelled in [
+            b"x C:/Users/a b/ws/a.rs".to_vec(),
+            b"x /C:/Users/a b/ws/a.rs".to_vec(),
+            b"x c:\\users\\A B\\ws".to_vec(),
+            b"{\"at\":\"C:\\\\Users\\\\a b\\\\ws\"}".to_vec(),
+            b"file:///C:/Users/a%20b/ws/a.rs".to_vec(),
+            wide,
+            wide_slash,
+        ] {
+            assert!(
+                roots.embedded(&spelled).contains(Role::Workspace),
+                "{:?}",
+                String::from_utf8_lossy(&spelled)
+            );
+        }
+        assert!(roots.embedded(br"C:\Users\other\ws").is_empty());
+    }
+
+    /// A read outside the roots and the machine's system directories ties the run to its
+    /// checkout; a read in `C:\Windows` or `Program Files` (the C compiler's headers) does not.
+    #[test]
+    fn a_windows_read_outside_the_roots_is_not_shared_and_a_system_read_is() {
+        let a = checkout(r"C:\Users\a");
+        let mut disk = Disk::of(r"C:\Users\a", b"int x;");
+        disk.files.insert(PathBuf::from(r"C:\proto\x.proto"), ContentId::of("test file", b"message X {}").0);
+        let (kept, _) = a.view().kept(&read(r"C:\Users\a", &disk), &printed(b"")).unwrap();
+        assert!(kept.shared.is_none(), "no copy for another checkout to verify");
+        let mut system = Disk::of(r"C:\Users\a", b"int x;");
+        system.files.insert(
+            PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include\ucrt\stdio.h"),
+            ContentId::of("test file", b"int printf();").0,
+        );
+        let (kept, _) = a.view().kept(&read(r"C:\Users\a", &system), &printed(b"")).unwrap();
+        assert!(kept.bound.is_empty() && kept.shared.is_some(), "{:?}", kept.bound);
+    }
+
+    /// Two checkouts on different drives are two tops: no relative path between them is a
+    /// spelling, and a target directory on another drive leaves the layout another key.
+    #[test]
+    fn windows_roots_on_two_drives_sit_apart() {
+        let inside = checkout(r"C:\Users\a");
+        let elsewhere =
+            checkout(r"C:\Users\b").with(Role::Target, Path::new(r"D:\cache\target"), &Looks::none());
+        assert_ne!(key(r"C:\Users\a", &inside), key(r"C:\Users\b", &elsewhere));
+        assert_eq!(super::super::relative(r"C:\Users\b\ws\p", r"D:\cache\target"), "");
     }
 }
