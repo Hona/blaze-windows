@@ -2104,7 +2104,7 @@ impl Sim {
                 if self.files.contains_key(&file) {
                     Done::Failed(IoError(format!("{file}: the staged file already exists")))
                 } else {
-                    file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
+                    file_mut(&mut self.files, &file).push_op(Op::Cut(len));
                     self.changed(&file);
                     Done::Truncated
                 }
@@ -2825,7 +2825,8 @@ impl Driver for Sim {
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::WriteAt { file, .. }
                     | Effect::WriteFrom { file, .. }
-                    | Effect::Truncate { file, .. },
+                    | Effect::Truncate { file, .. }
+                    | Effect::SparseFile { file, .. },
                     Some((dir, by)),
                 ) if file.is_under(dir) => *by,
                 _ => self.delay(),
@@ -4392,6 +4393,19 @@ mod tests {
         sim.crash();
         assert_eq!(ran(&mut sim, vec![write(b"new", 5)])[&Tag(5)], Done::Written);
         assert_eq!(sim.contents(&head), b"new");
+    }
+
+    #[test]
+    fn slow_writes_delays_sparse_file_like_truncate() {
+        let mut sim = Sim::new(7, Faults::default());
+        let delay = Duration::from_millis(25);
+        sim.slow_writes(name("placed"), delay);
+        let sparse = name("placed/sparse");
+        let before = sim.now();
+        let seen = ran(&mut sim, vec![Effect::SparseFile { file: sparse.clone(), len: 64, tag: Tag(1) }]);
+        assert_eq!(seen[&Tag(1)], Done::Truncated);
+        assert_eq!(sim.now() - before, delay, "SparseFile under slow_writes must take the configured delay");
+        assert_eq!(sim.contents(&sparse).len(), 64);
     }
 
     /// Memory of the simulation's tests, registered for reads into and writes from it.
