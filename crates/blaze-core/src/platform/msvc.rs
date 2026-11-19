@@ -187,25 +187,116 @@ impl Kept {
     }
 }
 
-/// [`find`], kept for the process's life and found again only when something it read has
-/// changed ([`Kept::still`]): a warm edit stats a dozen paths and reads one registry value
-/// where `find` starts `vswhere` (about 48 ms a build on a warm daemon, `lanes\backend.md`).
-/// An error is never kept: the next ask finds again, so a user who installs the tools needs
-/// no restart.
+/// The first line of [`Kept::encode`]'s text: its layout. Another is never read.
+const KEPT_LAYOUT: &str = "blaze msvc kept 1";
+
+impl Kept {
+    /// As one text for a file of the daemon's state ([`keep_across`]): `None` when a path or
+    /// value is not UTF-8, which is then found again by the next daemon.
+    pub fn encode(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        let Kept { developer: Developer { install, tools, kits, sdk }, programs, kits_root, reads } = self;
+        let mut out = String::new(); // alloc: once per find, the file's text
+        let _ = writeln!(out, "{KEPT_LAYOUT}");
+        for line in [install.to_str()?, tools, kits.to_str()?, sdk, programs.to_str()?, kits_root.to_str()?] {
+            if line.contains('\n') {
+                return None;
+            }
+            let _ = writeln!(out, "{line}");
+        }
+        for (path, was) in reads {
+            let path = path.to_str().filter(|it| !it.contains(['\n', '\t']))?;
+            match was {
+                None => {
+                    let _ = writeln!(out, "{path}\t-");
+                }
+                Some((len, at)) => {
+                    let at = at.duration_since(std::time::UNIX_EPOCH).ok()?;
+                    let _ = writeln!(out, "{path}\t{len}\t{}\t{}", at.as_secs(), at.subsec_nanos());
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// What [`Kept::encode`] wrote; `None` for any other text, which is then found again.
+    pub fn decode(text: &str) -> Option<Kept> {
+        let mut lines = text.lines();
+        if lines.next()? != KEPT_LAYOUT {
+            return None;
+        }
+        let mut field = || lines.next().map(str::to_owned);
+        let developer = Developer {
+            install: PathBuf::from(field()?),
+            tools: field()?,
+            kits: PathBuf::from(field()?),
+            sdk: field()?,
+        };
+        let programs = OsString::from(field()?);
+        let kits_root = PathBuf::from(field()?);
+        let mut reads = Vec::new(); // alloc: a dozen paths, once per daemon
+        for line in lines {
+            let mut parts = line.split('\t');
+            let path = PathBuf::from(parts.next()?);
+            let was = match (parts.next()?, parts.next(), parts.next()) {
+                ("-", None, None) => None,
+                (len, Some(secs), Some(nanos)) => {
+                    let at = std::time::Duration::new(secs.parse().ok()?, nanos.parse().ok()?);
+                    Some((len.parse().ok()?, std::time::UNIX_EPOCH.checked_add(at)?))
+                }
+                _ => return None,
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            reads.push((path, was));
+        }
+        Some(Kept { developer, programs, kits_root, reads })
+    }
+}
+
+/// Where [`found`] keeps what it found across daemons: set once by the daemon at its start;
+/// without it, what is found is kept for the process alone (a test, a one-off command).
+static ACROSS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// [`found`] keeps what it finds in the file `path` too, and a daemon started after this one
+/// reads it there, so its first link or build script starts no `vswhere` while what it read
+/// stands ([`Kept::still`]).
+pub fn keep_across(path: PathBuf) -> Result<(), String> {
+    ACROSS.set(path).map_err(|_| "where MSVC discovery is kept was already set".to_owned())
+}
+
+/// [`find`], kept for the process's life (and across daemons, [`keep_across`]) and found
+/// again only when something it read has changed ([`Kept::still`]): a warm edit stats a dozen
+/// paths and reads one registry value where `find` starts `vswhere` (about 48 ms a build on a
+/// warm daemon, `lanes\backend.md`; more on a daemon's first link). An error is never kept:
+/// the next ask finds again, so a user who installs the tools needs no restart.
 #[cfg(windows)]
 pub fn found() -> Result<Developer, String> {
     static KEPT: crate::lock::Lock<Option<Kept>> = crate::lock::Lock::new("platform.msvc.kept", None);
     let programs = std::env::var_os("ProgramFiles(x86)")
         .ok_or("ProgramFiles(x86), where vswhere is, is not set")?;
     let kits = kits_root()?;
-    if let Some(kept) = KEPT.lock().as_ref()
+    let mut kept = KEPT.lock();
+    if kept.is_none()
+        && let Some(file) = ACROSS.get()
+    {
+        *kept = std::fs::read_to_string(file).ok().as_deref().and_then(Kept::decode);
+    }
+    if let Some(kept) = kept.as_ref()
         && kept.still(&programs, &kits, stood)
     {
         return Ok(kept.developer.clone()); // clone: a few paths, once per job
     }
-    let kept = find_kept()?;
-    let developer = kept.developer.clone(); // clone: a few paths, once per find
-    *KEPT.lock() = Some(kept);
+    drop(kept);
+    let made = find_kept()?;
+    if let (Some(file), Some(text)) = (ACROSS.get(), made.encode()) {
+        // A file not written is found again by the next daemon: never an error of this one.
+        let next = file.with_extension("next");
+        let _ = std::fs::write(&next, text).and_then(|()| std::fs::rename(&next, file));
+    }
+    let developer = made.developer.clone(); // clone: a few paths, once per find
+    *KEPT.lock() = Some(made);
     Ok(developer)
 }
 

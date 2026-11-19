@@ -123,3 +123,31 @@ fn the_tools_are_found_whole_or_the_error_says_what_is_missing() {
         }
     }
 }
+
+/// What a daemon keeps across its stop reads back as what it was, every read with it, and any
+/// other text (another layout, a torn file, a read of another shape) reads as nothing, which
+/// the next daemon finds again.
+#[test]
+fn what_was_found_reads_back_across_daemons_and_nothing_else_does() {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::new(1_763_500_000, 123_456_789);
+    let kept = Kept {
+        developer: developer(),
+        programs: OsString::from(r"C:\Program Files (x86)"),
+        kits_root: PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\"),
+        reads: vec![
+            (PathBuf::from(r"C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances"), Some((0, at))),
+            (PathBuf::from(r"C:\missing\state.json"), None),
+        ],
+    };
+    let text = kept.encode().expect("every path is UTF-8");
+    assert_eq!(Kept::decode(&text), Some(kept.clone()));
+    assert_eq!(Kept::decode(&text.replacen("kept 1", "kept 0", 1)), None, "another layout");
+    for cut in 0..text.lines().count() {
+        let torn: String = text.lines().take(cut).map(|it| format!("{it}\n")).collect();
+        if cut <= 6 {
+            assert_eq!(Kept::decode(&torn), None, "torn after {cut} lines");
+        }
+    }
+    let odd = format!("{text}a path\t1\t2\n");
+    assert_eq!(Kept::decode(&odd), None, "a read of another shape");
+}
