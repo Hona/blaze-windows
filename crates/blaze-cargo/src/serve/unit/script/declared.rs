@@ -109,16 +109,16 @@ pub(super) fn given(
     // Fingerprint all existing candidates, not just the first visible to the daemon:
     // AppContainer may be unable to traverse an earlier PATH entry. Also covers a
     // higher-priority executable appearing between runs. Do not open arbitrary devices.
-    let tool = |h: &mut Hasher, path: &Path| -> Result<(), String> {
+    // Each candidate's stamp is the job's (`Job::tool_stamps`): stated once a request, read by
+    // every script of it.
+    let stamp = |path: &Path| -> Result<Option<[u64; 3]>, String> {
         use std::os::windows::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_file() => {
-                h.part(&ported(portable, path))
-                    .update(&m.file_size().to_le_bytes())
-                    .update(&m.last_write_time().to_le_bytes())
-                    .update(&m.creation_time().to_le_bytes());
-            }
-            Ok(_) => (),
+        if let Some(known) = job.tool_stamps.lock().get(path) {
+            return Ok(*known);
+        }
+        let stamp = match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => Some([m.file_size(), m.last_write_time(), m.creation_time()]),
+            Ok(_) => None,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -127,9 +127,20 @@ pub(super) fn given(
                         | std::io::ErrorKind::PermissionDenied
                 ) =>
             {
-                ()
+                None
             }
             Err(e) => return Err(format!("stamping tool {}: {e}", path.display())),
+        };
+        // alloc: once a candidate path a job, its stamp
+        job.tool_stamps.lock().insert(path.to_owned(), stamp);
+        Ok(stamp)
+    };
+    let tool = |h: &mut Hasher, path: &Path| -> Result<(), String> {
+        if let Some([size, written, created]) = stamp(path)? {
+            h.part(&ported(portable, path))
+                .update(&size.to_le_bytes())
+                .update(&written.to_le_bytes())
+                .update(&created.to_le_bytes());
         }
         Ok(())
     };

@@ -2473,6 +2473,13 @@ pub(crate) struct Job {
     /// developer prompt's variables for ([`script::started_in`]), found the first time one runs.
     #[cfg(windows)]
     pub(crate) msvc: OnceLock<Result<blaze_core::platform::msvc::Developer, String>>,
+    /// The stamps of the machine's tools the job's build scripts are keyed by
+    /// (`script::declared::given`): each candidate path's size and times, `None` where there is
+    /// no file, by path. The job's view of the machine: taken once, read by every script of the
+    /// job, so a request stats each candidate once and not once a script (59 scripts of
+    /// opencode-desktop, each every `PATH` directory times 8 names).
+    #[cfg(windows)]
+    pub(crate) tool_stamps: Lock<blaze_hash::HashMap<PathBuf, Option<[u64; 3]>, std::alloc::Global>>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
     /// The dependency crates checked this build, kept with the front end until the head's next
@@ -2542,6 +2549,8 @@ impl Job {
             ub: Default::default(),
             #[cfg(windows)]
             msvc: Default::default(),
+            #[cfg(windows)]
+            tool_stamps: Lock::new("serve.unit.tool_stamps", blaze_hash::HashMap::new_in(std::alloc::Global)),
             began: Instant::now(),
             later: Lock::new("serve.unit.later", Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Lock::new("serve.unit.seeds", Vec::new()),
