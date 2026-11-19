@@ -199,61 +199,6 @@ impl LoopWatch {
     }
 }
 
-/// What one look at the loop's turns found.
-#[cfg(all(unix, feature = "native"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Look {
-    /// A turn ended since the last look: the loop turns.
-    Turning,
-    /// No turn ended since the last look, for less than the report's bound, or the stuck turn
-    /// was reported already.
-    Holds,
-    /// No turn ended for `for_ns`, from `since_ns`, past the report's bound: said once a stuck
-    /// turn, the loop having finished `turns` turns.
-    Stuck { since_ns: u64, for_ns: u64, turns: u64 },
-}
-
-/// Judges the loop's turns, told the time and the count at each look: a turn that lasts past
-/// `report` is reported once, and again only after the loop turned in between.
-#[cfg(all(unix, feature = "native"))]
-#[derive(Debug)]
-pub struct LoopWatch {
-    report_ns: u64,
-    /// The turns at the last look that saw them move, and when.
-    seen: Option<(u64, u64)>,
-    said: bool,
-}
-
-#[cfg(all(unix, feature = "native"))]
-impl LoopWatch {
-    pub fn new(report: Duration) -> LoopWatch {
-        LoopWatch {
-            report_ns: u64::try_from(report.as_nanos()).unwrap_or(u64::MAX),
-            seen: None,
-            said: false,
-        }
-    }
-
-    /// One look: `now_ns` on a monotonic clock, `turns` the loop's count ([`Pulse::turns`]).
-    pub fn look(&mut self, now_ns: u64, turns: u64) -> Look {
-        match self.seen {
-            Some((seen, since_ns)) if seen == turns => {
-                let for_ns = now_ns.saturating_sub(since_ns);
-                if self.said || for_ns < self.report_ns {
-                    return Look::Holds;
-                }
-                self.said = true;
-                Look::Stuck { since_ns, for_ns, turns }
-            }
-            _ => {
-                self.seen = Some((turns, now_ns));
-                self.said = false;
-                Look::Turning
-            }
-        }
-    }
-}
-
 /// What one look at the daemon's footprint against its memory ceiling found
 /// ([`CeilingWatch::look`]).
 #[cfg(all(windows, feature = "native"))]
