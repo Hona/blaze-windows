@@ -526,3 +526,25 @@ fn a_block_counts_to_its_owner_while_it_lives_and_to_the_free_tag_after_never_bo
     drop(again);
     assert_eq!((live(owner) - owner_at, live(free) - free_at), (0, made));
 }
+
+#[test]
+fn trim_all_gives_back_warm_pages_below_keep_and_leaves_scratch_uncommitted_until_trim() {
+    let size = 8192;
+    let class: &'static Class =
+        Box::leak(Box::new(Class::new(size, 4 << 20, None, Tag::Other).expect("class")));
+    assert_eq!(
+        class.scratch.committed(),
+        0,
+        "scratch must not commit pages before the class ever trims"
+    );
+    let blocks: Vec<Owned> = (0..16).map(|_| class.take(Fill::Any, Tag::Other).expect("take")).collect();
+    drop(blocks);
+    let trimmed = class.trim_to(0);
+    assert!(!trimmed.busy);
+    assert!(
+        trimmed.given_back >= 16 * size,
+        "trim_to(0) must purge warm blocks even below KEEP (got {})",
+        trimmed.given_back
+    );
+    assert!(class.scratch.committed() > 0);
+}

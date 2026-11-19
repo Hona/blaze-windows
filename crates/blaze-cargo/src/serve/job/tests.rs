@@ -36,6 +36,7 @@ fn setup(runs: u64, runs_end: u64) -> Setup {
         slots: "/s/slots".into(),
         premises: crate::serve::daemon::Premises { engine: "/s/blaze-engine".into(), library: None },
         stores: stores(),
+        ntfs_edit: crate::serve::ntfs_edit::NtfsEdit::default(),
     }
 }
 
@@ -523,6 +524,29 @@ fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     assert!(paths.take_images(&[a, b, c]).is_empty());
 }
 
+#[test]
+fn compact_images_are_capped_and_evict_images_drops_non_live_images() {
+    let mut paths = Paths::<Real>::new();
+    for i in 0..12 {
+        let path = format!("/w/target/debug/build/script-{i}");
+        let id = paths.intern(&path);
+        paths.keep(&[id], vec![crate::serve::unit::test_kept_image(&path, false)]);
+    }
+    let (count, _bytes) = paths.kept_summary();
+    assert_eq!(
+        count,
+        Paths::<Real>::MAX_COMPACT_KEPT,
+        "compact build-script images must be capped at MAX_COMPACT_KEPT"
+    );
+    let app = "/w/target/debug/app";
+    let app_id = paths.intern(app);
+    paths.keep(&[app_id], vec![crate::serve::unit::test_kept_image(app, true)]);
+    assert_eq!(paths.kept_summary().0, Paths::<Real>::MAX_COMPACT_KEPT + 1);
+    let (dropped, _bytes) = paths.evict_images();
+    assert_eq!(dropped, Paths::<Real>::MAX_COMPACT_KEPT + 1);
+    assert_eq!(paths.kept_summary().0, 0);
+}
+
 /// A job that ends while its request is open cancels it when not ok and closes it when ok
 /// (once); one that ends after the plane finished its request, before the job read so, does
 /// neither, where the plane would refuse ("request 1 is not open").
@@ -711,4 +735,198 @@ fn how_a_client_is_shown_diagnostics_is_in_no_config_and_no_request_identity() {
         cargo.verbose = 2;
     }
     assert_ne!(request_id(&Work::Build(verbose)), request_id(&plain));
+}
+
+/// The invariant (B14): on an NTFS destination (`Sharing::Unshared`), `Jobs::place_made` routes
+/// edited outputs according to `Setup::ntfs_edit`:
+/// - `Route::Rename` (small PE images under `Auto`, any PE image under `Rename`, any output
+///   under `RenameAll`): skips `Own::LookBase`, emits no `Effect::TryPatch`, publishes a fresh
+///   sparse file via `RenameUnsynced`, succeeds while an earlier read mapping is live, and
+///   vouches the new file's stamp.
+/// - `Route::Patch` (large PE images and non-PE side files like `.pdb` under `Auto`, any
+///   output under `Patch`): emits `Own::LookBase`, then takes exclusive custody via
+///   `Effect::TryPatch` and writes only the delta.
+#[test]
+fn ntfs_edit_policy_routes_small_images_to_rename_and_large_or_pdb_to_custody() {
+    use blaze_core::sim::{Faults, Sim};
+    use crate::serve::ntfs_edit::NtfsEdit;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Trace {
+        looked_base: bool,
+        try_patched: bool,
+        renamed: bool,
+        vouched: bool,
+        contents: Vec<u8>,
+    }
+
+    let run_case = |policy: NtfsEdit, path_str: &str, executable: bool, hold_view: bool| -> Trace {
+        let mut sim = Sim::new(19, Faults { no_clone: true, ..Faults::default() });
+        let config = blaze_cas::Config {
+            dir: blaze_core::FileName::new("store").unwrap(),
+            layers: Vec::new(),
+            tags: 1 << 40,
+            load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+            loader: crate::serve::direct::pool::pumped(),
+        };
+        let mut effects = Vec::new();
+        let mut store = blaze_cas::Store::open(config, &mut effects);
+        blaze_core::run_until_idle(&mut sim, &mut effects, |c, effects| {
+            if store.owns(c.tag) {
+                store.complete(c, effects);
+            }
+        })
+        .expect("store opens");
+
+        let mut cfg = setup(0, 0);
+        cfg.ntfs_edit = policy;
+        let mut jobs = Jobs::<Real>::new(cfg).unwrap();
+        let id = JobId { slot: 0, generation: 0 };
+        assert!(jobs.jobs.put(key_of(id), job(Vec::new())).is_ok());
+        let path_id = jobs.paths.intern(path_str);
+        let file_name = jobs.paths.files[path_id as usize].clone().unwrap();
+
+        let old = vec![b'A'; 32];
+        let mut new = old.clone();
+        new[4..8].copy_from_slice(b"EDIT");
+        sim.change(&file_name, &old);
+
+        let mut stat_effects = vec![Effect::Stat { file: file_name.clone(), tag: Tag(u64::MAX - 3) }];
+        let mut meta = None;
+        blaze_core::run_until_idle(&mut sim, &mut stat_effects, |c, _| {
+            if let Done::Stat(m) = c.done {
+                meta = m;
+            }
+        })
+        .expect("initial stat completes");
+        let base_key = blaze_cas::Key(ContentId([7; 32]));
+        let next_key = blaze_cas::Key(ContentId([8; 32]));
+        jobs.paths.placed[path_id as usize] = Some(Placement {
+            key: base_key,
+            executable,
+            meta,
+            asked_ns: 0,
+            stamp: None,
+        });
+
+        let held_view = hold_view.then(|| {
+            let mut map_effects = vec![Effect::Map {
+                file: file_name.clone(),
+                extent: blaze_core::Extent::Whole,
+                tag: Tag(u64::MAX - 4),
+            }];
+            let mut view = None;
+            blaze_core::run_until_idle(&mut sim, &mut map_effects, |c, _| {
+                if let Done::Mapped(v) = c.done {
+                    view = Some(v);
+                }
+            })
+            .expect("map completes");
+            view.expect("mapped")
+        });
+
+        let whole_bytes = new.clone();
+        let made = Arc::new(Made::Patch {
+            base: base_key,
+            file: blaze_cas::Sparse { len: 32, runs: vec![(4, b"EDIT".to_vec())] },
+            whole: Arc::new(move || blaze_cas::Sparse { len: 32, runs: vec![(0, whole_bytes.clone())] }),
+        });
+
+        let sharing = |_: &str| Ok(Some(blaze_core::Sharing::Unshared));
+        let mut effects = Vec::new();
+        jobs.place_made_with(&mut store, &mut effects, &sharing, id, path_id, next_key, executable, made);
+
+        let mut looked_base = false;
+        let mut try_patched = false;
+        let mut renamed = false;
+        let mut inspect = |effects: &[Effect], jobs: &Jobs<Real>| {
+            for effect in effects {
+                match effect {
+                    Effect::Stat { tag, .. } if jobs.owns(*tag) => looked_base = true,
+                    Effect::TryPatch { .. } => try_patched = true,
+                    Effect::RenameUnsynced { to, .. } if *to == file_name => renamed = true,
+                    _ => {}
+                }
+            }
+        };
+        inspect(&effects, &jobs);
+        blaze_core::run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            let before = effects.len();
+            if store.owns(completion.tag) {
+                store.complete(completion, effects);
+            } else if jobs.owns(completion.tag) {
+                let own = completion.tag.0.wrapping_sub(jobs.setup.tags);
+                if let Some(handle) = jobs.own.find(own)
+                    && let Some(Own::LookBase { job: jid, path, key, executable, destination }) = jobs.own.remove(handle)
+                {
+                    let over = matches!(
+                        (&completion.done, &jobs.paths.placed[path as usize]),
+                        (Done::Stat(Some(m)), Some(p)) if p.meta == Some(*m)
+                    );
+                    let made = jobs.patching.remove(&path);
+                    jobs.end_placing(jid, path);
+                    if let Some(made) = made {
+                        jobs.place_made_as_with(&mut store, effects, &sharing, jid, path, key, executable, &made, over, Some(destination));
+                    }
+                }
+            }
+            inspect(&effects[before..], &jobs);
+        })
+        .expect("placement settles");
+
+        let placed = store.placed();
+        assert_eq!(placed.len(), 1, "{policy:?} {path_str}: {placed:?}");
+        assert_eq!(placed[0].result, Ok(()), "{policy:?} {path_str}: {:?}", placed[0]);
+        if let Some(view) = held_view {
+            assert_eq!(view.bytes(), old.as_slice(), "old mapping stayed immutable across rename");
+        }
+        Trace {
+            looked_base,
+            try_patched,
+            renamed,
+            vouched: placed[0].stamp.is_some(),
+            contents: sim.contents(&file_name),
+        }
+    };
+
+    let want = [b'A', b'A', b'A', b'A', b'E', b'D', b'I', b'T']
+        .into_iter()
+        .chain([b'A'; 24])
+        .collect::<Vec<u8>>();
+
+    // Small exe under Auto: skips LookBase, renames without TryPatch even with a live mapping, vouches stamp.
+    assert_eq!(
+        run_case(NtfsEdit::Auto { rename_up_to: 64 }, "/w/target/debug/hello.exe", true, true),
+        Trace { looked_base: false, try_patched: false, renamed: true, vouched: true, contents: want.clone() }
+    );
+    // Small DLL (executable == false, PE extension) under Auto: also renames without TryPatch.
+    assert_eq!(
+        run_case(NtfsEdit::Auto { rename_up_to: 64 }, "/w/target/debug/mod.dll", false, true),
+        Trace { looked_base: false, try_patched: false, renamed: true, vouched: true, contents: want.clone() }
+    );
+    // Large exe (len 32 > threshold 16) under Auto: takes LookBase + exclusive custody TryPatch.
+    assert_eq!(
+        run_case(NtfsEdit::Auto { rename_up_to: 16 }, "/w/target/debug/desktop.exe", true, false),
+        Trace { looked_base: true, try_patched: true, renamed: false, vouched: false, contents: want.clone() }
+    );
+    // Non-PE side file (.pdb) under Auto: stays on LookBase + exclusive custody TryPatch.
+    assert_eq!(
+        run_case(NtfsEdit::Auto { rename_up_to: 64 }, "/w/target/debug/hello.pdb", false, false),
+        Trace { looked_base: true, try_patched: true, renamed: false, vouched: false, contents: want.clone() }
+    );
+    // Forced Patch (baseline A/B mode): small exe uses LookBase + exclusive custody TryPatch.
+    assert_eq!(
+        run_case(NtfsEdit::Patch, "/w/target/debug/hello.exe", true, false),
+        Trace { looked_base: true, try_patched: true, renamed: false, vouched: false, contents: want.clone() }
+    );
+    // Forced Rename: large exe skips LookBase and uses new file + rename even with a live mapping.
+    assert_eq!(
+        run_case(NtfsEdit::Rename, "/w/target/debug/desktop.exe", true, true),
+        Trace { looked_base: false, try_patched: false, renamed: true, vouched: true, contents: want.clone() }
+    );
+    // Forced RenameAll: .pdb also uses new file + rename.
+    assert_eq!(
+        run_case(NtfsEdit::RenameAll, "/w/target/debug/hello.pdb", false, true),
+        Trace { looked_base: false, try_patched: false, renamed: true, vouched: true, contents: want }
+    );
 }

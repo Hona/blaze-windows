@@ -372,3 +372,39 @@ fn an_expansions_reads_are_noted_as_this_checkouts_paths() {
     let why = noted.2.expect("a root the expansion has not");
     assert!(why.contains("not a path of this checkout"), "{why}");
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_daemon_reads_are_noted_as_host_paths() {
+    use blaze_usercode::roots::{Role, Roots};
+    use std::path::{Path, PathBuf};
+    let package = "/C:/Users/a/w/pkg";
+    let roots = Roots::new([(Role::Package, package)]);
+    let ported = |path: &str| roots.path(Path::new(path)).into_owned();
+    let mark = PathBuf::from(format!("\0{}/\0root", char::from(Role::Package.tag())));
+    let shape = blaze_usercode::index::Shape {
+        files: vec![ported("/C:/Users/a/w/pkg/data/schema.json"), mark],
+        dirs: vec![ported("/C:/Users/a/w/pkg/data")],
+        ..Default::default()
+    };
+    let reads = Reads {
+        names: Vec::new(),
+        expansions: vec![super::Expansions {
+            env: env(&[("CARGO_MANIFEST_DIR", package)]),
+            shapes: vec![(shape.encode(), None)],
+        }],
+        primary: Vec::new(),
+        files: vec![("/C:/far/abs.txt".to_owned(), None)],
+    };
+    let mut noted = (Vec::new(), Vec::new(), None);
+    super::note_paths_in(&mut noted, &reads);
+    assert_eq!(noted.2, None);
+    assert_eq!(
+        noted.0,
+        [
+            PathBuf::from(r"C:\Users\a\w\pkg\data\schema.json"),
+            PathBuf::from(r"C:\far\abs.txt"),
+        ]
+    );
+    assert_eq!(noted.1, [PathBuf::from(r"C:\Users\a\w\pkg\data")]);
+}

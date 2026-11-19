@@ -36,7 +36,7 @@ fn piece<'a>(runs: &mut Runs<'a>, pos: u64, len: u64) -> (u64, Option<&'a [u8]>)
     (len, None)
 }
 
-pub(crate) fn matches_patch(
+pub fn matches_patch(
     base: &[u8],
     len: u64,
     mut delta: Runs<'_>,

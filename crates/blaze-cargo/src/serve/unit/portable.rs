@@ -64,10 +64,11 @@ const HERE: &str = "blaze v2 cargo unit record here 1";
 
 impl Places {
     /// The roots of a build of the workspace at `workspace` whose build directory is `target`,
-    /// by a daemon whose shared standard library directory is `std`, tools `tools`, launcher
-    /// `launcher` and fetched packages' directory `sources`
-    /// (`blaze_manifest::home::sources`). One that is not absolute, not UTF-8 or the file
-    /// system's root is no root: what is under it stays as it is in every key.
+    /// by a daemon whose shared standard library directory is `std` (all daemon names), and whose
+    /// `tools`, `launcher` and fetched packages' directory `sources` (`blaze_manifest::home::sources`)
+    /// are host paths converted through [`blaze_core::platform::path::daemon`]. One that is not
+    /// absolute, not UTF-8 or a volume root is no root: what is under it stays as it is in every
+    /// key.
     pub(crate) fn new(
         workspace: &str,
         target: &str,
@@ -76,13 +77,65 @@ impl Places {
         launcher: &std::path::Path,
         sources: &std::path::Path,
     ) -> Places {
+        let host = |path: &std::path::Path| blaze_core::platform::path::daemon(path).ok();
+        let tools = host(tools);
+        let launcher = host(launcher);
+        let sources = host(sources);
+        Places::of_daemon(
+            Some(workspace),
+            Some(target),
+            Some(std),
+            tools.as_deref(),
+            launcher.as_deref(),
+            sources.as_deref(),
+        )
+    }
+
+    /// [`Places`] from host filesystem paths, each converted through
+    /// [`blaze_core::platform::path::daemon`].
+    pub(crate) fn of_host(
+        workspace: Option<&std::path::Path>,
+        target: Option<&std::path::Path>,
+        std: Option<&std::path::Path>,
+        tools: Option<&std::path::Path>,
+        launcher: Option<&std::path::Path>,
+        sources: Option<&std::path::Path>,
+    ) -> Places {
+        let conv = |path: Option<&std::path::Path>| {
+            path.and_then(|it| blaze_core::platform::path::daemon(it).ok())
+        };
+        let workspace = conv(workspace);
+        let target = conv(target);
+        let std = conv(std);
+        let tools = conv(tools);
+        let launcher = conv(launcher);
+        let sources = conv(sources);
+        Places::of_daemon(
+            workspace.as_deref(),
+            target.as_deref(),
+            std.as_deref(),
+            tools.as_deref(),
+            launcher.as_deref(),
+            sources.as_deref(),
+        )
+    }
+
+    /// [`Places`] from daemon names directly (`/`-rooted UTF-8 paths).
+    pub(crate) fn of_daemon(
+        workspace: Option<&str>,
+        target: Option<&str>,
+        std: Option<&str>,
+        tools: Option<&str>,
+        launcher: Option<&str>,
+        sources: Option<&str>,
+    ) -> Places {
         let given = [
-            (Role::Workspace, Some(workspace)),
-            (Role::Target, Some(target)),
-            (Role::Std, Some(std)),
-            (Role::Tools, tools.to_str()),
-            (Role::Launcher, launcher.to_str()),
-            (Role::Sources, sources.to_str()),
+            (Role::Workspace, workspace),
+            (Role::Target, target),
+            (Role::Std, std),
+            (Role::Tools, tools),
+            (Role::Launcher, launcher),
+            (Role::Sources, sources),
         ];
         Places { dirs: Dirs::new(given) }
     }

@@ -953,14 +953,22 @@ fn uplifted_on_windows() {
             format!("{out}/foo.d"),
         ]
     );
-    // A cdylib and a bin of one package share a crate name: the DLL's PDB is named for the
-    // DLL, so the two PDBs are two paths (INTEGRATION I45: cargo's `foo.pdb` for both).
+    // A cdylib and a bin of one package share a crate name: the DLL's PDB and uplifted
+    // dep-info keep `.dll` (`foo.dll.pdb`, `foo.dll.d`), so the two units share no output
+    // path at all, whether or not the package name has a hyphen (INTEGRATION I45).
     let cdylib = TargetKind::Lib(vec![CrateType::Cdylib, CrateType::Rlib]);
-    let lib = files(msvc, hash::CompileMode::Build, &cdylib, "luau-panel", None, true);
-    let bin = files(msvc, hash::CompileMode::Build, &TargetKind::Bin, "luau-panel", None, true);
-    assert!(lib.contains(&format!("{dest}/luau_panel.dll.pdb")), "{lib:?}");
-    assert!(bin.contains(&format!("{dest}/luau_panel.pdb")), "{bin:?}");
-    assert!(lib.iter().all(|it| !bin.contains(it) || it.ends_with(".d")), "{lib:?} {bin:?}");
+    for name in ["luau-panel", "panel"] {
+        let crate_name = name.replace('-', "_");
+        let lib = files(msvc, hash::CompileMode::Build, &cdylib, name, None, true);
+        let bin = files(msvc, hash::CompileMode::Build, &TargetKind::Bin, name, None, true);
+        assert!(lib.contains(&format!("{dest}/{crate_name}.dll.pdb")), "{lib:?}");
+        assert!(lib.contains(&format!("{dest}/{crate_name}.dll.lib")), "{lib:?}");
+        assert!(lib.contains(&format!("{dest}/{crate_name}.dll.d")), "{lib:?}");
+        assert!(bin.contains(&format!("{dest}/{crate_name}.pdb")), "{bin:?}");
+        assert!(bin.contains(&format!("{dest}/{name}.d")), "{bin:?}");
+        let shared: Vec<&String> = lib.iter().filter(|it| bin.contains(it)).collect();
+        assert!(shared.is_empty(), "{name}: cdylib and bin collided on {shared:?}\nlib={lib:?}\nbin={bin:?}");
+    }
     let gnu = "x86_64-pc-windows-gnu";
     let gnu_out = format!("/w/build/{gnu}/debug/build/app/{H}/out");
     assert_eq!(

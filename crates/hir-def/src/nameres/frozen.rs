@@ -903,7 +903,13 @@ impl<'a> Enc<'a> {
             }
         }
         self.out.extend_from_slice(&body);
-        if let Some(place) = places.iter().find(|it| holds(&self.out, it.as_bytes())) {
+        let has_place = |place: &str| {
+            holds(&self.out, place.as_bytes())
+                || blaze_core::platform::path::DaemonPath::parse(place)
+                    .and_then(blaze_core::platform::path::DaemonPath::host_spelling)
+                    .is_some_and(|host| holds(&self.out, host.as_bytes()))
+        };
+        if let Some(place) = places.iter().find(|it| has_place(it)) {
             // alloc: error path
             return Err(format!("the bytes name {place}, a build directory of one checkout"));
         }
@@ -940,10 +946,13 @@ impl<'a> Enc<'a> {
         let mut unplaced = String::with_capacity(written.len());
         let mut rest = written;
         loop {
-            // The first `OUT_DIR` in what is left; of those that start there, the longest,
-            // then the closure's first.
+            // The first `OUT_DIR` in what is left (in the form `env!("OUT_DIR")` expanded to);
+            // of those that start there, the longest, then the closure's first.
             let next = (self.out_dirs.iter())
-                .filter_map(|(index, out)| Some((rest.find(out.as_str())?, out.len(), *index)))
+                .filter_map(|(index, out)| {
+                    let given = base_db::given_value("OUT_DIR", out.as_str());
+                    Some((rest.find(&*given)?, given.len(), *index))
+                })
                 .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
             let piece = next.map_or(rest, |(at, ..)| &rest[..at]);
             let ported = files.ported(piece.as_bytes());
@@ -2727,7 +2736,8 @@ impl<'a> Dec<'a> {
             let (index, after) = mark.ok_or("a literal with half a mark of an OUT_DIR")?;
             let krate = index.parse::<usize>().ok().and_then(|it| self.closure.get(it).copied());
             let krate = krate.ok_or("a literal with the OUT_DIR of no crate of the closure")?;
-            placed.push_str(&out_dir(self.db, krate).ok_or("an OUT_DIR the crate lacks")?);
+            let out = out_dir(self.db, krate).ok_or("an OUT_DIR the crate lacks")?;
+            placed.push_str(&base_db::given_value("OUT_DIR", &out));
             rest = after;
         }
         piece(&mut placed, rest)?;

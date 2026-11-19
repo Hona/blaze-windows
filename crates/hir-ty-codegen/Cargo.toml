@@ -59,9 +59,10 @@ blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
-blaze-items.workspace = true
 blaze-item-hash.workspace = true
+blaze-items.workspace = true
 blaze-mem.workspace = true
+blaze-record.workspace = true
 blaze-stencil.workspace = true
 # The CPUs of `-C target-cpu` and their features (target_features::cpus): the toolchain's CPU.
 target-features.workspace = true
@@ -83,8 +84,6 @@ rsasm = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-# Measure the item store's real classifier at the describe query boundary, not a copy of its rules.
-blaze-item-hash.workspace = true
 # The code identity, held to what rustc says each of the code generator's crates read
 # (`toolchain/tests.rs`).
 blaze-codegen-code.workspace = true

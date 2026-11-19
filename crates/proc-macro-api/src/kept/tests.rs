@@ -99,6 +99,17 @@ fn a_changed_span_gives_another_key() {
     split.site = span(1, 0, 0, 9);
     split.subtree = tree("A", span(1, 5, 0, 9));
     assert_ne!(split.key(), Inputs::new().key());
+    // Two anchors in the same file vs in two different files must produce different keys:
+    // `Span::join` returns `Some` within one file and `None` across files without asking `db`.
+    let mut two_files = Inputs::new();
+    two_files.site = span(1, 0, 0, 9);
+    two_files.subtree = tree("A", span(2, 5, 0, 9));
+    assert_ne!(split.key(), two_files.key());
+    // Moving both anchors to another file while preserving same-file membership keeps the key.
+    let mut moved_pair = Inputs::new();
+    moved_pair.site = span(9, 10, 0, 9);
+    moved_pair.subtree = tree("A", span(9, 15, 0, 9));
+    assert_eq!(split.key(), moved_pair.key());
 }
 
 #[test]
@@ -117,7 +128,6 @@ fn a_changed_variable_name_or_directory_gives_another_key() {
 
 /// The calling crate's variables and directory are written against its package and
 /// `OUT_DIR`: the same call on the same crate in another checkout has the same key.
-#[cfg(not(windows))] // Windows has no roots (`blaze_usercode::roots`).
 #[test]
 fn the_same_call_in_another_checkout_gives_the_same_key() {
     let at = |home: &str| {
@@ -146,7 +156,6 @@ fn the_same_call_in_another_checkout_gives_the_same_key() {
 
 /// What an expansion read, written against its crate's roots, is the same in two checkouts
 /// while the files are, and not once one under the root changed.
-#[cfg(not(windows))] // Windows has no roots (`blaze_usercode::roots`).
 #[test]
 fn a_file_read_under_the_crates_package_is_keyed_by_its_place_in_it() {
     let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: Inputs::new().key() };
@@ -321,7 +330,6 @@ fn daemon(
         tags: 1 << 48,
         load_tags: (1 << 48) + (1 << 32),
         loader: blaze_cas::Loader::Pumped,
-        sharing: blaze_core::Sharing::Blocks,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {

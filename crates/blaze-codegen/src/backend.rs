@@ -354,6 +354,58 @@ pub trait Frontend: Sync {
         None
     }
 
+    /// Describes `instance` for `requester` against `records`, pushing any new records to `puts`
+    /// and returning whether a stored record answered it (`true` on a hit, `false` on a miss).
+    ///
+    /// The default uses the single-key protocol ([`Self::record_key`], [`Self::from_record`],
+    /// [`Self::to_record`]). A front end that also validates traced describe records (for
+    /// unsealed crates whose code walk reads cross-function dependencies) overrides this.
+    fn describe_recorded(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        // dyn: the store's verified reader, one lookup per unkept function
+        records: &dyn crate::driver::Records,
+        puts: &mut Vec<crate::driver::Put>,
+    ) -> Result<(Described<Self::Instance, Self::Static>, bool), CodegenError> {
+        let Some(key) = self.record_key(instance, requester) else {
+            return self.describe(instance, requester).map(|it| (it, false));
+        };
+        let unread = |why: String| CodegenError {
+            unit: crate::InstanceKey(ContentId::default()),
+            item: blaze_items::ItemKey(ContentId::default()),
+            // alloc: an error
+            what: format!(
+                "the record of the describe of `{}` under the store key {:x} does not read: \
+                 {why}",
+                self.spell(instance),
+                key.0
+            ),
+            front: None,
+        };
+        let mut found = None;
+        let had = records
+            .read(&key, &mut |bytes| {
+                found = Some(self.from_record(instance, requester, bytes));
+            })
+            .map_err(unread)?;
+        match (had, found) {
+            (true, Some(read)) => read.map(|it| (it, true)).map_err(unread),
+            _ => {
+                let now = self.describe(instance, requester)?;
+                if let Some(bytes) = self.to_record(instance, requester, &now) {
+                    puts.push(crate::driver::Put {
+                        key,
+                        kind: crate::driver::RECORD_KIND,
+                        bytes,
+                        of: None,
+                    });
+                }
+                Ok((now, false))
+            }
+        }
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.

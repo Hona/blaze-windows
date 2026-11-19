@@ -1943,6 +1943,25 @@ fn a_statics_writable_data_is_its_own_and_writable() {
     assert!(within(".rodata", one_shared), "{one_shared:#x}");
 }
 
+#[test]
+fn resting_a_compact_image_releases_scratch_and_undo_history() {
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let mut disk = Disk::default();
+    let f = function(1, &[0xc3], vec![]);
+    let change = Change {
+        added: vec![&f],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    image.scratch.reserve(64 << 10);
+    assert!(image.scratch.capacity() >= 64 << 10);
+    image.rest();
+    assert_eq!(image.scratch.capacity(), 0, "rest() must release key-hashing scratch");
+    assert_eq!(image.history.capacity(), 0, "rest() must drop undo history on compact images");
+}
+
 /// An x86-64 ELF object defining `c_helper`, which calls `rust_fn`.
 fn c_object() -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);

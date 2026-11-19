@@ -6,9 +6,65 @@ fn debug_outputs_use_daemon_names_for_native_and_foreign_targets() {
     let (file, plist) = super::side_paths(Format::Pe, "/C:/out/app.exe", "app.pdb");
     assert_eq!(file, "/C:/out/app.pdb");
     assert_eq!(plist, None);
+    let (file, plist) = super::side_paths(Format::Pe, "/C:/out/luau_panel.dll", "luau_panel.dll.pdb");
+    assert_eq!(file, "/C:/out/luau_panel.dll.pdb");
+    assert_eq!(plist, None);
     let (file, plist) = super::side_paths(Format::MachO, "/root/app", "ignored");
     assert_eq!(file, "/root/app.dSYM/Contents/Resources/DWARF/app");
     assert_eq!(plist.as_deref(), Some("/root/app.dSYM/Contents/Info.plist"));
+}
+
+#[test]
+fn shared_library_name_uses_uplifted_dll_name_when_present() {
+    let plan = |extra: &str, outputs: &[&str]| blaze_units::query::UnitPlan {
+        checked_as_test: false,
+        metadata: extra.trim_start_matches('-').to_owned(),
+        extra_filename: extra.to_owned(),
+        unit_id: format!("{:0>16}", extra.trim_start_matches('-')),
+        cfgs: Vec::new(),
+        check_cfg: Vec::new(),
+        rustflags: Vec::new(),
+        lints: Vec::new(),
+        env: Vec::new(),
+        outputs: outputs.iter().map(|it| (*it).to_owned()).collect(),
+        out_dir: None,
+        links: None,
+        unsandboxed: false,
+        runner: Vec::new(),
+        harness: true,
+        clippy: None,
+        macro_wasm: false,
+        gpu_msl: None,
+    };
+    let hashed = plan(
+        "-89ab",
+        &[
+            "/w/target/debug/deps/rune_www-89ab.dll",
+            "/w/target/debug/rune_www.dll",
+            "/w/target/debug/deps/rune_www-89ab.dll.lib",
+            "/w/target/debug/rune_www.dll.lib",
+        ],
+    );
+    assert_eq!(
+        super::shared_name("/w/target/debug/deps/rune_www-89ab.dll", &hashed),
+        "rune_www.dll"
+    );
+    let unhashed = plan(
+        "",
+        &[
+            "/w/build/debug/build/rune_www/0123/out/rune_www.dll",
+            "/w/target/debug/rune_www.dll",
+        ],
+    );
+    assert_eq!(
+        super::shared_name("/w/build/debug/build/rune_www/0123/out/rune_www.dll", &unhashed),
+        "rune_www.dll"
+    );
+    let dep = plan("-89ab", &["/w/target/debug/deps/dep-89ab.dll"]);
+    assert_eq!(
+        super::shared_name("/w/target/debug/deps/dep-89ab.dll", &dep),
+        "dep-89ab.dll"
+    );
 }
 
 use std::collections::HashMap;
@@ -586,4 +642,23 @@ fn a_link_out_of_room_names_the_image_and_whose_limit_it_is() {
     assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
     assert!(no_room.contains("the limit is the output's"), "{no_room}");
     assert!(!failed(None).contains("the limit is the output's"));
+}
+
+#[test]
+fn native_bytes_shares_one_allocation_across_links_and_releases_when_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("libcmt.lib");
+    let payload = vec![0xABu8; 64 * 1024];
+    std::fs::write(&file, &payload).unwrap();
+    let mut hasher = blaze_ids::b3::Hasher::new();
+    hasher.update(&payload);
+    let id = ContentId(hasher.finalize());
+    let pool = crate::serve::unit::NativeBytes::default();
+    let first = pool.get_or_read(id, &file).unwrap();
+    let second = pool.get_or_read(id, &file).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "same content must share one Arc<[u8]>");
+    let weak = std::sync::Arc::downgrade(&first);
+    drop(first);
+    drop(second);
+    assert!(weak.upgrade().is_none(), "weak pool must not pin bytes after last image drops");
 }

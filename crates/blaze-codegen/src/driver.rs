@@ -2393,47 +2393,23 @@ impl<'a, B: Prepare> Build<'a, B> {
         requester: &Origin,
         counts: &kept::Counts,
     ) -> Result<Described<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
-        let key = match self.records {
-            Some(_) => self.frontend.record_key(instance, requester),
-            None => None,
-        };
-        let (Some(records), Some(key)) = (self.records, key) else {
+        let Some(records) = self.records else {
             counts.described();
             return self.frontend.describe(instance, requester);
         };
-        let unread = |why: String| {
-            error(
-                InstanceKey(ContentId::default()),
-                ItemKey(ContentId::default()),
-                // alloc: an error
-                format!(
-                    "the record of the describe of `{}` under the store key {:x} does not read: \
-                     {why}",
-                    self.frontend.spell(instance),
-                    key.0
-                ),
-            )
-        };
-        let mut found = None;
-        let had = records
-            .read(&key, &mut |bytes| {
-                found = Some(self.frontend.from_record(instance, requester, bytes));
-            })
-            .map_err(unread)?;
-        match (had, found) {
-            (true, Some(read)) => {
-                counts.found();
-                read.map_err(unread)
-            }
-            _ => {
+        let mut puts = Vec::new(); // alloc: none on a hit; at most two puts on a miss
+        let (described, hit) =
+            self.frontend.describe_recorded(instance, requester, records, &mut puts)?;
+        match hit {
+            true => counts.found(),
+            false => {
                 counts.described();
-                let now = self.frontend.describe(instance, requester)?;
-                if let Some(bytes) = self.frontend.to_record(instance, requester, &now) {
-                    self.recorded.push(Put { key, kind: records::KIND, bytes, of: None });
+                for put in puts {
+                    self.recorded.push(put);
                 }
-                Ok(now)
             }
         }
+        Ok(described)
     }
 
     fn static_node(
@@ -5621,7 +5597,7 @@ use frontier::{Frontier, Order};
 mod kept;
 pub use kept::{Kept, Walk, Work};
 mod records;
-pub use records::Records;
+pub use records::{KIND as RECORD_KIND, Records};
 mod later;
 mod lists;
 mod near;

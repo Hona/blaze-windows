@@ -1919,6 +1919,12 @@ fn owners_ids_and_argument_names_are_read_from_the_pages() {
         "probe::interned_arguments"
     );
     assert!(db.storage().ingredient_file(Cells::ingredient().index()).ends_with("tests.rs"));
+    assert!(db.storage().ingredient_in_file(Cells::ingredient().index(), "blaze-query/src/db/tests.rs"));
+    assert!(!db.storage().ingredient_in_file(Cells::ingredient().index(), "not-blaze-query/src/db/tests.rs"));
+    assert!(super::file_ends_with(r"C:\work\crates\hir-def\src\nameres.rs", "hir-def/src/nameres.rs"));
+    assert!(super::file_ends_with("crates/hir-def/src/nameres.rs", "hir-def/src/nameres.rs"));
+    assert!(!super::file_ends_with(r"crates\not-hir-def\src\nameres.rs", "hir-def/src/nameres.rs"));
+    assert!(!super::file_ends_with(r"crates\hir-def\src\other\nameres.rs", "hir-def/src/nameres.rs"));
     let cells = Cells::ingredient().index();
     assert_eq!(db.storage().field_name(cells, 1), "b");
     let at = DatabaseKeyIndex::new(cells, cell.0);

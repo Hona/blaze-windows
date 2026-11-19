@@ -1982,6 +1982,7 @@ fn options() -> Options {
         without: super::daemon::Without::default(),
         premises: super::daemon::Premises::of_this_process().expect("the test's own executable"),
         unheld: None,
+        ntfs_edit: super::ntfs_edit::NtfsEdit::default(),
     }
 }
 

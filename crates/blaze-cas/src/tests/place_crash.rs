@@ -57,6 +57,96 @@ fn exclusive_edit(tape: &Tape) {
     }
 }
 
+/// The invariant (B14): on a volume without block sharing (NTFS), placing an edited output by
+/// new sparse file + atomic rename (`Store::place_edit_rename`) never issues an exclusive
+/// custody open (`Effect::TryPatch`), never clones or copies from `to`, succeeds even while a
+/// live read-only mapping holds the old generation (simulating an asynchronous Defender scan or
+/// running reader), preserves the old mapping's bytes, places the exact new bytes (with sparse
+/// holes as zeros), and vouches the new file's stamp.
+#[test]
+fn ntfs_edit_rename_places_whole_without_exclusive_open_and_vouches_stamp() {
+    let mut sim = Sim::new(41, Faults { no_clone: true, ..quiet() });
+    let mut store = open(&mut sim, "store");
+    let to = name("out/app.exe");
+    let old = b"OLD_PE_HEADER_0000_OLD_BODY".to_vec();
+    sim.change(&to, &old);
+
+    // Hold a live read-only mapping on `to`: exclusive custody (`TryPatch`) must refuse it.
+    let mut map_effects = vec![Effect::Map { file: to.clone(), extent: blaze_core::Extent::Whole, tag: Tag(u64::MAX - 1) }];
+    let mut held_view = None;
+    run_until_idle(&mut sim, &mut map_effects, |c, _| {
+        if let Done::Mapped(view) = c.done {
+            held_view = Some(view);
+        }
+    })
+    .expect("map completes");
+    let held_view = held_view.expect("old exe mapped");
+    assert_eq!(held_view.bytes(), old.as_slice());
+
+    // Control: `Effect::TryPatch` refuses a mapped generation.
+    let new_bytes = b"NEW_PE_HEADER_0000_NEW_BODY".to_vec();
+    let mut probe_effects = vec![Effect::TryPatch {
+        file: to.clone(),
+        len: new_bytes.len() as u64,
+        delta: vec![(0, b"NEW".to_vec()), (19, b"NEW".to_vec())],
+        whole: Arc::new(vec![(0, new_bytes.clone())]),
+        tag: Tag(u64::MAX - 2),
+    }];
+    let mut probe_done = None;
+    run_until_idle(&mut sim, &mut probe_effects, |c, _| probe_done = Some(c.done)).expect("probe completes");
+    assert_eq!(probe_done, Some(Done::Patched(false)), "control: exclusive custody refuses a live mapping");
+
+    // Under test: `place_edit_rename` places a sparse file with a hole and replaces `to` via rename.
+    let runs = vec![(0u64, b"NEW_PE_HEADER".to_vec()), (18u64, b"_NEW_BODY".to_vec())];
+    let expected = b"NEW_PE_HEADER\0\0\0\0\0_NEW_BODY".to_vec();
+    let sparse = Sparse { len: expected.len() as u64, runs };
+    let copied_expected = sparse.bytes();
+    store.starts(&to, true);
+    let mut effects = Vec::new();
+    let tag = store.place_edit_rename(to.clone(), sparse, &mut effects);
+
+    let mut saw_try_patch = false;
+    let mut saw_clone = false;
+    let mut saw_copy = false;
+    let mut saw_rename = false;
+    let mut inspect = |effects: &[Effect]| {
+        for effect in effects {
+            match effect {
+                Effect::TryPatch { .. } => saw_try_patch = true,
+                Effect::Clone { .. } => saw_clone = true,
+                Effect::CopyData { .. } => saw_copy = true,
+                Effect::RenameUnsynced { to: onto, .. } if *onto == to => saw_rename = true,
+                _ => {}
+            }
+        }
+    };
+    inspect(&effects);
+    run_until_idle(&mut sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            let before = effects.len();
+            store.complete(completion, effects);
+            inspect(&effects[before..]);
+        }
+    })
+    .expect("place_edit_rename completes");
+
+    assert!(!saw_try_patch, "ntfs rename must never issue Effect::TryPatch");
+    assert!(!saw_clone, "ntfs rename must never issue Effect::Clone");
+    assert!(!saw_copy, "ntfs rename must never issue Effect::CopyData");
+    assert!(saw_rename, "ntfs rename must publish via RenameUnsynced");
+
+    let placed = store.placed();
+    assert_eq!(placed.len(), 1);
+    assert_eq!(placed[0].tag, tag);
+    assert_eq!(placed[0].result, Ok(()));
+    assert_eq!(placed[0].bytes.cloned, 0);
+    assert_eq!(placed[0].bytes.copied, copied_expected);
+    let vouched = placed[0].stamp.expect("ntfs rename vouches the renamed file's stamp");
+    assert_eq!(vouched.stamp, sim.stamp(&to), "vouched stamp matches the renamed destination");
+    assert_eq!(sim.contents(&to), expected, "destination holds the sparse output whole");
+    assert_eq!(held_view.bytes(), old.as_slice(), "existing reader retains the old generation untouched");
+}
+
 /// How long a derived value's file is, against its base's.
 #[derive(Clone, Copy, Debug)]
 enum Len {

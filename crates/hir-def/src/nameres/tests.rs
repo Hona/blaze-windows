@@ -1204,3 +1204,38 @@ enum Empty {}
         },
     );
 }
+
+#[test]
+fn name_read_classifies_nameres_reads_with_host_file_separators() {
+    use crate::nameres::boundary::{self, NameRead};
+
+    let db = fixture::db_with_boundaries(
+        "struct S;",
+        |builder| {
+            for &kind in boundary::KINDS {
+                builder.mark_boundary(kind);
+            }
+        },
+        blaze_memo::Reads::Kept,
+    )
+    .into_db();
+    let krate = db.fetch_test_crate();
+    let memo = blaze_memo::Database::memo(&db);
+    let ((), reads) = blaze_memo::record(memo, || {
+        let def_map = crate_def_map(&db, krate);
+        let _ = def_map.module(&db, def_map.root).scope(&db).get(
+            &hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("S")),
+        );
+    })
+    .expect("nameres reads are recorded");
+    let seen: Vec<(&'static str, Option<NameRead>)> = reads
+        .into_iter()
+        .filter(|read| boundary::KINDS.contains(&read.kind().name()))
+        .map(|read| (read.kind().name(), boundary::name_read(&db, read)))
+        .collect();
+    assert!(!seen.is_empty(), "expected at least one nameres boundary read");
+    assert!(
+        seen.iter().all(|(_, read)| read.is_some()),
+        "nameres boundary reads must classify on every host: {seen:#?}"
+    );
+}

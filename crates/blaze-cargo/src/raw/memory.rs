@@ -411,7 +411,8 @@ pub fn hold_own_footprint(bytes: u64) -> std::io::Result<i32> {
 
 /// Gives the system back the pages of what was freed, which the system's allocator keeps to
 /// reuse otherwise: glibc's `malloc_trim(0)` on Linux (every arena, top and inner free pages
-/// madvised away), every malloc zone's pressure relief on macOS ([`relieve_system_zones`]).
+/// madvised away), every malloc zone's pressure relief on macOS ([`relieve_system_zones`]),
+/// and `HeapCompact` over every process heap on Windows.
 pub fn purge_freed_pages() {
     // SAFETY: `malloc_trim` takes each arena's lock itself and touches no memory of the
     // caller's; a pad of 0 keeps nothing at the top of the heap.
@@ -421,6 +422,28 @@ pub fn purge_freed_pages() {
     }
     #[cfg(target_os = "macos")]
     relieve_system_zones();
+    #[cfg(windows)]
+    compact_windows_heaps();
+}
+
+/// Coalesces free blocks and decommits large free committed segments on every Win32 heap of this
+/// process (`GetProcessHeap()` for Rust's `std::alloc::System`, plus the CRT/LLVM heaps).
+#[cfg(windows)]
+fn compact_windows_heaps() {
+    use windows_sys::Win32::System::Memory::{GetProcessHeaps, HeapCompact};
+    const MOST: usize = 64;
+    let mut heaps = [std::ptr::null_mut(); MOST];
+    // SAFETY: `heaps` holds `MOST` slots for the kernel to fill with this process's heap handles.
+    let count = unsafe { GetProcessHeaps(MOST as u32, heaps.as_mut_ptr()) } as usize;
+    for &heap in &heaps[..count.min(MOST)] {
+        if !heap.is_null() {
+            // SAFETY: `heap` is a live heap handle returned by `GetProcessHeaps`; `HeapCompact`
+            // synchronizes internally and only coalesces/decommits free blocks.
+            unsafe {
+                HeapCompact(heap, 0);
+            }
+        }
+    }
 }
 
 // SAFETY: libsystem_malloc's `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t
@@ -488,6 +511,7 @@ pub fn purge() -> Purged {
     let before = own_footprint_now();
     purge_freed_pages();
     blaze_mem::chunks::trim();
+    blaze_mem::blocks::trim_all();
     let after = own_footprint_now();
     let purged = Purged { before, after };
     PURGED.fetch_add(purged.returned(), std::sync::atomic::Ordering::Relaxed);

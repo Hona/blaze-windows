@@ -49,8 +49,11 @@
 //! costs `O(log f + k)` per question, `f` the state's facts and `k` the facts about the terms
 //! it asks of, with each linear proof at most [`LINEAR_FUEL`] steps: linear in the body for
 //! bounded `k`, and at most [`work_bound`] whatever `k` is. What is not quite linear: the
-//! first write after a copy moves an index's list of chunks, `f / CHUNK` pointers; liveness is
-//! `l / 64` words a block; and a join of `p` paths asks `p` questions of each joined local.
+//! first write after a copy moves an index's list of chunks, `f / CHUNK` pointers; and a join
+//! of `p` paths asks `p` questions of each joined local. Liveness keeps always-live locals
+//! apart from sparse nonzero words per block and runs in postorder passes (one pass on a DAG),
+//! joins intersect persistent sets by skipping shared chunks, and implication pruning checks
+//! fact reachability through the state's term index without scanning all facts.
 
 pub mod models;
 mod obligations;
@@ -237,6 +240,26 @@ struct Work {
     used: Cell<u64>,
     bound: u64,
     stopped: Cell<Option<u32>>,
+}
+
+impl Work {
+    fn charge(&self, at_block: u32, units: u64) -> bool {
+        let used = self.used.get().saturating_add(units);
+        #[cfg(test)]
+        if PLANT_UNBOUNDED_WORK.get() {
+            self.used.set(used);
+            return true;
+        }
+        if used <= self.bound {
+            self.used.set(used);
+            return true;
+        }
+        self.used.set(self.bound);
+        if self.stopped.get().is_none() {
+            self.stopped.set(Some(at_block));
+        }
+        false
+    }
 }
 
 /// What one question of a state has worked out: the state does not change while it is asked,
@@ -755,6 +778,147 @@ impl<T: Ord + Copy> Sorted<T> {
         changed
     }
 
+    /// Keeps only the entries that `other` also has, sharing any chunks that are identical by
+    /// pointer. Returns whether `self` changed and the work spent (1 per shared chunk skipped,
+    /// plus each element inspected in differing chunks).
+    fn intersect(&mut self, other: &Sorted<T>) -> (bool, u64) {
+        if self.len == 0 {
+            return (false, 1);
+        }
+        if other.len == 0 {
+            self.len = 0;
+            self.chunks = Rc::new_in(Vec::new_in(Global), Global);
+            return (true, 1);
+        }
+        if Rc::ptr_eq(&self.chunks, &other.chunks) {
+            return (false, 1);
+        }
+        let mut out = Vec::with_capacity_in(self.chunks.len(), Global);
+        let mut changed = false;
+        let mut len = 0;
+        let mut work = 0u64;
+        let mut j = 0usize;
+        let other_chunks = &other.chunks;
+        for chunk in self.chunks.iter() {
+            let first = &chunk[0];
+            if j < other_chunks.len() && other_chunks[j].last().is_some_and(|last| last < first) {
+                j += 1;
+                if j < other_chunks.len() && other_chunks[j].last().is_some_and(|last| last < first) {
+                    j += other_chunks[j..]
+                        .partition_point(|it| it.last().is_some_and(|last| last < first));
+                }
+            }
+            if j >= other_chunks.len() {
+                changed = true;
+                work += 1;
+                break;
+            }
+            if Rc::ptr_eq(chunk, &other_chunks[j]) {
+                len += chunk.len();
+                out.push(chunk.clone()); // clone: the chunk, shared
+                j += 1;
+                work += 1;
+                continue;
+            }
+            work += chunk.len() as u64;
+            let mut kept = Vec::new_in(Global);
+            let mut dropped_any = false;
+            let mut oj = j;
+            for (idx, it) in chunk.iter().enumerate() {
+                if oj < other_chunks.len() && other_chunks[oj].last().is_some_and(|last| last < it) {
+                    oj += 1;
+                    if oj < other_chunks.len()
+                        && other_chunks[oj].last().is_some_and(|last| last < it)
+                    {
+                        oj += other_chunks[oj..]
+                            .partition_point(|oc| oc.last().is_some_and(|last| last < it));
+                    }
+                }
+                let present = other_chunks.get(oj).is_some_and(|oc| oc.binary_search(it).is_ok());
+                if present {
+                    if dropped_any {
+                        kept.push(*it);
+                    }
+                } else if !dropped_any {
+                    dropped_any = true;
+                    kept.reserve(chunk.len() - 1);
+                    kept.extend_from_slice(&chunk[..idx]);
+                }
+            }
+            j = oj;
+            if !dropped_any {
+                len += chunk.len();
+                out.push(chunk.clone()); // clone: all elements kept, shared
+            } else {
+                changed = true;
+                if !kept.is_empty() {
+                    len += kept.len();
+                    out.push(Rc::new_in(kept, Global));
+                }
+            }
+        }
+        if changed {
+            self.chunks = Rc::new_in(out, Global);
+            self.len = len;
+        }
+        (changed, work.max(1))
+    }
+
+    /// Appends every entry of `self` that `other` does not have, in order, skipping chunks
+    /// shared by pointer. Returns the work spent.
+    fn diff_into(&self, other: &Sorted<T>, out: &mut Vec<T>) -> u64 {
+        if self.len == 0 || Rc::ptr_eq(&self.chunks, &other.chunks) {
+            return 1;
+        }
+        if other.len == 0 {
+            out.reserve(self.len);
+            out.extend(self.iter().copied());
+            return self.len as u64;
+        }
+        let mut work = 0u64;
+        let mut j = 0usize;
+        let other_chunks = &other.chunks;
+        for chunk in self.chunks.iter() {
+            let first = &chunk[0];
+            if j < other_chunks.len() && other_chunks[j].last().is_some_and(|last| last < first) {
+                j += 1;
+                if j < other_chunks.len() && other_chunks[j].last().is_some_and(|last| last < first) {
+                    j += other_chunks[j..]
+                        .partition_point(|it| it.last().is_some_and(|last| last < first));
+                }
+            }
+            if j >= other_chunks.len() {
+                out.extend_from_slice(chunk);
+                work += chunk.len() as u64;
+                continue;
+            }
+            if Rc::ptr_eq(chunk, &other_chunks[j]) {
+                j += 1;
+                work += 1;
+                continue;
+            }
+            work += chunk.len() as u64;
+            let mut oj = j;
+            for it in chunk.iter() {
+                if oj < other_chunks.len() && other_chunks[oj].last().is_some_and(|last| last < it) {
+                    oj += 1;
+                    if oj < other_chunks.len()
+                        && other_chunks[oj].last().is_some_and(|last| last < it)
+                    {
+                        oj += other_chunks[oj..]
+                            .partition_point(|oc| oc.last().is_some_and(|last| last < it));
+                    }
+                }
+                let present = other_chunks.get(oj).is_some_and(|oc| oc.binary_search(it).is_ok());
+                if !present {
+                    out.push(*it);
+                }
+            }
+            j = oj;
+        }
+        work.max(1)
+    }
+
     fn iter(&self) -> impl Iterator<Item = &T> + '_ {
         self.chunks.iter().flat_map(|it| it.iter())
     }
@@ -875,6 +1039,28 @@ impl State {
             return;
         }
         self.concluding.insert((imp.1, imp.0));
+    }
+
+    /// Keeps the facts `other` also has, and their entries in `about`, skipping shared chunks.
+    /// Returns the work spent.
+    fn intersect_facts(&mut self, other: &State) -> u64 {
+        let (changed, work) = self.facts.intersect(&other.facts);
+        if !changed {
+            return work;
+        }
+        let (_, about_work) = self.about.intersect(&other.about);
+        work + about_work
+    }
+
+    /// Keeps the implications `other` also has, and their entries in `concluding`, skipping
+    /// shared chunks. Returns the work spent.
+    fn intersect_imps(&mut self, other: &State) -> u64 {
+        let (changed, work) = self.imps.intersect(&other.imps);
+        if !changed {
+            return work;
+        }
+        let (_, conc_work) = self.concluding.intersect(&other.concluding);
+        work + conc_work
     }
 
     /// Keeps the facts `keep` says yes to, and their entries in the indexes.
@@ -1192,9 +1378,215 @@ fn set_bit(bits: &mut [u64], slot: usize) {
     }
 }
 
-fn clear_bit(bits: &mut [u64], slot: usize) {
-    if let Some(word) = bits.get_mut(slot / 64) {
-        *word &= !(1 << (slot % 64));
+/// A sparse set of local slots, stored as sorted `(word, bits)` pairs with `bits != 0`.
+/// Keeps liveness and dead-slot clearing proportional to the locals live at a block rather
+/// than to the body's total local count.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct SparseBits {
+    words: Vec<(u32, u64)>,
+}
+
+impl SparseBits {
+    fn new() -> SparseBits {
+        SparseBits { words: Vec::new_in(Global) }
+    }
+
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        let word = (slot / 64) as u32;
+        let mask = 1u64 << (slot % 64);
+        self.words
+            .binary_search_by_key(&word, |&(w, _)| w)
+            .is_ok_and(|at| self.words[at].1 & mask != 0)
+    }
+
+    fn contains_word_bits(&self, word: u32, bits: u64) -> bool {
+        self.words
+            .binary_search_by_key(&word, |&(w, _)| w)
+            .is_ok_and(|at| (self.words[at].1 & bits) == bits)
+    }
+
+    fn insert(&mut self, slot: usize) {
+        let word = (slot / 64) as u32;
+        let mask = 1u64 << (slot % 64);
+        match self.words.binary_search_by_key(&word, |&(w, _)| w) {
+            Ok(at) => self.words[at].1 |= mask,
+            Err(at) => self.words.insert(at, (word, mask)),
+        }
+    }
+
+    fn remove(&mut self, slot: usize) {
+        let word = (slot / 64) as u32;
+        let mask = 1u64 << (slot % 64);
+        if let Ok(at) = self.words.binary_search_by_key(&word, |&(w, _)| w) {
+            self.words[at].1 &= !mask;
+            if self.words[at].1 == 0 {
+                self.words.remove(at);
+            }
+        }
+    }
+}
+
+/// Fixed-point backward liveness over sparse nonzero words, in postorder passes.
+/// `live` starts as each block's upward-exposed uses (excluding always-live locals) and grows
+/// in place to the least fixed point. On a DAG every reachable block runs once; a back edge
+/// queues only the predecessors of blocks whose live set grew.
+#[expect(clippy::too_many_arguments)]
+fn propagate_liveness(
+    words: usize,
+    order: &[u32],
+    rpo: &[u32],
+    predecessors: &[Vec<u32>],
+    defs: &[SparseBits],
+    live: &mut [SparseBits],
+    mut successors: impl FnMut(usize, &mut dyn FnMut(usize)),
+    mut charge: impl FnMut(u64) -> bool,
+) {
+    let count = live.len();
+    let mut scratch = Vec::with_capacity_in(words, Global);
+    scratch.resize(words, 0u64);
+    let mut touched: Vec<u32> = Vec::new_in(Global);
+
+    let step = |block: usize,
+                live: &mut [SparseBits],
+                scratch: &mut [u64],
+                touched: &mut Vec<u32>,
+                successors: &mut dyn FnMut(usize, &mut dyn FnMut(usize)),
+                charge: &mut dyn FnMut(u64) -> bool|
+     -> Option<bool> {
+        touched.clear();
+        let mut stopped = false;
+        successors(block, &mut |target| {
+            if stopped {
+                return;
+            }
+            let target_words = &live[target].words;
+            if !charge(target_words.len().max(1) as u64) {
+                stopped = true;
+                return;
+            }
+            for &(w, bits) in target_words {
+                let slot = &mut scratch[w as usize];
+                if *slot == 0 {
+                    touched.push(w);
+                }
+                *slot |= bits;
+            }
+        });
+        if stopped {
+            return None;
+        }
+        if touched.is_empty() {
+            return Some(false);
+        }
+        if !defs[block].words.is_empty() {
+            if !charge(defs[block].len() as u64) {
+                return None;
+            }
+            for &(w, bits) in &defs[block].words {
+                scratch[w as usize] &= !bits;
+            }
+        }
+        let mut added = false;
+        for &w in touched.iter() {
+            let bits = scratch[w as usize];
+            if bits != 0 && !live[block].contains_word_bits(w, bits) {
+                added = true;
+                break;
+            }
+        }
+        if added {
+            for &(w, bits) in &live[block].words {
+                let slot = &mut scratch[w as usize];
+                if *slot == 0 {
+                    touched.push(w);
+                }
+                *slot |= bits;
+            }
+            touched.sort_unstable();
+            touched.dedup();
+            live[block].words.clear();
+            for &w in touched.iter() {
+                let bits = scratch[w as usize];
+                if bits != 0 {
+                    live[block].words.push((w, bits));
+                }
+                scratch[w as usize] = 0;
+            }
+        } else {
+            for &w in touched.iter() {
+                scratch[w as usize] = 0;
+            }
+        }
+        Some(added)
+    };
+
+    const NONE: u32 = u32::MAX;
+    let mut queued = vec![NONE; count]; // alloc: once per proof
+    let mut queue: std::collections::BinaryHeap<(u32, u32)> = std::collections::BinaryHeap::new();
+    let mut next: std::collections::BinaryHeap<(u32, u32)> = std::collections::BinaryHeap::new();
+
+    // Pass 0: every reachable block once in postorder. Forward predecessors (smaller rpo)
+    // have not run yet and will see the updated live set; back-edge predecessors (rpo >= here)
+    // already ran and are queued for pass 1.
+    for &block_u32 in order.iter().rev() {
+        let block = block_u32 as usize;
+        let Some(added) =
+            step(block, live, &mut scratch, &mut touched, &mut successors, &mut charge)
+        else {
+            return;
+        };
+        if added {
+            let here = rpo[block];
+            for &pred in &predecessors[block] {
+                let pr = rpo[pred as usize];
+                if pr != u32::MAX && pr >= here && queued[pred as usize] == NONE {
+                    queued[pred as usize] = 1;
+                    next.push((pr, pred));
+                }
+            }
+        }
+    }
+
+    // Subsequent passes (only reached when a loop carries liveness around a back edge).
+    for pass in 1..=(count as u32) {
+        if next.is_empty() {
+            break;
+        }
+        std::mem::swap(&mut queue, &mut next);
+        while let Some((here, block_u32)) = queue.pop() {
+            let block = block_u32 as usize;
+            if queued[block] != pass {
+                continue;
+            }
+            queued[block] = NONE;
+            let Some(added) =
+                step(block, live, &mut scratch, &mut touched, &mut successors, &mut charge)
+            else {
+                return;
+            };
+            if added {
+                for &pred in &predecessors[block] {
+                    let pr = rpo[pred as usize];
+                    if pr == u32::MAX {
+                        continue;
+                    }
+                    let slot = &mut queued[pred as usize];
+                    if pr < here {
+                        if *slot != pass {
+                            *slot = pass;
+                            queue.push((pr, pred));
+                        }
+                    } else if *slot == NONE {
+                        *slot = pass + 1;
+                        next.push((pr, pred));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1559,7 +1951,14 @@ struct Solver<'a, 'db> {
     /// The enum each discriminant term is of, for messages.
     enums: HashMap<TermId, hir_def::EnumId, Global>,
     variants: Vec<EnumVariantId>,
+    variant_ids: HashMap<EnumVariantId, u32, Global>,
     models: HashMap<hir_def::FunctionId, Option<Model>, Global>,
+    /// Whether compound `fact_key` term `id` has been indexed into `fact_keys_by_unknown`.
+    registered_fact_key: Vec<bool>,
+    /// For each unknown `u`, the non-`Unknown`, non-`Lin` fact keys seen in `put` that mention `u`.
+    /// Lets `forget_dead_implications` test if any fact in `state` mentions `u` via `state.about`
+    /// without scanning `state.facts`.
+    fact_keys_by_unknown: HashMap<TermId, Vec<TermId>, Global>,
     /// The locals whose address a `&mut` or a raw pointer took.
     exposed: Vec<bool>,
     /// The same, as the slots' numbers in order: what [`Self::bump`] visits.
@@ -1599,12 +1998,16 @@ struct Solver<'a, 'db> {
     /// the order [`Self::solve`] walks them in, so a block is joined after every block before
     /// it on an acyclic path.
     rpo: Vec<u32>,
-    /// Per block, `live_words` words of bits: the locals that may still be read from its
-    /// entry ([`Self::liveness`]). Only these are worth what a join works out of a slot.
-    live: Vec<u64>,
+    /// Locals live everywhere (`_0`, parameters, exposed locals), kept apart from per-block
+    /// sparse liveness sets so liveness and dead-slot clearing never carry them per block.
+    always: Vec<u64>,
+    always_slots: Vec<usize>,
+    /// Per block, sparse nonzero words of non-`always` locals that may still be read from its
+    /// entry ([`Self::liveness`]). Only these (plus `always`) are worth what a join works out.
+    live: Vec<SparseBits>,
     live_words: usize,
-    /// Per block, `live_words` words of bits: the locals it writes ([`Self::liveness`]).
-    written: Vec<u64>,
+    /// Per block, sparse nonzero words of non-`always` locals it writes ([`Self::liveness`]).
+    written: Vec<SparseBits>,
     /// Each slot's value at the body's entry ([`Self::entry`]): what a slot no path reads
     /// any more holds ([`Self::clear_dead`]).
     entry_vals: Vec<TermId>,
@@ -1630,7 +2033,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             for target in terminator.kind.all_successors() {
                 let to = index(target);
                 graph.edge(from as u32, to as u32);
-                if !predecessors[to].contains(&(from as u32)) {
+                if predecessors[to].last() != Some(&(from as u32)) {
                     predecessors[to].push(from as u32);
                 }
             }
@@ -1661,7 +2064,10 @@ impl<'a, 'db> Solver<'a, 'db> {
             named: Vec::new(),
             enums: HashMap::new_in(Global),
             variants: Vec::new(), // alloc: the variants the body names, few
+            variant_ids: HashMap::new_in(Global),
             models: HashMap::new_in(Global),
+            registered_fact_key: Vec::new_in(Global),
+            fact_keys_by_unknown: HashMap::new_in(Global),
             exposed: Vec::new(),
             exposed_slots: Vec::new_in(Global),
             cyclic,
@@ -1681,6 +2087,8 @@ impl<'a, 'db> Solver<'a, 'db> {
             lin_bounds: Vec::new(), // alloc: the facts' linear bounds, once per proof
             local_tys: body.locals.iter().map(|(_, local)| local.ty.as_ref()).collect(),
             rpo: Vec::new_in(Global),
+            always: Vec::new_in(Global),
+            always_slots: Vec::new_in(Global),
             live: Vec::new_in(Global),
             live_words: body.locals.len().div_ceil(64),
             written: Vec::new_in(Global),
@@ -1703,21 +2111,7 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// every question answers "not shown", which is sound, and [`Self::solve`] stops. What is
     /// used never passes the bound.
     fn charge(&self, units: u64) -> bool {
-        let used = self.work.used.get().saturating_add(units);
-        #[cfg(test)]
-        if PLANT_UNBOUNDED_WORK.get() {
-            self.work.used.set(used);
-            return true;
-        }
-        if used <= self.work.bound {
-            self.work.used.set(used);
-            return true;
-        }
-        self.work.used.set(self.work.bound);
-        if self.work.stopped.get().is_none() {
-            self.work.stopped.set(Some(self.at.0));
-        }
-        false
+        self.work.charge(self.at.0, units)
     }
 
     /// Whether the proof ran out of work.
@@ -1782,11 +2176,37 @@ impl<'a, 'db> Solver<'a, 'db> {
         self.fact_keys(atom.b, &mut keys);
         keys.sort_unstable();
         keys.dedup();
+        for &key in &keys {
+            self.register_fact_key(key);
+        }
         // Each key a binary search and an insert into one chunk of at most [`CHUNK`] entries
         // ([`Sorted`]), and the lists' share of the first write after a copy.
         let _ = self.charge(2 * keys.len() as u64 + 2 + state.lists());
         state.marks |= self.marks[atom.a as usize] | self.marks[atom.b as usize];
         state.insert(atom, &keys);
+    }
+
+    /// Indexes a compound `fact_key` under each unknown it mentions, once per proof.
+    /// `Term::Unknown` is already looked up directly in `state.about`, and `Term::Lin` has
+    /// every part already indexed as a `fact_key`.
+    fn register_fact_key(&mut self, key: TermId) {
+        if self.registered_fact_key[key as usize] {
+            return;
+        }
+        self.registered_fact_key[key as usize] = true;
+        if matches!(self.terms[key as usize], Term::Const(_) | Term::Unknown(_) | Term::Lin(..)) {
+            return;
+        }
+        let mut us = smallvec::SmallVec::<[TermId; 4]>::new();
+        collect_unknowns(&self.terms, key, &mut us);
+        us.sort_unstable();
+        us.dedup();
+        for u in us {
+            self.fact_keys_by_unknown
+                .entry(u)
+                .or_insert_with(|| Vec::new_in(Global))
+                .push(key);
+        }
     }
 
     /// Puts `imp` into `state`, under the terms of its premise.
@@ -1825,6 +2245,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         self.terms.push(term.clone()); // clone: the table's copy and the map's key
         self.ranges.push(range);
         self.marks.push(mark);
+        self.registered_fact_key.push(false);
         self.ids.insert(term, id);
         id
     }
@@ -1918,13 +2339,13 @@ impl<'a, 'db> Solver<'a, 'db> {
     }
 
     fn variant(&mut self, variant: EnumVariantId) -> u32 {
-        match self.variants.iter().position(|&it| it == variant) {
-            Some(at) => at as u32,
-            None => {
-                self.variants.push(variant);
-                self.variants.len() as u32 - 1
-            }
+        if let Some(&id) = self.variant_ids.get(&variant) {
+            return id;
         }
+        let id = self.variants.len() as u32;
+        self.variants.push(variant);
+        self.variant_ids.insert(variant, id);
+        id
     }
 
     /// `a rel b` as a value: a constant when both are, else the comparison.
@@ -2705,106 +3126,163 @@ impl<'a, 'db> Solver<'a, 'db> {
         post
     }
 
-    /// Fills [`Self::live`] and [`Self::written`]: per block, the locals that may be read
-    /// from its entry on before a statement writes all of them (a statement or terminator
-    /// reads them, or writes part of them), and the locals the block writes. The parameters,
-    /// the return place and every exposed local are live everywhere. So a local not live at
-    /// a block is not read on any path from it before it is written whole: what a join would
-    /// work out of its slot is never asked, and [`Self::clear_dead`] gives its slot back its
-    /// entry value. A local's reads and whole writes are found once, in one backward scan of
-    /// each block; then each pass, in postorder, charges a unit per word per edge, carries
-    /// reads back along every forward edge, and the passes are at most one more than the back
-    /// edges on a path, and never more than the blocks.
+    /// Whether the local in `slot` is always live (`_0`, a parameter, or exposed).
+    fn is_always(&self, slot: usize) -> bool {
+        self.always.get(slot / 64).is_some_and(|&word| word & (1 << (slot % 64)) != 0)
+    }
+
+    /// Fills [`Self::always`], [`Self::always_slots`], [`Self::live`] and [`Self::written`]:
+    /// per block, sparse nonzero words of the non-always locals that may still be read from
+    /// its entry on before a statement writes all of them (a statement or terminator reads
+    /// them, or writes part of them), and the non-always locals the block writes. The
+    /// parameters, the return place and every exposed local are kept once in `always` and live
+    /// everywhere. A local's reads and whole writes are found once in one backward scan of
+    /// each block; then [`propagate_liveness`] runs in postorder passes (one pass on a DAG,
+    /// revisiting only blocks reached by a back edge whose successor grew), charging per
+    /// nonzero live word rather than `locals / 64`.
     fn liveness(&mut self, order: &[u32]) {
         let words = self.live_words;
         let count = self.blocks.len();
-        let zeros = |len: usize| {
-            let mut bits = Vec::with_capacity_in(len, Global);
-            bits.resize(len, 0u64);
-            bits
-        };
-        let mut always = zeros(words);
-        set_bit(&mut always, 0);
+        let locals = self.local_tys.len();
+        let mut always = Vec::with_capacity_in(words, Global);
+        always.resize(words, 0u64);
+        if locals > 0 {
+            set_bit(&mut always, 0);
+        }
         for &local in self.body.param_locals.iter() {
             set_bit(&mut always, local_index(local));
         }
         for &slot in &self.exposed_slots {
             set_bit(&mut always, slot as usize);
         }
-        // Each block's reads not after a whole write in it, its whole writes, and its writes.
-        let (mut uses, mut defs, mut written) = (zeros(count * words), zeros(count * words), zeros(count * words));
+        let mut always_slots = Vec::new_in(Global);
+        for (at, &word) in always.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let slot = at * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if slot < locals {
+                    always_slots.push(slot);
+                }
+            }
+        }
+        self.always = always;
+        self.always_slots = always_slots;
+
+        // Each block's reads not after a whole write in it (which becomes `live`), its whole
+        // writes, and its writes, all excluding `always`.
+        let mut live: Vec<SparseBits> = (0..count).map(|_| SparseBits::new()).collect();
+        let mut defs: Vec<SparseBits> = (0..count).map(|_| SparseBits::new()).collect();
+        let mut written: Vec<SparseBits> = (0..count).map(|_| SparseBits::new()).collect();
         let mut scanned = 0u64;
         for (block, data) in self.blocks.iter().enumerate() {
-            let range = block * words..(block + 1) * words;
-            let uses = &mut uses[range.clone()];
-            let defs = &mut defs[range.clone()];
-            let written = &mut written[range];
+            let uses = &mut live[block];
+            let def = &mut defs[block];
+            let writ = &mut written[block];
             if let Some(terminator) = &data.terminator {
-                terminator_reads(&terminator.kind, &mut |slot| set_bit(uses, slot));
-                terminator_writes(&terminator.kind, &mut |slot| set_bit(written, slot));
+                terminator_reads(&terminator.kind, &mut |slot| {
+                    if slot < locals && !self.is_always(slot) {
+                        uses.insert(slot);
+                    }
+                });
+                terminator_writes(&terminator.kind, &mut |slot| {
+                    if slot < locals && !self.is_always(slot) {
+                        writ.insert(slot);
+                    }
+                });
             }
             for statement in data.statements.iter().rev() {
                 scanned += 1;
-                if let Some(def) = statement_def(&statement.kind) {
-                    clear_bit(uses, def);
-                    set_bit(defs, def);
+                if let Some(slot) = statement_def(&statement.kind)
+                    && slot < locals
+                    && !self.is_always(slot)
+                {
+                    uses.remove(slot);
+                    def.insert(slot);
                 }
-                statement_reads(&statement.kind, &mut |slot| set_bit(uses, slot));
-                statement_writes(&statement.kind, &mut |slot| set_bit(written, slot));
+                statement_reads(&statement.kind, &mut |slot| {
+                    if slot < locals && !self.is_always(slot) {
+                        uses.insert(slot);
+                    }
+                });
+                statement_writes(&statement.kind, &mut |slot| {
+                    if slot < locals && !self.is_always(slot) {
+                        writ.insert(slot);
+                    }
+                });
             }
         }
-        let _ = self.charge(scanned + (count * words) as u64);
-        let mut live = zeros(count * words);
-        for block in 0..count {
-            for at in 0..words {
-                live[block * words + at] = uses[block * words + at] | always[at];
-            }
+        if !self.charge(scanned + count as u64 + words as u64) {
+            self.live = live;
+            self.written = written;
+            return;
         }
-        let mut out = zeros(words);
-        for _ in 0..=count {
-            let mut changed = false;
-            for &block in order.iter().rev() {
-                let block = block as usize;
-                let Some(terminator) = &self.blocks[block].terminator else { continue };
-                out.fill(0);
-                for target in terminator.kind.all_successors() {
-                    let _ = self.charge(words as u64);
-                    let target = index(target);
-                    for (word, &add) in out.iter_mut().zip(&live[target * words..(target + 1) * words]) {
-                        *word |= add;
+        let blocks = self.blocks;
+        let rpo = &self.rpo;
+        let predecessors = &self.predecessors;
+        let work = &self.work;
+        let at_block = self.at.0;
+        propagate_liveness(
+            words,
+            order,
+            rpo,
+            predecessors,
+            &defs,
+            &mut live,
+            |block, visit| {
+                if let Some(terminator) = &blocks[block].terminator {
+                    for target in terminator.kind.all_successors() {
+                        visit(index(target));
                     }
                 }
-                for at in 0..words {
-                    let here = block * words + at;
-                    let now = live[here] | uses[here] | (out[at] & !defs[here]) | always[at];
-                    changed |= now != live[here];
-                    live[here] = now;
-                }
-            }
-            // Out of work, [`Self::solve`] stops before any join reads it.
-            if !changed || self.spent() {
-                break;
-            }
-        }
+            },
+            |units| work.charge(at_block, units),
+        );
         self.live = live;
         self.written = written;
     }
 
     /// Gives back their entry values ([`Self::entry`]) to the slots of an edge's `state` from
     /// `block` to `target` that are not live at `target` and that the block may have changed
-    /// (live at its entry, or written in it). Nothing on a path from `target` reads them
-    /// before writing all of them, and every state at a block's entry then holds the entry
-    /// value in each slot not live there: paths that meet agree on what none of them reads, so
-    /// a join of many paths sees only what differs that matters. Each slot dies once on a
-    /// path, so this costs the body's writes, and a word per 64 locals per edge.
+    /// (live at its entry, or written in it). Always-live locals are live at `target` too and
+    /// never die. Costs only the sparse nonzero live/written words of `block` plus dead slots.
     fn clear_dead(&mut self, block: u32, target: u32, state: &mut State) {
-        let words = self.live_words;
-        let _ = self.charge(words as u64);
-        for at in 0..words {
-            let (here, there) = (block as usize * words + at, target as usize * words + at);
-            let mut dead = (self.live[here] | self.written[here]) & !self.live[there];
+        let live_here = &self.live[block as usize].words;
+        let written_here = &self.written[block as usize].words;
+        let live_there = &self.live[target as usize].words;
+        let _ = self.charge((live_here.len() + written_here.len()).max(1) as u64);
+        let (mut i, mut j, mut k) = (0, 0, 0);
+        while i < live_here.len() || j < written_here.len() {
+            let (word, bits) = match (live_here.get(i), written_here.get(j)) {
+                (Some(&(wa, ba)), Some(&(wb, bb))) if wa == wb => {
+                    i += 1;
+                    j += 1;
+                    (wa, ba | bb)
+                }
+                (Some(&(wa, ba)), Some(&(wb, _))) if wa < wb => {
+                    i += 1;
+                    (wa, ba)
+                }
+                (Some(&(wa, ba)), None) => {
+                    i += 1;
+                    (wa, ba)
+                }
+                (_, Some(&(wb, bb))) => {
+                    j += 1;
+                    (wb, bb)
+                }
+                (None, None) => break,
+            };
+            while k < live_there.len() && live_there[k].0 < word {
+                k += 1;
+            }
+            let kept = match live_there.get(k) {
+                Some(&(wt, bt)) if wt == word => bt,
+                _ => 0,
+            };
+            let mut dead = bits & !kept;
             while dead != 0 {
-                let slot = at * 64 + dead.trailing_zeros() as usize;
+                let slot = word as usize * 64 + dead.trailing_zeros() as usize;
                 dead &= dead - 1;
                 if let Some(&value) = self.entry_vals.get(slot) {
                     let _ = self.charge(1);
@@ -2820,16 +3298,23 @@ impl<'a, 'db> Solver<'a, 'db> {
         if slot >= self.local_tys.len() {
             return true;
         }
-        let word = self.live[block as usize * self.live_words + slot / 64];
-        word & (1 << (slot % 64)) != 0
+        self.is_always(slot) || self.live[block as usize].contains(slot)
     }
 
     fn entry(&mut self) -> State {
+        let start = index(self.body.start_block) as u32;
         let slots = self.epoch_slot() + 1;
+        // Dead-on-entry temporaries are never read before a whole write; sharing one sentinel
+        // term keeps `self.terms` from filling up with unreachable entry unknowns on wide bodies.
+        let dead = self.unknown(Key::Entry(u32::MAX), None);
         let mut vals = Vec::with_capacity_in(slots, Global);
         for slot in 0..slots {
-            let ty = self.local_ty(slot);
-            vals.push(self.unknown(Key::Entry(slot as u32), ty));
+            if self.live_at(start, slot) {
+                let ty = self.local_ty(slot);
+                vals.push(self.unknown(Key::Entry(slot as u32), ty));
+            } else {
+                vals.push(dead);
+            }
         }
         let state = State::new(Slots::new(&vals, &self.marks));
         self.entry_vals = vals;
@@ -3648,14 +4133,17 @@ impl<'a, 'db> Solver<'a, 'db> {
             return Some(std::mem::replace(&mut incoming[0], empty));
         }
         let before = self.joined[block as usize].len();
+        let cyclic = self.cyclic[block as usize];
         let mark = join_mark(block);
-        // The slots worth a look: where a path's value differs from the first's, and where the
-        // first's (so, when none differs, every path's) may mention this join's unknowns.
+        // The slots worth a look: where a path's value differs from the first's, and (on a
+        // cycle) where the first's may mention this join's unknowns from an earlier pass.
         let mut looked = Vec::new_in(Global);
         for other in incoming.iter().skip(1) {
             incoming[0].vals.diff(&other.vals, &mut |slot| looked.push(slot as u32));
         }
-        incoming[0].vals.marked(mark, &self.marks, &mut |slot| looked.push(slot as u32));
+        if cyclic {
+            incoming[0].vals.marked(mark, &self.marks, &mut |slot| looked.push(slot as u32));
+        }
         looked.sort_unstable();
         looked.dedup();
         let _ = self.charge(incoming.len() as u64 + looked.len() as u64);
@@ -3681,7 +4169,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                 let stale = |key: Key| {
                     matches!(key, Key::Join(at, of) if at == block && joined.binary_search(&of).is_ok())
                 };
-                let holds_stale = incoming.iter().any(|it| self.mentions(it.vals[slot], &stale));
+                let holds_stale =
+                    cyclic && incoming.iter().any(|it| self.mentions(it.vals[slot], &stale));
                 if !differ && !holds_stale {
                     continue;
                 }
@@ -3749,7 +4238,10 @@ impl<'a, 'db> Solver<'a, 'db> {
             for at in 0..incoming.len().min(4) {
                 let anchor = incoming[at].vals[slot];
                 let repeated = incoming[..at].iter().any(|it| it.vals[slot] == anchor);
-                if repeated || self.mentions(anchor, &made) || self.const_of(anchor).is_some() {
+                if repeated
+                    || (cyclic && self.mentions(anchor, &made))
+                    || self.const_of(anchor).is_some()
+                {
                     continue;
                 }
                 for below in [true, false] {
@@ -3769,20 +4261,22 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // What this join makes again is forgotten in each state first. Never cut short by the
         // work bound (a fact kept past what makes it true would be unsound): it is charged.
-        // Only a state whose marks have this join's bit can have one.
-        for state in incoming.iter_mut() {
-            if state.marks & mark == 0 {
-                continue;
+        // Only a cyclic block can receive a state mentioning its own join unknowns.
+        if cyclic {
+            for state in incoming.iter_mut() {
+                if state.marks & mark == 0 {
+                    continue;
+                }
+                let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
+                state.retain_facts(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
+                state.retain_imps(|(premise, then)| {
+                    ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, &made))
+                });
             }
-            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
-            state.retain_facts(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
-            state.retain_imps(|(premise, then)| {
-                ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, &made))
-            });
         }
         // The joined state starts from the path with the fewest facts, and keeps what every
-        // other path has: a look-up per fact it has, per other path. Its slots are every
-        // path's where none differs, and the joined slots are made again below.
+        // other path has, skipping chunks shared by pointer. Its slots are every path's where
+        // none differs, and the joined slots are made again below.
         let base = (0..incoming.len())
             .min_by_key(|&at| incoming[at].facts.len() + incoming[at].imps.len())
             .unwrap_or(0);
@@ -3792,9 +4286,8 @@ impl<'a, 'db> Solver<'a, 'db> {
             if at == base {
                 continue;
             }
-            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
-            state.retain_facts(|fact| other.has(fact));
-            state.retain_imps(|imp| other.has_imp(imp));
+            let work = state.intersect_facts(other) + state.intersect_imps(other);
+            let _ = self.charge(work);
         }
         // The joined slots' values, with the bounds every path gives them.
         let mut bounds = Vec::new(); // alloc: the joined slots' bounds, few
@@ -3864,38 +4357,54 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A joined `bool` keeps what each of its values meant on the paths that gave it (`a &&
         // b` is lowered to a temporary both arms write): what every path that can give the
         // value holds, once its own value is taken to be that, is implied by the value.
+        // Only facts absent from `state.facts` can become new implications; seed from the
+        // smallest feasible path's diff against `state.facts`, retain against the rest, and
+        // stop as soon as no common candidate remains.
+        let mut bool_order: Vec<usize> = Vec::new_in(Global);
         for &whole in wholes {
             let slot = whole as usize;
             let is_bool = self.local_ty(slot).is_some_and(|ty| ty.is_bool());
             if !is_bool || !self.live_at(block, slot) {
                 continue;
             }
+            if bool_order.is_empty() {
+                bool_order.extend(0..incoming.len());
+                if bool_order.len() > 2 {
+                    bool_order.sort_by_key(|&at| (incoming[at].facts.len(), at));
+                }
+            }
             let value = state.vals[slot];
             for case in [0, 1] {
                 let case = self.constant(case);
                 let mut common: Option<Vec<Atom>> = None;
-                for it in incoming.iter() {
+                for &at in &bool_order {
+                    let it = &incoming[at];
                     let _ = self.charge(it.size());
                     let mut given = it.clone(); // clone: the path with the value assumed
                     if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals[slot], case)) {
                         continue;
                     }
-                    let _ = self.charge(given.facts.len() as u64);
                     common = Some(match common {
                         None => {
-                            let mut all = Vec::with_capacity_in(given.facts.len(), Global);
-                            all.extend(given.facts.iter().copied());
+                            let mut all = Vec::new_in(Global);
+                            let work = given.facts.diff_into(&state.facts, &mut all);
+                            let _ = self.charge(work);
                             all
                         }
                         Some(mut have) => {
+                            let _ = self.charge(have.len() as u64);
                             have.retain(|fact| given.has(*fact));
                             have
                         }
                     });
+                    if common.as_ref().is_some_and(Vec::is_empty) {
+                        break;
+                    }
                 }
                 for fact in common.unwrap_or_default() {
-                    let stale = self.mentions(fact.a, &made) || self.mentions(fact.b, &made);
-                    if !stale && !state.has(fact) {
+                    let stale =
+                        cyclic && (self.mentions(fact.a, &made) || self.mentions(fact.b, &made));
+                    if !stale {
                         self.put_imp(&mut state, (Atom::new(Rel::Eq, value, case), fact));
                     }
                 }
@@ -3921,51 +4430,104 @@ impl<'a, 'db> Solver<'a, 'db> {
         let epoch = self.epoch_slot();
         // alloc: the unknowns still reachable, once per join
         let mut live: blaze_hash::HashSet<TermId, Global> = blaze_hash::HashSet::new_in(Global);
-        // Seed the same closure as `live_at`, without testing every temporary of every
-        // other arm. Padding bits are zero; the extra epoch slot is always live.
-        let start = block as usize * self.live_words;
-        if !self.charge((self.live_words + 1 + state.facts.len()) as u64) { return; }
-        for (at, &word) in self.live[start..start + self.live_words].iter().enumerate() {
-            let mut bits = word;
+        let live_words = &self.live[block as usize].words;
+        if !self.charge((self.always_slots.len() + live_words.len() + 1) as u64) {
+            return;
+        }
+        for &slot in &self.always_slots {
+            self.unknowns(state.vals[slot], &mut |it| {
+                live.insert(it);
+            });
+        }
+        for &(word, mut bits) in live_words {
             while bits != 0 {
-                let slot = at * 64 + bits.trailing_zeros() as usize;
+                let slot = word as usize * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if !self.charge(1) { return; }
-                self.unknowns(state.vals[slot], &mut |it| { live.insert(it); });
-            }
-        }
-        self.unknowns(state.vals[epoch], &mut |it| { live.insert(it); });
-        for fact in state.facts.iter() {
-            self.unknowns(fact.a, &mut |it| { live.insert(it); });
-            self.unknowns(fact.b, &mut |it| { live.insert(it); });
-        }
-        let reaches = |live: &blaze_hash::HashSet<TermId, Global>, atom: Atom| {
-            let (mut any, mut reached) = (false, false);
-            for side in [atom.a, atom.b] {
-                self.unknowns(side, &mut |it| {
-                    any = true;
-                    reached |= live.contains(&it);
+                if !self.charge(1) {
+                    return;
+                }
+                self.unknowns(state.vals[slot], &mut |it| {
+                    live.insert(it);
                 });
             }
-            reached || !any
-        };
+        }
+        self.unknowns(state.vals[epoch], &mut |it| {
+            live.insert(it);
+        });
+        // Check fact reachability only for unknowns named by an unkept premise, using
+        // `state.about` and the proof-wide `fact_keys_by_unknown` table instead of scanning
+        // every fact in `state.facts`.
+        let mut checked_fact: blaze_hash::HashSet<TermId, Global> =
+            blaze_hash::HashSet::new_in(Global);
+        let mut reached_by_live_or_facts =
+            |u: TermId, live: &mut blaze_hash::HashSet<TermId, Global>| -> bool {
+                if live.contains(&u) {
+                    return true;
+                }
+                if !checked_fact.insert(u) {
+                    return false;
+                }
+                if !self.charge(1) {
+                    return false;
+                }
+                let mut found = state.about.keyed(u).next().is_some();
+                if !found && let Some(keys) = self.fact_keys_by_unknown.get(&u) {
+                    for &k in keys {
+                        if !self.charge(1) {
+                            return false;
+                        }
+                        if state.about.keyed(k).next().is_some() {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    live.insert(u);
+                }
+                found
+            };
         let mut kept = vec![false; state.imps.len()]; // alloc: a flag per implication, once per join
+        let mut kept_count = 0usize;
         loop {
-            if !self.charge(state.imps.len() as u64) { return; }
+            if !self.charge(state.imps.len() as u64) {
+                return;
+            }
             let mut grew = false;
             for (at, imp) in state.imps.iter().enumerate() {
-                if kept[at] || !reaches(&live, imp.0) {
+                if kept[at] {
+                    continue;
+                }
+                let (mut any, mut reached) = (false, false);
+                for side in [imp.0.a, imp.0.b] {
+                    self.unknowns(side, &mut |it| {
+                        any = true;
+                        if !reached && reached_by_live_or_facts(it, &mut live) {
+                            reached = true;
+                        }
+                    });
+                }
+                if self.spent() {
+                    return;
+                }
+                if !reached && any {
                     continue;
                 }
                 kept[at] = true;
+                kept_count += 1;
                 grew = true;
                 for side in [imp.1.a, imp.1.b] {
-                    self.unknowns(side, &mut |it| { live.insert(it); });
+                    self.unknowns(side, &mut |it| {
+                        live.insert(it);
+                    });
                 }
             }
-            if !grew {
+            if !grew || kept_count == state.imps.len() {
                 break;
             }
+        }
+        if kept_count == state.imps.len() {
+            return;
         }
         let mut at = 0;
         state.retain_imps(|_| {
@@ -4038,6 +4600,9 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         self.rpo = rpo;
         self.liveness(&order);
+        if self.spent() {
+            return None;
+        }
         let mut entry = self.entry();
         // The parameters' invariants and the body's `requires`: none in a program that states
         // neither (docs/v2/plan/design/refined-values.md).
@@ -4295,6 +4860,29 @@ impl<'a, 'db> Solver<'a, 'db> {
             at = from;
         }
         "nothing before it rules out the path to it".to_owned() // alloc: a message
+    }
+}
+
+/// Appends every `Term::Unknown` inside `term` (without charging work; used once per distinct
+/// compound fact key to build `Solver::fact_keys_by_unknown`).
+fn collect_unknowns(terms: &[Term], term: TermId, out: &mut smallvec::SmallVec<[TermId; 4]>) {
+    match &terms[term as usize] {
+        Term::Const(_) => {}
+        Term::Unknown(_) => out.push(term),
+        Term::Len(a)
+        | Term::Discr(a)
+        | Term::Field(a, _)
+        | Term::Payload(a, _, _)
+        | Term::Not(a)
+        | Term::RefTo(a)
+        | Term::Deref(a)
+        | Term::Wrap(a, _) => collect_unknowns(terms, *a, out),
+        Term::Cmp(_, a, b) | Term::DerefAt(a, b) | Term::MutRef(_, a, b) => {
+            collect_unknowns(terms, *a, out);
+            collect_unknowns(terms, *b, out);
+        }
+        Term::Agg(_, fields) => fields.iter().for_each(|&it| collect_unknowns(terms, it, out)),
+        Term::Lin(parts, _) => parts.iter().for_each(|&(it, _)| collect_unknowns(terms, it, out)),
     }
 }
 

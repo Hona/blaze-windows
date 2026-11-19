@@ -86,10 +86,12 @@ fn note_named(names: &[String]) {
 static PATHS: blaze_core::lock::Lock<Noted> =
     blaze_core::lock::Lock::new("serve.unit.reads.paths", (Vec::new(), Vec::new(), None));
 
-/// `path` kept in `sorted`, once.
+/// `path` kept in `sorted`, once, converted to its host path when it is a Windows daemon name
+/// (`/C:/...` -> `C:\...`) so no-op watchers and request certificates compare host paths.
 fn note_path(sorted: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
-    if let Err(at) = sorted.binary_search_by(|it| it.as_path().cmp(path)) {
-        sorted.insert(at, path.to_owned()); // alloc: a path, once for the process's life
+    let host = blaze_core::platform::path::host_if_daemon(path);
+    if let Err(at) = sorted.binary_search_by(|it| it.as_path().cmp(host.as_ref())) {
+        sorted.insert(at, host.into_owned()); // alloc: a path, once for the process's life
     }
 }
 

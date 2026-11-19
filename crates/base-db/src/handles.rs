@@ -356,10 +356,8 @@ impl IncludedFile {
         path: &std::path::Path,
         looks: &Looks,
     ) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        #[cfg(windows)]
-        let on_host = path.to_str().map(blaze_core::platform::path::host);
-        #[cfg(windows)]
-        let path = on_host.as_deref().unwrap_or(path);
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
+        let path = on_host.as_ref();
         let looked_ns = blaze_core::system_wall_ns();
         let stamp = blaze_vfs::outside::stat(path);
         let read = std::fs::read(path);
@@ -395,10 +393,8 @@ impl IncludedFile {
     /// every real project. Every ask pushes its look to `looks` with the stamp, answered from
     /// memory or not, so a build's list is the same whatever was remembered.
     pub fn content_now(path: &std::path::Path, looks: &Looks) -> ContentId {
-        #[cfg(windows)]
-        let on_host = path.to_str().map(blaze_core::platform::path::host);
-        #[cfg(windows)]
-        let path = on_host.as_deref().unwrap_or(path);
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
+        let path = on_host.as_ref();
         let kept = KEPT.lock().get(path).copied();
         if let Some(Kept::Held(id)) = kept
             && !LOOKS_EVERY_TIME.get()
@@ -441,11 +437,8 @@ impl IncludedFile {
     /// of reth), their directory hearing blaze's own restore of them, so no watch vouched and
     /// the build was never answered again without a walk.
     pub fn hold(path: &std::path::Path, content: ContentId) {
-        #[cfg(windows)]
-        let on_host = path.to_str().map(blaze_core::platform::path::host);
-        #[cfg(windows)]
-        let path = on_host.as_deref().unwrap_or(path);
-        KEPT.lock().insert(path.to_path_buf(), Kept::Held(content));
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
+        KEPT.lock().insert(on_host.into_owned(), Kept::Held(content));
     }
 
     /// The bytes, or why they could not be read. Takes the [`Db`]: a read outside the VFS is

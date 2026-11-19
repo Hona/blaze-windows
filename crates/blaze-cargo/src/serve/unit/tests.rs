@@ -82,14 +82,13 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
 /// The directories of the builds these tests lower ([`super::portable::Places`]): the
 /// workspace at `/w`, its build directory in it, the daemon's own under `/s`.
 fn test_places() -> super::portable::Places {
-    use std::path::Path;
-    super::portable::Places::new(
-        "/w",
-        "/w/target",
-        "/s/std",
-        Path::new("/s/tools"),
-        Path::new("/s/blaze"),
-        Path::new("/s/sources"),
+    super::portable::Places::of_daemon(
+        Some("/w"),
+        Some("/w/target"),
+        Some("/s/std"),
+        Some("/s/tools"),
+        Some("/s/blaze"),
+        Some("/s/sources"),
     )
 }
 
@@ -595,6 +594,42 @@ fn an_msvc_cdylib_is_one_image_and_its_import_library_is_beside_it() {
         .filter(|it| artifact::listed(it) && it.starts_with(deps) && !it.ends_with(".pdb"))
         .collect();
     assert_eq!(control.len(), 2, "the control: the DLL and its import library both images");
+
+    // New unhashed layout (build/<pkg>/<hash>/out -> target/debug): cdylib+rlib plans one
+    // DLL image plus the rlib, its import library is uplifted alongside it, and `.dll.pdb`
+    // and `.dll.exp` stay out of `made` and `filenames`.
+    let out = "/w/build/debug/build/luau-panel/0123/out";
+    let new_outputs = [
+        format!("{out}/luau_panel.dll"),
+        "/w/target/debug/luau_panel.dll".to_owned(),
+        format!("{out}/luau_panel.dll.lib"),
+        "/w/target/debug/luau_panel.dll.lib".to_owned(),
+        format!("{out}/luau_panel.dll.exp"),
+        "/w/target/debug/luau_panel.dll.exp".to_owned(),
+        format!("{out}/luau_panel.dll.pdb"),
+        "/w/target/debug/luau_panel.dll.pdb".to_owned(),
+        format!("{out}/libluau_panel.rlib"),
+        format!("{out}/luau_panel.d"),
+        "/w/target/debug/luau_panel.dll.d".to_owned(),
+    ];
+    let new_plan = plan("", &new_outputs.iter().map(String::as_str).collect::<Vec<_>>());
+    let new_dll = format!("{out}/luau_panel.dll");
+    let new_rlib = format!("{out}/libluau_panel.rlib");
+    assert_eq!(artifact::made(&new_plan), [new_dll.as_str(), new_rlib.as_str()]);
+    assert_eq!(artifact::import_library(&new_dll, &new_plan), Some(format!("{new_dll}.lib").as_str()));
+    assert_eq!(
+        artifact::uplifted(&format!("{new_dll}.lib"), &new_plan),
+        Some("/w/target/debug/luau_panel.dll.lib")
+    );
+    let panel = unit(P, target("luau_panel", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    assert_eq!(
+        artifact::filenames(&panel, &new_plan),
+        [
+            "/w/target/debug/luau_panel.dll",
+            "/w/target/debug/luau_panel.dll.lib",
+            new_rlib.as_str(),
+        ]
+    );
 }
 
 #[test]
@@ -1485,6 +1520,33 @@ fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
     );
     let module = b"\0asm\x01\0\0\0".to_vec();
     assert_eq!(compile::module_at(path, module.clone()), Ok(module));
+}
+
+/// MIR is let go on a write only past the `mir` cap, and never where no cap is set (Linux,
+/// macOS): 1 GiB holds about 175,000 values at 6 KiB each.
+#[test]
+fn mir_goes_on_a_write_only_past_its_cap() {
+    assert!(!super::mir_past_cap(10_000_000, u64::MAX), "no cap: never");
+    assert!(!super::mir_past_cap(170_000, 1 << 30));
+    assert!(super::mir_past_cap(180_000, 1 << 30));
+    assert!(!super::mir_past_cap(0, 0), "nothing held is never past");
+}
+
+/// Mid-build, a write lets go of each finished dependency crate once and never of a workspace
+/// member's: the member's inference is the next edit's. Control: a selection that ignores
+/// `released` lets one crate go twice.
+#[test]
+fn a_finished_dependency_is_released_once_and_a_member_never_mid_build() {
+    let local = |krate: &u32| *krate >= 100;
+    let mut released = Vec::new();
+    assert_eq!(super::newly(vec![3, 1, 100], local, &mut released), [1, 3]);
+    assert_eq!(super::newly(vec![3, 1, 2, 100, 101], local, &mut released), [2], "1 and 3 went already");
+    assert_eq!(released, [1, 2, 3]);
+    assert!(super::newly(vec![1, 2, 3], local, &mut released).is_empty());
+    let mut ignoring = Vec::new();
+    let twice = |finished: Vec<u32>, _: &mut Vec<u32>| finished.into_iter().filter(|it| !local(it)).collect::<Vec<_>>();
+    let first = twice(vec![1], &mut ignoring);
+    assert_eq!(first, twice(vec![1], &mut ignoring), "the control lets go of crate 1 at every write");
 }
 
 /// A front end held on the loop whose drop panics (a storage with a table it can't walk) lets

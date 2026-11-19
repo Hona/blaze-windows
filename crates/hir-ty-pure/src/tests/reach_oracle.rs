@@ -295,7 +295,9 @@ fn dispatch_source(arms: usize) -> String {
 
 #[test]
 fn a_wide_dispatch_proof_scales() {
-    for arms in [20usize, 40, 80, 160, 320] {
+    let mut prev: Option<(usize, u64, u64)> = None;
+    let mut at_40: Option<(u64, u64)> = None;
+    for arms in [20usize, 40, 80, 160, 320, 640] {
         let source = dispatch_source(arms);
         let db = fixture::db(&source).into_db();
         let krate = crate_named(&db, "kernel");
@@ -307,13 +309,50 @@ fn a_wide_dispatch_proof_scales() {
             let start = std::time::Instant::now();
             let reach = reach::of_body(&db, def);
             let visits = reach::PROOF_VISITS.get();
-            eprintln!("{arms} arms, {blocks} blocks, {} locals, {} steps: {visits} visits, work {}/{}, stopped {:?}, {:?}", body.locals.len(), reach.steps, reach.work, reach.bound, reach.stopped, start.elapsed());
-            assert_eq!(reach.refused, None);
+            eprintln!(
+                "{arms} arms, {blocks} blocks, {} locals, {} steps: {visits} visits, work {}/{}, stopped {:?}, {:?}",
+                body.locals.len(),
+                reach.steps,
+                reach.work,
+                reach.bound,
+                reach.stopped,
+                start.elapsed()
+            );
+            assert_eq!(reach.refused, None, "{arms} arms refused: {:?}", reach.refusal());
             assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
             // A path carries one exclusion per preceding arm. None is a transitive or
             // linear premise; each question should inspect only a bounded number of facts.
             // Counts fact inspections and endpoint lookups, not allocations or wall time.
             assert!(visits <= 80 * blocks as u64, "{blocks} blocks, {visits} visits");
+            // Near-linear work growth: doubling the arms raises work per step by at most 5/4
+            // (matches `reach_work::work_grows_near_linearly_with_the_body`), and a 16x span
+            // (40 -> 640 arms) raises work per step by at most 3/2.
+            if arms == 40 {
+                at_40 = Some((reach.steps, reach.work));
+            }
+            if let Some((prev_arms, prev_steps, prev_work)) = prev
+                && prev_arms >= 40
+            {
+                assert!(
+                    4 * reach.work * prev_steps <= 5 * prev_work * reach.steps,
+                    "work/step grew faster than 5/4 from {prev_arms} to {arms} arms: \
+                     {prev_work}/{prev_steps} -> {}/{}",
+                    reach.work,
+                    reach.steps,
+                );
+            }
+            if arms == 640
+                && let Some((steps_40, work_40)) = at_40
+            {
+                assert!(
+                    2 * reach.work * steps_40 <= 3 * work_40 * reach.steps,
+                    "work/step grew faster than 3/2 from 40 to 640 arms: \
+                     {work_40}/{steps_40} -> {}/{}",
+                    reach.work,
+                    reach.steps,
+                );
+            }
+            prev = Some((arms, reach.steps, reach.work));
         });
     }
 }

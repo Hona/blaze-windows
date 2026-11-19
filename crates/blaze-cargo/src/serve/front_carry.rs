@@ -1790,10 +1790,6 @@ pub(crate) mod bodies {
         };
         let mut did = Did::default();
         for it in &claim.refused {
-            #[cfg(test)]
-            if did.refused == 0 {
-                eprintln!("first body record refused: {:?} {:?}: {}", it.def, it.step, it.why);
-            }
             did.refused += 1;
             #[cfg(test)]
             refused_for_test(&it.why, format_args!("{:?} of {:?}", it.step, it.def));

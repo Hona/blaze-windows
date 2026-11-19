@@ -172,9 +172,10 @@ fn answered(db: &Db, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, 
             SubResponse::SpanParentResult { parent_span }
         }
         // Two spans of one file, of different items (the caller joins spans of one anchor
-        // itself): the span from where the first starts to where the second ends, both
-        // resolved to the file, as rustc's `Span::join` gives it. Spans of other contexts join
-        // to the first, as they do under one anchor.
+        // itself): the span from where the first starts to where the second ends, anchored to
+        // whichever input item starts earlier so the output keeps an input anchor (rather than
+        // re-anchoring to `ROOT_ERASED_FILE_AST_ID`, which prevents encoding against the call's
+        // anchors). Spans of other contexts join to the first, as they do under one anchor.
         SubRequest::SpanJoin {
             file_id,
             ast_id_first,
@@ -188,20 +189,34 @@ fn answered(db: &Db, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, 
         } => {
             context(db, contexts, ctx_first)?;
             context(db, contexts, ctx_second)?;
-            let first = resolve(db, file_id, ast_id_first, range(start_first, end_first)?)?;
-            let second = resolve(db, file_id, ast_id_second, range(start_second, end_second)?)?;
-            let range = match ctx_first == ctx_second {
-                true => first.range.cover(second.range),
-                false => first.range,
-            };
-            SubResponse::SpanJoinResult {
-                span: Some(SpanJoin {
-                    ast_id: ROOT_ERASED_FILE_AST_ID.into_raw(),
-                    start: u32::from(range.start()),
-                    end: u32::from(range.end()),
+            let first_range = range(start_first, end_first)?;
+            let second_range = range(start_second, end_second)?;
+            let (_, _, at_first) = anchor(db, file_id, ast_id_first)?;
+            let (_, _, at_second) = anchor(db, file_id, ast_id_second)?;
+            let abs_first = within(first_range, at_first, file_id)?;
+            let abs_second = within(second_range, at_second, file_id)?;
+            let joined = if ctx_first != ctx_second {
+                SpanJoin {
+                    ast_id: ast_id_first,
+                    start: start_first,
+                    end: end_first,
                     ctx: ctx_first,
-                }),
-            }
+                }
+            } else {
+                let covered = abs_first.cover(abs_second);
+                let (ast_id, base) = if abs_first.start() <= abs_second.start() {
+                    (ast_id_first, at_first)
+                } else {
+                    (ast_id_second, at_second)
+                };
+                SpanJoin {
+                    ast_id,
+                    start: u32::from(covered.start() - base),
+                    end: u32::from(covered.end() - base),
+                    ctx: ctx_first,
+                }
+            };
+            SubResponse::SpanJoinResult { span: Some(joined) }
         }
     })
 }

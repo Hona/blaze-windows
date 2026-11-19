@@ -4225,6 +4225,27 @@ impl Store {
         tag
     }
 
+    /// On a volume without block sharing, publish an edited output by writing a fresh sparse
+    /// file beside `to` and renaming it into place instead of taking exclusive custody of `to`
+    /// ([`Store::place_edit`]). Records `how = "ntfs rename"` on the place's span so profiles
+    /// distinguish this route from first-build whole writes and exclusive-custody patches, and
+    /// vouches the renamed file's stamp.
+    pub fn place_edit_rename(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+        assert!(
+            !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
+            "{to} is in the store: values are placed outside it"
+        );
+        self.tidy();
+        let tag = self.tags.fresh();
+        let span = Self::place_span(&to);
+        span.record("how", "ntfs rename");
+        self.place_spans.insert(tag, span);
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
+        self.write_runs(tag, to, file, publish::Base::Holes, false, 0, effects);
+        self.names_step(effects);
+        tag
+    }
+
     /// On a volume without block sharing, publish by exclusive custody when the bytes
     /// prove the base; otherwise start a new generation. `whole` is the independent
     /// witness from the linker, not bytes read from the destination.

@@ -51,6 +51,7 @@ use hir_ty::check_cache::port;
 use super::*;
 
 pub(crate) mod plan;
+pub(crate) mod traced;
 
 /// The domain of a describe record's inputs, and of its schema.
 const DOMAIN: &str = "blaze v2 describe record 1";
@@ -199,7 +200,7 @@ pub(super) fn found_in(slot: &mut FoundSlot, db: &Db) -> Arc<Found> {
 /// The crates an instance worked out in `home` may name: `home` and what it depends on,
 /// whose content `home`'s image key covers.
 #[derive(Clone, Copy)]
-struct Closure<'db> {
+pub(super) struct Closure<'db> {
     db: &'db Db,
     crates: &'db [Crate],
 }
@@ -560,19 +561,17 @@ fn ask_read(db: &Db, bytes: &[u8]) -> R<(HirInstance, Origin)> {
 }
 
 impl<'db> HirFrontend<'db> {
-    /// What a record key holds of this front end: its producer, and its [`Stage`] with
-    /// whether the build links an image and is build-time code. `None` for a front end whose
-    /// describes are no records: one made with no policy, one keyed by the tests' hashes
-    /// (ids of a database), and one whose bodies are walked against a program's dyn facts
-    /// (its describes are of that program, [`Facing::world`]).
-    fn record_stage(&self) -> Option<(ContentId, ContentId)> {
+    /// What a record key holds of this front end, regardless of whether a closed devirt world
+    /// is active: `describe_recorded_in` checks `Described::takes_world` on a hit so that
+    /// non-devirtualized functions reuse their `world = None` records across devirt round 2.
+    pub(super) fn record_stage_for_trace(&self) -> Option<(ContentId, ContentId)> {
         let stage = self.stage?;
         let by_content = match &self.hashes {
             HashSource::Items(_) => true,
             #[cfg(test)]
             HashSource::ById(_) => false,
         };
-        if !by_content || self.devirt.world().is_some() {
+        if !by_content {
             return None;
         }
         let mut hasher = Hasher::new(STAGE_DOMAIN);
@@ -580,16 +579,50 @@ impl<'db> HirFrontend<'db> {
         Some((stage.toolchain, hasher.finish()))
     }
 
+    /// What a record key holds of this front end: its producer, and its [`Stage`] with
+    /// whether the build links an image and is build-time code. `None` for a front end whose
+    /// describes are no records: one made with no policy, one keyed by the tests' hashes
+    /// (ids of a database), and one whose bodies are walked against a program's dyn facts
+    /// (its describes are of that program, [`Facing::world`]).
+    fn record_stage(&self) -> Option<(ContentId, ContentId)> {
+        if self.devirt.world().is_some() {
+            return None;
+        }
+        self.record_stage_for_trace()
+    }
+
     /// The image key of the home of `instance`, and the crates it may name; `None` for an
-    /// instance with no home read from an image, or worked out in an environment that is not
-    /// empty.
+    /// instance whose home crate is not sealed (`hir_def::deps::sealed`: workspace crates and
+    /// crates above them have image keys that hash dependency `surface`s, which exclude
+    /// `#[inline]` bodies, so they use traced describe records in [`traced`] instead), has no
+    /// image, or is worked out in an environment that is not empty.
     fn sealed(db: &'db Db, instance: &HirInstance) -> Option<(ContentId, Closure<'db>)> {
         let Kind::Code(_, env) = &instance.0 else { return None };
         if env.param_env(db) != ParamEnv::empty() {
             return None;
         }
+        if !hir_def::deps::sealed(db, env.krate) {
+            return None;
+        }
         let image = hir_def::deps::image_of(db, env.krate).as_ref()?.key();
         Some((image, Closure::of(db, env.krate)))
+    }
+
+    /// What a describe of `instance` for `requester` is read under ([`Under`]) and its
+    /// producer; `None` where it has no single-key sealed record.
+    fn under_with_stage(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        stage: Option<(ContentId, ContentId)>,
+    ) -> Option<(ContentId, Under, Closure<'db>)> {
+        let (producer, stage) = stage?;
+        let (image, closure) = Self::sealed(db, instance)?;
+        let mut asked = Hasher::new(STAGE_DOMAIN);
+        asked.id(&stage);
+        self.units.as_ref()?.asked_as(requester, &mut asked)?;
+        Some((producer, Under { image, asked: asked.finish() }, closure))
     }
 
     /// What a describe of `instance` for `requester` is read under ([`Under`]) and its
@@ -600,12 +633,25 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Option<(ContentId, Under, Closure<'db>)> {
-        let (producer, stage) = self.record_stage()?;
-        let (image, closure) = Self::sealed(db, instance)?;
-        let mut asked = Hasher::new(STAGE_DOMAIN);
-        asked.id(&stage);
-        self.units.as_ref()?.asked_as(requester, &mut asked)?;
-        Some((producer, Under { image, asked: asked.finish() }, closure))
+        self.under_with_stage(db, instance, requester, self.record_stage())
+    }
+
+    fn sealed_key_with_stage(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        stage: Option<(ContentId, ContentId)>,
+    ) -> Option<(Key, Under, Closure<'db>)> {
+        let (producer, under, closure) = self.under_with_stage(db, instance, requester, stage)?;
+        let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
+        // alloc: once per key, the instance's few words
+        let mut named = Vec::with_capacity(64);
+        put_instance(&closure, &mut writer, &mut named, instance)?;
+        let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
+        let mut inputs = Hasher::new(DOMAIN);
+        inputs.id(&under.asked).id(&under.image).part(&named).part(&ported);
+        Some((Key::of(SCHEMA, producer, &[inputs.finish()]), under, closure))
     }
 
     /// [`Frontend::record_key`], given the database.
@@ -615,15 +661,7 @@ impl<'db> HirFrontend<'db> {
         instance: &HirInstance,
         requester: &Origin,
     ) -> Option<Key> {
-        let (producer, under, closure) = self.under(db, instance, requester)?;
-        let mut writer = port::Writer::new(db, DbInterner::new_no_crate(db));
-        // alloc: once per key, the instance's few words
-        let mut named = Vec::with_capacity(64);
-        put_instance(&closure, &mut writer, &mut named, instance)?;
-        let ported = writer.finish(&mut |item| closure.name(item)).ok()?;
-        let mut inputs = Hasher::new(DOMAIN);
-        inputs.id(&under.asked).id(&under.image).part(&named).part(&ported);
-        Some(Key::of(SCHEMA, producer, &[inputs.finish()]))
+        self.sealed_key_with_stage(db, instance, requester, self.record_stage()).map(|it| it.0)
     }
 
     /// What the build calls the files of `instance`'s home crate and of each crate it loads:
@@ -725,7 +763,9 @@ impl<'db> HirFrontend<'db> {
     pub fn static_naming_of(&self, value: &HirStatic) -> Option<ContentId> {
         self.with(|db| self.naming_over(db, value.0.krate(db).transitive_deps(db)))
     }
+}
 
+impl<'db> HirFrontend<'db> {
     /// [`Frontend::to_record`], given the database.
     pub(super) fn to_record_in(
         &self,
@@ -754,7 +794,7 @@ impl<'db> HirFrontend<'db> {
 /// requester's (tag 0). `None` for a describe with no portable form: a reference outside
 /// `closure`, a list past `u32::MAX`. One encoder, which the describe record and the plan
 /// record ([`plan`]) both write.
-fn encode_described<'db>(
+pub(super) fn encode_described<'db>(
     db: &'db Db,
     closure: &Closure<'db>,
     own: Option<&Origin>,
@@ -1078,7 +1118,7 @@ impl<'r> Head<'r> {
 /// says the recursion limit reads of each function it refers to. An `Err` names why it does
 /// not read: an item `db` has none of, bytes cut short or left over. Never a panic: the bytes
 /// are a store's.
-fn decode_described(
+pub(super) fn decode_described(
     db: &Db,
     requester: &Origin,
     record: &[u8],
@@ -1134,6 +1174,80 @@ impl<'db> HirFrontend<'db> {
         // clone: the map's key, once per record read
         found.records.pin().insert((instance.clone(), *requester), under);
         Ok(described)
+    }
+
+    /// [`Frontend::describe_recorded`], given the database: sealed crates use the single-key
+    /// record path; unsealed crates use [`traced::describe_recorded`] which captures and
+    /// validates every dependency read by `code_walk` and `described`.
+    pub(super) fn describe_recorded_in(
+        &self,
+        db: &'db Db,
+        instance: &HirInstance,
+        requester: &Origin,
+        // dyn: the store's verified reader
+        records: &dyn blaze_codegen::driver::Records,
+        puts: &mut Vec<blaze_codegen::driver::Put>,
+    ) -> Result<(Described<HirInstance, HirStatic>, bool), CodegenError> {
+        let world_active = self.devirt.world().is_some();
+        if let Some((key, under, closure)) =
+            self.sealed_key_with_stage(db, instance, requester, self.record_stage_for_trace())
+        {
+            let unread = |why: String| {
+                undescribed(
+                    db,
+                    &crate::v2::Named(db, instance),
+                    None,
+                    // alloc: error path
+                    format!(
+                        "the record of the describe of `{}` under the store key {:x} does not read: \
+                         {why}",
+                        spelled(db, &instance.0),
+                        key.0
+                    ),
+                )
+            };
+            let found_table = self.found.as_ref();
+            let mut decoded = None;
+            let had = records
+                .read(&key, &mut |bytes| {
+                    decoded = Some(decode_described(db, requester, bytes, |callee, counted| {
+                        if let Some(found) = found_table {
+                            found.counted.pin().insert(callee.clone(), counted);
+                        }
+                    }));
+                })
+                .map_err(unread)?;
+            if let (true, Some(read)) = (had, decoded) {
+                let desc = read.map_err(unread)?;
+                if !(world_active && desc.takes_world) {
+                    if let Some(found) = found_table {
+                        found.records.pin().insert((instance.clone(), *requester), under);
+                    }
+                    return Ok((desc, true));
+                }
+                // `world_active && desc.takes_world`: must describe live against the closed world.
+                return self.described_now(db, instance, requester).map(|it| (it, false));
+            }
+            let now = self.described_now(db, instance, requester)?;
+            if !(world_active && now.takes_world) {
+                let own = match crate_of(db, &instance.0) {
+                    Some(krate) if !user_compiled(db, &instance.0) => Some(self.origin(db, krate)),
+                    _ => None,
+                };
+                if now.origin == own.unwrap_or(*requester)
+                    && let Some(bytes) = encode_described(db, &closure, own.as_ref(), &now)
+                {
+                    puts.push(blaze_codegen::driver::Put {
+                        key,
+                        kind: blaze_codegen::driver::RECORD_KIND,
+                        bytes,
+                        of: None,
+                    });
+                }
+            }
+            return Ok((now, false));
+        }
+        traced::describe_recorded(self, db, instance, requester, records, puts)
     }
 
     /// Whether the describe of `instance` for `requester` was read from a record in this

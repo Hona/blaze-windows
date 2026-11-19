@@ -347,6 +347,8 @@ pub struct Setup {
     /// The daemon's two stores as its tasks read them, with no pool: each read is one direct
     /// read into the reading task's frame ([`super::direct`]). Every job's input lends it.
     pub stores: Arc<super::direct::Stores>,
+    /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
+    pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
 }
 
 /// Every fetch of a batch that failed (`failed`, places in `fetches`), as one error: each
@@ -2148,10 +2150,14 @@ struct Paths<S: Steps> {
     /// file is still so is not placed again.
     placed: Vec<Option<Placement>>,
     /// The image kept linked there: moved into the compile that relinks it and back once it
-    /// ends ([`Image`]). Nothing lets one go for memory: the kernel's limit is the ceiling.
+    /// ends ([`Image`]).
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
+    /// Non-incremental kept image path ids (fetched build scripts, compact links), oldest first,
+    /// capped at [`Self::MAX_COMPACT_KEPT`] so large workspaces with dozens of build scripts do
+    /// not hold dozens of 448-region linker images forever while small builds keep build-id reuse.
+    compact: std::collections::VecDeque<u32>,
     /// The images a unit links beside its planned outputs (a library's doctests, each its own
     /// program, under its runner's `.doctests` directory), by the unit's first output: taken
     /// with that output's, so an edit relinks the one example it changed.
@@ -2162,6 +2168,9 @@ struct Paths<S: Steps> {
 }
 
 impl<S: Steps> Paths<S> {
+    /// Most non-incremental (compact build-script) linker images kept at once.
+    const MAX_COMPACT_KEPT: usize = 8;
+
     fn new() -> Paths<S> {
         Paths {
             ids: HashMap::new_in(Global),
@@ -2170,6 +2179,7 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
+            compact: std::collections::VecDeque::new(), // alloc: none until a compact image is kept
             extras: HashMap::new_in(Global),
             back: Arc::new(SegQueue::new()), // alloc: once for the daemon's life
         }
@@ -2265,10 +2275,56 @@ impl<S: Steps> Paths<S> {
                 extras.push(id);
             }
         }
+        let slot_id = id;
+        let incremental = image.kept.incremental();
         let id = id as usize;
         if self.images[id].replace(image).is_none() {
             self.kept += 1;
         }
+        if !incremental {
+            self.compact.retain(|&it| it != slot_id);
+            self.compact.push_back(slot_id);
+            while self.compact.len() > Self::MAX_COMPACT_KEPT {
+                let Some(old) = self.compact.pop_front() else { break };
+                if let Some(existing) = self.images.get_mut(old as usize)
+                    && existing.as_ref().is_some_and(|it| !it.kept.live() && !it.kept.incremental())
+                {
+                    *existing = None;
+                    self.kept -= 1;
+                }
+            }
+        }
+    }
+
+    /// Number of kept linker images and their summed `Kept::held()` bytes.
+    fn kept_summary(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for image in self.images.iter().flatten() {
+            count += 1;
+            bytes = bytes.saturating_add(image.kept.held());
+        }
+        (count, bytes)
+    }
+
+    /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
+    /// Used under memory pressure: the next link lays the image out from scratch.
+    fn evict_images(&mut self) -> (usize, u64) {
+        while let Some(image) = self.back.pop() {
+            self.keep_one(&[], image);
+        }
+        let mut dropped = 0usize;
+        let mut bytes = 0u64;
+        for slot in &mut self.images {
+            if slot.as_ref().is_some_and(|it| !it.kept.live()) {
+                let gone = slot.take().expect("checked is_some_and");
+                self.kept = self.kept.saturating_sub(1);
+                dropped += 1;
+                bytes = bytes.saturating_add(gone.kept.held());
+            }
+        }
+        self.compact.retain(|&id| self.images.get(id as usize).is_some_and(Option::is_some));
+        (dropped, bytes)
     }
 }
 
@@ -4629,7 +4685,13 @@ enum Own {
     /// The file at a path looked at before a link's patch of it is placed there
     /// ([`Jobs::patching`]): the patch is written over a clone of it where it is as it was
     /// placed, and the whole file is written where it is not.
-    LookBase { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
+    LookBase {
+        job: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        destination: Option<blaze_core::Sharing>,
+    },
     /// A file placed, looked at for its [`Placement`] before its job is done: a file changed
     /// after the job's `Done` must not be recorded as the one placed.
     Record { job: JobId, path: u32, key: blaze_cas::Key },
@@ -6290,6 +6352,65 @@ impl<S: Steps> Jobs<S> {
             // alloc: a refused task, once
             None => w.plane.refuse(w.now, task, "its job has no front end to read now".to_owned()),
         }
+    }
+
+    /// Number of kept linker images and their summed held bytes.
+    pub fn kept_images_summary(&self) -> (usize, u64) {
+        self.paths.kept_summary()
+    }
+
+    /// Drops every kept linker image that no live dev-run maps, returning `(dropped, bytes)`.
+    pub fn evict_kept_images(&mut self) -> (usize, u64) {
+        self.paths.evict_images()
+    }
+
+    /// On the loop, past the memory ceiling ([`super::relief`]): gives back what `rung` names
+    /// of what the loop keeps between builds. Kept link images that no running program maps,
+    /// or each kept front end's compiled code or values; a front end out being stored is
+    /// passed over (its task holds it).
+    pub(crate) fn relieve(&mut self, steps: &S, rung: super::relief::Rung) -> super::relief::Given {
+        use super::relief::{Given, Rung};
+        let mut given = Given::default();
+        match rung {
+            Rung::Purge => {}
+            Rung::Images => {
+                let (images, bytes) = self.paths.evict_images();
+                given.images = images;
+                given.image_bytes = bytes;
+            }
+            Rung::Compiled | Rung::Values => {
+                for front in self.roots.fronts.iter_mut().flatten() {
+                    given.add(steps.relieve_kept(front, rung));
+                }
+            }
+        }
+        given
+    }
+
+    /// Lock-free summary of memo bytes across every active build and kept front end:
+    /// `(databases, total_bytes, top_owners)`. Sound while queries run.
+    pub fn query_memory_summary(&self) -> (usize, u64, Vec<(&'static str, u64)>) {
+        let mut dbs = 0usize;
+        let mut total = 0u64;
+        let mut add = |db: &base_db::Db| {
+            dbs += 1;
+            let held = blaze_memo::Database::memo(db).held() as u64;
+            total = total.saturating_add(held);
+        };
+        for &id in &self.order {
+            if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get(key_of(id))
+                && let Some(db) = build.writer.here().and_then(|it| it.db())
+            {
+                add(db);
+            }
+        }
+        for front in self.roots.fronts.iter().flatten() {
+            if let Some(db) = front.db() {
+                add(db);
+            }
+        }
+        let top = if total > 0 { vec![("blaze-memo", total)] } else { Vec::new() };
+        (dbs, total, top)
     }
 
     /// What each kept front end's snapshot holds, a line a front end in the daemon's log: the
@@ -9258,26 +9379,68 @@ impl<S: Steps> Jobs<S> {
         executable: bool,
         made: Arc<Made>,
     ) {
-        let based = match &*made {
-            Made::Patch { base, .. } => self.paths.placed[path as usize]
-                .as_ref()
-                .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
-            Made::Whole(_) => false,
+        let steps = w.steps;
+        self.place_made_with(w.store, w.effects, &|p| steps.destination_sharing(p), id, path, key, executable, made);
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "same arguments as place_made, decoupled from World for simulation tests")]
+    fn place_made_with(
+        &mut self,
+        store: &mut Store,
+        effects: &mut Vec<Effect>,
+        destination_sharing: &dyn Fn(&str) -> Result<Option<blaze_core::Sharing>, String>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: Arc<Made>,
+    ) {
+        let patch_len = match &*made {
+            Made::Patch { base, file, .. }
+                if self.paths.placed[path as usize].as_ref().is_some_and(|it| {
+                    it.key == *base && it.executable == executable && it.meta.is_some()
+                }) =>
+            {
+                Some(file.len)
+            }
+            _ => None,
         };
-        if !based {
-            self.place_made_as(w, id, path, key, executable, &made, false);
+        let Some(patch_len) = patch_len else {
+            self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, false, None);
+            return;
+        };
+        let destination = match destination_sharing(&self.paths.names[path as usize]) {
+            Ok(v) => v,
+            Err(why) => {
+                let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+                self.placing_failed(id, path, ApiError::new(why, Some(name)));
+                return;
+            }
+        };
+        // On NTFS, when the policy chooses new-file-plus-rename we write a fresh sparse file
+        // and rename it over the destination without opening the existing file at all, so the
+        // pre-patch `LookBase` stat round trip is unnecessary.
+        if destination == Some(blaze_core::Sharing::Unshared)
+            && self
+                .setup
+                .ntfs_edit
+                .choose(&self.paths.names[path as usize], executable, patch_len)
+                .route
+                == super::ntfs_edit::Route::Rename
+        {
+            self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, true, Some(destination));
             return;
         }
-        match self.own_tag(Own::LookBase { job: id, path, key, executable }) {
+        match self.own_tag(Own::LookBase { job: id, path, key, executable, destination }) {
             Ok(tag) => {
                 // clone: the driver's effect owns the file's name, once per output
                 let Some(file) = self.paths.files[path as usize].clone() else {
-                    self.place_made_as(w, id, path, key, executable, &made, false);
+                    self.place_made_as_with(store, effects, destination_sharing, id, path, key, executable, &made, false, Some(destination));
                     return;
                 };
                 self.patching.insert(path, made);
                 self.begin_placing(id, path);
-                w.effects.push(Effect::Stat { file, tag });
+                effects.push(Effect::Stat { file, tag });
             }
             Err(error) => self.placing_failed(id, path, error),
         }
@@ -9300,6 +9463,25 @@ impl<S: Steps> Jobs<S> {
         executable: bool,
         made: &Arc<Made>,
         over: bool,
+        destination: Option<Option<blaze_core::Sharing>>,
+    ) {
+        let steps = w.steps;
+        self.place_made_as_with(w.store, w.effects, &|p| steps.destination_sharing(p), id, path, key, executable, made, over, destination);
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "a placement's parts, each its own")]
+    fn place_made_as_with(
+        &mut self,
+        store: &mut Store,
+        effects: &mut Vec<Effect>,
+        destination_sharing: &dyn Fn(&str) -> Result<Option<blaze_core::Sharing>, String>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: &Arc<Made>,
+        over: bool,
+        destination: Option<Option<blaze_core::Sharing>>,
     ) {
         // The path's last value stays in the store (D45); a whole file kept only to clone it
         // from, no value's home, is let go of as this is answered ([`Jobs::place`]).
@@ -9326,35 +9508,66 @@ impl<S: Steps> Jobs<S> {
         PLACED_PATHS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
         // An executable is started from its path: its staged file gets its mode before its
         // look and rename, and a clone is prewarmed (`blaze_cas::Store::starts`).
-        w.store.starts(&file, executable);
+        store.starts(&file, executable);
         // A further path of a file whose place from its maker's bytes is in flight: another
         // name of that file, made beside its rename.
-        let destination = match w.steps.destination_sharing(&self.paths.names[path as usize]) {
-            Ok(v) => v,
-            Err(why) => { self.placing_failed(id, path, ApiError::new(why, Some(file.to_string()))); return; }
+        let destination = match destination {
+            Some(v) => v,
+            None => match destination_sharing(&self.paths.names[path as usize]) {
+                Ok(v) => v,
+                Err(why) => {
+                    self.placing_failed(id, path, ApiError::new(why, Some(file.to_string())));
+                    return;
+                }
+            },
         };
         // A custody patch needs a single-link base; never alias its output (including its
         // initial whole place). Across Windows volumes a second path is independent too.
         let first = destination.is_none().then(|| self.firsts.iter().find(|(it, _)| Arc::ptr_eq(it, made)).map(|(_, tag)| *tag)).flatten();
         if let Some(first) = first {
-            let tag = w.store.place_also(first, file);
+            let tag = store.place_also(first, file);
             self.placing.insert(tag, Placing { job: id, path, key, executable });
             self.begin_placing(id, path);
             return;
         }
         let tag = match (&**made, over) {
             (Made::Patch { file: patch, whole, .. }, true) if destination == Some(blaze_core::Sharing::Unshared) => {
-                w.store.place_edit(file, patch.clone(), whole(), w.effects)
+                let name = &*self.paths.names[path as usize];
+                let choice = self.setup.ntfs_edit.choose(name, executable, patch.len);
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "ntfs edit place",
+                    function = name,
+                    route = choice.route.as_str(),
+                    policy = choice.policy,
+                    reason = choice.reason,
+                    image = choice.image,
+                    file_bytes = patch.len,
+                    patch_bytes = patch.bytes(),
+                    written_bytes = tracing::field::Empty,
+                )
+                .entered();
+                let runs = whole();
+                match choice.route {
+                    super::ntfs_edit::Route::Rename => {
+                        span.record("written_bytes", runs.bytes());
+                        store.place_edit_rename(file, runs, effects)
+                    }
+                    super::ntfs_edit::Route::Patch => {
+                        span.record("written_bytes", patch.bytes());
+                        store.place_edit(file, patch.clone(), runs, effects)
+                    }
+                }
             }
             (Made::Patch { file: patch, .. }, true) if destination == Some(blaze_core::Sharing::Blocks) => {
-                w.store.place_cloned_patch(file, patch.clone(), executable, w.effects)
+                store.place_cloned_patch(file, patch.clone(), executable, effects)
             }
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
             // An executable is started from its path: its clone is prewarmed. A debug file
             // is not.
             (Made::Patch { file: patch, .. }, true) => {
-                w.store.place_patched(file, patch.clone(), executable, w.effects)
+                store.place_patched(file, patch.clone(), executable, effects)
             }
             (Made::Patch { whole, .. }, false) => {
                 let span = tracing::info_span!(
@@ -9366,11 +9579,11 @@ impl<S: Steps> Jobs<S> {
                 .entered();
                 let runs = whole();
                 span.record("bytes", runs.bytes());
-                w.store.place_made(file, runs, w.effects)
+                store.place_made(file, runs, effects)
             }
             // clone: the runs, which the path's writes own (an effect owns its bytes); once
             // per path
-            (Made::Whole(runs), _) => w.store.place_made(file, runs.clone(), w.effects),
+            (Made::Whole(runs), _) => store.place_made(file, runs.clone(), effects),
         };
         // clone: an Arc's count, held until the first is answered
         if destination.is_none() { self.firsts.push((Arc::clone(made), tag)); }
@@ -9674,7 +9887,7 @@ impl<S: Steps> Jobs<S> {
                     self.place(w, id, path, key, executable);
                 }
             }
-            Own::LookBase { job: id, path, key, executable } => {
+            Own::LookBase { job: id, path, key, executable, destination } => {
                 // The path's record is of the patch's base (checked as the look was
                 // asked): the file is that one where it is as it was placed.
                 let over = matches!(
@@ -9686,7 +9899,7 @@ impl<S: Steps> Jobs<S> {
                 if let Some(made) = made
                     && self.owned(id)
                 {
-                    self.place_made_as(w, id, path, key, executable, &made, over);
+                    self.place_made_as(w, id, path, key, executable, &made, over, Some(destination));
                 }
             }
             Own::Write { job: id, path } => {

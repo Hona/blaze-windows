@@ -603,6 +603,8 @@ pub struct Options {
     /// `BLAZE_DAEMON_EXIT_UNHELD`): it stops itself once no client or launcher connection was
     /// open for this long. `None` exits only as [`super::idle::exit_due`] says, or when told.
     pub unheld: Option<Duration>,
+    /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
+    pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
@@ -1027,6 +1029,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     builds: Vec<blaze_api::Building>,
     /// When the memory by tag was last logged, on the driver's clock.
     memory_logged: Duration,
+    /// Peak footprint observed by this daemon and its breakdown by owner, logged at stop.
+    peak: PeakMemory,
     /// When the system's memory pressure last asked for the heaps' free pages back
     /// ([`PURGE_EVERY`]), on the driver's clock.
     given_back: Duration,
@@ -1321,6 +1325,22 @@ impl fmt::Display for MemoryLine<'_> {
                 )?;
             }
         }
+        if !memory.heap_by_tag {
+            let mut churn = blaze_mem::Tag::ALL;
+            churn.sort_by_key(|&tag| std::cmp::Reverse(memory.get(tag).heap_allocated));
+            let mut wrote = false;
+            for tag in churn.into_iter().take(8) {
+                let allocated = memory.get(tag).heap_allocated;
+                if allocated < Self::SHOWN {
+                    break;
+                }
+                if !wrote {
+                    f.write_str("; heap churn (allocated)")?;
+                    wrote = true;
+                }
+                write!(f, " {tag} {:.2}", gib(allocated))?;
+            }
+        }
         if self.chunks != blaze_mem::chunks::Cached::default() {
             write!(
                 f,
@@ -1360,6 +1380,126 @@ impl fmt::Display for MemoryLine<'_> {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Peak footprint observed by the daemon and the owners that held it at that instant, logged
+/// when the daemon stops so every run (including ladders) reports peak bytes by owner.
+#[derive(Default)]
+struct PeakMemory {
+    footprint: u64,
+    heap_live: u64,
+    memory: Option<blaze_mem::tag::Snapshot>,
+    pool: blaze_cas::PoolCounts,
+    kept_images: (usize, u64),
+    query_dbs: usize,
+    query_total: u64,
+    query_top: Vec<(&'static str, u64)>,
+    #[cfg(windows)]
+    commit: Option<crate::raw::memory::CommitMap>,
+}
+
+impl PeakMemory {
+    /// Minimum growth past the last captured peak before taking a fresh `VirtualQuery` / query
+    /// snapshot, so steady climbs do not pay a walk on every 10 ms tick.
+    const STEP: u64 = 32 << 20;
+
+    fn note<S: Steps>(
+        &mut self,
+        footprint: u64,
+        memory: &blaze_mem::tag::Snapshot,
+        jobs: &Jobs<S>,
+    ) {
+        if self.footprint != 0 && footprint <= self.footprint.saturating_add(Self::STEP) {
+            return;
+        }
+        self.footprint = footprint;
+        self.heap_live = blaze_graph::arena::held();
+        self.memory = Some(*memory);
+        self.pool = blaze_cas::pool_counts();
+        self.kept_images = jobs.kept_images_summary();
+        let (dbs, total, top) = jobs.query_memory_summary();
+        self.query_dbs = dbs;
+        self.query_total = total;
+        self.query_top = top;
+        #[cfg(windows)]
+        {
+            self.commit = Some(crate::raw::memory::commit_map());
+        }
+    }
+
+    fn log(&self) {
+        use std::fmt::Write as _;
+        let Some(memory) = &self.memory else { return };
+        let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+        let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+        let kept = self
+            .footprint
+            .saturating_sub(memory.resident_committed())
+            .saturating_sub(self.heap_live);
+        let mut line = String::new(); // alloc: once at daemon stop
+        let _ = write!(
+            line,
+            "peak memory: footprint {:.2} GiB (heap live {:.2}, blaze-mem {:.2}, kept/other {:.2}; \
+             kept images {} holding {:.2} GiB; store pool {:.2} GiB, store heap {:.2} GiB; \
+             query storage {:.2} GiB across {} dbs)",
+            gib(self.footprint),
+            gib(self.heap_live),
+            gib(memory.resident_committed()),
+            gib(kept),
+            self.kept_images.0,
+            gib(self.kept_images.1),
+            gib(self.pool.resident),
+            gib(self.pool.store_heap),
+            gib(self.query_total),
+            self.query_dbs,
+        );
+        let mut tags = blaze_mem::Tag::ALL;
+        tags.sort_by_key(|&tag| {
+            let c = memory.get(tag);
+            std::cmp::Reverse(c.live.saturating_add(c.heap))
+        });
+        let _ = write!(line, "; tags (GiB):");
+        for tag in tags {
+            let c = memory.get(tag);
+            if c.live >= (16 << 20) || c.heap >= (16 << 20) {
+                let _ = write!(
+                    line,
+                    " {tag}={:.2}(+h{:.2},reg={})",
+                    gib(c.live),
+                    gib(c.heap),
+                    c.regions,
+                );
+            }
+        }
+        if !memory.heap_by_tag {
+            let mut churn = blaze_mem::Tag::ALL;
+            churn.sort_by_key(|&tag| std::cmp::Reverse(memory.get(tag).heap_allocated));
+            let _ = write!(line, "; heap alloc churn (GiB):");
+            for tag in churn.into_iter().take(8) {
+                let a = memory.get(tag).heap_allocated;
+                if a >= (32 << 20) {
+                    let _ = write!(line, " {tag}={:.2}", gib(a));
+                }
+            }
+        }
+        if !self.query_top.is_empty() {
+            let _ = write!(line, "; query top (MiB):");
+            for (name, bytes) in &self.query_top {
+                if *bytes >= (4 << 20) {
+                    let _ = write!(line, " {name}={:.1}", mib(*bytes));
+                }
+            }
+        }
+        // logged: the info event below
+        eprintln!("blaze serve: {line}");
+        tracing::info!(target: "blaze", "{line}");
+        #[cfg(windows)]
+        if let Some(commit) = &self.commit {
+            // logged: the info event below
+            eprintln!("blaze serve: peak {commit}");
+            tracing::info!(target: "blaze", "peak {commit}");
+        }
     }
 }
 
@@ -1959,6 +2099,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             slots: format!("/{state}/slots"),
             premises: options.premises.clone(), // clone: the jobs' own copy, once a start
             stores: super::direct::Stores::new(store.reader(), std.reader(), options.reads.clone()), // clone: a path's refcount, once a start
+            ntfs_edit: options.ntfs_edit,
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
         // The front end's carry sessions the journal marks: each checkout's next build opens
@@ -2060,6 +2201,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             looked: Duration::ZERO,
             builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
+            peak: PeakMemory::default(),
             given_back: Duration::ZERO,
             idle: super::idle::Idle::default(),
             solo: blaze_certify::kept::Take::new(SOLO_ROWS),
@@ -2383,8 +2525,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // bounds it from here, though a client's Stop asked it inside a turn.
         #[cfg(unix)]
         super::signals::stop_begun();
-        // The memory by tag as the work ends, its high-water marks the run's.
-        log_memory(&blaze_mem::tag::snapshot());
+        // The memory by tag as the work ends, its high-water marks the run's, plus the peak
+        // owner breakdown captured at the highest footprint seen during the daemon's life.
+        let memory = blaze_mem::tag::snapshot();
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        if let Some(bytes) = crate::raw::memory::own_footprint_now() {
+            self.peak.note(bytes, &memory, &self.jobs);
+        }
+        log_memory(&memory);
+        self.peak.log();
         self.stopping = Some(Stopping::Image);
         // Nothing is built ahead from here on, and what is, is cancelled (the turn's
         // `ahead_turn` sends the cancel).
@@ -3212,11 +3361,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             blaze_profile::plot(Plot::Footprint, bytes);
             let kept = blaze_graph::arena::kept_of(&memory, bytes);
             blaze_profile::plot(Plot::AllocatorKeptBytes, kept);
+            self.peak.note(bytes, &memory, &self.jobs);
         }
         // Nothing to do for a while: the warm memory each thread keeps for its next task goes
         // back, once a stretch, on the purger's thread and the workers' own as they park
         // ([`super::idle`]).
         let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        // Past the memory ceiling, the guard asks a rung of what the loop keeps
+        // ([`super::relief`]): answered here, on the loop that alone owns it.
+        if let Some((seq, rung)) = super::relief::CHANNEL.pending() {
+            let _span = tracing::info_span!(target: "blaze", "memory relief", rung = rung.name()).entered();
+            let given = self.jobs.relieve(&self.steps, rung);
+            tracing::warn!(target: "blaze", rung = rung.name(), ?given, "past the memory ceiling: gave back");
+            super::relief::CHANNEL.answer(seq, rung, given);
+        }
         if self.idle.look(now, working) {
             tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
             blaze_mem::frame::ask_spare_trim();

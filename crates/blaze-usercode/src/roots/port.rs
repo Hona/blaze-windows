@@ -6,7 +6,9 @@
 
 use std::borrow::Cow;
 
-use super::{Role, Roots};
+use blaze_core::platform::path::DaemonPath;
+
+use super::{Role, Roots, sort_host_roots};
 
 /// What starts a path in a package id (`path+file:///w/p#0.1.0`): the root after it starts
 /// no path as [`Roots::port`] reads one (a `/` is before it), so a string is ported in the
@@ -18,24 +20,54 @@ const URL: &[u8] = b"file://";
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Dirs {
     roots: Vec<(Role, String)>,
+    /// On Windows, the native host-path spelling (`C:\Users\a\w`) of each root that maps to a
+    /// host volume, sorted longest first (ties by role), for `\0h<tag>` porting and leak scans.
+    /// Empty on Unix.
+    host_roots: Vec<(Role, String)>,
 }
 
 impl Dirs {
-    /// The directories `given` names; one that is none, not absolute or the file system's
-    /// root is no root: what is under it stays as it is.
+    /// The directories `given` names as daemon paths (`/home/a/w`, `/C:/Users/a/w`); one that
+    /// is none, not a valid daemon name, or a volume root (`/`, `/C:`, `/UNC/server/share`) is
+    /// no root: what is under it stays as it is.
     pub fn new<'a>(given: impl IntoIterator<Item = (Role, Option<&'a str>)>) -> Dirs {
+        Dirs::from_daemon(
+            given
+                .into_iter()
+                .map(|(role, path)| (role, path.and_then(DaemonPath::parse))),
+        )
+    }
+
+    /// Typed form of [`Dirs::new`] taking validated [`DaemonPath`]s directly.
+    pub fn from_daemon<'a>(given: impl IntoIterator<Item = (Role, Option<DaemonPath<'a>>)>) -> Dirs {
         // alloc: once per build's directories, a root each
-        let roots = given
-            .into_iter()
-            .filter_map(|(role, path)| Some((role, path?.trim_end_matches('/').to_owned())))
-            .filter(|(_, path)| path.starts_with('/') && path.len() > 1)
-            .collect();
-        Dirs { roots }
+        let mut roots: Vec<(Role, String)> = Vec::new();
+        for (role, path) in given {
+            let Some(path) = path.map(DaemonPath::trim_end_slash).filter(|it| !it.is_volume_root())
+            else {
+                continue;
+            };
+            match roots.iter_mut().find(|it| it.0 == role) {
+                Some(existing) => existing.1 = path.as_str().to_owned(), // alloc: as above
+                None => roots.push((role, path.as_str().to_owned())),    // alloc: as above
+            }
+        }
+        let mut host_roots = Vec::new();
+        for (role, path) in &roots {
+            if let Some(host) = DaemonPath::parse(path).and_then(DaemonPath::host_spelling) {
+                host_roots.push((*role, host));
+            }
+        }
+        sort_host_roots(&mut host_roots);
+        Dirs { roots, host_roots }
     }
 
     /// The roots, lent.
     pub fn view(&self) -> Roots<'_> {
-        Roots::new(self.roots.iter().map(|(role, path)| (*role, path.as_str())))
+        Roots::daemon_with_host(
+            self.roots.iter().filter_map(|(role, path)| Some((*role, DaemonPath::parse(path)?))),
+            &self.host_roots,
+        )
     }
 
     /// Each root, by what it is, in the order given.

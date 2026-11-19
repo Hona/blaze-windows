@@ -37,6 +37,8 @@ use blaze_api::Setting;
 pub const STARTED_WITH: &[&str] = &[
     #[cfg(windows)]
     super::commit::VAR,
+    #[cfg(windows)]
+    super::ntfs_edit::VAR,
     // Whether, and after what grace, it exits once no connection holds it (`serve::engine`,
     // read once; `serve::unheld`).
     super::unheld::VAR,
@@ -145,6 +147,11 @@ fn same(name: &str, a: Option<&str>, b: Option<&str>) -> bool {
     {
         return a.agrees(&b);
     }
+    if name == super::ntfs_edit::VAR
+        && let (Ok(a), Ok(b)) = (super::ntfs_edit::NtfsEdit::parse(a), super::ntfs_edit::NtfsEdit::parse(b))
+    {
+        return a == b;
+    }
     a == b
 }
 
@@ -251,5 +258,15 @@ mod tests {
             said(&drift(&all, &daemon)),
             "BLAZE_CORES: the daemon has it unset, this command `all`; BLAZE_LEAN: the daemon has it unset, this command `1`"
         );
+    }
+
+    #[test]
+    fn ntfs_edit_normalizes_equivalent_policies_and_drifts_on_distinct_ones() {
+        assert!(same(super::super::ntfs_edit::VAR, Some("auto"), None));
+        assert!(same(super::super::ntfs_edit::VAR, Some("16mib"), None));
+        assert!(same(super::super::ntfs_edit::VAR, Some("0"), Some("patch")));
+        assert!(!same(super::super::ntfs_edit::VAR, Some("rename"), None));
+        assert!(!same(super::super::ntfs_edit::VAR, Some("patch"), None));
+        assert!(!same(super::super::ntfs_edit::VAR, Some("32mib"), Some("16mib")));
     }
 }

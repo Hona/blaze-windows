@@ -875,7 +875,16 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// precondition of the checkout's next build: once `wanted` is set (a request of the
     /// checkout waits for the front end) it is skipped, and that build goes on with what was
     /// not let go.
-    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool);
+    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
+        let _ = (kept, wanted);
+    }
+    /// On the loop, past the memory ceiling ([`super::relief`]): lets go of what `rung` names
+    /// of the kept front end `kept`, every value keeping its memo so a read makes it again.
+    /// What went. Steps with no front end give nothing.
+    fn relieve_kept(&self, kept: &mut Self::KeptFront, rung: super::relief::Rung) -> super::relief::Given {
+        let _ = (kept, rung);
+        super::relief::Given::default()
+    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// before [`Steps::release_kept`]: the first calls of the checkout's launched runs that no
     /// bind record answers, made with the front end (`run::needs`), until `wanted` is set,
@@ -1022,6 +1031,11 @@ pub trait Kept: Send + 'static {
     /// Whether a run of user code maps it now (a dev executable's running program): such an
     /// image is never let go, or the next link could not patch what runs.
     fn live(&self) -> bool;
+    /// Whether this image keeps patch room for incremental edits (`false` for compact fetched
+    /// build scripts and wasm reactors, which may be capped aggressively).
+    fn incremental(&self) -> bool {
+        true
+    }
     /// Lets go of what it keeps only to start its next link warm, as it is kept idle.
     fn rest(&mut self);
 }
@@ -1102,6 +1116,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// A reader of the front end as it stands, for one task about to be posted; none while a
     /// write is asked for and not applied, when the loop holds the task instead.
     fn reader(&self) -> Option<S::Reader>;
+    /// The database this writer owns, for lock-free memory accounting while a build runs.
+    fn db(&self) -> Option<&base_db::Db> {
+        None
+    }
     /// Asks for the run of build script unit `run` applied to the units depending on it
     /// (`blaze_lower::Lowered::ran`): checked now, an error naming what is wrong with it,
     /// and applied by [`Writer::apply`].

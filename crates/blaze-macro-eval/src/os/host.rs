@@ -21,9 +21,9 @@ pub(super) fn on_host(path: &str) -> Option<Cow<'_, Path>> {
     if !cfg!(windows) {
         return Some(Cow::Borrowed(Path::new(path)));
     }
-    let first = path.strip_prefix('/')?.split('/').next()?;
-    let drive = matches!(first.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
-    (drive || first == "UNC").then(|| Cow::Owned(blaze_core::platform::path::host(path)))
+    blaze_core::platform::path::DaemonPath::parse(path)?
+        .try_host()
+        .map(|host| Cow::Owned(host.into_path_buf()))
 }
 
 /// `path` as the macro named it, in the walk's spelling: on a Windows host a path Windows

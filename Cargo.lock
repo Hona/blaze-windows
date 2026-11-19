@@ -4256,6 +4256,7 @@ dependencies = [
  "blaze-mem",
  "blaze-memo",
  "blaze-query",
+ "blaze-record",
  "blaze-serde",
  "blaze-sim",
  "blaze-stencil",

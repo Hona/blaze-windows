@@ -71,7 +71,7 @@ use crate::bridge::wire::{self, Parts};
 
 /// The version of what a macro is given and gives back that expansions are kept under: a
 /// change to either bumps it, so nothing kept before is found.
-const ABI: u32 = 9;
+const ABI: u32 = 10;
 
 /// What the content ID of a macro's library is made with.
 pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
@@ -515,6 +515,8 @@ struct Scratch {
     input: Vec<u8>,
     attrs: Vec<u8>,
     shapes: Vec<u8>,
+    files: Vec<span::EditionedFileId>,
+    anchor_files: Vec<u8>,
     room: Vec<u8>,
 }
 
@@ -603,11 +605,13 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
         .roots(&roots)
         .ported("dir", call.current_dir.as_bytes(), &roots);
     with_scratch(|scratch| {
-        let Scratch { parts, input, attrs, shapes, .. } = scratch;
+        let Scratch { parts, input, attrs, shapes, files, anchor_files, .. } = scratch;
         parts.clear();
         input.clear();
         attrs.clear();
         shapes.clear();
+        files.clear();
+        anchor_files.clear();
         let sites = [call.def_site, call.call_site, call.mixed_site].map(|site| {
             let part = parts.part(site.anchor, site.ctx);
             [site.range.start().into(), site.range.len().into(), part]
@@ -621,6 +625,13 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
                 shapes.extend_from_slice(&it.to_le_bytes());
             }
         }
+        // Same-file membership of the call's anchors, numbered relatively by first appearance:
+        // `Span::join` returns `None` across different files and `Some` within one without
+        // asking the database, so the key must distinguish anchors in one file from anchors
+        // in two (rule 21).
+        for anchor in &spans.anchors {
+            anchor_files.extend_from_slice(&number(files, anchor.file_id).to_le_bytes());
+        }
         for it in sites.as_flattened() {
             shapes.extend_from_slice(&it.to_le_bytes());
         }
@@ -628,7 +639,8 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
         given
             .part("input columns", input.as_slice())
             .part("attrs columns", attrs)
-            .part("span parts", shapes.as_slice());
+            .part("span parts", shapes.as_slice())
+            .part("anchor files", anchor_files.as_slice());
     });
     given.env_keyed_ported(
         call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())),
@@ -736,7 +748,7 @@ mod budget {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -791,7 +803,7 @@ mod budget {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped, sharing: blaze_core::Sharing::Blocks };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);

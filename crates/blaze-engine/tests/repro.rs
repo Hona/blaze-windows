@@ -17,10 +17,10 @@
 //!
 //! Every case builds std, which is compiled at opt-level 3, so only a blaze with LLVM can build
 //! one: in the seed profile (no `native`) this target is empty.
-#![cfg(all(unix, feature = "native"))]
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
 #![feature(register_tool)]
 #![register_tool(blaze)]
+#![cfg(all(unix, feature = "native"))]
 
 use std::{
     fs,

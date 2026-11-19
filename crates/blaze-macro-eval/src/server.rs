@@ -595,12 +595,43 @@ impl Server {
         Ok(())
     }
 
+    /// Joins `first` and `second`. When the join actually asks the database (same file,
+    /// same syntax context, different AST anchors), records the file's path as tracked so a
+    /// comment or spacing edit between the two items invalidates any unit record filed over it
+    /// even when `code_text` strips the comment (rule 21).
+    fn join_spans(&mut self, db: &(impl Answer + ?Sized), first: Span, second: Span) -> Option<Span> {
+        let mut asked_file = None;
+        let joined = spans::join(first, second, |req| {
+            asked_file = Some(first.anchor.file_id.file_id().index());
+            Some(self.ask(db, req))
+        });
+        if let Some(file_id) = asked_file
+            && self.lost.is_none()
+        {
+            match db.answer(self.contexts, SubRequest::LocalFilePath { file_id }) {
+                Ok(SubResponse::LocalFilePathResult { name: Some(name) }) => {
+                    let host =
+                        blaze_core::platform::path::host(&name).to_string_lossy().into_owned();
+                    if !self.tracked.contains(&host) {
+                        // alloc: once per file whose cross-item span offsets a macro read
+                        self.tracked.push(host);
+                    }
+                }
+                Ok(_) => {}
+                Err(stop) => {
+                    self.lost.get_or_insert(stop);
+                }
+            }
+        }
+        joined
+    }
+
     /// rustc's `Span::to`: the span from `first` to `second`. Of spans of two contexts it is
     /// the one not of the root (`prepare_to_combine`); two contexts neither at the root, or
     /// two files, would need what rustc's source map has, so the call stops.
     fn to(&mut self, db: &(impl Answer + ?Sized), first: Span, second: Span) -> Result<Span, Stop> {
         if first.ctx == second.ctx {
-            return spans::join(first, second, |req| Some(self.ask(db, req))).ok_or_else(|| {
+            return self.join_spans(db, first, second).ok_or_else(|| {
                 // alloc: error path
                 Stop(format!("glued punctuation of two files ({first:?} and {second:?}), whose joined span blaze does not have"))
             });
@@ -989,7 +1020,7 @@ impl Server {
             Method::SpanJoin => {
                 let first = self.read_span(&mut r)?;
                 let second = self.read_span(&mut r)?;
-                let joined = spans::join(first, second, |req| Some(self.ask(db, req)));
+                let joined = self.join_spans(db, first, second);
                 w.ok(true);
                 w.some(joined.is_some());
                 if let Some(joined) = joined {

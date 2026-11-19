@@ -69,7 +69,7 @@ pub use seal::{
     SealCensus, SealGroup, SealGroupCensus, SealKind, SealNotWhole, SealPass, SealState,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
-pub use storage::{Database, Durability, Hook, Storage, Unread, View};
+pub use storage::{Database, Durability, Hook, Storage, Unread, View, file_ends_with};
 pub use value::Value;
 pub use witness::{Witness, covered, witnessed};
 

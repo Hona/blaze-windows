@@ -34,8 +34,10 @@ use std::{
 
 use blaze_mem::Tag;
 
+#[cfg(not(windows))]
+use super::dense::Whole;
 use super::{
-    dense::{Heap, MAX_ALIGN, Whole},
+    dense::{Heap, MAX_ALIGN},
     id::{Id, MAX_PAGES, PAGE_LEN},
 };
 
@@ -401,6 +403,11 @@ pub(crate) unsafe fn header_at<'a>(page: NonNull<u8>, slot: usize, size: usize) 
 }
 
 /// A column of one `AtomicU32` per ID page: the ingredient owning it (0 for none).
+/// On overcommitting kernels `Whole` costs only touched pages; on Windows it would commit
+/// 4 MiB per storage upfront, so use a growing column committed only up to `next_page`.
+#[cfg(windows)]
+pub(crate) type Owners = super::dense::Dense<AtomicU32>;
+#[cfg(not(windows))]
 pub(crate) type Owners = Whole<AtomicU32, MAX_PAGES>;
 
 #[cfg(test)]
@@ -425,6 +432,22 @@ mod tests {
         assert_eq!(read(1), at.as_ptr());
         assert!(read(MAX_PAGES - 1).is_null());
         assert!(pages.dir.committed_bytes() < MAX_PAGES * size_of::<AtomicPtr<u8>>());
+    }
+
+    #[test]
+    fn a_fresh_storage_does_not_commit_page_owners_for_unallocated_pages() {
+        let storage = super::super::Storage::new(None);
+        assert_eq!(storage.owner(Id::at(MAX_PAGES - 1, 0)), None);
+        #[cfg(windows)]
+        assert_eq!(
+            storage.owners_committed_bytes(),
+            0,
+            "an unused Windows Storage must not commit 4 MiB for Owners"
+        );
+        let page = storage.new_page(7);
+        assert_eq!(storage.owner(Id::at(page, 0)), Some(7));
+        assert_eq!(storage.owner(Id::at(MAX_PAGES - 1, 0)), None);
+        assert!(storage.owners_committed_bytes() < MAX_PAGES * size_of::<AtomicU32>());
     }
 
     /// A value that counts its drops, `N` words long.

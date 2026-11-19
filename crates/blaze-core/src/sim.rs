@@ -200,7 +200,7 @@ const FAULT: &str = "injected by the simulation";
 struct SimFile {
     /// The immutable generation leased to readers by Map. A rename moves the lease with
     /// the file; replacing its name makes an independent generation. Never owns the view.
-    mapped: Vec<(crate::Extent, std::sync::Weak<crate::Held>)>,
+    mapped: Vec<std::sync::Weak<crate::Held>>,
     /// What survives a crash.
     durable: Vec<u8>,
     /// What changed it since the last sync that covered it, in order; read as part of the
@@ -947,6 +947,8 @@ impl Sim {
             file.back = 0;
             file.stamps.clear();
             file.barriers.clear();
+            // A power cut ends every process and its memory mappings.
+            file.mapped.clear();
             if undo && let Some(taken) = taken {
                 undone.push((name, *taken));
             }
@@ -965,6 +967,7 @@ impl Sim {
                 was.ops.clear();
                 was.back = 0;
                 was.undo = None;
+                was.mapped.clear();
                 if !self.planted(host::Plant::PutBackWithBarriers) {
                     was.stamps.clear();
                     was.barriers.clear();
@@ -1653,7 +1656,7 @@ impl Sim {
             _ => return None,
         };
         let sim = self.files.get(file)?;
-        if sim.mapped.iter().any(|(_, held)| held.strong_count() != 0) {
+        if sim.mapped.iter().any(|held| held.strong_count() != 0) {
             // alloc: an error naming the in-place writer and the affected generation.
             return Some(Done::Failed(IoError(format!("{file}: in-place write to a mapped generation"))));
         }
@@ -2342,7 +2345,7 @@ impl Sim {
             Effect::Timer { .. } => Done::Fired,
             Effect::TryPatch { file, len, delta, whole, .. } => {
                 match self.files.get(&file) {
-                    Some(f) if !f.link && f.mode & OWNER_WRITES != 0 && f.mapped.iter().all(|(_, held)| held.strong_count() == 0) => {
+                    Some(f) if !f.link && f.mode & OWNER_WRITES != 0 && f.mapped.iter().all(|held| held.strong_count() == 0) => {
                         let mut base = f.contents();
                         match crate::fs::matches_patch(&base, len, &delta, &whole) {
                             Ok(true) => {
@@ -2366,10 +2369,11 @@ impl Sim {
                     // alloc: an error naming the missing file.
                     return Completion { tag, done: Done::Failed(IoError(format!("{file}: no such file to map"))) };
                 };
-                f.mapped.retain(|(_, held)| held.strong_count() != 0);
-                if let Some(held) = f.mapped.iter().find_map(|(e, w)| (*e == extent).then(|| w.upgrade()).flatten()) {
-                    return Completion { tag, done: Done::Mapped(crate::Mapping(held)) };
-                }
+                f.mapped.retain(|held| held.strong_count() != 0);
+                // Always read fresh bytes from the file rather than reusing an earlier mapping's
+                // buffer: `Sim::rot` mutates the disk beneath existing views, and each map must
+                // observe the disk's current bytes and account `bytes_read` while still leasing
+                // this generation against in-place writes.
                 let bytes = f.contents();
                 let range = match extent {
                     crate::Extent::Whole => Ok(&bytes[..]),
@@ -2393,7 +2397,7 @@ impl Sim {
                         // alloc: the mapping, which the completion carries.
                         let view = crate::Mapping::copy(range);
                         if !range.is_empty() {
-                            f.mapped.push((extent, std::sync::Arc::downgrade(&view.0)));
+                            f.mapped.push(std::sync::Arc::downgrade(&view.0));
                         }
                         Done::Mapped(view)
                     }
@@ -3114,6 +3118,44 @@ mod tests {
             drop(new);
             assert_eq!(run(cut()), Done::Truncated);
         }
+    }
+
+    /// The invariant: a fresh `Effect::Map` reads the disk's current bytes (including silent
+    /// corruption injected by [`Sim::rot`]) and accounts `bytes_read`, even when another actor
+    /// still holds an earlier mapping of the same file; both views still lease that generation
+    /// against in-place writes until dropped or ended by a crash.
+    #[test]
+    fn a_new_map_reads_rotted_bytes_while_an_earlier_view_holds_its_lease() {
+        let mut sim = Sim::new(7, Faults::default());
+        let path = name("segment");
+        sim.change(&path, b"abcdef");
+        let run = |sim: &mut Sim, effect| {
+            let mut answer = None;
+            run_until_idle(sim, &mut vec![effect], |it, _| answer = Some(it.done))
+                .expect("one effect completes");
+            answer.unwrap()
+        };
+        let map = || Effect::Map { file: path.clone(), extent: crate::Extent::Whole, tag: Tag(1) };
+        let cut = || Effect::Truncate { file: path.clone(), len: 0, tag: Tag(2) };
+        let Done::Mapped(first) = run(&mut sim, map()) else { panic!("first map succeeds") };
+        assert_eq!(first.bytes(), b"abcdef");
+        assert_eq!(sim.bytes_read(), 6);
+
+        sim.rot(&path, 2, b"X");
+        let Done::Mapped(second) = run(&mut sim, map()) else { panic!("second map succeeds") };
+        assert_eq!(second.bytes(), b"abXdef", "a fresh map sees bytes rotted on disk while an earlier view is live");
+        assert_eq!(first.bytes(), b"abcdef");
+        assert_eq!(sim.bytes_read(), 12, "each map accounts the bytes it reads");
+
+        drop(first);
+        assert!(matches!(run(&mut sim, cut()), Done::Failed(_)), "second view still leases the generation");
+        drop(second);
+        assert_eq!(run(&mut sim, cut()), Done::Truncated, "dropping all views releases the lease");
+
+        sim.change(&path, b"abcdef");
+        let Done::Mapped(_pre_crash) = run(&mut sim, map()) else { panic!("map before crash succeeds") };
+        sim.crash();
+        assert_eq!(run(&mut sim, cut()), Done::Truncated, "a power cut ends every process's mapping lease");
     }
 
     #[test]

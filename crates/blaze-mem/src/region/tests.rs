@@ -258,6 +258,27 @@ fn evicting_more_than_is_held_is_refused() {
     let _ = unsafe { region.evict(&[0..2 * PAGE]) };
 }
 
+#[cfg(windows)]
+#[test]
+fn a_small_windows_region_commits_one_page_and_caps_overcommit() {
+    let small = Region::reserve(1 << 20, Tag::Other).expect("reserve");
+    small.ensure(64).expect("commit first bytes");
+    assert_eq!(
+        small.committed(),
+        crate::os::page_size(),
+        "a small Windows region must commit one 4 KiB page, not 64 KiB"
+    );
+    let large = Region::reserve(128 << 20, Tag::Other).expect("reserve large");
+    large.ensure(32 << 20).expect("commit 32 MiB");
+    let before = large.committed();
+    large.ensure(before + 1).expect("grow past 32 MiB");
+    assert_eq!(
+        large.committed() - before,
+        4 << 20,
+        "a large Windows region must cap its geometric commit step at 4 MiB"
+    );
+}
+
 #[test]
 #[should_panic(expected = "not sparse")]
 fn evicting_from_a_region_that_is_not_sparse_is_refused() {

@@ -86,7 +86,7 @@ pub use mir::{calls_place_macro, is_place, location_literals, place_call, placed
 #[doc(hidden)]
 pub use mir::testing;
 pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
-pub use value::step_value;
+pub use value::{step_value, step_value_with};
 
 /// The inherent impls' associated types of `adt` a path's lowering looks a name up in
 /// (`lower::path::inherent_assoc_types`), each by its binding name, alias and impl: what a

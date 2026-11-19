@@ -33,8 +33,14 @@ enum Sparse {
     RangesOnly,
 }
 
-/// The largest single commit: past it a region grows 64 MB per system call.
+/// The largest single commit: past it a region grows by this much per system call.
+/// On overcommitting kernels untouched pages cost nothing, so 64 MiB keeps system calls down;
+/// on Windows every committed byte is charged immediately against the commit limit, so cap at
+/// 4 MiB to bound untouched tail commit across hundreds of arenas.
+#[cfg(not(windows))]
 const MAX_STEP: usize = 64 << 20;
+#[cfg(windows)]
+const MAX_STEP: usize = 4 << 20;
 
 /// Held while a region of the reserved pool grows: mapping hugetlb pages over a range replaces
 /// what is there, so unlike `mprotect` two growers must never map the same range. Growth of
@@ -193,8 +199,16 @@ impl Region {
     }
 
     fn placed(bytes: usize, pages: Pages, node: Option<u32>, tag: Tag) -> Result<Region, MemError> {
+        // On overcommitting Unix kernels committing 64 KiB only backs pages actually touched;
+        // on Windows `VirtualAlloc(MEM_COMMIT)` charges every page immediately to the commit
+        // limit, so commit at native page granularity (4 KiB) while still rounding reservations
+        // to `RESERVE_ALIGN` (64 KiB).
+        #[cfg(windows)]
+        let granule = os::page_size();
+        #[cfg(not(windows))]
         let granule = os::page_size().max(64 << 10);
-        let whole = if pages.is_huge() { huge_unit() } else { granule };
+        let reserve_unit = if cfg!(windows) { os::RESERVE_ALIGN.max(granule) } else { granule };
+        let whole = if pages.is_huge() { huge_unit() } else { reserve_unit };
         let reserved = crate::align::checked_align_up(bytes.max(1), whole)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
         let transparent = pages == Pages::Transparent;

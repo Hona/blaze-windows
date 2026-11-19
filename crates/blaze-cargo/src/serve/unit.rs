@@ -144,6 +144,64 @@ pub(crate) struct Shared {
     /// The programs blaze's launcher runs, and the socket their launchers connect to
     /// (docs/v2/plan/design/launcher.md).
     pub(crate) launches: run::launch::Launches,
+    /// Native library bytes shared across every kept image by content hash (`Weak<[u8]>` so
+    /// bytes free automatically once the last image referencing them drops). Without this,
+    /// 72 build scripts and binaries each hold their own copy of MSVC CRT/SDK `.lib` archives.
+    pub(crate) native_bytes: NativeBytes,
+}
+
+/// Content-addressed weak pool of native object/archive bytes shared across linked images.
+pub(crate) struct NativeBytes {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "cold lock held only when a new native archive is added to a link image"
+    )]
+    by_id: blaze_core::lock::Lock<blaze_hash::HashMap<ContentId, std::sync::Weak<[u8]>, std::alloc::Global>>,
+}
+
+impl Default for NativeBytes {
+    fn default() -> NativeBytes {
+        NativeBytes {
+            by_id: blaze_core::lock::Lock::new(
+                "serve.unit.native_bytes",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+        }
+    }
+}
+
+impl NativeBytes {
+    /// Returns the shared bytes for native input `id` at `path`, reading from disk only when no
+    /// live image already holds the same content.
+    pub(crate) fn get_or_read(
+        &self,
+        id: ContentId,
+        path: &std::path::Path,
+    ) -> Result<Arc<[u8]>, blaze_usercode::inputs::Unreadable> {
+        if let Some(shared) = self.by_id.lock().get(&id).and_then(std::sync::Weak::upgrade) {
+            return Ok(shared);
+        }
+        let bytes = std::fs::read(path).map_err(|error| blaze_usercode::inputs::Unreadable {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        })?;
+        // Key by the actual BLAKE3 of the bytes just read so a concurrent file edit can never
+        // alias another content id.
+        let mut hasher = blaze_ids::b3::Hasher::new();
+        hasher.update(&bytes);
+        let actual = ContentId(hasher.finalize());
+        // alloc: once per unique native archive across all images that link it
+        let arc = Arc::<[u8]>::from(bytes);
+        let mut map = self.by_id.lock();
+        if let Some(existing) = map.get(&actual).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
+        }
+        if map.len() >= 128 {
+            map.retain(|_, weak| weak.strong_count() > 0);
+        }
+        map.insert(actual, Arc::downgrade(&arc));
+        Ok(arc)
+    }
 }
 
 impl Real {
@@ -168,6 +226,7 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
             launches: run::launch::Launches::new(paths.state.join("launch")),
+            native_bytes: NativeBytes::default(),
         };
         let native = blaze_manifest::user_config::home().ok().map(|it| it.join(crate::serve::native::NATIVE));
         Ok(Real {
@@ -476,6 +535,31 @@ impl Steps for Real {
             return;
         }
         end.release(&mut kept.lowered);
+    }
+
+    fn relieve_kept(&self, kept: &mut KeptLowered, rung: crate::serve::relief::Rung) -> crate::serve::relief::Given {
+        use crate::serve::relief::{Given, Rung};
+        let mut given = Given { fronts: 1, ..Given::default() };
+        match rung {
+            Rung::Purge | Rung::Images => return Given::default(),
+            Rung::Compiled => {
+                given.walked = kept.walks.let_go();
+                let db = kept.lowered.served_db();
+                let dropped = hir::evict::drop_crates_after_store(db, &[], true);
+                given.values = dropped.solver_caches + dropped.intern_tables;
+            }
+            Rung::Values => {
+                let before = blaze_memo::Database::memo(kept.lowered.served_db()).held() as u64;
+                given.walked = kept.walks.let_go();
+                let dropped = hir::evict::drop_crates_after_store(kept.lowered.served_db(), &[], true);
+                given.values = dropped.solver_caches + dropped.intern_tables;
+                // Release any retained previous-build memo handle so dead arenas can free.
+                let _ = kept.memo.take();
+                let after = blaze_memo::Database::memo(kept.lowered.served_db()).held() as u64;
+                given.query_bytes = before.saturating_sub(after);
+            }
+        }
+        given
     }
 
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
@@ -1303,6 +1387,9 @@ struct BuildEnd {
     compiled: Vec<bool>,
     /// Whether the build compiles code: none for a check.
     compiles: bool,
+    /// The dependency crates whose solver caches a write of this build let go already, mid-build
+    /// ([`BuildEnd::newly_finished`]), sorted by key.
+    released: Vec<base_db::CrateKey>,
 }
 
 impl BuildEnd {
@@ -1312,7 +1399,23 @@ impl BuildEnd {
             kept: vec![false; units],     // alloc: a flag a unit, once per build
             compiled: vec![false; units], // alloc: a flag a unit, once per build
             compiles,
+            released: Vec::new(), // alloc: none until a crate finishes
         }
+    }
+
+    /// The dependency crates (no workspace member's) every unit of which compiled since the
+    /// last call, now counted as released: what a write mid-build lets go the solver caches of
+    /// ([`release_finished`]). None for a check.
+    fn newly_finished(&mut self, db: &base_db::Db) -> Vec<base_db::Crate> {
+        if !self.compiles {
+            return Vec::new(); // alloc: none
+        }
+        let keys = newly(
+            self.finished(std::alloc::Global),
+            |key| db.krate(*key).data(db).origin.is_local(),
+            &mut self.released,
+        );
+        keys.into_iter().map(|key| db.krate(key)).collect()
     }
 
     /// How many crates the build made: those of a compiled unit not found kept.
@@ -1390,6 +1493,65 @@ impl BuildEnd {
     }
 }
 
+/// What one MIR value holds, about: the withdeps ladder's memory lines held 0.24 GiB of `mir`
+/// heap for 45,344 bodies (5.6 KiB each), rounded up. MIR values are let go only when asked
+/// (`lru = 0`) and weigh nothing to the storage, so their count stands in for their bytes.
+const MIR_VALUE_BYTES: u64 = 6 << 10;
+
+/// Whether `values` MIR values, at [`MIR_VALUE_BYTES`] each, are past the `mir` tag's cap
+/// (`blaze_mem::tag::budget`, set on Windows by `serve::commit::set_value_budgets`; none
+/// elsewhere, so never).
+fn mir_past_cap(values: usize, cap: u64) -> bool {
+    cap != u64::MAX && (values as u64).saturating_mul(MIR_VALUE_BYTES) > cap
+}
+
+/// On a write a build asked anyway: under `blaze-memo`, MIR values live in their crate's
+/// arena and are reclaimed on arena drop rather than evicted per-query (`hir::evict`).
+/// Kept as a hook for future arena-level MIR trimming; `mir_past_cap` holds the cap predicate.
+#[cfg_attr(not(test), expect(dead_code, reason = "kept for tests and future arena-level MIR cap"))]
+fn release_mir_past_cap(_lowered: &mut Lowered, end: &BuildEnd) {
+    let _ = (end.compiles, mir_past_cap(0, blaze_mem::tag::budget(blaze_mem::Tag::Mir)));
+}
+
+/// Of `finished`, the crates that are not `local` and not in `released` (sorted), each added to
+/// it: each dependency crate is let go once, a workspace member's never mid-build.
+fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, released: &mut Vec<C>) -> Vec<C> {
+    finished.retain(|krate| !local(krate) && released.binary_search(krate).is_err());
+    finished.sort_unstable();
+    finished.dedup();
+    for krate in &finished {
+        if let Err(at) = released.binary_search(krate) {
+            released.insert(at, *krate);
+        }
+    }
+    finished
+}
+
+/// With the front end exclusive for a write that was asked anyway (a build script's run, a
+/// proc macro's load), lets go of the solver caches and retired intern tables of every
+/// dependency crate that finished compiling since the last such write ([`BuildEnd::newly_finished`]).
+fn release_finished(lowered: &mut Lowered, end: &mut BuildEnd) {
+    release_mir_past_cap(lowered, end);
+    let crates = {
+        let db: &base_db::Db = &*lowered.served_db();
+        end.newly_finished(db)
+    };
+    if crates.is_empty() {
+        return;
+    }
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end release of finished dependency crates, on a write",
+        crates = crates.len(),
+        solver_caches = tracing::field::Empty,
+        intern_tables = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let dropped = hir::evict::drop_crates_after_store(lowered.served_db(), &crates, false);
+    span.record("solver_caches", dropped.solver_caches);
+    span.record("intern_tables", dropped.intern_tables);
+}
+
 /// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
 /// once for each. `itself`: the step was part of making those units (their harness, their
 /// dependencies served), so each is refused too, not only what depends on it.
@@ -1409,6 +1571,10 @@ impl Writer<Real> for UnitWriter {
                 checks: self.session.checks(),
                 bodies: self.session.bodies(),
             })
+    }
+
+    fn db(&self) -> Option<&base_db::Db> {
+        Some(self.front.db())
     }
 
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
@@ -1616,6 +1782,7 @@ impl Writer<Real> for UnitWriter {
             self.broken = true;
             return Err(error);
         }
+        release_finished(lowered, &mut self.end);
         Ok(true)
     }
 
@@ -1643,6 +1810,8 @@ impl Writer<Real> for UnitWriter {
         deps::item_errors(&self.session)?;
         let mut said: Vec<blaze_api::Diagnostic> =
             codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
+        // What the daemon let go past its memory ceiling since the last build said it.
+        said.extend(crate::serve::relief::CHANNEL.take_notes().into_iter().map(warning));
         let job = Arc::clone(&self.job);
         said.extend(configs::report(&job, || self.final_reader(), ok, built)?);
         Ok(said)
@@ -2815,9 +2984,28 @@ impl Kept for codegen::Linked {
         codegen::Linked::live(self)
     }
 
+    fn incremental(&self) -> bool {
+        codegen::Linked::incremental(self)
+    }
+
     fn rest(&mut self) {
         codegen::Linked::rest(self);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_kept_image(path: &str, incremental: bool) -> crate::serve::work::Image<Real> {
+    let mut output = blaze_link::target::output(
+        "x86_64-unknown-linux-gnu",
+        None,
+        blaze_link::Debug::None,
+        incremental,
+        blaze_link::target::RunsOn::Here,
+    )
+    .unwrap();
+    output.incremental = incremental;
+    let kept = codegen::fresh_image(path, &output, None).unwrap();
+    crate::serve::work::Image { path: path.to_owned(), kept }
 }
 
 /// User code of a job, run on the loop: a build script's run, the build's tests, its

@@ -140,6 +140,11 @@ pub fn witnessed<D: Database, R>(db: &D, reads: &mut Vec<u64>, f: impl FnOnce() 
         let frame = &local.frames[at as usize];
         let mut complete = !frame.untracked && !frame.unshareable && frame.head == NONE;
         for &node in &local.edges[frame.edges_start as usize..] {
+            // A capture opened inside a witnessed run pushes reads at or above `skip_at` too
+            // (`Local::read`): leave them out of the witness's own list below `HIGH`.
+            if durability_of(storage, node).is_some_and(|it| it >= frame.skip_at) {
+                continue;
+            }
             match storage.key_of(node) {
                 0 => complete = false,
                 // alloc: none, reserved above

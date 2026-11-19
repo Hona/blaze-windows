@@ -232,14 +232,15 @@ pub fn given_value<'v>(name: &str, value: &'v str) -> std::borrow::Cow<'v, str> 
         name,
         "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "OUT_DIR" | "CARGO_TARGET_TMPDIR"
     ) || name.starts_with("CARGO_BIN_EXE_");
-    let named = value.starts_with('/') && cfg!(windows);
-    match path && named {
-        true => std::borrow::Cow::Owned(
-            // alloc: a path a program reads, once per read
-            blaze_core::platform::path::host(value).to_string_lossy().into_owned(),
-        ),
-        false => std::borrow::Cow::Borrowed(value),
+    if path
+        && cfg!(windows)
+        && let Some(host) = blaze_core::platform::path::DaemonPath::parse(value)
+            .and_then(blaze_core::platform::path::DaemonPath::try_host)
+    {
+        // alloc: a path a program reads, once per read
+        return std::borrow::Cow::Owned(host.as_path().to_string_lossy().into_owned());
     }
+    std::borrow::Cow::Borrowed(value)
 }
 
 /// A path a program names a file by (`include!`, `include_str!`, `include_bytes!`) as the

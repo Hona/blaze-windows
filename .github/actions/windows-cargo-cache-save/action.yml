@@ -1,0 +1,33 @@
+# Prune workspace crates and executables from target/<profile>, then save the external+vendored
+# dependency cache on a primary-key miss. Keeps cache entries compact (~300-600 MiB) and avoids
+# re-uploading when the exact key already hit.
+name: windows-cargo-cache-save
+description: Prune workspace crates and save compiled Windows dependency cache on miss
+inputs:
+  profile:
+    description: Cargo target profile directory (debug or release)
+    required: true
+  cache-hit:
+    description: Value of steps.<restore>.outputs.deps-cache-hit
+    required: true
+  cache-key:
+    description: Value of steps.<restore>.outputs.deps-cache-key
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prune workspace crates before caching dependencies
+      if: inputs.cache-hit != 'true'
+      shell: pwsh
+      run: ./.github/scripts/windows-prune-target.ps1 -Profile '${{ inputs.profile }}'
+    - name: Save compiled dependency cache
+      if: inputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          target/${{ inputs.profile }}/build
+          target/${{ inputs.profile }}/deps
+          target/${{ inputs.profile }}/.fingerprint
+          target/.rustc_info.json
+        key: ${{ inputs.cache-key }}
