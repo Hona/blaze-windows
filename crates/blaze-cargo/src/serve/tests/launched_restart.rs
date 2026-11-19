@@ -182,10 +182,13 @@ fn a_start_image_is_marked_once_durable_and_a_start_hands_over_the_newest_or_not
     let handed = HANDED.with_borrow(|it| it.last().cloned()).expect("the start handed the launch host its marks");
     let [mark] = &handed[..] else { panic!("one mark is handed over: {handed:?}") };
     assert_eq!((mark.program.as_str(), mark.runs_as.as_str()), (PROGRAM, RUNS_AS), "{mark:?}");
-    // A build answered since the start: it names the program by the path it runs from.
+    // A build answered since the start: it names the program by the path it runs from. The
+    // fakes' program reports its artifact only when its compile gives its output ([`OUTPUT`]).
     let mut client = dial(&mut daemon);
+    OUTPUT.set(true);
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);
+    OUTPUT.set(false);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     let executable = got.iter().find_map(|it| match it {
         Response::Built { artifacts, .. } => artifacts.iter().find_map(|it| it.executable.clone()),

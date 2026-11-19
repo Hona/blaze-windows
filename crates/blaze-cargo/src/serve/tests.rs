@@ -4364,6 +4364,9 @@ fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) 
     settle(&mut daemon, &mut client);
     let mut daemon = restart(daemon, &steps, seed + 1000);
     let mut client = dial(&mut daemon);
+    // A source edited: the same request with nothing changed is its certificate's, which runs
+    // no job and so no lowering (as `after_a_restart_the_first_lowering_reads_what_the_last_build_stored`).
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
     let (before, reads) = (crate::serve::direct::thread_counts(), KEPT_READS.get());
     let id =
         client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
