@@ -9,7 +9,7 @@ pub(crate) use mapped::{map, map_extent};
 pub use mapped::{Advice, MapOptions, Mapped, granularity};
 
 mod patch;
-pub(crate) use patch::matches_patch;
+pub use patch::matches_patch;
 #[cfg(windows)]
 pub(crate) use patch::{PATCH_PUBLICATION, PublishStep};
 

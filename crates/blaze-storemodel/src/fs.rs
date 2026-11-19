@@ -557,6 +557,35 @@ impl Files {
                 self.edit(file, Change::Cut(*len), asked);
                 Done::Truncated
             }
+            // A new staged file sized to `len` of zero room, failing if already present.
+            Effect::SparseFile { file, len, .. } => {
+                if self.live.contains_key(file.as_str()) {
+                    Done::Failed(IoError(format!("{file}: the staged file already exists")))
+                } else {
+                    let ino = self.inode(Inode::default());
+                    self.link(file.as_str(), ino, asked);
+                    if *len > 0 {
+                        self.edit(file, Change::Cut(*len), asked);
+                    }
+                    Done::Truncated
+                }
+            }
+            // Exclusive-custody in-place patch: applies `delta` only when the current file
+            // matches `whole` outside `delta`; otherwise declines so the caller replaces whole.
+            Effect::TryPatch { file, len, delta, whole, .. } => match self.ino(file) {
+                Some(ino) => match blaze_core::fs::matches_patch(&self.inodes[ino].live, *len, delta, whole) {
+                    Ok(true) => {
+                        self.edit(file, Change::Cut(*len), asked);
+                        for (at, bytes) in delta {
+                            self.edit(file, Change::At(*at, bytes.clone()), asked);
+                        }
+                        Done::Patched(true)
+                    }
+                    Ok(false) => Done::Patched(false),
+                    Err(e) => Done::Failed(IoError(e.to_string())),
+                },
+                None => Done::Patched(false),
+            },
             Effect::WriteAt { file, at, bytes, .. } => match self.ino(file) {
                 Some(_) => {
                     self.edit(file, Change::At(*at, bytes.clone()), asked);
