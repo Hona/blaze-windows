@@ -890,6 +890,9 @@ fn walk(dir: &Path) -> Result<Vec<(String, Arc<[u8]>)>, String> {
             } else if kind.is_file() {
                 let bytes = std::fs::read(entry.path())
                     .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+                // An archive the run left made the same bytes whatever its dates, as a
+                // sandboxed run's are (`blaze_usercode::run::collect`).
+                let bytes = blaze_usercode::run::settled_output(&entry.path(), bytes)?;
                 // alloc: once a file, its bytes moved into the one allocation the front end
                 // shares (the read buffer let go)
                 out.push((rel.to_string_lossy().replace('\\', "/"), Arc::<[u8]>::from(bytes)));
