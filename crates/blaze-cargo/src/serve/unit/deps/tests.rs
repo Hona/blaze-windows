@@ -269,6 +269,26 @@ fn every_task_of_a_batch_runs_once_on_the_pool() {
 }
 
 #[test]
+fn a_lent_store_batch_runs_in_line_on_the_calling_thread() {
+    let mut sim = Sim::new(1, Faults::default());
+    let mut store = opened(&mut sim);
+    store.put(Key(key(1)), Kind::Query, b"lent image").unwrap();
+    let reader = store.reader();
+    let images = Images::new(reader.clone(), stores_of(&reader), no_macros());
+    let caller = std::thread::current().id();
+    let seen = AtomicU32::new(0);
+    as_task(&mut sim, || {
+        images.for_each(4, &|_| {
+            assert_eq!(std::thread::current().id(), caller, "Reads::Lent must stay on the lent thread");
+            let found = images.get(&key(1)).unwrap().expect("put by the loop");
+            assert_eq!(found.bytes(), b"lent image");
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+    });
+    assert_eq!(seen.load(Ordering::Relaxed), 4);
+}
+
+#[test]
 fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
     let ran: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(0)).collect();
     on_pool(ran.len(), &|at| {
