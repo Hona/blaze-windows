@@ -558,6 +558,7 @@ pub(super) fn link(
         nothing: false,
         files: Vec::new(),
         puts: Vec::new(),
+        shared: Vec::new(),
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
@@ -723,6 +724,12 @@ pub(super) fn link(
         let Code::Built(parts, _) = code else { continue };
         let puts = std::mem::take(&mut parts.built.puts);
         making.puts.extend(puts.into_iter().map(|it| Put {
+            key: it.key,
+            kind: it.kind,
+            bytes: it.bytes,
+        }));
+        let shared = std::mem::take(&mut parts.built.shared);
+        making.shared.extend(shared.into_iter().map(|it| Put {
             key: it.key,
             kind: it.kind,
             bytes: it.bytes,

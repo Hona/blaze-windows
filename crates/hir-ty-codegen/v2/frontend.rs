@@ -123,6 +123,9 @@ pub struct HirFrontend<'db> {
     give_way: Option<&'db AtomicBool>,
     /// What the walk of a final binary found of its trait objects ([`super::devirt`]).
     pub(crate) devirt: super::devirt::State,
+    /// What this front end's walks read and made of sealed code's describes, and where they
+    /// entered it ([`described::reach`]).
+    pub(crate) reach: described::reach::State,
 }
 
 /// One value for each origin of the build's [`Policy`], told apart as the plan tells them.
@@ -622,6 +625,7 @@ impl<'db> HirFrontend<'db> {
             stop: None,
             give_way: None,
             devirt: Default::default(),
+            reach: Default::default(),
         }
     }
 
@@ -1358,6 +1362,10 @@ impl Frontend for HirFrontend<'_> {
         puts: &mut Vec<blaze_codegen::driver::Put>,
     ) -> Result<(Described<HirInstance, HirStatic>, bool), CodegenError> {
         self.with(|db| self.describe_recorded_in(db, instance, requester, records, puts))
+    }
+
+    fn walk_records(&self, shared: &mut Vec<blaze_codegen::driver::Put>) {
+        self.with(|db| self.reach_records_in(db, shared));
     }
 
     fn describe_static(

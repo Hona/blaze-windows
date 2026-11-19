@@ -396,6 +396,31 @@ identical bytes" over a real database with a dependency read from an image (the 
 five measurements of the lane's brief (second project, restart, second home, wall time, the
 edit loop).
 
+**Reach records** (2026-11-19, backlog B11; code
+`crates/hir-ty-codegen/v2/frontend/described/reach.rs`). A describe record saves a describe,
+not the walk. A second project still made a key and read the store once for each sealed
+function it reached: 4.6 s of `codegen walk` for hello world, with no describe run. A reach
+record holds, for the place where the walk enters sealed code (a sealed function referred to
+by a describe outside sealed code, or a root), every describe it reaches through sealed code.
+It has one ported buffer, and each describe is placed by the one that first refers to it.
+Each describe's requester is its parent's origin, so no package name is written.
+
+- **Key:** the entry's describe record key under the reach schema. That key covers every input:
+  the entry home's image (every crate below it), the stage, and what the units give the
+  requester.
+- **Read:** once, at the entry. Every other sealed function the walk visits is then answered
+  in memory: no key is made and no store read is done.
+- **Written:** at the walk's end, for each entry whose record was missing, but only when every
+  sealed function it reaches was read or described in this walk (rule 21).
+- **Where the records go:** sealed describe and reach records go to `Built::shared`.
+  blaze-cargo puts them in the machine's sealed layer (`Compiled::share`), never in the home
+  alone, so a second home and an installed cover read them.
+- **Tests, not run yet** (`hir-ty-codegen` `describe_reads::sealed_reach`):
+  - a second project describes only its own function and reads the store at most 8 times for
+    a 41-function sealed chain;
+  - a restart describes none;
+  - an edit of the sealed crate misses and builds the same as a build with no store.
+
 ## What a step reads
 
 2026-11-12, lane envkeys-1112 (decision D21). "Content keys" says how an input is written into

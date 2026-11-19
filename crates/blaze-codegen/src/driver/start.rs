@@ -388,10 +388,14 @@ impl<B: Prepare> Build<'_, B> {
     }
 
     /// The records of the describes made since they were last taken, sorted, each key once
-    /// ([`records::sorted`]).
+    /// ([`records::sorted`]). A launched run's records go to its home with the rest of its
+    /// puts, the sealed layer's among them ([`Frontend::walk_records`]).
     fn records_made(&self) -> Result<Vec<Put>, CodegenError> {
         // alloc: per call, the records its describes made
-        let made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        let mut made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        if self.records.is_some() {
+            self.frontend.walk_records(&mut made);
+        }
         if made.is_empty() {
             return Ok(made);
         }

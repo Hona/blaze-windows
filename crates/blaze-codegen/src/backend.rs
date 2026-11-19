@@ -429,6 +429,17 @@ pub trait Frontend: Sync {
         }
     }
 
+    /// The records this front end made for the walk that belong to the machine's sealed layer,
+    /// pushed to `shared`: the describes of sealed code ([`Self::describe_recorded`] keeps
+    /// them here rather than among its `puts`) and what each place the walk entered sealed code
+    /// reaches. Each is made once and handed over once: a second call gives only what was
+    /// made since. Asked by a build that reads records ([`crate::driver::Build::recording`])
+    /// once its walk has reached everything. Keyed by content alone, so every home of the
+    /// machine, and every machine the layer is installed on, reads them. The default has none.
+    fn walk_records(&self, shared: &mut Vec<crate::driver::Put>) {
+        let _ = shared;
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.
