@@ -35,12 +35,12 @@ use blaze_hash::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{
-    bits::locate,
+    bits::{AtomicBits, locate},
     radix::{self, Csr},
 };
 use smallvec::SmallVec;
@@ -54,7 +54,7 @@ use crate::model::{
 use crate::premap::{Outside, Strength, outside_def};
 use crate::stage::{Content, Stage, error};
 use crate::state::{Def, Input, PieceId, State, What};
-use crate::symbols::{NameId, Obj, SymKey, Symbols, Wide};
+use crate::symbols::{NameId, Obj, SHARDS, SymKey, Symbols, Wide};
 use crate::unwind;
 use crate::{Change, Format, LinkError, NativeKind, OutputKind};
 
@@ -141,6 +141,24 @@ impl CowFlags {
                 true
             }
         }
+    }
+
+    /// Builds a flag column from a flat word slice, trimming trailing zero words.
+    fn from_words(words: &[u64]) -> CowFlags {
+        let len = words.iter().rposition(|&w| w != 0).map_or(0, |at| at + 1);
+        CowFlags(CowVec::from_slice(&words[..len]))
+    }
+
+    /// Copies the flag words into a flat vector of `bits.div_ceil(64)` words for parallel reads.
+    fn to_words(&self, bits: usize) -> Vec<u64> {
+        let need = bits.div_ceil(64);
+        // alloc: once per parallel collection, one word per 64 sections
+        let mut out = vec![0u64; need];
+        let copy = self.0.len().min(need);
+        for (dst, &word) in out[..copy].iter_mut().zip(self.0.iter()) {
+            *dst = word;
+        }
+        out
     }
 }
 
@@ -240,7 +258,111 @@ impl Table {
     }
 }
 
+/// Which of the 64 shards a name hash maps to: bits 32..38, matching [`Symbols`]'s shard bits
+/// so the high bits [`Table::start`] reads stay independent.
+#[inline]
+fn name_shard(hashed: u64) -> usize {
+    ((hashed >> 32) as usize) & (SHARDS - 1)
+}
+
+/// An archive's index pre-hashed and partitioned into 64 shards, built once per archive and kept
+/// for the image's life: merging any subset of searched archives into one [`ArchiveMap`] then
+/// hashes no string again.
+pub(crate) struct ArchiveIndex {
+    shards: [Vec<(u64, u32)>; SHARDS],
+}
+
+impl ArchiveIndex {
+    fn build(archive: &Archive) -> ArchiveIndex {
+        let mut shards: [Vec<(u64, u32)>; SHARDS] = std::array::from_fn(|_| Vec::new());
+        for (at, (name, _)) in archive.index.iter().enumerate() {
+            let h = hash(archive.name(*name));
+            shards[name_shard(h)].push((h, at as u32));
+        }
+        ArchiveIndex { shards }
+    }
+}
+
+struct ArchiveShard {
+    table: Table,
+    /// `(input, index_pos)` in link-line order, first winning per name.
+    entries: Vec<(u32, u32)>,
+}
+
+/// Every searched archive's index merged into one 64-shard table: an archive lookup is one hash
+/// and one probe regardless of how many archives are on the link line, while returning the exact
+/// first `(input, member)` in link-line order.
+#[derive(Default)]
+struct ArchiveMap {
+    /// Searched archive input indices in link-line order, kept for checkpoint/restore.
+    inputs: Vec<u32>,
+    shards: Vec<ArchiveShard>,
+}
+
+impl ArchiveMap {
+    fn build(archives: &[(u32, Arc<ArchiveIndex>)], inputs: &[Input]) -> ArchiveMap {
+        if archives.is_empty() {
+            return ArchiveMap::default();
+        }
+        let archive_inputs: Vec<u32> = archives.iter().map(|&(input, _)| input).collect();
+        let shards = par::map(0..SHARDS, |s| {
+            let total: usize = archives.iter().map(|(_, idx)| idx.shards[s].len()).sum();
+            let mut table = Table::with_capacity(total);
+            // alloc: once per graph built, one entry per distinct symbol in the shard's archives
+            let mut entries: Vec<(u32, u32)> = Vec::with_capacity(total);
+            for &(input, ref idx) in archives {
+                let NativeFile::Archive(archive) = &*inputs[input as usize].file else {
+                    unreachable!("searched inputs are archives")
+                };
+                for &(h, at) in &idx.shards[s] {
+                    let name = archive.name(archive.index[at as usize].0);
+                    let next = entries.len() as u32;
+                    if table
+                        .insert(h, next, |it| {
+                            let (i, e) = entries[it as usize];
+                            let NativeFile::Archive(a) = &*inputs[i as usize].file else {
+                                return false;
+                            };
+                            a.name(a.index[e as usize].0) == name
+                        })
+                        .is_ok()
+                    {
+                        entries.push((input, at));
+                    }
+                }
+            }
+            ArchiveShard { table, entries }
+        });
+        ArchiveMap { inputs: archive_inputs, shards }
+    }
+
+    fn find(&self, inputs: &[Input], name: &str) -> Option<(u32, u32)> {
+        if self.shards.is_empty() {
+            return None;
+        }
+        let h = hash(name);
+        let shard = &self.shards[name_shard(h)];
+        shard
+            .table
+            .find(h, |it| {
+                let (i, e) = shard.entries[it as usize];
+                let NativeFile::Archive(a) = &*inputs[i as usize].file else {
+                    return false;
+                };
+                a.name(a.index[e as usize].0) == name
+            })
+            .map(|it| {
+                let (i, e) = shard.entries[it as usize];
+                let NativeFile::Archive(a) = &*inputs[i as usize].file else {
+                    unreachable!("searched inputs are archives")
+                };
+                (i, a.index[e as usize].1)
+            })
+    }
+}
+
 /// An archive's index by name, the first member of a name keeping it.
+#[cfg(test)]
 fn archive_index(archive: &Archive) -> Table {
     let mut table = Table::with_capacity(archive.index.len());
     for (at, (name, _)) in archive.index.iter().enumerate() {
@@ -253,6 +375,7 @@ fn archive_index(archive: &Archive) -> Table {
 
 /// The member an archive's index says defines `name`, whose [`hash`] is `hashed`: a name
 /// looked for in every searched archive is hashed once for all of them.
+#[cfg(test)]
 fn archive_find(table: &Table, archive: &Archive, hashed: u64, name: &str) -> Option<u32> {
     table
         .find(hashed, |it| archive.name(archive.index[it as usize].0) == name)
@@ -261,6 +384,7 @@ fn archive_find(table: &Table, archive: &Archive, hashed: u64, name: &str) -> Op
 
 /// The first searched archive (in link-line order) whose index names `name`, and the member
 /// it says defines it: one hash of the name, one probe of each archive's index.
+#[cfg(test)]
 fn search(archives: &[(u32, Arc<Table>)], inputs: &[Input], name: &str) -> Option<(u32, u32)> {
     let hashed = hash(name);
     archives.iter().find_map(|(input, table)| match &*inputs[*input as usize].file {
@@ -651,8 +775,8 @@ pub(crate) enum Read {
     Object(Arc<Parsed>),
     /// An import library's member: one DLL's symbols.
     Shared(Arc<NativeFile>),
-    /// A searched archive's index (at member 0, which no object of an archive is).
-    Index(Arc<Table>),
+    /// A searched archive's pre-hashed sharded index (at member 0, which no object of an archive is).
+    Index(Arc<ArchiveIndex>),
 }
 
 /// A record of a native `.eh_frame` section.
@@ -909,28 +1033,50 @@ impl Parsed {
     }
 }
 
-/// The keys of an object's symbols, sections and frame records, in [`Parsed::new`]'s order.
+#[cfg(test)]
 fn object_keys<'f>(
     obj: Obj,
     object: &'f Object,
     records: &[(u32, Vec<unwind::Native>)],
     out: &mut Vec<Wide<'f>>,
 ) {
-    for (at, symbol) in object.symbols.iter().enumerate() {
-        out.push(match (symbol.binding, symbol.kind, symbol.def) {
+    let base = out.len();
+    let count = object.symbols.len()
+        + object.sections.len()
+        + records.iter().map(|(_, it)| it.len()).sum::<usize>();
+    out.resize(base + count, Wide::Key(SymKey::Generation));
+    object_keys_into(obj, object, records, &mut out[base..]);
+}
+
+/// The keys of an object's symbols, sections and frame records, in [`Parsed::new`]'s order.
+fn object_keys_into<'f>(
+    obj: Obj,
+    object: &'f Object,
+    records: &[(u32, Vec<unwind::Native>)],
+    out: &mut [Wide<'f>],
+) {
+    let mut at = 0;
+    for (idx, symbol) in object.symbols.iter().enumerate() {
+        out[at] = match (symbol.binding, symbol.kind, symbol.def) {
             (_, SymbolKind::Section, SymbolDef::Section { section, .. }) => {
                 Wide::Key(SymKey::Section(obj, section))
             }
-            (Binding::Local, _, _) => Wide::Key(SymKey::Local(obj, at as u32)),
+            (Binding::Local, _, _) => Wide::Key(SymKey::Local(obj, idx as u32)),
             _ => Wide::Name(object.name(symbol.name)),
-        });
+        };
+        at += 1;
     }
-    out.extend((0..object.sections.len() as u32).map(|it| Wide::Key(SymKey::Section(obj, it))));
+    for section in 0..object.sections.len() as u32 {
+        out[at] = Wide::Key(SymKey::Section(obj, section));
+        at += 1;
+    }
     for (section, records) in records {
-        out.extend(
-            records.iter().map(|it| Wide::Key(SymKey::Frame(obj, *section, it.range.start as u32))),
-        );
+        for record in records {
+            out[at] = Wide::Key(SymKey::Frame(obj, *section, record.range.start as u32));
+            at += 1;
+        }
     }
+    debug_assert_eq!(at, out.len());
 }
 
 /// A native object's symbol, section or call frame record as an error names it: the input by
@@ -1276,6 +1422,36 @@ static GRAPHS: AtomicU64 = AtomicU64::new(1);
 /// [`Resolved::natives_version`]s, given out once a process each.
 static NATIVES_VERSIONS: AtomicU64 = AtomicU64::new(1);
 
+/// Dense `Sym -> slot` index partitioned by [`Symbols::split`]: one array read instead of a
+/// hash probe, populated in parallel across all 64 shards.
+struct SlotMap {
+    shards: [Vec<u32>; SHARDS],
+}
+
+impl Default for SlotMap {
+    fn default() -> SlotMap {
+        SlotMap { shards: std::array::from_fn(|_| Vec::new()) }
+    }
+}
+
+impl SlotMap {
+    #[inline]
+    fn get(&self, sym: Sym) -> Option<u32> {
+        let (shard, at) = Symbols::split(sym);
+        self.shards[shard].get(at).copied().filter(|&it| it != NONE)
+    }
+
+    fn insert(&mut self, sym: Sym, slot: u32) -> Option<u32> {
+        let (shard, at) = Symbols::split(sym);
+        let vec = &mut self.shards[shard];
+        if at >= vec.len() {
+            vec.resize(at + 1, NONE);
+        }
+        let prev = std::mem::replace(&mut vec[at], slot);
+        (prev != NONE).then_some(prev)
+    }
+}
+
 /// A resolution of the natives: the objects loaded, what every global is, which COMDAT groups
 /// won, and the indexes collection walks. Built when the natives or Rust's definitions
 /// change, shared by the stages after.
@@ -1285,7 +1461,7 @@ pub(crate) struct Graph {
     id: u64,
     loads: Vec<Load>,
     by_obj: HashMap<Obj, u32, std::alloc::Global>,
-    slot_of: HashMap<Sym, u32, std::alloc::Global>,
+    slot_of: SlotMap,
     slots: Vec<Slot>,
     /// Sections (flat) of a group that lost.
     discarded: CowFlags,
@@ -1301,8 +1477,8 @@ pub(crate) struct Graph {
     named: Vec<(NameId, u32)>,
     /// Sections (flat) kept whatever refers to them.
     roots: Vec<u32>,
-    /// The archives searched for names, in link-line order: input and index.
-    archives: Vec<(u32, Arc<Table>)>,
+    /// Every searched archive's index merged into one 64-shard table, in link-line order.
+    archives: ArchiveMap,
     exports: Arc<Exports>,
     /// Of each library `exports` was built of, in order, the input and member it was read
     /// from (0 for the input itself): what a restore reads again to build it
@@ -1328,7 +1504,7 @@ impl Graph {
             // alloc: none (an empty `Vec`); the loads, once per graph built
             loads: Vec::new(),
             by_obj: HashMap::new_in(std::alloc::Global),
-            slot_of: HashMap::new_in(std::alloc::Global),
+            slot_of: SlotMap::default(),
             // alloc: none (an empty `Vec`); the slots, once per graph built
             slots: Vec::new(),
             discarded: CowFlags::default(),
@@ -1341,8 +1517,7 @@ impl Graph {
             named: Vec::new(),
             // alloc: none (an empty `Vec`), replaced by `Graph::index`
             roots: Vec::new(),
-            // alloc: none (an empty `Vec`), replaced once per graph built
-            archives: Vec::new(),
+            archives: ArchiveMap::default(),
             exports: Arc::default(),
             // alloc: none (an empty `Vec`), replaced once per graph built
             exports_from: Vec::new(),
@@ -1350,24 +1525,6 @@ impl Graph {
             wasm: HashMap::new_in(std::alloc::Global),
             entry: None,
             outside: HashMap::new_in(std::alloc::Global),
-        }
-    }
-
-    fn slot(&mut self, sym: Sym) -> u32 {
-        let next = self.slots.len() as u32;
-        match self.slot_of.entry(sym) {
-            Entry::Occupied(it) => *it.get(),
-            Entry::Vacant(it) => {
-                it.insert(next);
-                self.slots.push(Slot {
-                    sym,
-                    best: NONE64,
-                    strength: 0,
-                    flags: 0,
-                    fallback: NONE64,
-                });
-                next
-            }
         }
     }
 
@@ -1478,8 +1635,8 @@ impl Graph {
     }
 
     /// The indexes collection walks: describers, live support, named sections, roots.
-    /// Once per graph built: each list is sized from the loads, but the live support's (as
-    /// many as its sections' relocations).
+    /// Built in parallel across chunks of loads on large graphs and joined in load order, so
+    /// every list matches the serial walk.
     fn index(&mut self) {
         let sum =
             |of: fn(&Parsed) -> usize| self.loads.iter().map(|it| of(&it.parsed)).sum::<usize>();
@@ -1489,38 +1646,70 @@ impl Graph {
         let mut roots = Vec::with_capacity(sum(|it| it.roots.len()));
         // alloc: none without live support; it grows once per graph built
         let mut supports = Vec::new();
-        for (load, it) in self.loads.iter().enumerate() {
-            let load = load as u32;
-            for section in &it.parsed.object().live_support {
-                for symbol in it.parsed.refs.row(*section as usize) {
-                    match self.target(load, *symbol) {
-                        Some((l, s)) if (l, s) != (load, *section) => {
-                            supports.push((self.flat(l, s) as u32, it.sections + section));
+        let collect_range = |range: Range<usize>| {
+            let mut u = Vec::new();
+            let mut f = Vec::new();
+            let mut n = Vec::new();
+            let mut r = Vec::new();
+            let mut s = Vec::new();
+            for load in range {
+                let it = &self.loads[load];
+                let load = load as u32;
+                for section in &it.parsed.object().live_support {
+                    for symbol in it.parsed.refs.row(*section as usize) {
+                        match self.target(load, *symbol) {
+                            Some((l, sec)) if (l, sec) != (load, *section) => {
+                                s.push((self.flat(l, sec) as u32, it.sections + section));
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
+                for (section, symbol) in &it.parsed.unwind {
+                    if *symbol == NONE {
+                        continue;
+                    }
+                    if let Some((l, sec)) = self.target(load, *symbol) {
+                        u.push((self.flat(l, sec) as u32, it.sections + section));
+                    }
+                }
+                for (at, frame) in it.parsed.frames.iter().enumerate() {
+                    if !frame.fde || frame.function == NONE {
+                        continue;
+                    }
+                    if let Some((l, sec)) = self.target(load, frame.function) {
+                        f.push((self.flat(l, sec) as u32, it.frames + at as u32));
+                    }
+                }
+                n.extend(
+                    it.parsed.named.iter().map(|(name, section)| (*name, it.sections + section)),
+                );
+                r.extend(it.parsed.roots.iter().map(|section| it.sections + section));
             }
-            for (section, symbol) in &it.parsed.unwind {
-                if *symbol == NONE {
-                    continue;
-                }
-                if let Some((l, s)) = self.target(load, *symbol) {
-                    unwinds.push((self.flat(l, s) as u32, it.sections + section));
-                }
+            (u, f, n, r, s)
+        };
+        if self.loads.len() > 1 && self.sections >= 1024 {
+            let grain = self.loads.len().div_ceil(par::threads() * 4).max(1);
+            let chunks = self.loads.len().div_ceil(grain);
+            let parts = par::map(0..chunks, |c| {
+                let start = c * grain;
+                let end = (start + grain).min(self.loads.len());
+                collect_range(start..end)
+            });
+            for (u, f, n, r, s) in parts {
+                unwinds.extend(u);
+                fdes.extend(f);
+                named.extend(n);
+                roots.extend(r);
+                supports.extend(s);
             }
-            for (at, frame) in it.parsed.frames.iter().enumerate() {
-                if !frame.fde || frame.function == NONE {
-                    continue;
-                }
-                if let Some((l, s)) = self.target(load, frame.function) {
-                    fdes.push((self.flat(l, s) as u32, it.frames + at as u32));
-                }
-            }
-            named.extend(
-                it.parsed.named.iter().map(|(name, section)| (*name, it.sections + section)),
-            );
-            roots.extend(it.parsed.roots.iter().map(|section| it.sections + section));
+        } else {
+            let (u, f, n, r, s) = collect_range(0..self.loads.len());
+            unwinds = u;
+            fdes = f;
+            named = n;
+            roots = r;
+            supports = s;
         }
         radix::sort_copy_by_key(&mut named, |&(name, flat)| radix::pack_32(name.0, flat));
         self.unwinds = Csr::build(self.sections as usize, unwinds.iter().copied());
@@ -1695,7 +1884,7 @@ fn special_mark(graph: &Graph, symbols: &Symbols, writer: &Formats, sym: Sym) ->
         Some(got @ Special::Got { .. }) => got
             .got_target(name)
             .and_then(|target| symbols.find_sym_name(target))
-            .and_then(|it| graph.slot_of.get(&it).copied())
+            .and_then(|it| graph.slot_of.get(it))
             .unwrap_or(NOTHING),
         _ => NOTHING,
     }
@@ -1898,6 +2087,240 @@ fn note_native(
     }
 }
 
+/// Whole-graph collection and native reference strength marking for [`Stage::rebuild`]: level-
+/// synchronous parallel BFS over flat [`AtomicBits`], then parallel `note_native` over flat
+/// [`AtomicU8`]s, packed into [`Marks`] once at the end. Marks the exact same reachable set
+/// and maximum reference strength as [`Marker::run`] + [`note_native`].
+fn collect_parallel(graph: &Graph, symbols: &Symbols, writer: &Formats) -> Marks {
+    let section_count = graph.sections as usize;
+    let frame_count = graph.frames as usize;
+    let slot_count = graph.slots.len();
+    let discarded = graph.discarded.to_words(section_count);
+    let is_discarded = |flat: usize| -> bool {
+        let (w, m) = locate(flat);
+        discarded.get(w).is_some_and(|word| word & m != 0)
+    };
+    let section_bits = AtomicBits::new(section_count);
+    let frame_bits = AtomicBits::new(frame_count);
+    let named_bits = AtomicBits::new(graph.named.len());
+    // alloc: once per full graph collection, one atomic u32 per slot for the special cache
+    let special: Vec<AtomicU32> = (0..slot_count).map(|_| AtomicU32::new(UNKNOWN)).collect();
+
+    let push_section = |(load, section): (u32, u32), out: &mut Vec<u64>| {
+        let flat = graph.flat(load, section);
+        if !is_discarded(flat) && section_bits.insert_if_clear(flat, Ordering::Relaxed) {
+            out.push(pack(load, section));
+        }
+    };
+    let push_frame = |load: u32, frame: u32, out_frames: &mut Vec<u64>| {
+        let base = graph.loads[load as usize].frames;
+        if !frame_bits.insert_if_clear((base + frame) as usize, Ordering::Relaxed) {
+            return;
+        }
+        out_frames.push(pack(load, frame));
+        let cie = graph.loads[load as usize].parsed.frames[frame as usize].cie;
+        if cie != NONE && frame_bits.insert_if_clear((base + cie) as usize, Ordering::Relaxed) {
+            out_frames.push(pack(load, cie));
+        }
+    };
+    let mark_special = |slot: u32, out: &mut Vec<u64>| {
+        let mut it = special[slot as usize].load(Ordering::Relaxed);
+        if it == UNKNOWN {
+            it = special_mark(graph, symbols, writer, graph.slots[slot as usize].sym);
+            special[slot as usize].store(it, Ordering::Relaxed);
+        }
+        if it == NOTHING {
+            return;
+        }
+        if it & NAMED != 0 {
+            let run = (it & !NAMED) as usize;
+            if named_bits.insert_if_clear(run, Ordering::Relaxed) {
+                let name = graph.named[run].0;
+                for (n, flat) in &graph.named[run..] {
+                    if *n != name {
+                        break;
+                    }
+                    push_section(graph.unflat(*flat), out);
+                }
+            }
+        } else if let Some(at) = graph.home(it) {
+            push_section(at, out);
+        }
+    };
+    let mark_symbol = |load: u32, symbol: u32, out: &mut Vec<u64>| {
+        if let Some(at) = graph.target(load, symbol) {
+            push_section(at, out);
+        }
+        let slot = graph.loads[load as usize].slots[symbol as usize];
+        if slot != NONE {
+            mark_special(slot, out);
+        }
+    };
+
+    // Seed the initial frontier from root slots and retained sections.
+    let mut frontier_sections: Vec<u64> = Vec::with_capacity(graph.roots.len() + 64);
+    let mut frontier_frames: Vec<u64> = Vec::new();
+    for slot in 0..slot_count as u32 {
+        if graph.slots[slot as usize].flags & (WANTED | ROOT | LOOSE) != 0 {
+            if let Some(at) = graph.home(slot) {
+                push_section(at, &mut frontier_sections);
+            }
+            mark_special(slot, &mut frontier_sections);
+        }
+    }
+    for &flat in &graph.roots {
+        push_section(graph.unflat(flat), &mut frontier_sections);
+    }
+
+    let step_section = |item: u64, next_s: &mut Vec<u64>, next_f: &mut Vec<u64>| {
+        let (load, section) = unpack(item);
+        let flat = graph.flat(load, section);
+        let parsed = &graph.loads[load as usize].parsed;
+        let object = parsed.object();
+        let group = parsed.group_of[section as usize];
+        if group != NONE {
+            for &it in object.group_sections(&object.groups[group as usize]) {
+                push_section((load, it), next_s);
+            }
+        }
+        for &it in parsed.ties.get(section as usize).unwrap_or_default() {
+            push_section((load, it), next_s);
+        }
+        for &symbol in parsed.refs.row(section as usize) {
+            mark_symbol(load, symbol, next_s);
+        }
+        for &it in graph.unwinds.row(flat) {
+            push_section(graph.unflat(it), next_s);
+        }
+        for &it in graph.supports.get(flat).unwrap_or_default() {
+            push_section(graph.unflat(it), next_s);
+        }
+        for &it in graph.fdes.row(flat) {
+            let (l, f) = graph.unflat_frame(it);
+            push_frame(l, f, next_f);
+        }
+    };
+    let step_frame = |item: u64, next_s: &mut Vec<u64>| {
+        let (load, frame) = unpack(item);
+        let parsed = &graph.loads[load as usize].parsed;
+        let object = parsed.object();
+        for &fixup in parsed.frame_fixups.row(frame as usize) {
+            mark_symbol(load, object.fixups[fixup as usize].symbol, next_s);
+        }
+    };
+
+    const PAR_WAVE: usize = 256;
+    while !frontier_sections.is_empty() || !frontier_frames.is_empty() {
+        let mut next_sections: Vec<u64> = Vec::new();
+        let mut next_frames: Vec<u64> = Vec::new();
+        if frontier_sections.len() >= PAR_WAVE {
+            let grain = frontier_sections.len().div_ceil(par::threads() * 8).max(32);
+            let parts: Vec<(Vec<u64>, Vec<u64>)> =
+                par::map(par::chunks(&frontier_sections, grain), |chunk| {
+                    let mut ns = Vec::new();
+                    let mut nf = Vec::new();
+                    for &item in chunk {
+                        step_section(item, &mut ns, &mut nf);
+                    }
+                    (ns, nf)
+                });
+            let total_s: usize = parts.iter().map(|it| it.0.len()).sum();
+            let total_f: usize = parts.iter().map(|it| it.1.len()).sum();
+            next_sections.reserve(total_s);
+            next_frames.reserve(total_f);
+            for (ns, nf) in parts {
+                next_sections.extend(ns);
+                next_frames.extend(nf);
+            }
+        } else {
+            for &item in &frontier_sections {
+                step_section(item, &mut next_sections, &mut next_frames);
+            }
+        }
+        if frontier_frames.len() >= PAR_WAVE {
+            let grain = frontier_frames.len().div_ceil(par::threads() * 8).max(32);
+            let parts: Vec<Vec<u64>> = par::map(par::chunks(&frontier_frames, grain), |chunk| {
+                let mut ns = Vec::new();
+                for &item in chunk {
+                    step_frame(item, &mut ns);
+                }
+                ns
+            });
+            for ns in parts {
+                next_sections.extend(ns);
+            }
+        } else {
+            for &item in &frontier_frames {
+                step_frame(item, &mut next_sections);
+            }
+        }
+        frontier_sections = next_sections;
+        frontier_frames = next_frames;
+    }
+
+    // Parallel `note_native`: record maximum reference strength (weak=1, strong=2) per slot.
+    // alloc: once per full graph collection, one atomic byte per slot
+    let native: Vec<AtomicU8> = (0..slot_count).map(|_| AtomicU8::new(0)).collect();
+    let note_range = |range: Range<usize>| {
+        let note = |load_slots: &[u32], object: &Object, symbol: u32| {
+            let slot = load_slots[symbol as usize];
+            if slot == NONE {
+                return;
+            }
+            let level = if object.symbols[symbol as usize].binding == Binding::Weak { 1 } else { 2 };
+            let cell = &native[slot as usize];
+            if cell.load(Ordering::Relaxed) < level {
+                cell.fetch_max(level, Ordering::Relaxed);
+            }
+        };
+        for load in range {
+            let it = &graph.loads[load];
+            let parsed = &it.parsed;
+            let object = parsed.object();
+            for s in 0..object.sections.len() as u32 {
+                if section_bits.contains((it.sections + s) as usize, Ordering::Relaxed) {
+                    for &symbol in parsed.refs.row(s as usize) {
+                        note(&it.slots, object, symbol);
+                    }
+                }
+            }
+            for f in 0..parsed.frames.len() as u32 {
+                if frame_bits.contains((it.frames + f) as usize, Ordering::Relaxed) {
+                    for &fixup in parsed.frame_fixups.row(f as usize) {
+                        note(&it.slots, object, object.fixups[fixup as usize].symbol);
+                    }
+                }
+            }
+        }
+    };
+    if graph.loads.len() > 1 && section_count >= 1024 {
+        let grain = graph.loads.len().div_ceil(par::threads() * 4).max(1);
+        let chunks = graph.loads.len().div_ceil(grain);
+        par::for_each(0..chunks, |c| {
+            let start = c * grain;
+            let end = (start + grain).min(graph.loads.len());
+            note_range(start..end);
+        });
+    } else {
+        note_range(0..graph.loads.len());
+    }
+
+    let words_of = |bits: &AtomicBits| -> Vec<u64> {
+        bits.words().iter().map(|it| it.load(Ordering::Relaxed)).collect()
+    };
+    let special_vals: Vec<u32> = special.into_iter().map(AtomicU32::into_inner).collect();
+    let special_len = special_vals.iter().rposition(|&v| v != UNKNOWN).map_or(0, |at| at + 1);
+    let native_vals: Vec<u8> = native.into_iter().map(AtomicU8::into_inner).collect();
+    let native_len = native_vals.iter().rposition(|&v| v != 0).map_or(0, |at| at + 1);
+    Marks {
+        sections: CowFlags::from_words(&words_of(&section_bits)),
+        frames: CowFlags::from_words(&words_of(&frame_bits)),
+        named: CowFlags::from_words(&words_of(&named_bits)),
+        special: CowVec::from_slice(&special_vals[..special_len]),
+        native: CowVec::from_slice(&native_vals[..native_len]),
+    }
+}
+
 /// The symbols other than its own a kept section defines: its locals, and the globals it is
 /// the winning definition of.
 fn section_defines(graph: &Graph, load: u32, section: u32, out: &mut Vec<Sym>) {
@@ -2053,15 +2476,200 @@ pub(crate) fn resolution_id(resolved: &Resolved) -> u64 {
     resolved.graph.as_ref().map_or(0, |it| it.id)
 }
 
+/// One of 64 symbol-resolution shards, keyed by [`Symbols::split`]: during the pull loop each
+/// shard owns its global symbols' slots, pull queue and commons with no cross-shard sharing,
+/// so every pull round resolves all 64 shards in parallel in exact `(load, symbol)` order.
+struct ShardBuild {
+    /// Local symbol index in this shard -> index in `self.slots`, or [`NONE`].
+    slot_of: Vec<u32>,
+    slots: Vec<Slot>,
+    /// Local slot indices newly flagged [`PULL`] in this round.
+    queue: Vec<u32>,
+    /// Local slot index -> `(max_size, max_align)` for tentative definitions.
+    commons: HashMap<u32, (u64, u64), std::alloc::Global>,
+}
+
+impl Default for ShardBuild {
+    fn default() -> ShardBuild {
+        ShardBuild {
+            slot_of: Vec::new(),
+            slots: Vec::new(),
+            queue: Vec::new(),
+            commons: HashMap::new_in(std::alloc::Global),
+        }
+    }
+}
+
+impl ShardBuild {
+    #[inline]
+    fn slot(&mut self, sym: Sym) -> u32 {
+        let (_, at) = Symbols::split(sym);
+        if at >= self.slot_of.len() {
+            self.slot_of.resize(at + 1, NONE);
+        }
+        let existing = self.slot_of[at];
+        if existing != NONE {
+            return existing;
+        }
+        let next = self.slots.len() as u32;
+        self.slot_of[at] = next;
+        self.slots.push(Slot { sym, best: NONE64, strength: 0, flags: 0, fallback: NONE64 });
+        next
+    }
+
+    #[inline]
+    fn flag(&mut self, slot: u32, flags: u16) {
+        let it = &mut self.slots[slot as usize];
+        it.flags |= flags;
+        if flags & PULL != 0 && it.flags & QUEUED == 0 {
+            it.flags |= QUEUED;
+            self.queue.push(slot);
+        }
+    }
+
+    #[inline]
+    fn best(loads: &[Load], discarded: &[u64], slot: &Slot) -> Option<(u32, u32)> {
+        let it = slot.best;
+        if it == NONE64 {
+            return None;
+        }
+        let (load, symbol) = unpack(it);
+        match loads[load as usize].parsed.object().symbols[symbol as usize].def {
+            SymbolDef::Section { section, .. } => {
+                let flat = (loads[load as usize].sections + section) as usize;
+                let (w, m) = locate(flat);
+                if discarded.get(w).is_some_and(|word| word & m != 0) {
+                    None
+                } else {
+                    Some((load, symbol))
+                }
+            }
+            _ => Some((load, symbol)),
+        }
+    }
+
+    /// Resolves one global symbol occurrence `(sym, load, at)` into this shard in exact
+    /// link-line order, returning `Err` on a duplicate strong definition.
+    fn apply(
+        &mut self,
+        loads: &[Load],
+        inputs: &[Input],
+        discarded: &[u64],
+        sym: Sym,
+        load: u32,
+        at: u32,
+    ) -> Result<(), LinkError> {
+        let slot = self.slot(sym);
+        let parsed = &loads[load as usize].parsed;
+        let object = parsed.object();
+        let input = loads[load as usize].input;
+        let symbol = &object.symbols[at as usize];
+        let weak = symbol.binding == Binding::Weak;
+        let strength = match symbol.def {
+            SymbolDef::Undefined => {
+                if !weak {
+                    self.flag(slot, PULL);
+                }
+                return Ok(());
+            }
+            SymbolDef::Fallback { symbol: default, search } => {
+                if search {
+                    self.flag(slot, PULL);
+                }
+                let it = &mut self.slots[slot as usize];
+                if it.fallback == NONE64 {
+                    it.fallback = pack(load, default);
+                }
+                return Ok(());
+            }
+            SymbolDef::Section { section, .. } => {
+                let flat = (loads[load as usize].sections + section) as usize;
+                let (w, m) = locate(flat);
+                if discarded.get(w).is_some_and(|word| word & m != 0) {
+                    return Ok(());
+                }
+                if weak { 2 } else { 3 }
+            }
+            SymbolDef::Absolute(_) => {
+                if weak { 2 } else { 3 }
+            }
+            SymbolDef::Common { size, align } => {
+                let it = self.commons.entry(slot).or_insert((0, 1));
+                it.0 = it.0.max(size);
+                it.1 = it.1.max(align);
+                1
+            }
+        };
+        let it = self.slots[slot as usize];
+        if it.flags & RUST != 0 {
+            if strength < 3 {
+                return Ok(());
+            }
+            if it.flags & RUST_WEAK == 0 {
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "duplicate symbol `{}`: Rust code defines it, and so does {}",
+                        object.name(symbol.name),
+                        inputs[input as usize].name
+                    ),
+                ));
+            }
+            let it = &mut self.slots[slot as usize];
+            it.flags &= !RUST;
+            it.best = pack(load, at);
+            it.strength = 3;
+            return Ok(());
+        }
+        let take = match Self::best(loads, discarded, &it) {
+            None => true,
+            Some(_) if strength > it.strength => true,
+            Some((l, i)) if strength == 3 && it.strength == 3 => {
+                let first = match loads[l as usize].parsed.object().symbols[i as usize].def {
+                    SymbolDef::Section { .. } => &*inputs[loads[l as usize].input as usize].name,
+                    _ => "an absolute definition",
+                };
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "duplicate symbol `{}`: in {first} and in {}",
+                        object.name(symbol.name),
+                        inputs[input as usize].name
+                    ),
+                ));
+            }
+            Some(_) => false,
+        };
+        if take {
+            let it = &mut self.slots[slot as usize];
+            it.best = pack(load, at);
+            it.strength = strength;
+        }
+        Ok(())
+    }
+}
+
+/// One of 64 COMDAT-group deduplication shards, keyed by [`name_shard`].
+#[derive(Default)]
+struct GroupShard {
+    table: Table,
+    list: Vec<(u32, u32)>,
+}
+
 /// A resolution being built.
 struct Build {
     graph: Graph,
-    /// Slots to look for in the archives after the round.
-    queue: Vec<u32>,
+    /// Sharded symbol tables and pull queues during the pull loop, flattened into
+    /// [`Graph::slots`] and [`Graph::slot_of`] by [`Build::finalize`].
+    shards: [ShardBuild; SHARDS],
+    /// Flat bitmap of discarded sections during the pull loop, packed into [`Graph::discarded`]
+    /// by [`Build::finalize`].
+    discarded_words: Vec<u64>,
     pulled: HashSet<(u32, u32), std::alloc::Global>,
-    /// COMDAT groups by name: the winner's `(load, group)` in `group_list`.
-    groups: Table,
-    group_list: Vec<(u32, u32)>,
+    /// COMDAT groups by name hash shard: each winner's `(load, group)` in `list`.
+    group_shards: [GroupShard; SHARDS],
     mismatches: HashMap<String, (String, u32), std::alloc::Global>,
     asked: HashSet<String, std::alloc::Global>,
     /// The line's shared libraries: file, `as_needed`, place on the line.
@@ -2072,19 +2680,18 @@ struct Build {
     /// ([`Graph::exports_from`]).
     shared_from: Vec<(u32, u32)>,
     members_from: Vec<(u32, u32)>,
-    commons: HashMap<u32, (u64, u64), std::alloc::Global>,
+    commons: Vec<(u32, u64, u64)>,
 }
 
 impl Build {
     fn new() -> Build {
         Build {
             graph: Graph::new(),
-            // alloc: none (an empty `Vec`); it grows once per graph built
-            queue: Vec::new(),
+            shards: std::array::from_fn(|_| ShardBuild::default()),
+            // alloc: none (an empty `Vec`); grows to `sections / 64` words during pull rounds
+            discarded_words: Vec::new(),
             pulled: HashSet::new_in(std::alloc::Global),
-            groups: Table::default(),
-            // alloc: none (an empty `Vec`); it grows once per graph built
-            group_list: Vec::new(),
+            group_shards: std::array::from_fn(|_| GroupShard::default()),
             mismatches: HashMap::new_in(std::alloc::Global),
             asked: HashSet::new_in(std::alloc::Global),
             // alloc: none (an empty `Vec`); it grows once per graph built
@@ -2094,39 +2701,35 @@ impl Build {
             // alloc: none (an empty `Vec`); each grows once per graph built
             shared_from: Vec::new(),
             members_from: Vec::new(),
-            commons: HashMap::new_in(std::alloc::Global),
+            // alloc: none (an empty `Vec`); filled by `finalize`
+            commons: Vec::new(),
         }
     }
 
-    fn slot(&mut self, sym: Sym) -> u32 {
-        self.graph.slot(sym)
-    }
-
-    /// Room for `slots` more slots: the slot map is sized once a pull round, never doubled
-    /// (and rehashed) while a round registers its objects.
-    fn reserve(&mut self, slots: usize) {
-        self.graph.slot_of.reserve(slots);
-        self.graph.slots.reserve(slots);
-    }
-
-    fn flag(&mut self, slot: u32, flags: u16) {
-        let it = &mut self.graph.slots[slot as usize];
-        it.flags |= flags;
-        if flags & PULL != 0 && it.flags & QUEUED == 0 {
-            it.flags |= QUEUED;
-            self.queue.push(slot);
-        }
+    fn flag_sym(&mut self, sym: Sym, flags: u16) {
+        let (s, _) = Symbols::split(sym);
+        let shard = &mut self.shards[s];
+        let slot = shard.slot(sym);
+        shard.flag(slot, flags);
     }
 
     /// Drops a group's sections, and the sections tied to one dropped (lld drops a
     /// `SHF_LINK_ORDER` section whose `sh_link` is dropped).
     fn discard(&mut self, load: u32, group: u32) {
-        let Graph { loads, discarded, .. } = &mut self.graph;
-        let it = &loads[load as usize];
+        let set_bit = |words: &mut Vec<u64>, flat: usize| -> bool {
+            let (w, m) = locate(flat);
+            if w >= words.len() {
+                words.resize(w + 1, 0);
+            }
+            let was = words[w] & m != 0;
+            words[w] |= m;
+            !was
+        };
+        let it = &self.graph.loads[load as usize];
         let object = it.parsed.object();
         let members = object.group_sections(&object.groups[group as usize]);
         for section in members {
-            discarded.set((it.sections + section) as usize);
+            set_bit(&mut self.discarded_words, (it.sections + section) as usize);
         }
         if object.ties.is_empty() {
             return;
@@ -2135,11 +2738,65 @@ impl Build {
         while let Some(section) = work.pop() {
             for tied in it.parsed.ties.get(section as usize).unwrap_or_default() {
                 let dependent = tie_of(object, *tied).is_some_and(|tie| tie.to == section);
-                if dependent && discarded.set((it.sections + tied) as usize) {
+                if dependent && set_bit(&mut self.discarded_words, (it.sections + tied) as usize) {
                     work.push(*tied);
                 }
             }
         }
+    }
+
+    /// Flattens the 64 sharded symbol tables into [`Graph::slots`] and [`Graph::slot_of`] in
+    /// deterministic shard order (independent of thread count), packs `discarded_words`, and
+    /// fills every load's `slots` column in parallel.
+    fn finalize(&mut self) {
+        self.graph.discarded = CowFlags::from_words(&self.discarded_words);
+        let mut bases = [0u32; SHARDS];
+        let mut total = 0u32;
+        for (s, shard) in self.shards.iter().enumerate() {
+            bases[s] = total;
+            total += shard.slots.len() as u32;
+        }
+        let mut slots = Vec::with_capacity(total as usize);
+        let mut commons = Vec::new();
+        for (s, shard) in self.shards.iter_mut().enumerate() {
+            let base = bases[s];
+            slots.extend_from_slice(&shard.slots);
+            for (&local, &(size, align)) in &shard.commons {
+                commons.push((base + local, size, align));
+            }
+        }
+        self.graph.slots = slots;
+        self.commons = commons;
+
+        // Adjust each shard's `slot_of` indices by its prefix base in parallel, then move into
+        // `Graph::slot_of`.
+        par::for_each(par::zip(&mut self.shards[..], &bases[..]), |(shard, &base)| {
+            if base != 0 {
+                for entry in &mut shard.slot_of {
+                    if *entry != NONE {
+                        *entry += base;
+                    }
+                }
+            }
+        });
+        for (s, shard) in self.shards.iter_mut().enumerate() {
+            self.graph.slot_of.shards[s] = std::mem::take(&mut shard.slot_of);
+        }
+
+        // Fill `Load::slots` for every loaded object in parallel: one dense array lookup per
+        // non-local symbol, zero hashing.
+        let slot_of = &self.graph.slot_of;
+        par::for_each(&mut self.graph.loads, |load| {
+            let object = load.parsed.object();
+            // alloc: once per object per graph built
+            let mut out = vec![NONE; object.symbols.len()];
+            for (at, symbol) in object.symbols.iter().enumerate() {
+                if !is_local(symbol) {
+                    out[at] = slot_of.get(load.parsed.sym(at as u32)).unwrap_or(NONE);
+                }
+            }
+            load.slots = out;
+        });
     }
 
     /// Weak externals left undefined become aliases of what they fall back to, which the
@@ -2503,9 +3160,11 @@ fn read_objects<'b>(
         // alloc: one buffer per batch read, the objects of the batch
         let got: Vec<Got> = got.into_iter().collect::<Result<_, _>>()?;
         // One batch for every object's symbols, sections and frame records, and one for the
-        // names of its named sections, each sized once.
+        // names of its named sections, each sized once and filled in parallel across objects.
+        let mut starts = Vec::with_capacity(got.len() + 1);
         let (mut key_count, mut name_count) = (0, 0);
         for it in &got {
+            starts.push((key_count, name_count));
             let NativeFile::Object(object) = &*it.file else { continue };
             key_count += object.symbols.len() + object.sections.len();
             key_count += it.records.iter().map(|(_, records)| records.len()).sum::<usize>();
@@ -2515,23 +3174,56 @@ fn read_objects<'b>(
                 .filter(|it| matches!(it.what, SectionKind::Alloc(Class::Named { .. }, _)))
                 .count();
         }
-        let mut starts = Vec::with_capacity(got.len() + 1);
+        starts.push((key_count, name_count));
         let syms;
         let name_ids;
         {
-            let mut keys: Vec<Wide<'_>> = Vec::with_capacity(key_count);
-            let mut names: Vec<&str> = Vec::with_capacity(name_count);
-            for (it, at) in got.iter().zip(misses) {
-                starts.push((keys.len(), names.len()));
-                let NativeFile::Object(object) = &*it.file else { continue };
-                object_keys(objs[*at], object, &it.records, &mut keys);
+            let mut keys: Vec<Wide<'_>> = vec![Wide::Key(SymKey::Generation); key_count];
+            let mut names: Vec<&str> = vec![""; name_count];
+            let mut key_parts: Vec<&mut [Wide<'_>]> = Vec::with_capacity(got.len());
+            let mut name_parts: Vec<&mut [&str]> = Vec::with_capacity(got.len());
+            let (mut rest_k, mut rest_n) = (&mut keys[..], &mut names[..]);
+            for n in 0..got.len() {
+                let (k_len, n_len) = (starts[n + 1].0 - starts[n].0, starts[n + 1].1 - starts[n].1);
+                let (kp, tk) = std::mem::take(&mut rest_k).split_at_mut(k_len);
+                let (np, tn) = std::mem::take(&mut rest_n).split_at_mut(n_len);
+                key_parts.push(kp);
+                name_parts.push(np);
+                (rest_k, rest_n) = (tk, tn);
+            }
+            fn fill<'f>(
+                it: &'f Got,
+                obj: Obj,
+                k_out: &mut [Wide<'f>],
+                n_out: &mut [&'f str],
+            ) {
+                let NativeFile::Object(object) = &*it.file else { return };
+                object_keys_into(obj, object, &it.records, k_out);
+                let mut n_at = 0;
                 for section in &object.sections {
                     if matches!(section.what, SectionKind::Alloc(Class::Named { .. }, _)) {
-                        names.push(object.name(section.name));
+                        n_out[n_at] = object.name(section.name);
+                        n_at += 1;
                     }
                 }
             }
-            starts.push((keys.len(), names.len()));
+            if key_count >= 4096 && got.len() > 1 {
+                par::for_each(
+                    par::zip(
+                        par::zip(&got[..], misses),
+                        par::zip(&mut key_parts[..], &mut name_parts[..]),
+                    ),
+                    |((it, at), (k_out, n_out))| fill(it, objs[*at], k_out, n_out),
+                );
+            } else {
+                for ((it, at), (k_out, n_out)) in
+                    got.iter().zip(misses).zip(key_parts.iter_mut().zip(name_parts.iter_mut()))
+                {
+                    fill(it, objs[*at], k_out, n_out);
+                }
+            }
+            drop(key_parts);
+            drop(name_parts);
             syms = symbols.intern_wide(&keys);
             name_ids = symbols.names_all(&names);
         }
@@ -2559,16 +3251,16 @@ fn read_objects<'b>(
 }
 
 impl<'a> Stage<'a> {
-    /// The indexes of the searched archives, kept ones as they are, the rest built in
-    /// parallel.
-    fn indexes(&mut self, inputs: &[Input], lazy: &[u32]) -> Vec<(u32, Arc<Table>)> {
+    /// The pre-hashed sharded indexes of the searched archives, kept ones as they are, the rest
+    /// built in parallel.
+    fn indexes(&mut self, inputs: &[Input], lazy: &[u32]) -> Vec<(u32, Arc<ArchiveIndex>)> {
         let mut objs: Vec<Obj> = Vec::with_capacity(lazy.len());
         objs.extend(lazy.iter().map(|it| self.symbols.obj(&inputs[*it as usize].id, 0)));
         let objects = &*self.objects;
-        let mut out: Vec<(u32, Arc<Table>)> = Vec::with_capacity(lazy.len());
+        let mut out: Vec<(u32, Arc<ArchiveIndex>)> = Vec::with_capacity(lazy.len());
         out.clear();
         par::extend(&mut out, par::zip(lazy, &objs), |(input, obj)| {
-            let table = match objects.get(obj) {
+            let index = match objects.get(obj) {
                 // clone: an `Arc`: the archive's index as the image keeps it
                 Some(Read::Index(it)) => it.clone(),
                 _ => {
@@ -2576,258 +3268,323 @@ impl<'a> Stage<'a> {
                         unreachable!("searched inputs are archives")
                     };
                     // alloc: once per archive searched, kept for the image's life
-                    Arc::new(archive_index(archive))
+                    Arc::new(ArchiveIndex::build(archive))
                 }
             };
-            (*input, table)
+            (*input, index)
         });
-        for (obj, (_, table)) in objs.iter().zip(&out) {
+        for (obj, (_, index)) in objs.iter().zip(&out) {
             // clone: an `Arc`: the image's handle on the index
-            self.objects.entry(*obj).or_insert_with(|| Read::Index(table.clone()));
+            self.objects.entry(*obj).or_insert_with(|| Read::Index(index.clone()));
         }
         out
     }
 
-    /// Adds an object to the graph: its groups, directives, imports and globals, in lld's
-    /// order of precedence (the graph's loads are in link-line order, then pull rounds).
-    fn register(
+    /// Registers one pull round's objects into `b` in deterministic link-line order: directives
+    /// and wasm imports in load order, COMDAT deduplication in parallel across 64 name-hash
+    /// shards, and global symbol resolution in parallel across 64 symbol shards. Every conflict
+    /// picks the smallest `(load, symbol)` so the outcome and error match serial registration.
+    fn register_round(
         &mut self,
         b: &mut Build,
-        parsed: &Arc<Parsed>,
-        input: u32,
+        inputs: &[Input],
+        round: &[(u32, u32)],
+        reads: Vec<Read>,
         pulled: bool,
     ) -> Result<(), LinkError> {
-        let object = parsed.object();
-        let load = b.graph.loads.len() as u32;
-        // alloc: the load's slot of each symbol, once per object per graph built
-        let mut slots = vec![NONE; object.symbols.len()];
-        for (at, symbol) in object.symbols.iter().enumerate() {
-            if !is_local(symbol) {
-                slots[at] = b.slot(parsed.sym(at as u32));
+        let load_start = b.graph.loads.len();
+        let mut group_total = 0usize;
+        let mut global_total = 0usize;
+        for (&(input, member), read) in round.iter().zip(reads) {
+            match read {
+                Read::Object(parsed) => {
+                    let object = parsed.object();
+                    let load = b.graph.loads.len() as u32;
+                    let (sections, frames) = (b.graph.sections, b.graph.frames);
+                    b.graph.sections += object.sections.len() as u32;
+                    b.graph.frames += parsed.frames.len() as u32;
+                    group_total += object.groups.len();
+                    global_total += parsed.globals;
+                    b.graph.by_obj.insert(parsed.obj, load);
+                    b.graph.loads.push(Load {
+                        parsed,
+                        input,
+                        pulled,
+                        sections,
+                        frames,
+                        // Filled in parallel once the pull loop finishes (`Build::finalize`).
+                        slots: Vec::new(),
+                    });
+                }
+                Read::Shared(file) => {
+                    b.members.push((file, inputs[input as usize].order));
+                    b.members_from.push((input, member));
+                }
+                Read::Index(_) => {}
             }
         }
-        let (sections, frames) = (b.graph.sections, b.graph.frames);
-        b.graph.sections += object.sections.len() as u32;
-        b.graph.frames += parsed.frames.len() as u32;
-        b.graph.by_obj.insert(parsed.obj, load);
-        // clone: an `Arc`: the load keeps the object while this reads it and the graph grows
-        b.graph.loads.push(Load { parsed: parsed.clone(), input, pulled, sections, frames, slots });
-
-        let size = |graph: &Graph, load: u32, group: u32| -> u64 {
-            let object = graph.object(load);
-            object
-                .group_sections(&object.groups[group as usize])
-                .first()
-                .map_or(0, |it| object.sections[*it as usize].data.len())
-        };
-        for (index, group) in object.groups.iter().enumerate() {
-            if group.local {
-                continue;
-            }
-            let index = index as u32;
-            let name = object.name(group.name);
-            let entry = b.group_list.len() as u32;
-            let (graph, list) = (&b.graph, &b.group_list);
-            let found = b.groups.insert(hash(name), entry, |it| {
-                let (l, g) = list[it as usize];
-                let o = graph.object(l);
-                o.name(o.groups[g as usize].name) == name
-            });
-            match found {
-                Ok(()) => b.group_list.push((load, index)),
-                Err(winner) => {
-                    let (wl, wg) = b.group_list[winner as usize];
-                    if wl == load {
-                        continue;
-                    }
-                    if group.largest && size(&b.graph, load, index) > size(&b.graph, wl, wg) {
-                        b.discard(wl, wg);
-                        b.group_list[winner as usize] = (load, index);
-                    } else {
-                        b.discard(load, index);
-                    }
-                }
-            }
+        let load_end = b.graph.loads.len();
+        if load_start == load_end {
+            return Ok(());
+        }
+        let need_words = (b.graph.sections as usize).div_ceil(64);
+        if b.discarded_words.len() < need_words {
+            b.discarded_words.resize(need_words, 0);
         }
 
-        for directive in &object.directives {
-            match directive {
-                Directive::Include(name) => {
-                    let slot = b.slot(self.symbols.sym_name(name));
-                    b.flag(slot, PULL | REQUIRED | ROOT);
-                }
-                Directive::Export { name, symbol, data } => {
-                    let slot = b.slot(self.symbols.sym_name(symbol));
-                    b.flag(slot, PULL | REQUIRED | ROOT);
-                    // alloc: the set's own name, once per `/EXPORT` directive per graph built
-                    if b.asked.insert(name.clone()) {
-                        // alloc: the writers' own names, once per name exported per graph built
-                        Arc::make_mut(&mut b.graph.asked).push(Exported {
-                            name: name.clone(),
-                            symbol: symbol.clone(),
-                            data: *data,
-                            weak: false,
-                            own: None,
-                        });
+        // Directives and wasm imports: few objects carry them, handled in exact load order.
+        for load in load_start..load_end {
+            let input = b.graph.loads[load].input;
+            let parsed = b.graph.loads[load].parsed.clone();
+            let object = parsed.object();
+            for directive in &object.directives {
+                match directive {
+                    Directive::Include(name) => {
+                        let sym = self.symbols.sym_name(name);
+                        b.flag_sym(sym, PULL | REQUIRED | ROOT);
                     }
-                }
-                Directive::Mismatch { key, value } => match b.mismatches.get(key) {
-                    Some((first, by)) if first != value => {
-                        return Err(error(
-                            None,
-                            // alloc: error path
-                            format!(
-                                "`{key}` is `{first}` in {} and `{value}` in {} (/FAILIFMISMATCH)",
-                                self.input_name(*by),
-                                self.input_name(input)
-                            ),
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        // alloc: once per `/FAILIFMISMATCH` key per graph built
-                        b.mismatches.insert(key.clone(), (value.clone(), input));
-                    }
-                },
-                Directive::NoDefaultLib(_) => {}
-            }
-        }
-
-        let all = &self.native.input(self.old, input)[parsed.base..];
-        for (at, it) in &object.imports {
-            let sym = parsed.sym(*at);
-            let bad = |what: String| {
-                let name = object.name(object.symbols[*at as usize].name);
-                // alloc: error path
-                error(
-                    None,
-                    format!("{}: the wasm import of `{name}`: {what}", self.input_name(input)),
-                )
-            };
-            let ty = it.type_bytes(all).map_err(bad)?;
-            // alloc: the type's params and results, once per import per graph built; error path
-            let ty = blaze_codegen::wasm::Signature::decode(ty, &mut 0)
-                .map_err(|what| bad(what.to_string()))?;
-            // alloc: the graph's own wasm import (module and field names, its type), once per import per graph built
-            let import = blaze_codegen::wasm::Import {
-                module: object.name(it.module).to_owned(),
-                field: object.name(it.field).to_owned(),
-                ty,
-            };
-            match b.graph.wasm.get(&sym) {
-                Some((by, known)) if *known != import => {
-                    let name = object.name(object.symbols[*at as usize].name);
-                    return Err(error(
-                        None,
-                        // alloc: error path
-                        format!(
-                            "`{name}` is imported as {known:?} by {} and as {import:?} by {}",
-                            self.input_name(*by),
-                            self.input_name(input)
-                        ),
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    b.graph.wasm.insert(sym, (input, import));
-                }
-            }
-        }
-
-        for (at, symbol) in object.symbols.iter().enumerate() {
-            if is_local(symbol) {
-                continue;
-            }
-            let slot = b.graph.loads[load as usize].slots[at];
-            let weak = symbol.binding == Binding::Weak;
-            let strength = match symbol.def {
-                SymbolDef::Undefined => {
-                    if !weak {
-                        b.flag(slot, PULL);
-                    }
-                    continue;
-                }
-                SymbolDef::Fallback { symbol: default, search } => {
-                    if search {
-                        b.flag(slot, PULL);
-                    }
-                    let it = &mut b.graph.slots[slot as usize];
-                    if it.fallback == NONE64 {
-                        it.fallback = pack(load, default);
-                    }
-                    continue;
-                }
-                SymbolDef::Section { section, .. } => {
-                    if b.graph.discarded.get(b.graph.flat(load, section)) {
-                        continue;
-                    }
-                    if weak { 2 } else { 3 }
-                }
-                SymbolDef::Absolute(_) => {
-                    if weak {
-                        2
-                    } else {
-                        3
-                    }
-                }
-                SymbolDef::Common { size, align } => {
-                    let it = b.commons.entry(slot).or_insert((0, 1));
-                    it.0 = it.0.max(size);
-                    it.1 = it.1.max(align);
-                    1
-                }
-            };
-            let it = b.graph.slots[slot as usize];
-            if it.flags & RUST != 0 {
-                // Rust's definition is first on the line: it beats a weak one and a common.
-                if strength < 3 {
-                    continue;
-                }
-                if it.flags & RUST_WEAK == 0 {
-                    return Err(error(
-                        None,
-                        // alloc: error path
-                        format!(
-                            "duplicate symbol `{}`: Rust code defines it, and so does {}",
-                            object.name(symbol.name),
-                            self.input_name(input)
-                        ),
-                    ));
-                }
-                // A strong definition beats Rust's weak one, as ld64 and lld take it: the name is
-                // this one's, and a later strong one is the duplicate symbol error with it.
-                let it = &mut b.graph.slots[slot as usize];
-                it.flags &= !RUST;
-                it.best = pack(load, at as u32);
-                it.strength = 3;
-                continue;
-            }
-            let take = match b.graph.best(slot) {
-                None => true,
-                Some(_) if strength > it.strength => true,
-                Some((l, i)) if strength == 3 && it.strength == 3 => {
-                    let first = match b.graph.object(l).symbols[i as usize].def {
-                        SymbolDef::Section { .. } => {
-                            self.input_name(b.graph.loads[l as usize].input)
+                    Directive::Export { name, symbol, data } => {
+                        let sym = self.symbols.sym_name(symbol);
+                        b.flag_sym(sym, PULL | REQUIRED | ROOT);
+                        // alloc: the set's own name, once per `/EXPORT` directive per graph built
+                        if b.asked.insert(name.clone()) {
+                            // alloc: the writers' own names, once per name exported per graph built
+                            Arc::make_mut(&mut b.graph.asked).push(Exported {
+                                name: name.clone(),
+                                symbol: symbol.clone(),
+                                data: *data,
+                                weak: false,
+                                own: None,
+                            });
                         }
-                        _ => "an absolute definition",
-                    };
-                    return Err(error(
-                        None,
-                        // alloc: error path
-                        format!(
-                            "duplicate symbol `{}`: in {first} and in {}",
-                            object.name(symbol.name),
-                            self.input_name(input)
-                        ),
-                    ));
+                    }
+                    Directive::Mismatch { key, value } => match b.mismatches.get(key) {
+                        Some((first, by)) if first != value => {
+                            return Err(error(
+                                None,
+                                // alloc: error path
+                                format!(
+                                    "`{key}` is `{first}` in {} and `{value}` in {} (/FAILIFMISMATCH)",
+                                    inputs[*by as usize].name,
+                                    inputs[input as usize].name
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            // alloc: once per `/FAILIFMISMATCH` key per graph built
+                            b.mismatches.insert(key.clone(), (value.clone(), input));
+                        }
+                    },
+                    Directive::NoDefaultLib(_) => {}
                 }
-                Some(_) => false,
+            }
+            if !object.imports.is_empty() {
+                let all = &self.native.input(self.old, input)[parsed.base..];
+                for (at, it) in &object.imports {
+                    let sym = parsed.sym(*at);
+                    let bad = |what: String| {
+                        let name = object.name(object.symbols[*at as usize].name);
+                        // alloc: error path
+                        error(
+                            None,
+                            format!("{}: the wasm import of `{name}`: {what}", inputs[input as usize].name),
+                        )
+                    };
+                    let ty = it.type_bytes(all).map_err(bad)?;
+                    // alloc: the type's params and results, once per import per graph built; error path
+                    let ty = blaze_codegen::wasm::Signature::decode(ty, &mut 0)
+                        .map_err(|what| bad(what.to_string()))?;
+                    // alloc: the graph's own wasm import (module and field names, its type), once per import per graph built
+                    let import = blaze_codegen::wasm::Import {
+                        module: object.name(it.module).to_owned(),
+                        field: object.name(it.field).to_owned(),
+                        ty,
+                    };
+                    match b.graph.wasm.get(&sym) {
+                        Some((by, known)) if *known != import => {
+                            let name = object.name(object.symbols[*at as usize].name);
+                            return Err(error(
+                                None,
+                                // alloc: error path
+                                format!(
+                                    "`{name}` is imported as {known:?} by {} and as {import:?} by {}",
+                                    inputs[*by as usize].name,
+                                    inputs[input as usize].name
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            b.graph.wasm.insert(sym, (input, import));
+                        }
+                    }
+                }
+            }
+        }
+
+        // COMDAT deduplication: hash group names and resolve each of the 64 shards in ascending
+        // `(load, group)` order.
+        if group_total > 0 {
+            let group_size = |loads: &[Load], load: u32, group: u32| -> u64 {
+                let object = loads[load as usize].parsed.object();
+                object
+                    .group_sections(&object.groups[group as usize])
+                    .first()
+                    .map_or(0, |it| object.sections[*it as usize].data.len())
             };
-            if take {
-                let it = &mut b.graph.slots[slot as usize];
-                it.best = pack(load, at as u32);
-                it.strength = strength;
+            let resolve_group =
+                |loads: &[Load], gs: &mut GroupShard, h: u64, load: u32, index: u32, largest: bool, discards: &mut Vec<(u32, u32)>| {
+                    let o_new = loads[load as usize].parsed.object();
+                    let name = o_new.name(o_new.groups[index as usize].name);
+                    let entry = gs.list.len() as u32;
+                    let list = &gs.list;
+                    let found = gs.table.insert(h, entry, |it| {
+                        let (l, g) = list[it as usize];
+                        let o = loads[l as usize].parsed.object();
+                        o.name(o.groups[g as usize].name) == name
+                    });
+                    match found {
+                        Ok(()) => gs.list.push((load, index)),
+                        Err(winner) => {
+                            let (wl, wg) = gs.list[winner as usize];
+                            if wl == load {
+                                return;
+                            }
+                            if largest && group_size(loads, load, index) > group_size(loads, wl, wg) {
+                                discards.push((wl, wg));
+                                gs.list[winner as usize] = (load, index);
+                            } else {
+                                discards.push((load, index));
+                            }
+                        }
+                    }
+                };
+            let discards: Vec<(u32, u32)> = if group_total >= 256 && load_end - load_start > 1 {
+                let loads = &b.graph.loads;
+                let count = load_end - load_start;
+                let grain = count.div_ceil(par::threads() * 4).max(1);
+                let chunks = count.div_ceil(grain);
+                // Partition group events per chunk into 64 name-hash shards, preserving load order.
+                let chunked: Vec<[Vec<(u64, u32, u32, bool)>; SHARDS]> = par::map(0..chunks, |c| {
+                    let from = load_start + c * grain;
+                    let to = (from + grain).min(load_end);
+                    let mut buckets: [Vec<(u64, u32, u32, bool)>; SHARDS] =
+                        std::array::from_fn(|_| Vec::new());
+                    for load in from..to {
+                        let object = loads[load].parsed.object();
+                        for (index, group) in object.groups.iter().enumerate() {
+                            if group.local {
+                                continue;
+                            }
+                            let h = hash(object.name(group.name));
+                            buckets[name_shard(h)].push((h, load as u32, index as u32, group.largest));
+                        }
+                    }
+                    buckets
+                });
+                let Build { graph, group_shards, .. } = b;
+                let loads = &graph.loads;
+                let per_shard: Vec<Vec<(u32, u32)>> =
+                    par::map(par::enumerate(&mut group_shards[..]), |(s, gs)| {
+                        let mut dropped = Vec::new();
+                        for bucket in &chunked {
+                            for &(h, load, index, largest) in &bucket[s] {
+                                resolve_group(loads, gs, h, load, index, largest, &mut dropped);
+                            }
+                        }
+                        dropped
+                    });
+                per_shard.into_iter().flatten().collect()
+            } else {
+                let Build { graph, group_shards, .. } = b;
+                let loads = &graph.loads;
+                let mut dropped = Vec::new();
+                for load in load_start..load_end {
+                    let object = loads[load].parsed.object();
+                    for (index, group) in object.groups.iter().enumerate() {
+                        if group.local {
+                            continue;
+                        }
+                        let h = hash(object.name(group.name));
+                        let gs = &mut group_shards[name_shard(h)];
+                        resolve_group(loads, gs, h, load as u32, index as u32, group.largest, &mut dropped);
+                    }
+                }
+                dropped
+            };
+            for (load, group) in discards {
+                b.discard(load, group);
+            }
+        }
+
+        // Size each shard's `slot_of` column once before resolving symbols.
+        let shard_lens = self.symbols.key_shard_lens();
+        for (s, &len) in shard_lens.iter().enumerate() {
+            if b.shards[s].slot_of.len() < len {
+                b.shards[s].slot_of.resize(len, NONE);
+            }
+        }
+
+        // Global symbol resolution: 64-way parallel across symbol shards on large rounds,
+        // direct on the calling thread for small ones.
+        if global_total >= 4096 && load_end - load_start > 1 {
+            let count = load_end - load_start;
+            let grain = count.div_ceil(par::threads() * 4).max(1);
+            let chunks = count.div_ceil(grain);
+            let loads = &b.graph.loads;
+            let chunked: Vec<[Vec<(Sym, u32, u32)>; SHARDS]> = par::map(0..chunks, |c| {
+                let from = load_start + c * grain;
+                let to = (from + grain).min(load_end);
+                let mut buckets: [Vec<(Sym, u32, u32)>; SHARDS] =
+                    std::array::from_fn(|_| Vec::new());
+                for load in from..to {
+                    let parsed = &loads[load].parsed;
+                    let object = parsed.object();
+                    for (at, symbol) in object.symbols.iter().enumerate() {
+                        if !is_local(symbol) {
+                            let sym = parsed.sym(at as u32);
+                            buckets[Symbols::split(sym).0].push((sym, load as u32, at as u32));
+                        }
+                    }
+                }
+                buckets
+            });
+            let Build { graph, shards, discarded_words, .. } = b;
+            let loads = &graph.loads;
+            let discarded = &discarded_words[..];
+            let errors: Vec<Option<(u32, u32, LinkError)>> =
+                par::map(par::enumerate(&mut shards[..]), |(s, shard)| {
+                    for bucket in &chunked {
+                        for &(sym, load, at) in &bucket[s] {
+                            if let Err(err) = shard.apply(loads, inputs, discarded, sym, load, at) {
+                                return Some((load, at, err));
+                            }
+                        }
+                    }
+                    None
+                });
+            if let Some((_, _, err)) = errors
+                .into_iter()
+                .flatten()
+                .min_by_key(|(load, at, _)| (*load, *at))
+            {
+                return Err(err);
+            }
+        } else {
+            let Build { graph, shards, discarded_words, .. } = b;
+            let loads = &graph.loads;
+            let discarded = &discarded_words[..];
+            for load in load_start..load_end {
+                let parsed = &loads[load].parsed;
+                let object = parsed.object();
+                for (at, symbol) in object.symbols.iter().enumerate() {
+                    if !is_local(symbol) {
+                        let sym = parsed.sym(at as u32);
+                        let shard = &mut shards[Symbols::split(sym).0];
+                        shard.apply(loads, inputs, discarded, sym, load as u32, at as u32)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -2836,137 +3593,7 @@ impl<'a> Stage<'a> {
     /// What is left of a name nothing defines: the linker's, a shared library's, 0, or an
     /// error naming it and who refers to it.
     fn decide(&self, graph: &Graph, sym: Sym, weak: bool) -> Result<Decision, LinkError> {
-        let Some(name) = self.symbols.name_of(sym) else { return Ok(Decision::Skip) };
-        if self.output.dev_run.is_some() && name == crate::stage::START_HOOK {
-            return Err(error(
-                None,
-                // alloc: error path
-                format!(
-                    "undefined symbol `{name}`, which a dev run's first initializer calls: blaze-live's dev runtime \
-                     (`blaze_inproc::runtime`) must be linked into the executable itself"
-                ),
-            ));
-        }
-        if self.lazy.is_some() && name == blaze_lazy::hook::SYMBOL {
-            return Err(crate::lazy::no_hook(self.output.format));
-        }
-        if let Some(special) = self.writer.special(name) {
-            return Ok(Decision::Special(match special {
-                // ELF's `__start_X` is defined only when a section `X` is: one only weak
-                // references name is 0 when none is ([`Special::WeakSection`]).
-                Special::Section { name, end }
-                    if weak && self.output.format == crate::Format::Elf =>
-                {
-                    Special::WeakSection { name, end }
-                }
-                special => special,
-            }));
-        }
-        if let Some(export) = graph.exports.find(name) {
-            let import = Import {
-                // alloc: the writers' `Import` owns its name: once per import a resolution makes
-                name: name.to_owned(),
-                library: None,
-                version: graph.exports.version(export),
-                kind: export.kind,
-                weak: weak || export.weak,
-                wasm: None,
-            };
-            return Ok(Decision::Import(import, export.library));
-        }
-        let executable = matches!(self.output.kind, OutputKind::Executable { .. });
-        if self.output.format == crate::Format::Wasm {
-            // rustc links wasm with `--allow-undefined`: a function something says the
-            // import of is imported; a weak one is null.
-            let native = graph.wasm.get(&sym);
-            let rust = match self.symbols.key(sym) {
-                SymKey::Name(id) => self.new.wasm_imports.get(&id),
-                _ => None,
-            };
-            if let (Some((by, a)), Some(b)) = (native, rust) {
-                if a != b {
-                    return Err(error(
-                        None,
-                        // alloc: error path
-                        format!(
-                            "`{name}` is imported as {a:?} by {} and as {b:?} by Rust code",
-                            self.new.inputs[*by as usize].name
-                        ),
-                    ));
-                }
-            }
-            return match native.map(|it| &it.1).or(rust) {
-                Some(it) if !weak => Ok(Decision::Import(
-                    Import {
-                        // alloc: the writers' `Import` owns its name: once per import a resolution makes
-                        name: name.to_owned(),
-                        library: None,
-                        version: None,
-                        kind: SymbolKind::Function,
-                        weak: false,
-                        // clone: the import's own module and field names, once per import made
-                        wasm: Some(it.clone()),
-                    },
-                    NONE,
-                )),
-                _ if weak => Ok(Decision::Zero),
-                _ => Err(error(
-                    None,
-                    // alloc: error path
-                    format!(
-                        "undefined symbol `{name}`{}, which no input says the wasm import of",
-                        self.referrer(sym)
-                    ),
-                )),
-            };
-        }
-        // Left for the loader to find in whatever is loaded (Mach-O's flat lookup, an ELF
-        // undefined dynamic symbol): a shared library's by default, and an executable's under
-        // `-undefined dynamic_lookup`, but for a core root it need not define.
-        let lookup = match self.output.link.undefined {
-            crate::Undefined::Default => !executable,
-            crate::Undefined::DynamicLookup => !(executable && optional(name)),
-            crate::Undefined::Error => false,
-        };
-        if weak && executable && !lookup {
-            return Ok(Decision::Zero);
-        }
-        if lookup || weak {
-            // alloc: the writers' `Import` owns its name: once per import a resolution makes
-            let import = Import {
-                name: name.to_owned(),
-                library: None,
-                version: None,
-                kind: SymbolKind::Other,
-                weak,
-                wasm: None,
-            };
-            return Ok(Decision::Import(import, NONE));
-        }
-        if optional(name) {
-            return Ok(Decision::Skip);
-        }
-        // alloc: error path
-        Err(error(None, format!("undefined symbol `{name}`{}", self.referrer(sym))))
-    }
-
-    /// Who refers to an undefined symbol: only for an undefined symbol's error.
-    fn referrer(&self, sym: Sym) -> String {
-        let Some(piece) = self.new.refs(sym).find_map(|it| self.new.piece(it)) else {
-            // alloc: none (an empty `String`), error path
-            return String::new();
-        };
-        match piece.what() {
-            What::Native { obj, .. } | What::NativeFrame { obj, .. } => {
-                let id = self.symbols.content(obj.native);
-                let name =
-                    self.new.inputs.iter().find(|it| it.id == *id).map_or("?", |it| &*it.name);
-                // alloc: error path
-                format!(", referred to by {name}")
-            }
-            // alloc: error path
-            _ => format!(", referred to by {}", self.symbols.describe(piece.sym)),
-        }
+        decide_sym(self.symbols, self.output, self.writer, &self.new, self.lazy.is_some(), graph, sym, weak)
     }
 
     /// Makes a kept section's piece, its bytes borrowed from its input.
@@ -3277,7 +3904,7 @@ impl<'a> Stage<'a> {
             for &sym in gained {
                 // A gained name is new to the names: nothing but Rust refers to it.
                 let weak = if refs.class(sym) == 2 { 0 } else { O_WEAK };
-                let slot = graph.slot_of.get(&sym).copied();
+                let slot = graph.slot_of.get(sym);
                 // A weak Rust name a strong definition took is resolved as that one's.
                 let taken = slot.is_some_and(|it| {
                     graph.slots[it as usize].flags & (RUST | RUST_WEAK) == RUST_WEAK
@@ -3322,7 +3949,7 @@ impl<'a> Stage<'a> {
                 }
                 if refs.class(sym) == 2 {
                     let name = symbols.name_of(sym).unwrap_or("");
-                    if search(&graph.archives, &self.new.inputs, name).is_some() {
+                    if graph.archives.find(&self.new.inputs, name).is_some() {
                         return Ok(None);
                     }
                 }
@@ -3357,7 +3984,7 @@ impl<'a> Stage<'a> {
         undefined.dedup();
         let mut decisions = Vec::with_capacity(undefined.len());
         for sym in undefined {
-            let slot = graph.slot_of.get(&sym).copied();
+            let slot = graph.slot_of.get(sym);
             let flags = slot.map_or(0, |it| graph.slots[it as usize].flags);
             let native = slot.map_or(0, |it| marks.native_of(it));
             let strong = flags & (REQUIRED | STRONG) != 0 || native == 2;
@@ -3661,27 +4288,17 @@ impl<'a> Stage<'a> {
         // clone: an `Arc`: Rust's names, read while the stage defines them
         let names = self.new.names.clone();
         let mut b = Build::new();
-        // Rust's names, the names it refers to, the entry, `_init` and `_fini`; the exports are
-        // few and grow it at most once.
-        b.reserve(names.len() + refs.names.len() + 3);
         let mut rust: Vec<(Sym, Sym)> = Vec::with_capacity(names.len());
         for (name, it) in names.iter() {
             let sym = self.symbols.intern(SymKey::Name(*name));
             rust.push((sym, it.target));
-            let slot = b.slot(sym);
-            b.flag(slot, if it.weak { RUST | RUST_WEAK } else { RUST });
+            b.flag_sym(sym, if it.weak { RUST | RUST_WEAK } else { RUST });
         }
         for sym in refs.names.iter() {
             match refs.class(*sym) {
                 0 => {}
-                1 => {
-                    let slot = b.slot(*sym);
-                    b.flag(slot, WANTED);
-                }
-                _ => {
-                    let slot = b.slot(*sym);
-                    b.flag(slot, WANTED | PULL);
-                }
+                1 => b.flag_sym(*sym, WANTED),
+                _ => b.flag_sym(*sym, WANTED | PULL),
             }
         }
         let entry = match &output.kind {
@@ -3691,28 +4308,27 @@ impl<'a> Stage<'a> {
             }
         };
         if let Some(sym) = entry {
-            let slot = b.slot(sym);
-            b.flag(slot, ROOT | STRONG | PULL);
+            b.flag_sym(sym, ROOT | STRONG | PULL);
         }
         b.graph.entry = entry;
         if let OutputKind::Shared { exports, .. } = &output.kind {
             for name in exports {
-                let slot = b.slot(self.symbols.sym_name(name));
-                b.flag(slot, ROOT | STRONG | PULL);
+                let sym = self.symbols.sym_name(name);
+                b.flag_sym(sym, ROOT | STRONG | PULL);
             }
         }
         for name in ["_init", "_fini"] {
-            let slot = b.slot(self.symbols.sym_name(name));
-            b.flag(slot, LOOSE);
+            let sym = self.symbols.sym_name(name);
+            b.flag_sym(sym, LOOSE);
         }
         for name in self.writer.searched_roots() {
-            let slot = b.slot(self.symbols.sym_name(name));
-            b.flag(slot, PULL | LOOSE);
+            let sym = self.symbols.sym_name(name);
+            b.flag_sym(sym, PULL | LOOSE);
         }
         // link.exe's `/INCLUDE:symbol` given as a link argument, as a `.drectve`'s is.
         for name in &output.link.pe.include {
-            let slot = b.slot(self.symbols.sym_name(name));
-            b.flag(slot, PULL | REQUIRED | ROOT);
+            let sym = self.symbols.sym_name(name);
+            b.flag_sym(sym, PULL | REQUIRED | ROOT);
         }
 
         // Load: the line's objects and whole archives, then members for what is strongly
@@ -3745,43 +4361,70 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        let archives = self.indexes(&inputs, &lazy);
+        let archive_indexes = self.indexes(&inputs, &lazy);
+        let archive_map = ArchiveMap::build(&archive_indexes, &inputs);
         let mut pulled = false;
         loop {
             let reads = self.read(&round)?;
-            b.reserve(
-                reads
-                    .iter()
-                    .map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 })
-                    .sum(),
-            );
-            for (&(input, member), read) in round.iter().zip(reads) {
-                match read {
-                    Read::Object(parsed) => self.register(&mut b, &parsed, input, pulled)?,
-                    Read::Shared(file) => {
-                        b.members.push((file, inputs[input as usize].order));
-                        b.members_from.push((input, member));
-                    }
-                    Read::Index(_) => {}
-                }
-            }
-            // alloc: none when nothing is pulled; the members pulled, once per pull round
+            self.register_round(&mut b, &inputs, &round, reads, pulled)?;
+            // Search the merged archive index for every unresolved symbol queued this round,
+            // in parallel across all 64 shards when there is enough work (and no non-Sync
+            // `Outside` image to check).
+            let queued: usize = b.shards.iter().map(|s| s.queue.len()).sum();
             let mut next: Vec<(u32, u32)> = Vec::new();
-            for slot in std::mem::take(&mut b.queue) {
-                if b.graph.slots[slot as usize].flags & RUST != 0 || b.graph.best(slot).is_some() {
-                    continue;
-                }
-                let Some(name) = self.symbols.name_of(b.graph.slots[slot as usize].sym) else {
-                    continue;
-                };
-                // A member is pulled only for what is still undefined after the image beside.
-                if O::ANY && outside.name(name).is_some() {
-                    continue;
-                }
-                if let Some((input, member)) = search(&archives, &inputs, name) {
-                    if b.pulled.insert((input, member)) {
-                        next.push((input, member + 1));
+            if queued > 0 && !archive_map.shards.is_empty() {
+                if !O::ANY && queued >= 256 {
+                    let symbols: &Symbols = &*self.symbols;
+                    let loads = &b.graph.loads;
+                    let discarded = &b.discarded_words;
+                    let hits: Vec<Vec<(u32, u32)>> = par::map(&mut b.shards[..], |shard| {
+                        let mut found = Vec::new();
+                        for local in std::mem::take(&mut shard.queue) {
+                            let slot = &shard.slots[local as usize];
+                            if slot.flags & RUST != 0
+                                || ShardBuild::best(loads, discarded, slot).is_some()
+                            {
+                                continue;
+                            }
+                            let Some(name) = symbols.name_of(slot.sym) else { continue };
+                            if let Some(hit) = archive_map.find(&inputs, name) {
+                                found.push(hit);
+                            }
+                        }
+                        found
+                    });
+                    for hit in hits.into_iter().flatten() {
+                        if b.pulled.insert(hit) {
+                            next.push((hit.0, hit.1 + 1));
+                        }
                     }
+                } else {
+                    let symbols: &Symbols = &*self.symbols;
+                    let Build { graph, shards, discarded_words, pulled: already, .. } = &mut b;
+                    for shard in shards.iter_mut() {
+                        for local in std::mem::take(&mut shard.queue) {
+                            let slot = &shard.slots[local as usize];
+                            if slot.flags & RUST != 0
+                                || ShardBuild::best(&graph.loads, discarded_words, slot).is_some()
+                            {
+                                continue;
+                            }
+                            let Some(name) = symbols.name_of(slot.sym) else { continue };
+                            // A member is pulled only for what is still undefined after the image beside.
+                            if O::ANY && outside.name(name).is_some() {
+                                continue;
+                            }
+                            if let Some((input, member)) = archive_map.find(&inputs, name) {
+                                if already.insert((input, member)) {
+                                    next.push((input, member + 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for shard in &mut b.shards {
+                    shard.queue.clear();
                 }
             }
             if next.is_empty() {
@@ -3791,10 +4434,11 @@ impl<'a> Stage<'a> {
             round = next;
             pulled = true;
         }
+        b.finalize();
         // A weak Rust name whose strong native definition a later COMDAT group's win dropped,
         // with no other strong one, is Rust's again: Rust's beats what weak ones are left.
         for (sym, _) in &rust {
-            let slot = b.graph.slot_of[sym];
+            let slot = b.graph.slot_of.get(*sym).expect("rust name registered");
             if b.graph.slots[slot as usize].flags & (RUST | RUST_WEAK) == RUST_WEAK
                 && b.graph.best(slot).is_none()
             {
@@ -3814,11 +4458,11 @@ impl<'a> Stage<'a> {
         }
         b.aliases(&*self.symbols)?;
         let mut commons: Vec<(Sym, u64, u64)> = Vec::with_capacity(b.commons.len());
-        for (slot, (size, align)) in &b.commons {
-            let Some((load, symbol)) = b.graph.best(*slot) else { continue };
+        for &(slot, size, align) in &b.commons {
+            let Some((load, symbol)) = b.graph.best(slot) else { continue };
             if matches!(b.graph.object(load).symbols[symbol as usize].def, SymbolDef::Common { .. })
             {
-                commons.push((b.graph.slots[*slot as usize].sym, *size, *align));
+                commons.push((b.graph.slots[slot as usize].sym, size, align));
             }
         }
         commons.sort_unstable_by_key(|it| it.0);
@@ -3836,28 +4480,13 @@ impl<'a> Stage<'a> {
         if output.format == Format::Elf && matches!(output.kind, OutputKind::Executable { .. }) {
             self.export_for_libraries(&mut b)?;
         }
-        b.graph.archives = archives;
+        b.graph.archives = archive_map;
         b.graph.index();
         // alloc: once per graph built, shared by the stages after
         let graph = Arc::new(b.graph);
 
-        // Collect.
-        let mut marks = Marks::default();
-        let (sections, frames) = {
-            let mut marker = Marker::new(&graph, &mut marks, &*self.symbols, self.writer);
-            for slot in 0..graph.slots.len() as u32 {
-                if graph.slots[slot as usize].flags & (WANTED | ROOT | LOOSE) != 0 {
-                    marker.name(slot);
-                }
-            }
-            for flat in &graph.roots {
-                let at = graph.unflat(*flat);
-                marker.push(at);
-            }
-            marker.run();
-            (marker.sections, marker.frames)
-        };
-        note_native(&graph, &mut marks, &sections, &frames, None);
+        // Collect and note native reference strengths in parallel.
+        let marks = collect_parallel(&graph, &*self.symbols, self.writer);
 
         // What went: sections, frame records and commons the image has and the graph does not
         // keep. Loads whose sections came or went, or whose globals' winners changed, have
@@ -4046,7 +4675,10 @@ impl<'a> Stage<'a> {
         for (sym, target) in &rust {
             // A weak name a native or the image beside defines strongly is theirs, defined
             // above: Rust's own symbol stays its own, and nothing reaches it by this name.
-            if graph.slots[graph.slot_of[sym] as usize].flags & RUST == 0 {
+            if graph.slots[graph.slot_of.get(*sym).expect("rust name registered") as usize].flags
+                & RUST
+                == 0
+            {
                 continue;
             }
             self.define(*sym, Def::Alias(*target));
@@ -4066,19 +4698,46 @@ impl<'a> Stage<'a> {
             if Some(sym) == live {
                 return Some(O_RUST);
             }
-            let slot = *graph.slot_of.get(&sym)?;
+            let slot = graph.slot_of.get(sym)?;
             graph.defined(slot).then(|| graph.kind(slot))
         };
         // alloc: the names left to resolve, once per graph built
-        let mut wanted: Vec<Sym> = Vec::new();
-        for (slot, it) in graph.slots.iter().enumerate() {
-            if it.flags & (ROOT | REQUIRED) != 0
-                || marks.native_of(slot as u32) > 0
-                || refs.class(it.sym) > 0
-            {
-                wanted.push(it.sym);
+        let mut wanted: Vec<Sym> = if graph.slots.len() >= 4096 {
+            let grain = graph.slots.len().div_ceil(par::threads() * 4).max(256);
+            let chunks = graph.slots.len().div_ceil(grain);
+            let parts: Vec<Vec<Sym>> = par::map(0..chunks, |c| {
+                let start = c * grain;
+                let end = (start + grain).min(graph.slots.len());
+                let mut out = Vec::new();
+                for slot in start..end {
+                    let it = &graph.slots[slot];
+                    if it.flags & (ROOT | REQUIRED) != 0
+                        || marks.native_of(slot as u32) > 0
+                        || refs.class(it.sym) > 0
+                    {
+                        out.push(it.sym);
+                    }
+                }
+                out
+            });
+            let total: usize = parts.iter().map(Vec::len).sum();
+            let mut out = Vec::with_capacity(total);
+            for part in parts {
+                out.extend(part);
             }
-        }
+            out
+        } else {
+            let mut out = Vec::new();
+            for (slot, it) in graph.slots.iter().enumerate() {
+                if it.flags & (ROOT | REQUIRED) != 0
+                    || marks.native_of(slot as u32) > 0
+                    || refs.class(it.sym) > 0
+                {
+                    out.push(it.sym);
+                }
+            }
+            out
+        };
         let mut cells: HashSet<Sym, std::alloc::Global> = HashSet::new_in(std::alloc::Global);
         for sym in &wanted {
             if kind_of(*sym).is_some() {
@@ -4107,48 +4766,88 @@ impl<'a> Stage<'a> {
         let mut imports: Vec<(Sym, Import, u32)> = Vec::new();
         // alloc: none without the linker's names; those decided, once per graph built
         let mut specials: Vec<(Sym, Special)> = Vec::new();
-        for sym in wanted {
-            let slot = graph.slot_of.get(&sym).copied();
-            let flags = slot.map_or(0, |it| graph.slots[it as usize].flags);
-            let native = slot.map_or(0, |it| marks.native_of(it));
-            let strong = flags & (REQUIRED | STRONG) != 0 || native == 2 || cells.contains(&sym);
-            let others = strong || flags & ROOT != 0 || native > 0;
-            let weak = !strong && refs.class(sym) != 2;
-            let bits = if weak { O_WEAK } else { 0 }
-                | if strong { O_STRONG } else { 0 }
-                | if others { O_OTHERS } else { 0 };
-            let kind = match kind_of(sym) {
-                Some(kind) => kind,
-                None => match self.decide(&graph, sym, weak)? {
-                    Decision::Special(special) => {
-                        let kind = if matches!(
-                            special,
-                            Special::Section { .. }
-                                | Special::WeakSection { .. }
-                                | Special::Got { .. }
-                        ) {
-                            O_MARKS
-                        } else {
-                            O_OTHER
-                        };
-                        specials.push((sym, special));
-                        kind
-                    }
-                    Decision::Import(import, library) => {
-                        let needed =
-                            library != NONE && graph.exports.libraries[library as usize].as_needed;
-                        imports.push((sym, import, library));
-                        if needed { O_NEEDED } else { O_IMPORT }
-                    }
-                    Decision::Zero => {
-                        self.define(sym, Def::Absolute(0));
-                        defined.push(sym);
-                        O_OTHER
-                    }
-                    Decision::Skip => O_OTHER,
-                },
+        let mut zeros: Vec<Sym> = Vec::new();
+        {
+            let symbols: &Symbols = &*self.symbols;
+            let state: &State = &self.new;
+            let writer = self.writer;
+            let has_lazy = self.lazy.is_some();
+            let decide_chunk = |chunk: &[Sym]| -> Result<
+                (Vec<(Sym, u8)>, Vec<(Sym, Special)>, Vec<(Sym, Import, u32)>, Vec<Sym>),
+                LinkError,
+            > {
+                let mut c_outcomes = Vec::with_capacity(chunk.len());
+                let mut c_specials = Vec::new();
+                let mut c_imports = Vec::new();
+                let mut c_zeros = Vec::new();
+                for &sym in chunk {
+                    let slot = graph.slot_of.get(sym);
+                    let flags = slot.map_or(0, |it| graph.slots[it as usize].flags);
+                    let native = slot.map_or(0, |it| marks.native_of(it));
+                    let strong =
+                        flags & (REQUIRED | STRONG) != 0 || native == 2 || cells.contains(&sym);
+                    let others = strong || flags & ROOT != 0 || native > 0;
+                    let weak = !strong && refs.class(sym) != 2;
+                    let bits = if weak { O_WEAK } else { 0 }
+                        | if strong { O_STRONG } else { 0 }
+                        | if others { O_OTHERS } else { 0 };
+                    let kind = match kind_of(sym) {
+                        Some(kind) => kind,
+                        None => match decide_sym(
+                            symbols, output, writer, state, has_lazy, &graph, sym, weak,
+                        )? {
+                            Decision::Special(special) => {
+                                let kind = if matches!(
+                                    special,
+                                    Special::Section { .. }
+                                        | Special::WeakSection { .. }
+                                        | Special::Got { .. }
+                                ) {
+                                    O_MARKS
+                                } else {
+                                    O_OTHER
+                                };
+                                c_specials.push((sym, special));
+                                kind
+                            }
+                            Decision::Import(import, library) => {
+                                let needed = library != NONE
+                                    && graph.exports.libraries[library as usize].as_needed;
+                                c_imports.push((sym, import, library));
+                                if needed { O_NEEDED } else { O_IMPORT }
+                            }
+                            Decision::Zero => {
+                                c_zeros.push(sym);
+                                O_OTHER
+                            }
+                            Decision::Skip => O_OTHER,
+                        },
+                    };
+                    c_outcomes.push((sym, kind | bits));
+                }
+                Ok((c_outcomes, c_specials, c_imports, c_zeros))
             };
-            outcomes.push((sym, kind | bits));
+            if wanted.len() >= 4096 {
+                let grain = wanted.len().div_ceil(par::threads() * 4).max(256);
+                let parts = par::map(par::chunks(&wanted, grain), decide_chunk);
+                for part in parts {
+                    let (o, s, i, z) = part?;
+                    outcomes.extend(o);
+                    specials.extend(s);
+                    imports.extend(i);
+                    zeros.extend(z);
+                }
+            } else {
+                let (o, s, i, z) = decide_chunk(&wanted)?;
+                outcomes = o;
+                specials = s;
+                imports = i;
+                zeros = z;
+            }
+        }
+        for sym in zeros {
+            self.define(sym, Def::Absolute(0));
+            defined.push(sym);
         }
         match Arc::get_mut(&mut self.new.specials) {
             Some(list) => list.clear(),
@@ -4230,13 +4929,15 @@ impl<'a> Stage<'a> {
             order.into_iter().map(|(sym, import, _)| (sym, import)).unzip();
 
         // A name the image's resolution defined and this one does not is undefined now.
-        let mut now = CowFlags::default();
-        for sym in &defined {
-            now.set(Symbols::dense(*sym));
-        }
-        for sym in old.defined.iter() {
-            if !now.get(Symbols::dense(*sym)) {
-                self.define(*sym, Def::None);
+        if !old.defined.is_empty() {
+            let mut now = CowFlags::default();
+            for sym in &defined {
+                now.set(Symbols::dense(*sym));
+            }
+            for sym in old.defined.iter() {
+                if !now.get(Symbols::dense(*sym)) {
+                    self.define(*sym, Def::None);
+                }
             }
         }
         if let Some(entry) = graph.entry {
@@ -4249,20 +4950,32 @@ impl<'a> Stage<'a> {
             }
         }
 
-        // clone: copy-on-write: copied only where an outcome changes
-        let mut table = old.outcomes.clone();
-        for sym in old.named.iter() {
-            table.set(Symbols::dense(*sym), 0, || 0);
-        }
-        let mut named = CowVec::default();
-        for (sym, outcome) in outcomes {
-            table.set(Symbols::dense(sym), outcome, || 0);
-            named.push(sym);
-        }
-        let mut list = CowVec::default();
-        for sym in defined {
-            list.push(sym);
-        }
+        // Pack outcomes, named and defined in bulk when starting from an empty resolution.
+        let (table, named) = if old.outcomes.is_empty() && outcomes.len() >= 1024 {
+            let max_dense =
+                outcomes.iter().map(|&(sym, _)| Symbols::dense(sym)).max().unwrap_or(0);
+            // alloc: once per full graph build, 1 byte per dense symbol id
+            let mut flat = vec![0u8; max_dense + 1];
+            let mut named_syms = Vec::with_capacity(outcomes.len());
+            for (sym, outcome) in outcomes {
+                flat[Symbols::dense(sym)] = outcome;
+                named_syms.push(sym);
+            }
+            (CowVec::from_slice(&flat), CowVec::from_slice(&named_syms))
+        } else {
+            // clone: copy-on-write: copied only where an outcome changes
+            let mut table = old.outcomes.clone();
+            for sym in old.named.iter() {
+                table.set(Symbols::dense(*sym), 0, || 0);
+            }
+            let mut named_syms = Vec::with_capacity(outcomes.len());
+            for (sym, outcome) in outcomes {
+                table.set(Symbols::dense(sym), outcome, || 0);
+                named_syms.push(sym);
+            }
+            (table, CowVec::from_slice(&named_syms))
+        };
+        let list = CowVec::from_slice(&defined);
         // The same lists keep their identity: the writer rebinds only when they change.
         Ok(Resolved {
             imports: keep(&old.imports, imports),
@@ -4293,6 +5006,156 @@ impl<'a> Stage<'a> {
             defined: list,
             graph: Some(graph),
         })
+    }
+}
+
+/// What is left of a name nothing defines: the linker's, a shared library's, 0, or an error
+/// naming it and who refers to it. Free function so [`Stage::rebuild`] can call it in parallel.
+#[expect(clippy::too_many_arguments, reason = "read-only link context shared across workers")]
+fn decide_sym(
+    symbols: &Symbols,
+    output: &crate::Output,
+    writer: &Formats,
+    state: &State,
+    has_lazy: bool,
+    graph: &Graph,
+    sym: Sym,
+    weak: bool,
+) -> Result<Decision, LinkError> {
+    let Some(name) = symbols.name_of(sym) else { return Ok(Decision::Skip) };
+    if output.dev_run.is_some() && name == crate::stage::START_HOOK {
+        return Err(error(
+            None,
+            // alloc: error path
+            format!(
+                "undefined symbol `{name}`, which a dev run's first initializer calls: blaze-live's dev runtime \
+                 (`blaze_inproc::runtime`) must be linked into the executable itself"
+            ),
+        ));
+    }
+    if has_lazy && name == blaze_lazy::hook::SYMBOL {
+        return Err(crate::lazy::no_hook(output.format));
+    }
+    if let Some(special) = writer.special(name) {
+        return Ok(Decision::Special(match special {
+            // ELF's `__start_X` is defined only when a section `X` is: one only weak
+            // references name is 0 when none is ([`Special::WeakSection`]).
+            Special::Section { name, end } if weak && output.format == crate::Format::Elf => {
+                Special::WeakSection { name, end }
+            }
+            special => special,
+        }));
+    }
+    if let Some(export) = graph.exports.find(name) {
+        let import = Import {
+            // alloc: the writers' `Import` owns its name: once per import a resolution makes
+            name: name.to_owned(),
+            library: None,
+            version: graph.exports.version(export),
+            kind: export.kind,
+            weak: weak || export.weak,
+            wasm: None,
+        };
+        return Ok(Decision::Import(import, export.library));
+    }
+    let executable = matches!(output.kind, OutputKind::Executable { .. });
+    if output.format == crate::Format::Wasm {
+        // rustc links wasm with `--allow-undefined`: a function something says the
+        // import of is imported; a weak one is null.
+        let native = graph.wasm.get(&sym);
+        let rust = match symbols.key(sym) {
+            SymKey::Name(id) => state.wasm_imports.get(&id),
+            _ => None,
+        };
+        if let (Some((by, a)), Some(b)) = (native, rust) {
+            if a != b {
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "`{name}` is imported as {a:?} by {} and as {b:?} by Rust code",
+                        state.inputs[*by as usize].name
+                    ),
+                ));
+            }
+        }
+        return match native.map(|it| &it.1).or(rust) {
+            Some(it) if !weak => Ok(Decision::Import(
+                Import {
+                    // alloc: the writers' `Import` owns its name: once per import a resolution makes
+                    name: name.to_owned(),
+                    library: None,
+                    version: None,
+                    kind: SymbolKind::Function,
+                    weak: false,
+                    // clone: the import's own module and field names, once per import made
+                    wasm: Some(it.clone()),
+                },
+                NONE,
+            )),
+            _ if weak => Ok(Decision::Zero),
+            _ => Err(error(
+                None,
+                // alloc: error path
+                format!(
+                    "undefined symbol `{name}`{}, which no input says the wasm import of",
+                    referrer_in(symbols, state, sym)
+                ),
+            )),
+        };
+    }
+    // Left for the loader to find in whatever is loaded (Mach-O's flat lookup, an ELF
+    // undefined dynamic symbol): a shared library's by default, and an executable's under
+    // `-undefined dynamic_lookup`, but for a core root it need not define.
+    let lookup = match output.link.undefined {
+        crate::Undefined::Default => !executable,
+        crate::Undefined::DynamicLookup => !(executable && optional(name)),
+        crate::Undefined::Error => false,
+    };
+    if weak && executable && !lookup {
+        return Ok(Decision::Zero);
+    }
+    if lookup || weak {
+        // alloc: the writers' `Import` owns its name: once per import a resolution makes
+        let import = Import {
+            name: name.to_owned(),
+            library: None,
+            version: None,
+            kind: SymbolKind::Other,
+            weak,
+            wasm: None,
+        };
+        return Ok(Decision::Import(import, NONE));
+    }
+    if optional(name) {
+        return Ok(Decision::Skip);
+    }
+    // alloc: error path
+    Err(error(None, format!("undefined symbol `{name}`{}", referrer_in(symbols, state, sym))))
+}
+
+/// Who refers to an undefined symbol: only for an undefined symbol's error.
+fn referrer_in(symbols: &Symbols, state: &State, sym: Sym) -> String {
+    let found = state.refs(sym).find_map(|it| state.piece(it)).or_else(|| {
+        // When referrer lists are deferred during a first link, scan live pieces on the error
+        // path so the diagnostic still names the first referrer.
+        state.live_pieces().find(|piece| {
+            piece.fixups().iter().any(|f| f.target == sym || f.minus == Some(sym))
+        })
+    });
+    let Some(piece) = found else {
+        // alloc: none (an empty `String`), error path
+        return String::new();
+    };
+    match piece.what() {
+        What::Native { obj, .. } | What::NativeFrame { obj, .. } => {
+            let id = symbols.content(obj.native);
+            let name = state.inputs.iter().find(|it| it.id == *id).map_or("?", |it| &*it.name);
+            // alloc: error path
+            format!(", referred to by {name}")
+        }
+        // alloc: error path
+        _ => format!(", referred to by {}", symbols.describe(piece.sym)),
     }
 }
 
@@ -4418,6 +5281,17 @@ mod tests {
                     (at as u32, Arc::new(archive_index(archive)))
                 })
                 .collect();
+            let sharded: Vec<(u32, Arc<ArchiveIndex>)> = inputs
+                .iter()
+                .enumerate()
+                .map(|(at, it)| {
+                    let NativeFile::Archive(archive) = &*it.file else {
+                        unreachable!("made as archives")
+                    };
+                    (at as u32, Arc::new(ArchiveIndex::build(archive)))
+                })
+                .collect();
+            let merged = ArchiveMap::build(&sharded, &inputs);
             for name in &pool {
                 let scanned = written.iter().enumerate().find_map(|(at, listed)| {
                     listed.iter().find(|it| it.0 == *name).map(|it| (at as u32, it.1))
@@ -4426,7 +5300,12 @@ mod tests {
                     blaze_alloc_count::assert_at_most(0, "a search of the archives", || {
                         search(&archives, &inputs, name)
                     });
+                let mapped =
+                    blaze_alloc_count::assert_at_most(0, "a search of the merged archive map", || {
+                        merged.find(&inputs, name)
+                    });
                 assert_eq!(found, scanned, "{name}");
+                assert_eq!(mapped, scanned, "ArchiveMap mismatch for {name}");
             }
         }
     }
@@ -4913,8 +5792,8 @@ mod wire {
             discarded.put(out);
             sections.put(out);
             frames.put(out);
-            out.put_u64(archives.len() as u64);
-            for (input, _) in archives {
+            out.put_u64(archives.inputs.len() as u64);
+            for input in &archives.inputs {
                 input.put(out);
             }
             exports_from.put(out);
@@ -5010,22 +5889,24 @@ mod wire {
             // alloc: once per restore, shared by the stages after
             graph.exports = Arc::new(Exports::build(roots)?);
             graph.exports_from = exports_from;
+            let mut archive_indexes = Vec::with_capacity(archives.len());
             for input in archives {
                 let it = input_of(input)?;
                 let NativeFile::Archive(archive) = &*it.file else {
                     return Err("a searched archive that reads again as no archive".into());
                 };
                 let obj = symbols.obj(&it.id, 0);
-                let table = match objects.get(&obj) {
+                let index = match objects.get(&obj) {
                     // clone: an `Arc`: the archive's index as the image keeps it
-                    Some(Read::Index(table)) => table.clone(),
+                    Some(Read::Index(index)) => index.clone(),
                     // alloc: once per archive searched, kept for the image's life
-                    _ => Arc::new(archive_index(archive)),
+                    _ => Arc::new(ArchiveIndex::build(archive)),
                 };
                 // clone: an `Arc`: the image's handle on the index
-                objects.insert(obj, Read::Index(table.clone()));
-                graph.archives.push((input, table));
+                objects.insert(obj, Read::Index(index.clone()));
+                archive_indexes.push((input, index));
             }
+            graph.archives = ArchiveMap::build(&archive_indexes, inputs);
             graph.index();
             Ok(graph)
         }

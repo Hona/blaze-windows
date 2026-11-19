@@ -523,12 +523,87 @@ impl<T: Chunked> CowVec<T> {
         at
     }
 
+    /// Grows the column to at least `want` elements, filling whole chunks with `fill`.
+    pub(crate) fn ensure_len(&mut self, want: usize, fill: &T) {
+        if want <= self.len {
+            return;
+        }
+        assert!(want <= LONGEST_COLUMN, "a column past 2^28 elements");
+        let partial = self.len & (CHUNK - 1);
+        if partial != 0 {
+            let chunk = self.len >> CHUNK_BITS;
+            let to = want.min((chunk + 1) * CHUNK) - chunk * CHUNK;
+            let items = self
+                .chunks
+                .entry_mut(chunk)
+                .as_mut()
+                .expect("the column's last chunk")
+                .items_mut();
+            items[partial..to].fill(fill.clone());
+            self.len = chunk * CHUNK + to;
+        }
+        while self.len < want {
+            let chunk = self.len >> CHUNK_BITS;
+            *self.chunks.entry_mut(chunk) = Some(Chunk::new(CHUNK, &[], fill));
+            self.len = want.min((chunk + 1) * CHUNK);
+        }
+    }
+
     /// Sets `at`, growing the column with `fill` to reach it.
     pub fn set(&mut self, at: usize, value: T, fill: impl Fn() -> T) {
-        while self.len <= at {
-            self.push(fill());
+        if self.len <= at {
+            let default = fill();
+            self.ensure_len(at + 1, &default);
         }
         *self.get_mut(at).expect("grown to it") = value;
+    }
+
+    /// Appends `items` chunk by chunk, one tree walk per [`CHUNK`] elements.
+    pub(crate) fn extend_slice(&mut self, mut items: &[T]) {
+        if items.is_empty() {
+            return;
+        }
+        assert!(self.len + items.len() <= LONGEST_COLUMN, "a column past 2^28 elements");
+        while !items.is_empty() {
+            let at = self.len;
+            let offset = at & (CHUNK - 1);
+            let chunk = at >> CHUNK_BITS;
+            let take = (CHUNK - offset).min(items.len());
+            let (head, rest) = items.split_at(take);
+            if offset == 0 {
+                *self.chunks.entry_mut(chunk) = Some(Chunk::new(CHUNK, head, &head[0]));
+            } else {
+                self.chunks
+                    .entry_mut(chunk)
+                    .as_mut()
+                    .expect("the column's last chunk")
+                    .items_mut()[offset..offset + take]
+                    .clone_from_slice(head);
+            }
+            self.len += take;
+            items = rest;
+        }
+    }
+
+    /// Builds a column holding `items`, chunk by chunk.
+    pub(crate) fn from_slice(items: &[T]) -> CowVec<T> {
+        let mut out = CowVec::default();
+        out.extend_slice(items);
+        out
+    }
+
+    /// Chunk `chunk` to write in place (up to [`CHUNK`] live elements), copying it first while
+    /// shared. One tree walk for every element in the chunk.
+    pub(crate) fn chunk_mut(&mut self, chunk: usize) -> &mut [T] {
+        let start = chunk * CHUNK;
+        assert!(start < self.len, "chunk {chunk} past column length {}", self.len);
+        let len = (self.len - start).min(CHUNK);
+        &mut self
+            .chunks
+            .entry_mut(chunk)
+            .as_mut()
+            .expect("a chunk below the length")
+            .items_mut()[..len]
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
@@ -686,6 +761,26 @@ impl<T: Chunked> CowList<T> {
     pub fn live(&self) -> usize {
         self.live
     }
+
+    /// Appends every chunk of `other` without copying elements, returning the chunk index offset
+    /// to add to each [`ListRef::chunk`] produced by `other`.
+    pub(crate) fn append_list(&mut self, other: CowList<T>) -> u32 {
+        let base = self.count as u32;
+        if other.count == 0 {
+            return base;
+        }
+        assert!(self.count + other.count <= ENTRIES, "a list arena past 2^18 chunks");
+        for at in 0..other.count {
+            let chunk = other.chunks.get(at).expect("a chunk below the count").clone();
+            *self.chunks.entry_mut(self.count + at) = Some(chunk);
+        }
+        self.count += other.count;
+        self.fill = other.fill;
+        self.open = other.open;
+        self.live += other.live;
+        self.garbage += other.garbage;
+        base
+    }
 }
 
 /// A set of dense `u32` ids (pieces, slots): a bitset answers membership, and the members are
@@ -769,6 +864,37 @@ impl<A: Allocator + Copy> IdSet<A> {
         for id in ids {
             self.insert(id);
         }
+    }
+
+    /// Inserts every id in `start..end`, setting bitset words in bulk when the range is fresh.
+    pub(crate) fn insert_range(&mut self, start: u32, end: u32) {
+        if start >= end {
+            return;
+        }
+        let fresh = self.list.is_empty()
+            || (start as usize >= self.listed.words().len() * 64
+                && start as usize >= self.bits.words().len() * 64);
+        if fresh {
+            self.bits.grow(end as usize);
+            self.bits.insert_range(start..end);
+            self.listed.grow(end as usize);
+            self.listed.insert_range(start..end);
+            self.list.extend(start..end);
+            self.len += (end - start) as usize;
+            return;
+        }
+        self.bits.grow(end as usize);
+        self.listed.grow(end as usize);
+        self.list.reserve((end - start) as usize);
+        for id in start..end {
+            self.insert(id);
+        }
+    }
+
+    /// The ids ever listed, in first-insertion order (a member may later have been removed:
+    /// check [`IdSet::contains`]).
+    pub(crate) fn listed_slice(&self) -> &[u32] {
+        &self.list
     }
 }
 
@@ -1551,6 +1677,49 @@ mod tests {
         assert!(!column.chunks.ptr_eq(&column2.chunks));
         assert!(column.chunks.get(1).unwrap().ptr_eq(column2.chunks.get(1).unwrap()));
         assert!(column2.chunks.get(0).unwrap().ptr_eq(column3.chunks.get(0).unwrap()));
+    }
+
+    #[test]
+    fn bulk_cow_ops_match_serial_and_preserve_cow_clones() {
+        let mut a: CowVec<u32> = CowVec::default();
+        a.extend_slice(&[1, 2, 3]);
+        a.ensure_len(CHUNK * 2 + 17, &42);
+        assert_eq!(a.len(), CHUNK * 2 + 17);
+        assert_eq!(a.get(0), Some(&1));
+        assert_eq!(a.get(2), Some(&3));
+        assert_eq!(a.get(3), Some(&42));
+        assert_eq!(a.get(CHUNK * 2 + 16), Some(&42));
+        let more: Vec<u32> = (0..CHUNK as u32 + 50).collect();
+        a.extend_slice(&more);
+        assert_eq!(a.len(), CHUNK * 3 + 67);
+        for (at, &want) in more.iter().enumerate() {
+            assert_eq!(a.get(CHUNK * 2 + 17 + at), Some(&want));
+        }
+        let snap = a.clone();
+        a.chunk_mut(1)[5] = 999;
+        assert_eq!(a.get(CHUNK + 5), Some(&999));
+        assert_eq!(snap.get(CHUNK + 5), Some(&42));
+
+        let mut list_a: CowList<u32> = CowList::default();
+        let r0 = list_a.push(&[10, 20, 30]);
+        let mut list_b: CowList<u32> = CowList::default();
+        let mut refs_b = Vec::new();
+        for n in 0..1500u32 {
+            refs_b.push((list_b.push(&[n, n + 1, n + 2]), [n, n + 1, n + 2]));
+        }
+        let base = list_a.append_list(list_b);
+        assert_eq!(list_a.get(r0), &[10, 20, 30]);
+        for (mut r, want) in refs_b {
+            r.chunk += base;
+            assert_eq!(list_a.get(r), &want[..]);
+        }
+
+        let mut ids = IdSet::default();
+        ids.insert_range(0, 130);
+        ids.insert_range(130, 300);
+        ids.insert_range(250, 350);
+        assert_eq!(ids.len(), 350);
+        assert_eq!(ids.iter().collect::<Vec<_>>(), (0..350u32).collect::<Vec<_>>());
     }
 
     /// Of `Chunked` for the tests alone, so no other test shares its pools.

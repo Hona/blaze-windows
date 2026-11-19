@@ -444,22 +444,59 @@ impl Symbols {
         }
         let ids = self.ids_all(&ids);
         let names = self.names_all(&names);
-        let (mut id, mut name) = (ids.iter().copied(), names.iter().copied());
-        let mut next = || id.next().expect("one id per id of the keys");
         let mut compact: Vec<SymKey> = Vec::with_capacity(keys.len());
-        compact.extend(keys.iter().map(|key| match *key {
-            Wide::Key(key) => key,
-            Wide::Name(_) => SymKey::Name(name.next().expect("one name per name of the keys")),
-            Wide::Body(_) => SymKey::Body(next()),
-            Wide::Slot(_) => SymKey::Slot(next()),
-            Wide::Data(_) => SymKey::Data(next()),
-            Wide::Static(..) => {
-                let item = next();
-                SymKey::Static(item, next())
+        if ids.is_empty() && keys.len() >= PARALLEL {
+            // Native-object batches have only `Wide::Key` and `Wide::Name` (no `ContentId`s).
+            // Count names per chunk in parallel so every thread converts its chunk directly into
+            // `compact` with exact name offsets.
+            let grain = keys.len().div_ceil(par::threads() * 8).max(1);
+            let counts: Vec<usize> = par::map(par::chunks(keys, grain), |chunk| {
+                chunk.iter().filter(|it| matches!(it, Wide::Name(_))).count()
+            });
+            let mut starts = Vec::with_capacity(counts.len());
+            let mut acc = 0usize;
+            for count in counts {
+                starts.push(acc);
+                acc += count;
             }
-            Wide::Position(span) => SymKey::Position(next(), span.index),
-            Wide::Coverage(_, array) => SymKey::Coverage(next(), array),
-        }));
+            compact.resize(keys.len(), SymKey::Generation);
+            par::for_each(
+                par::zip(
+                    par::zip(par::chunks_mut(&mut compact, grain), par::chunks(keys, grain)),
+                    &starts,
+                ),
+                |((out, chunk), &name_start)| {
+                    let mut n = name_start;
+                    for (dst, key) in out.iter_mut().zip(chunk) {
+                        *dst = match *key {
+                            Wide::Key(key) => key,
+                            Wide::Name(_) => {
+                                let it = SymKey::Name(names[n]);
+                                n += 1;
+                                it
+                            }
+                            _ => unreachable!("ids was empty"),
+                        };
+                    }
+                },
+            );
+        } else {
+            let (mut id, mut name) = (ids.iter().copied(), names.iter().copied());
+            let mut next = || id.next().expect("one id per id of the keys");
+            compact.extend(keys.iter().map(|key| match *key {
+                Wide::Key(key) => key,
+                Wide::Name(_) => SymKey::Name(name.next().expect("one name per name of the keys")),
+                Wide::Body(_) => SymKey::Body(next()),
+                Wide::Slot(_) => SymKey::Slot(next()),
+                Wide::Data(_) => SymKey::Data(next()),
+                Wide::Static(..) => {
+                    let item = next();
+                    SymKey::Static(item, next())
+                }
+                Wide::Position(span) => SymKey::Position(next(), span.index),
+                Wide::Coverage(_, array) => SymKey::Coverage(next(), array),
+            }));
+        }
         self.intern_all(&compact)
     }
 
@@ -750,6 +787,11 @@ impl Symbols {
     /// The length a column indexed by [`Symbols::dense`] needs.
     pub fn dense_len(&self) -> usize {
         self.keys.iter().map(|it| it.len()).max().unwrap_or(0) * SHARDS
+    }
+
+    /// How many keys each symbol shard currently holds.
+    pub(crate) fn key_shard_lens(&self) -> [usize; SHARDS] {
+        std::array::from_fn(|s| self.keys[s].len())
     }
 
     /// Of an interned id, the same.
