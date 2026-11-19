@@ -241,6 +241,10 @@ pub struct Config {
     pub fail_fast: bool,
     pub kill_grace: Duration,
     pub tags: u64,
+    /// Whether the system's sandbox records what each test of a fork server reads, under the
+    /// test's scope (`MARK`): Linux's and macOS's do. Windows' records nothing of one test, so
+    /// there a test run in a process of its own ([`Mode::Process`]) is never kept on its reads.
+    pub records_each_test: bool,
 }
 
 /// Why a test failed.
@@ -280,6 +284,9 @@ pub enum Trace {
 
 /// Why what a test of a binary outside the sandbox read is not known.
 pub const OUTSIDE: &str = "it ran outside the sandbox, which alone records what a test reads";
+
+/// Why what a test read is not known where [`Config::records_each_test`] is false.
+const NO_RECORD_OF_A_TEST: &str = "the sandbox did not say what it read: Windows' sandbox records nothing of one test";
 
 impl Trace {
     /// What was read, hashed as `inputs` has it now: what blaze-testsel's machine keeps a
@@ -1721,6 +1728,10 @@ impl Queue {
     /// asks).
     fn lines(&mut self, b: usize, unit: u32) -> Trace {
         const PAST: &str = "the lines the test read are past 4 GiB";
+        if !self.config.records_each_test {
+            // Its record holds no line: an empty one would say the test read nothing.
+            return Trace::Unknown(NO_RECORD_OF_A_TEST.to_owned()); // alloc: once per result here
+        }
         let j = self.unit_job[unit as usize] as usize;
         let server = self.server(b);
         let common = match server.shared.as_ref().map(Arc::clone) {

@@ -29,7 +29,25 @@ pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std:
     std::process::exit(code)
 }
 
-#[cfg(not(unix))]
+/// Windows has no fork: the server hands each test to a warm process of the binary started
+/// ahead of it (`windows.rs`), and that process, started with [`SOCKET`] set to
+/// `windows::CHILD`, runs the one test and exits.
+#[cfg(windows)]
+pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> ! {
+    if socket.to_str() == Some(windows::CHILD) {
+        windows::child(tests)
+    }
+    let code = match windows::serve(tests, &socket) {
+        Ok(()) => 0,
+        Err(why) => {
+            eprintln!("blaze's fork server: {}", why);
+            101
+        }
+    };
+    std::process::exit(code)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: std::ffi::OsString) -> ! {
     let _ = (tests, socket);
     eprintln!("blaze's fork server: this platform has no fork; the package must run its tests as libtest's threads");
@@ -723,7 +741,7 @@ mod unix {
             if armed != 0 {
                 eprintln!("blaze's fork server: the runtime did not arm the execution record ({}); what this test executed is not known", armed);
             }
-            let code = run(test);
+            let code = super::one::run(test, mark, exit_now);
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
             // SAFETY: `_exit` ends the process at once and returns to nothing; the child's
@@ -822,6 +840,22 @@ mod unix {
         unsafe { access(path.as_ptr() as *const ::core::ffi::c_char, 0) };
     }
 
+}
+
+// One test run in the process it is in, as libtest runs it: what a fork server's child does on
+// Unix and a warm process does on Windows (`windows.rs`, after this).
+#[cfg(any(unix, windows))]
+mod one {
+    use super::std;
+    #[allow(unused_imports)]
+    use self::std::prelude::rust_2021::*;
+    #[allow(unused_imports)]
+    use self::std::{eprintln, format, vec};
+    use super::super::test;
+    use self::std::io::Write;
+
+    type Int = i32;
+
     #[derive(Clone, Copy)]
     enum Panics {
         No,
@@ -892,9 +926,11 @@ mod unix {
         }
     }
 
-    /// Runs one test in this child as libtest runs it: on a thread named after it, judged by
-    /// its `should_panic`. The exit code [`judge`] gives.
-    fn run(test: &'static test::TestDescAndFn) -> Int {
+    /// Runs one test in this process as libtest runs it: on a thread named after it, judged by
+    /// its `should_panic`. The exit code [`judge`] gives. `mark` tells the sandbox which test
+    /// runs (before and after); `exit_now` ends the process with a code, for the panic hook
+    /// under `panic = "abort"`.
+    pub fn run(test: &'static test::TestDescAndFn, mark: fn(&str), exit_now: fn(Int)) -> Int {
         let name = test.desc.name.as_slice();
         mark(name);
         let panics = match test.desc.should_panic {

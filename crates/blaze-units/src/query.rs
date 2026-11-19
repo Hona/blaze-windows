@@ -775,6 +775,12 @@ pub struct TestSandbox {
     pub outside_by_host: bool,
     /// `unsandboxed-tests`: the tests, by libtest's names, that run outside; sorted, each once.
     pub tests: Vec<String>,
+    /// `test-processes`: each test in a process of its own (`true`), or the binary's tests as
+    /// libtest's threads in one process (`false`); `None` for the host's default, a process
+    /// each on Linux and macOS and libtest's threads on Windows, where a test's process is a
+    /// warm one of the binary started ahead of it (`blaze_usercode`'s Windows fork server).
+    #[serde(default)]
+    pub processes: Option<bool>,
 }
 
 impl TestSandbox {

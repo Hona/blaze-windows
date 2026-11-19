@@ -568,6 +568,24 @@ v1 failed a test the sandbox denied something, whatever it ended with, naming wh
 and the way out; v2 records the refusal (`W` and `N` lines of the record) and the test ends as
 it ends.
 
+#### A test in a process of its own, or libtest's threads
+
+`test-processes` in the same table says how a binary's tests run: `true`, each in a process of
+its own, with a timeout of its own that kills the test and every process it started; `false`,
+the binary's tests together as libtest's threads in one process, one result for the binary and
+one timeout for all of it. Unsaid, it is `true` on Linux and macOS (a fork per test) and `false`
+on Windows. Windows has no fork: with `test-processes = true` the binary's server keeps up to
+eight processes of the binary started ahead of their tests (each waits on its input for the
+test it runs, in a job of its own), so a test starts with one write to a pipe instead of a
+process start (5 to 15 ms there) (`crates/blaze-usercode/src/test/fork_server/windows.rs`).
+Windows' sandbox records nothing of one test, so there no pass is kept on what a test read:
+each line says `(not kept: the sandbox did not say what it read)`.
+
+```toml
+[package.metadata.blaze.sandbox]
+test-processes = true
+```
+
 #### A package takes its tests out
 
 A member of the workspace takes its tests out of the sandbox in its own manifest:
