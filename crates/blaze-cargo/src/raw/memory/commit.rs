@@ -14,9 +14,9 @@
 //! reserves memory itself.
 
 use windows_sys::Win32::System::Memory::{
-    GetProcessHeaps, HEAP_SUMMARY, HeapSummary, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE,
-    MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-    PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    GetProcessHeap, GetProcessHeaps, HEAP_SUMMARY, HeapSummary, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED,
+    MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+    PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
 };
 
 /// The name the store's pool registers its pages under (`blaze-cas`'s `Pool::new`).
@@ -30,7 +30,7 @@ const HEAPS_MOST: usize = 64;
 pub struct CommitMap {
     /// The process's commit charge (`PrivateUsage`), read after the walk.
     pub total: u64,
-    /// Private ranges with a page of mimalloc's.
+    /// Private ranges with a page of a dedicated global heap (0 under `std::alloc::System`).
     pub heap: u64,
     /// Private ranges of the store's pools.
     pub pool: u64,
@@ -38,6 +38,14 @@ pub struct CommitMap {
     pub system_heaps: u64,
     /// What the system's heaps say they commit (`HeapSummary`), segments and large blocks alike.
     pub system_heaps_said: u64,
+    /// What `GetProcessHeap()` (Rust's `std::alloc::System`) says it commits (`HeapSummary`).
+    pub process_heap_said: u64,
+    /// What every other Win32 heap (CRT / LLVM / loader) says it commits (`HeapSummary`).
+    pub other_heaps_said: u64,
+    /// Live bytes tracked by `blaze_graph::arena::held()` at the walk.
+    pub heap_live: u64,
+    /// Resident committed bytes tracked by `blaze_mem` at the walk.
+    pub blaze_mem_resident: u64,
     /// Private ranges of allocations with a guard page: the threads' stacks.
     pub stacks: u64,
     /// Pages of images and mapped views that are writable copy-on-write or written: charged.
@@ -77,6 +85,8 @@ pub fn commit_map() -> CommitMap {
     });
     let pools = &pools[..pool_count];
     let mut heaps = [std::ptr::null_mut(); HEAPS_MOST];
+    // SAFETY: `GetProcessHeap` takes no arguments and returns this process's default heap handle.
+    let process_heap = unsafe { GetProcessHeap() };
     // SAFETY: `heaps` holds `HEAPS_MOST` handles for the call to write.
     let count = unsafe { GetProcessHeaps(HEAPS_MOST as u32, heaps.as_mut_ptr()) } as usize;
     let heaps = &heaps[..count.min(HEAPS_MOST)];
@@ -86,9 +96,17 @@ pub fn commit_map() -> CommitMap {
         summary.cb = size_of::<HEAP_SUMMARY>() as u32;
         // SAFETY: a heap of this process's, as the system named it, and a live record.
         if unsafe { HeapSummary(heap, 0, &mut summary) } != 0 {
-            map.system_heaps_said += summary.cbCommitted as u64;
+            let committed = summary.cbCommitted as u64;
+            map.system_heaps_said += committed;
+            if heap == process_heap {
+                map.process_heap_said += committed;
+            } else {
+                map.other_heaps_said += committed;
+            }
         }
     }
+    map.heap_live = blaze_graph::arena::held();
+    map.blaze_mem_resident = blaze_mem::tag::snapshot().resident_committed();
     let mut at = 0usize;
     // The allocation the walk is in, and what it was found to be.
     let mut allocation = usize::MAX;
@@ -163,18 +181,29 @@ fn guarded(base: usize) -> bool {
 impl std::fmt::Display for CommitMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+        // `blaze_mem_resident` already includes `pool` (store pool live pages), so subtract
+        // `system_heaps_said`, `blaze_mem_resident`, `stacks`, and `images` to show what private
+        // commit is still unexplained by the named owners.
+        let explained = self
+            .system_heaps_said
+            .saturating_add(self.blaze_mem_resident)
+            .saturating_add(self.stacks)
+            .saturating_add(self.images);
+        let unexplained = self.total.saturating_sub(explained);
         write!(
             f,
-            "commit {:.2} GiB: global heap {:.2}, store pool {:.2}, system heaps {:.2} (they say {:.2}), \
-             stacks {:.2}, images {:.2}, other private {:.2}",
+            "commit {:.2} GiB: process heap {:.2} (live {:.2}, kept {:.2}), other system heaps {:.2}, \
+             blaze-mem {:.2} (store pool {:.2}), stacks {:.2}, images {:.2}, unexplained {:.2}",
             gib(self.total),
-            gib(self.heap),
+            gib(self.process_heap_said),
+            gib(self.heap_live),
+            gib(self.process_heap_said.saturating_sub(self.heap_live)),
+            gib(self.other_heaps_said),
+            gib(self.blaze_mem_resident),
             gib(self.pool),
-            gib(self.system_heaps),
-            gib(self.system_heaps_said),
             gib(self.stacks),
             gib(self.images),
-            gib(self.other),
+            gib(unexplained),
         )
     }
 }

@@ -1467,6 +1467,10 @@ impl Writer<Real> for UnitWriter {
             })
     }
 
+    fn db(&self) -> Option<&base_db::Db> {
+        Some(self.front.db())
+    }
+
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
         self.front.check_ran(run, &ran).map_err(lower_error)?;
         self.runs.push((run, ran));

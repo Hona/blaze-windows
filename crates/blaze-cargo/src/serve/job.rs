@@ -6148,6 +6148,39 @@ impl<S: Steps> Jobs<S> {
         self.paths.evict_images()
     }
 
+    /// Lock-free summary of query storage bytes across every active build and kept front end:
+    /// `(databases, total_bytes, top_owners)`. Sound while queries run (atomic counters only).
+    pub fn query_memory_summary(&self) -> (usize, u64, Vec<(&'static str, u64)>) {
+        let mut by_name: HashMap<&'static str, u64, Global> = HashMap::new_in(Global);
+        let mut dbs = 0usize;
+        let mut total = 0u64;
+        let mut add = |db: &base_db::Db| {
+            dbs += 1;
+            let mut entries = Vec::new();
+            blaze_query::db::Database::storage(db).held_breakdown(&mut entries);
+            for (name, bytes) in entries {
+                total = total.saturating_add(bytes);
+                *by_name.entry(name).or_insert(0) += bytes;
+            }
+        };
+        for &id in &self.order {
+            if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get(key_of(id))
+                && let Some(db) = build.writer.here().and_then(|it| it.db())
+            {
+                add(db);
+            }
+        }
+        for front in self.roots.fronts.iter().flatten() {
+            if let Some(db) = front.db() {
+                add(db);
+            }
+        }
+        let mut top: Vec<(&'static str, u64)> = by_name.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        top.truncate(16);
+        (dbs, total, top)
+    }
+
     /// What each kept front end's query storage holds, by ingredient, a line a front end in
     /// the daemon's log: the idle daemon's answer to "what holds the memory" (rule
     /// ask-the-profile-first). A walk of every function's rows made, sound beside readers

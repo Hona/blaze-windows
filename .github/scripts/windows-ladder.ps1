@@ -6,12 +6,12 @@
 param(
     [Parameter(Mandatory)] [string] $Blaze,
     [Parameter(Mandatory)] [string] $Out,
-    [Parameter(Mandatory)] [ValidateSet('hello','withdeps','rune-cstr')] [string] $Fixture
+    [Parameter(Mandatory)] [ValidateSet('hello','withdeps','rune-cstr','one-luau','r28-ops')] [string] $Fixture
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Out | Out-Null
 $env:BLAZE_HOME = Join-Path $Out 'home'
-$env:BLAZE_CORES = if ($Fixture -eq 'withdeps') { '1' } else { 'all' }
+$env:BLAZE_CORES = if ($Fixture -in @('withdeps','one-luau','r28-ops')) { '1' } else { 'all' }
 $timings = Join-Path $Out 'timings.csv'
 'project,step,seconds,exit' | Set-Content $timings
 
@@ -56,11 +56,11 @@ function Step([string] $project, [string] $step, [string] $dir, [string[]] $word
     }
 }
 
-function Project([string] $name, [string] $manifest, [string] $main) {
+function Project([string] $name, [string] $manifest, [string] $main, [string] $entry = 'src/main.rs') {
     $dir = Join-Path $Out $name
     New-Item -ItemType Directory -Force (Join-Path $dir 'src') | Out-Null
     Set-Content (Join-Path $dir 'Cargo.toml') $manifest
-    Set-Content (Join-Path $dir 'src/main.rs') $main
+    Set-Content (Join-Path $dir $entry) $main
     $dir
 }
 
@@ -114,6 +114,25 @@ fn json() -> anyhow::Result<String> {
 }
 '@)
 
+$oneLuau = Project 'one-luau' @'
+[package]
+name = "perf-one-luau"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+mlua-sys = { git = "https://github.com/mlua-rs/mlua", rev = "a0ad4535fc72ba89967a931c5be57b162b5f0f3f", features = ["luau"] }
+'@ "pub fn one() -> i32 { 1 }`n" 'src/lib.rs'
+$r28Ops = Project 'r28-ops' @'
+[package]
+name = "perf-xlsx-ops"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+betteroffice-xlsx-ops = { git = "https://github.com/openooxml/betteroffice", rev = "ed0a3cea5bd24119c4f2e144a978849177e06fcd" }
+'@ "pub fn one() -> u8 { 1 }`n" 'src/lib.rs'
+
 $serverLog = Join-Path $Out 'serve.stderr.log'
 # Auto-starting clients install the pinned sysroot first; a directly launched server requires
 # it to be whole already. Install with blaze's own verifier, not the runner's rustup default.
@@ -151,6 +170,17 @@ try {
         (Get-Content $file -Raw).Replace("`"$said`"", "`"$said, edited`"") | Set-Content $file -NoNewline
         Step $name 'edit' $dir @('build') ''
         Step $name 'run-edited' $dir @('run', '-q') "$said, edited"
+    }
+    foreach ($p in @(@('one-luau', $oneLuau, 'pub fn one() -> i32 { 1 }', 'pub fn one() -> i32 { 2 }'), @('r28-ops', $r28Ops, 'pub fn one() -> u8 { 1 }', 'pub fn one() -> u8 { 2 }'))) {
+        $name, $dir, $before, $after = $p
+        if ($name -ne $Fixture) { continue }
+        Step $name 'lock' $dir @('lock') ''
+        Step $name 'check' $dir @('check') ''
+        Step $name 'build' $dir @('build') ''
+        Step $name 'noop' $dir @('build') ''
+        $file = Join-Path $dir 'src/lib.rs'
+        (Get-Content $file -Raw).Replace($before, $after) | Set-Content $file -NoNewline
+        Step $name 'edit' $dir @('build') ''
     }
 
 } finally {
@@ -193,5 +223,48 @@ if ($Fixture -ne 'rune-cstr') {
     if ([int]$builds[1].script_runs -ne 0) { throw 'the no-op ran a build script' }
     if ([int]$builds[2].script_runs -ne 0) { throw 'the one-line edit ran a build script' }
 }
+
+# Peak memory by owner from the profile's counters and task spans, plus the daemon's own peak
+# snapshot (which includes query storage and Windows CommitMap at the highest footprint).
+$memQuery = @"
+with c as (select build_id, t_ns, name, value
+           from read_parquet('$profile/*.counters.parquet', union_by_name=true))
+select name,
+       round(max(value) / 1048576.0, 2) as peak_mib,
+       round(arg_max(value, t_ns) / 1048576.0, 2) as end_mib
+from c
+where name in ('footprint bytes', 'heap live bytes', 'blaze-mem resident bytes',
+               'allocator kept bytes', 'allocator purged bytes', 'committed bytes',
+               'pool resident bytes', 'store heap bytes', 'blocks live bytes',
+               'blocks warm bytes', 'blocks cold bytes', 'chunks warm bytes', 'chunks cold bytes')
+   or name like 'tag live bytes: %'
+   or name like 'tag heap bytes: %'
+   or name like 'tag heap allocated bytes: %'
+group by name
+order by peak_mib desc
+"@
+$taskMemQuery = @"
+select build_id, function as task, crate, unit,
+       round(peak_bytes / 1048576.0, 2) as peak_mib,
+       round(heap_allocated_bytes / 1048576.0, 2) as alloc_mib,
+       round(dur_ns / 1e9, 3) as dur_s
+from read_parquet('$profile/*.spans.parquet', union_by_name=true)
+where name = 'task' and (peak_bytes is not null or heap_allocated_bytes is not null)
+order by coalesce(peak_bytes, 0) desc, coalesce(heap_allocated_bytes, 0) desc
+limit 25
+"@
+$memCsv = Join-Path $Out 'memory-peak.csv'
+$taskMemCsv = Join-Path $Out 'memory-tasks.csv'
+python -c "import duckdb,sys; duckdb.sql(sys.argv[1]).write_csv(sys.argv[2])" $memQuery $memCsv
+if ($LASTEXITCODE -eq 0) {
+    Write-Host '--- Peak memory by owner (MiB) ---'
+    Get-Content $memCsv
+}
+python -c "import duckdb,sys; duckdb.sql(sys.argv[1]).write_csv(sys.argv[2])" $taskMemQuery $taskMemCsv
+if ($LASTEXITCODE -eq 0) {
+    Write-Host '--- Top tasks by memory (MiB) ---'
+    Get-Content $taskMemCsv
+}
+Select-String -LiteralPath $serverLog -Pattern 'peak memory:|peak commit' | ForEach-Object { Write-Host $_.Line }
 
 Get-Content $timings

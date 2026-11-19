@@ -204,7 +204,7 @@ fn add(local: &Local, bytes: i64) {
 /// went by its captures on the stack, and the holder's slot was loaded only once its byte came
 /// back from the store (a third of a small block's pair in a task, lane checkheap's profile).
 #[inline(never)]
-fn count(holder: Option<Tag>, delta: i64, ptr: *mut u8) {
+fn count(live_holder: Option<Tag>, churn_holder: Option<Tag>, delta: i64, ptr: *mut u8) {
     LOCAL.with(|local| {
         local.net.set(local.net.get().wrapping_add(delta));
         let account = local.account.get();
@@ -220,31 +220,31 @@ fn count(holder: Option<Tag>, delta: i64, ptr: *mut u8) {
                 charge(local, account, charged);
             }
         }
-        let at = slot(holder);
+        let churn_at = slot(churn_holder);
         let (churned, gross) = match delta >= 0 {
-            true => (&local.churn_allocated[at], delta as u64),
-            false => (&local.churn_freed[at], delta.unsigned_abs()),
+            true => (&local.churn_allocated[churn_at], delta as u64),
+            false => (&local.churn_freed[churn_at], delta.unsigned_abs()),
         };
         let churn_now = churned.get() + gross;
         churned.set(churn_now);
         if churn_now >= CHURN_BATCH {
-            churn(local, at);
+            churn(local, churn_at);
         }
         if delta > 0 {
             let left = local.sample_left.get() - delta;
             if left > 0 {
                 local.sample_left.set(left);
             } else {
-                sample(local, holder, delta as u64, left, ptr);
+                sample(local, churn_holder, delta as u64, left, ptr);
             }
         }
         let batch = local.batch.get().unsigned_abs();
-        let moved = &local.holders[at];
+        let moved = &local.holders[slot(live_holder)];
         let held = moved.get().wrapping_add(delta);
         if held.unsigned_abs() < batch {
             moved.set(held);
         } else {
-            fold(moved, holder, held);
+            fold(moved, live_holder, held);
         }
         let unflushed = local.unflushed.get().wrapping_add(delta);
         if unflushed.unsigned_abs() < batch {
@@ -451,17 +451,21 @@ mod global {
 
         #[inline(always)]
         unsafe fn made(&self, layout: Layout, zeroed: bool) -> *mut u8 {
-            let holder = Self::running();
+            let tag = blaze_mem::frame::running_tag();
+            let live_holder = match A::BY_TAG {
+                true => tag,
+                false => None,
+            };
             // SAFETY: the caller upholds `alloc`'s contract for `layout`.
             let ptr = unsafe {
-                match (holder, zeroed) {
+                match (live_holder, zeroed) {
                     (Some(tag), _) => self.0.alloc_for(tag, layout, zeroed),
                     (None, true) => self.0.alloc_zeroed(layout),
                     (None, false) => self.0.alloc(layout),
                 }
             };
             if !ptr.is_null() {
-                count(holder, signed(layout.size()), ptr);
+                count(live_holder, tag, signed(layout.size()), ptr);
             }
             ptr
         }
@@ -502,7 +506,7 @@ mod global {
             sampled::freed(ptr);
             // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`.
             unsafe { self.0.dealloc(ptr, layout) };
-            count(holder, -signed(layout.size()), std::ptr::null_mut());
+            count(holder, holder, -signed(layout.size()), std::ptr::null_mut());
         }
 
         /// A block that moves goes to the running task's tag, as a new one would: a buffer
@@ -518,11 +522,16 @@ mod global {
             if !new.is_null() {
                 // SAFETY: `new` is the live block the realloc gave.
                 let now = unsafe { self.holder(new) };
+                let alloc_tag = blaze_mem::frame::running_tag();
                 match now == was {
-                    true => count(was, signed(new_size) - signed(layout.size()), new),
+                    true => {
+                        let delta = signed(new_size) - signed(layout.size());
+                        let churn_holder = if delta >= 0 { alloc_tag } else { was };
+                        count(was, churn_holder, delta, new);
+                    }
                     false => {
-                        count(was, -signed(layout.size()), std::ptr::null_mut());
-                        count(now, signed(new_size), new);
+                        count(was, was, -signed(layout.size()), std::ptr::null_mut());
+                        count(now, alloc_tag, signed(new_size), new);
                     }
                 }
             }
@@ -1135,6 +1144,32 @@ mod tests {
         // SAFETY: a valid layout, freed at once.
         unsafe { TAGGED.dealloc(TAGGED.alloc(small), small) };
         assert_eq!((heap(Tag::Fuzz), heap(Tag::Api)), (fuzz, api));
+    }
+
+    /// Even under an untagged allocator (`System`, `BY_TAG == false`), global-heap allocation
+    /// churn (`heap_allocated`) is attributed to the running task's tag so peak reports name
+    /// which subsystem churned the heap without per-block headers.
+    #[test]
+    #[allow(unsafe_code, reason = "drives a GlobalAlloc by hand")]
+    fn system_allocator_still_attributes_allocation_churn_by_tag() {
+        static UNTAGGED: Counting<std::alloc::System> = Counting(std::alloc::System);
+        let allocated = |tag: Tag| blaze_mem::tag::snapshot().get(tag).heap_allocated;
+        let before = allocated(Tag::Fuzz);
+        let block_layout = Layout::from_size_align(4 * MB, 16).expect("a layout");
+        blaze_mem::frame::task(Tag::Fuzz, |_| {
+            // SAFETY: valid layout, freed immediately.
+            unsafe {
+                let ptr = UNTAGGED.alloc(block_layout);
+                assert!(!ptr.is_null());
+                UNTAGGED.dealloc(ptr, block_layout);
+            }
+        });
+        fold_here();
+        let after = allocated(Tag::Fuzz);
+        assert!(
+            after >= before + 4 * MB as u64,
+            "System allocator must still record heap_allocated churn by tag: before={before} after={after}"
+        );
     }
 
     const MB: usize = 1 << 20;

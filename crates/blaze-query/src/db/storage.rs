@@ -694,6 +694,25 @@ impl Storage {
         }
     }
 
+    /// Lock-free breakdown of every live ingredient and dependency-graph column by bytes held
+    /// (counters only, no row walk; sound while queries run).
+    pub fn held_breakdown(&self, out: &mut Vec<(&'static str, u64)>) {
+        for index in self.live() {
+            let Some(vtable) = ingredient::vtable(index) else { continue };
+            let bytes = (vtable.memory)(self, index).held();
+            if bytes > 0 {
+                // alloc: the caller's peak report, one entry per active ingredient
+                out.push((vtable.name, bytes));
+            }
+        }
+        for graph in self.graph_usage() {
+            let bytes = graph.held();
+            if bytes > 0 {
+                out.push((graph.name, bytes));
+            }
+        }
+    }
+
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
     fn graph_usage(&self) -> [MemoryUsage; 4] {
         let live = self

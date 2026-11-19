@@ -1130,6 +1130,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// A reader of the front end as it stands, for one task about to be posted; none while a
     /// write is asked for and not applied, when the loop holds the task instead.
     fn reader(&self) -> Option<S::Reader>;
+    /// The database this writer owns, for lock-free memory accounting while a build runs.
+    fn db(&self) -> Option<&base_db::Db> {
+        None
+    }
     /// Asks for the run of build script unit `run` applied to the units depending on it
     /// (`blaze_lower::Lowered::ran`): checked now, an error naming what is wrong with it,
     /// and applied by [`Writer::apply`].

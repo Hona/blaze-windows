@@ -43,6 +43,7 @@ impl Guard {
                 Some(CeilingLook::Under) => {}
                 None | Some(CeilingLook::Passed) => {
                     super::said::logged!(ERROR, "blaze serve: pid {} stopped at its memory ceiling: private commit {bytes:?}, limit {ceiling} bytes", std::process::id());
+                    super::daemon::log_memory(&blaze_mem::tag::snapshot());
                     std::process::exit(Exit::MemoryCeiling.code());
                 }
             }
