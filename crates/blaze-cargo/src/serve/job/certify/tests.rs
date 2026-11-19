@@ -144,6 +144,11 @@ impl Program {
     fn look(&self, ask: &Ask) -> Result<Told, String> {
         Ok(match ask {
             Ask::Read { read: Read::Node(path), .. } if path == "src/main.rs" => Told::Read(self.node()),
+            // A build that patches in place leaves the prior file at `PROGRAM`, so that file is an
+            // input of the patched certificate (rule 21) and distinct from a fresh link of the same source.
+            Ask::Read { read: Read::Outside(path), .. } if path == PROGRAM => {
+                Told::Read(self.file.map_or(Digest::Nothing, |it| Digest::Is(it.0)))
+            }
             Ask::Read { read, .. } => return Err(format!("asked for {read:?}, which no build reads")),
             // The driver's look at a holder ([`certify`]'s `code_told`): what it holds, in place.
             Ask::Content { base, .. } if certificate::holder_of(*base).is_some() => {
@@ -169,7 +174,14 @@ impl Program {
         self.clock_ns += 1;
         let first = self.held.is_none();
         let patch = std::mem::take(&mut self.patch) && !first && self.holder == CodeHolder::Memory;
+        let mut valued = Vec::new();
         if patch {
+            // Patching in place leaves the previous file at `PROGRAM` untouched, so this build's
+            // output pair `(file, memory)` depends on that prior file as an input (rule 21),
+            // whereas a fresh build of the same source writes a new file and reads nothing there.
+            if let Some((base_file, _)) = self.file {
+                valued.push((Read::Outside(PROGRAM.to_owned()), Digest::Is(base_file)));
+            }
             self.held = Some(Program::patch_of(self.source));
         } else {
             if first || self.holder == CodeHolder::Memory {
@@ -189,7 +201,7 @@ impl Program {
         )?;
         Ok(Built {
             nodes: vec!["src/main.rs".to_owned()],
-            valued: Vec::new(),
+            valued,
             outputs,
             units: Vec::new(),
             said: b"Finished".to_vec(),
@@ -404,14 +416,26 @@ fn the_oracle_catches_a_holder_that_answers_the_certificates_record() {
 #[test]
 fn a_memory_output_with_no_holder_is_the_file_at_its_path() {
     let restarted = [CodeOp::Source(1), CodeOp::Request, CodeOp::Restart, CodeOp::Request];
-    let patched =
-        [CodeOp::Source(1), CodeOp::Request, CodeOp::Patch(2), CodeOp::Request, CodeOp::Restart, CodeOp::Request];
+    let patched = [
+        CodeOp::Source(1),
+        CodeOp::Request,
+        CodeOp::Patch(2),
+        CodeOp::Request,
+        CodeOp::Restart,
+        CodeOp::Request,
+        CodeOp::Restart,
+        CodeOp::Request,
+    ];
     let moved = Seen::Miss(Why::Moved(vec![node("src/main.rs")]));
     for seed in 0..16 {
         let seen = run_code(CodeHolder::Memory, &restarted, seed, Plant::None).unwrap();
         assert_eq!(seen, [Seen::Miss(Why::Unfiled), Seen::Hit], "seed {seed}");
         let seen = run_code(CodeHolder::Memory, &patched, seed, Plant::None).unwrap();
-        assert_eq!(seen, [Seen::Miss(Why::Unfiled), moved.clone(), code_miss(MEMORY, How::Gone)], "seed {seed}");
+        assert_eq!(
+            seen,
+            [Seen::Miss(Why::Unfiled), moved.clone(), code_miss(MEMORY, How::Gone), Seen::Hit],
+            "seed {seed}"
+        );
         let why = run_code(CodeHolder::Memory, &patched, seed, Plant::TakesAnyFileForTheMemory)
             .expect_err("the oracle missed a patched memory taken for its file");
         assert!(why.starts_with("step 5: the run printed 56, and its source prints 57"), "{why}");
