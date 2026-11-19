@@ -62,15 +62,24 @@ LLVM_PREFIX = "LLVM_SYS_231_PREFIX"
 # binary names the versions it asks for (in its dynamic string table).
 GLIBC = (2, 34)
 GLIBC_VERSION = re.compile(rb"GLIBC_(\d+)\.(\d+)(?:\.\d+)?\x00")
-# The libraries no shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it.
-NOT_LOADED = {"linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"), "darwin": re.compile(r"libLLVM")}
+# The libraries no shipped binary may load: LLVM is linked in, and on Linux libstdc++ with it;
+# on Windows both LLVM and the VC++ runtime are linked statically (/MT).
+NOT_LOADED = {
+    "linux": re.compile(r"libLLVM|libstdc\+\+|libc\+\+"),
+    "darwin": re.compile(r"libLLVM"),
+    "win32": re.compile(r"LLVM.*\.dll|VCRUNTIME\d+.*\.dll|MSVCP\d+.*\.dll", re.IGNORECASE),
+}
 # Flags from the environment would change what ships without the recipe saying so.
 FOREIGN_FLAGS = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
 HOSTS = {
     ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
     ("darwin", "arm64"): "aarch64-apple-darwin",
+    ("win32", "AMD64"): "x86_64-pc-windows-msvc",
+    ("win32", "x86_64"): "x86_64-pc-windows-msvc",
 }
+EXE = ".exe" if sys.platform == "win32" else ""
+STACK_RESERVE_PE = re.compile(r"^\s*800000 size of stack reserve\s*$", re.MULTILINE)
 TAIL_LINES = 80
 
 
@@ -157,7 +166,7 @@ async def run(
 
 # The daemon's log, as blaze's client names it when the daemon did not start or listen ("its log
 # is <path>", "its log <path> says why"). The daemon says there why it ended; the client does not.
-DAEMON_LOG = re.compile(r"its log (?:is )?(/\S+?serve\.log)")
+DAEMON_LOG = re.compile(r"its log (?:is )?(\S+?serve\.log)")
 DAEMON_LOG_LINES = 60
 
 
@@ -303,8 +312,20 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
         wrong += [
             f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["darwin"].search(line)
         ]
+    elif data[:2] == b"MZ":
+        deps = (
+            await run(f"check {binary.name} imports", ["dumpbin", "/nologo", "/dependents", str(binary)], secs=build.check_secs)
+        ).stdout
+        for line in deps.splitlines():
+            if NOT_LOADED["win32"].search(line):
+                wrong.append(f"{binary.name} loads {line.strip()}")
+        headers = (
+            await run(f"check {binary.name} headers", ["dumpbin", "/nologo", "/headers", str(binary)], secs=build.check_secs)
+        ).stdout
+        if not STACK_RESERVE_PE.search(headers):
+            wrong.append(f"{binary.name} does not reserve an 8 MiB main-thread stack")
     else:
-        wrong.append(f"{binary.name} is neither ELF nor Mach-O")
+        wrong.append(f"{binary.name} is neither ELF, Mach-O nor PE")
     return wrong
 
 
@@ -342,11 +363,12 @@ async def main_async(build: Build) -> None:
     out.mkdir(parents=True, exist_ok=True)
     shipped: list[Path] = []
     for name in binaries():
-        path = built / name
+        filename = f"{name}{EXE}"
+        path = built / filename
         if not path.is_file():
             raise Failed(f"build: `{' '.join(cmd)}` ended well and made no {path}")
-        shutil.copy2(path, out / name)
-        shipped.append(out / name)
+        shutil.copy2(path, out / filename)
+        shipped.append(out / filename)
     async with asyncio.TaskGroup() as group:
         checks = [group.create_task(check_binary(build, binary)) for binary in shipped]
     wrong = [item for task in checks for item in task.result()]
@@ -362,6 +384,8 @@ async def main_async(build: Build) -> None:
         + (
             ""
             if sys.platform == "darwin"
+            else " or dynamic VC++ runtime and reserves an 8 MiB stack"
+            if sys.platform == "win32"
             else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} or older"
         ),
         flush=True,

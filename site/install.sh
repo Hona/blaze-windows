@@ -127,7 +127,7 @@ case "$os" in
         esac
         ;;
     MINGW* | MSYS* | CYGWIN* | Windows_NT)
-        fail "this installer is for macOS and Linux." "On Windows, install with: cargo +$TOOLCHAIN install --locked blaze-engine"
+        fail "this installer is for macOS and Linux." "On Windows (PowerShell), run: irm https://ix.dev/blaze/install.ps1 | iex (or from source: cargo +$TOOLCHAIN install --locked blaze-engine)"
         ;;
     *) fail "blaze has no build for $os yet." "It runs on macOS with Apple silicon and on Linux (x86-64, ARM64)." ;;
 esac
