@@ -263,11 +263,7 @@ impl Class {
             warm: Stack::new(),
             cold: Stack::new(),
             counts: Counts::new(),
-            scratch: {
-                let scratch = Region::reserve(TRIM_MOST * size_of::<u32>(), free)?;
-                scratch.ensure(TRIM_MOST * size_of::<u32>())?;
-                scratch
-            },
+            scratch: Region::reserve(TRIM_MOST * size_of::<u32>(), free)?,
         })
     }
 
@@ -450,19 +446,31 @@ impl Class {
     #[cold]
     #[inline(never)]
     fn trim(&self) -> Trimmed {
+        self.trim_to((KEEP / 2) as i64)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_to(&self, goal: i64) -> Trimmed {
+        if self.warm.is_empty() {
+            return Trimmed::default();
+        }
         if self.counts.trimming.swap(true, Ordering::Acquire) {
             return Trimmed { busy: true, ..Trimmed::default() };
         }
-        // SAFETY: the scratch holds `TRIM_MOST` `u32`s, committed when the class was made and
-        // aligned to a page; the `trimming` flag, swapped to true above, makes this thread the
-        // one that touches it until the flag is cleared below.
+        if self.scratch.ensure(TRIM_MOST * size_of::<u32>()).is_err() {
+            self.counts.trimming.store(false, Ordering::Release);
+            return Trimmed::default();
+        }
+        // SAFETY: the scratch holds `TRIM_MOST` `u32`s, committed just above and aligned to a
+        // page; the `trimming` flag, swapped to true above, makes this thread the one that
+        // touches it until the flag is cleared below.
         let held = unsafe {
             std::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
         };
-        let goal = (KEEP / 2) as i64;
         let mut taken = 0;
         let mut warm = self.counts.warm.load(Ordering::Relaxed);
-        while taken < TRIM_MOST && warm > goal {
+        while taken < TRIM_MOST && (goal == 0 || warm > goal) {
             let step = TRIM_STEP.min(TRIM_MOST - taken);
             let popped = self.warm.pop_some(&self.links, &mut held[taken..taken + step]);
             if popped == 0 {
@@ -625,6 +633,27 @@ pub fn snapshot() -> Snapshot {
         }
     }
     snapshot
+}
+
+/// Gives back the whole pages covered by every warm free block across every initialized size
+/// class, even classes below [`KEEP`], and returns the bytes given back to the kernel.
+/// For a memory purge (`raw::memory::purge`), never on an allocation hot path.
+pub fn trim_all() -> usize {
+    let _ = tag::gathered(fold_thread);
+    let mut given = 0;
+    for class in &CLASS {
+        let Some(Ok(class)) = class.get() else { continue };
+        if class.at_once {
+            continue;
+        }
+        let trimmed = class.trim_to(0);
+        if !trimmed.busy && trimmed.given_back > 0 {
+            class.counts.trims.fetch_add(1, Ordering::Relaxed);
+            class.counts.given_back.fetch_add(trimmed.given_back as u64, Ordering::Relaxed);
+            given += trimmed.given_back;
+        }
+    }
+    given
 }
 
 /// The class of the smallest block that holds `bytes` aligned to `align`.

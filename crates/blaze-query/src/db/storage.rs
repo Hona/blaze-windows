@@ -375,7 +375,10 @@ impl Storage {
             making: blaze_core::lock::Lock::new("query.storage.making", ()),
             heap: Heap::new(HEAP, Tag::Query),
             intern_heap: Heap::new(INTERN_HEAP, Tag::Intern),
+            #[cfg(not(windows))]
             owners: Owners::sparse(Tag::Query, "page owners"),
+            #[cfg(windows)]
+            owners: Owners::growing(MAX_PAGES, Tag::Query, "page owners"),
             next_page: AtomicU32::new(1),
             nodes: Dense::growing(NODES, Tag::Query, "nodes"),
             runs: Dense::growing(NODES, Tag::Query, "node runs"),
@@ -1102,7 +1105,17 @@ impl Storage {
     /// The ingredient that owns `id`'s page.
     #[inline]
     pub fn owner(&self, id: Id) -> Option<u32> {
-        match self.owners.get(id.page()).load(Ordering::Acquire) {
+        let slot = {
+            #[cfg(windows)]
+            {
+                self.owners.get_checked(id.page())
+            }
+            #[cfg(not(windows))]
+            {
+                Some(self.owners.get(id.page()))
+            }
+        };
+        match slot.map_or(0, |it| it.load(Ordering::Acquire)) {
             0 => None,
             owner => Some(owner),
         }
@@ -1152,6 +1165,12 @@ impl Storage {
         let page = self.next_page.fetch_add(1, Ordering::Relaxed) as usize;
         assert!(page < MAX_PAGES, "the query database ran out of ID pages ({MAX_PAGES})");
         // Release: whoever sees an ID of the page sees its owner.
+        #[cfg(windows)]
+        {
+            self.owners.ensure(page + 1);
+            self.owners.get(page).store(ingredient, Ordering::Release);
+        }
+        #[cfg(not(windows))]
         self.owners.get_to_write(page).store(ingredient, Ordering::Release);
         page
     }
@@ -1159,6 +1178,11 @@ impl Storage {
     /// ID pages made so far: every page index is below it.
     pub(crate) fn pages_made(&self) -> usize {
         self.next_page.load(Ordering::Relaxed) as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owners_committed_bytes(&self) -> usize {
+        self.owners.committed_bytes()
     }
 
     /// `count` fresh nodes, consecutive, the first returned; their keys and colors zero.

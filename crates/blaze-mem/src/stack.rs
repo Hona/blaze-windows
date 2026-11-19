@@ -43,6 +43,10 @@ impl Stack {
         Stack { head: AtomicU64::new(pack(0, NONE)) }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        index(self.head.load(Ordering::Acquire)) == NONE
+    }
+
     /// Pushes `item`, which no one else holds or has on any stack.
     pub(crate) fn push(&self, item: u32, links: &impl Links) {
         debug_assert_ne!(item, NONE);
