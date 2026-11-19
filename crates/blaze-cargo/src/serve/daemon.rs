@@ -3341,6 +3341,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             || self.launch.undurable()
             || self.jobs.slots_writing();
         if self.stopping.is_none()
+            && self.unheld.is_none()
             && super::idle::exit_due(
                 idle_for,
                 self.jobs.exit_wait(self.worked),
