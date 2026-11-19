@@ -220,6 +220,16 @@ impl<W: Work> Runner<W> {
             Runner::Inline(_) => 0,
         }
     }
+
+    /// Node `id` was abandoned by the watchdog while its thread still runs it: stop counting
+    /// it as live running work so a stuck IO or pool thread cannot blind [`super::still`] for
+    /// later builds, and do not double-subtract if the lost thread returns late.
+    pub fn abandon(&mut self, id: NodeId) {
+        match self {
+            Runner::Threads(it) => it.abandon(id),
+            Runner::Inline(it) => it.abandon(id),
+        }
+    }
 }
 
 /// A thread task as the plane posts it.
@@ -250,6 +260,9 @@ pub struct Threads<W: Work> {
     running: usize,
     /// Of `running`, those posted to the worker pool.
     on_pool: usize,
+    /// Posted and not yet taken or abandoned: lets [`Threads::abandon`] remove a lost thread
+    /// from `running`/`on_pool` once without double-subtracting if it ever returns late.
+    live: HashMap<NodeId, Pool, Global>,
 }
 
 /// A task's way back to the loop: its end queued, then the loop's wait ended where its driver
@@ -323,7 +336,14 @@ impl<W: Work> Threads<W> {
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
         }
-        Threads { done_tx, done, io: io_tx, running: 0, on_pool: 0 }
+        Threads {
+            done_tx,
+            done,
+            io: io_tx,
+            running: 0,
+            on_pool: 0,
+            live: HashMap::new_in(Global),
+        }
     }
 }
 
@@ -574,6 +594,7 @@ fn post_work<W: Work>(
 impl<W: Work> Threads<W> {
     fn post(&mut self, task: Posting, work: Arc<W>, readers: W::Readers) {
         self.running += 1;
+        self.live.insert(task.id, task.pool);
         match task.pool {
             Pool::Work => {
                 self.on_pool += 1;
@@ -589,11 +610,22 @@ impl<W: Work> Threads<W> {
 
     fn take(&mut self, out: &mut Vec<Ran<W::Value>>) {
         while let Ok(ran) = self.done.try_recv() {
-            self.running -= 1;
-            if matches!(ran.task.pool, Pool::Work) {
-                self.on_pool -= 1;
+            if let Some(pool) = self.live.remove(&ran.task.id) {
+                self.running -= 1;
+                if matches!(pool, Pool::Work) {
+                    self.on_pool -= 1;
+                }
             }
             out.push(ran);
+        }
+    }
+
+    fn abandon(&mut self, id: NodeId) {
+        if let Some(pool) = self.live.remove(&id) {
+            self.running -= 1;
+            if matches!(pool, Pool::Work) {
+                self.on_pool -= 1;
+            }
         }
     }
 
@@ -622,6 +654,9 @@ pub struct Inline<W: Work> {
     posted: Vec<Posted<W>>,
     /// Kinds whose tasks stay queued, still running, until released ([`Inline::hold`]).
     held: Vec<TaskKind>,
+    /// Queued tasks abandoned by the watchdog while held; kept in `queue` so releasing `held`
+    /// still exercises dropping their late end, but excluded from [`Inline::running`].
+    abandoned: HashSet<NodeId, Global>,
 }
 
 type Posted<W> = (Posting, Arc<W>, <W as Work>::Readers);
@@ -629,7 +664,17 @@ type Posted<W> = (Posting, Arc<W>, <W as Work>::Readers);
 impl<W: Work> Inline<W> {
     pub fn new(seed: u64) -> Inline<W> {
         // alloc: the simulation's runner, once per daemon; `held` stays empty unless a test holds a kind
-        Inline { rng: Rng::new(seed), queue: VecDeque::new(), posted: Vec::new(), held: Vec::new() }
+        Inline {
+            rng: Rng::new(seed),
+            queue: VecDeque::new(),
+            posted: Vec::new(),
+            held: Vec::new(),
+            abandoned: HashSet::new_in(Global),
+        }
+    }
+
+    fn abandon(&mut self, id: NodeId) {
+        self.abandoned.insert(id);
     }
 
     /// Every task of `kind`, posted or to be, stays queued and counted running until
@@ -673,6 +718,7 @@ impl<W: Work> Inline<W> {
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
+            self.abandoned.remove(&task.id);
             match run_measured(&*work, task, readers) {
                 (Some(ended), peak, _, puts) => {
                     out.push(Ran { task, ended, peak, ran_ns: 0, puts })
@@ -697,7 +743,7 @@ impl<W: Work> Inline<W> {
     }
 
     fn running(&self) -> usize {
-        self.queue.len()
+        self.queue.iter().filter(|(task, ..)| !self.abandoned.contains(&task.id)).count()
     }
 }
 
@@ -762,6 +808,9 @@ pub struct Plane<W: Work, P: Predict> {
     /// Each thread task failed while its thread still runs it, stuck where nothing can unwind
     /// it ([`Plane::abandon`]): its late end, if one ever comes, is dropped.
     abandoned: HashSet<NodeId, Global>,
+    /// Nodes held outside the pool behind a front-end write ([`Plane::hold`]): `Running` to the
+    /// graph with no core charged and no thread running them, so `abandon` and `doing` skip them.
+    held: HashSet<NodeId, Global>,
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
@@ -872,6 +921,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             loops: BTreeMap::new(),
             replays: HashSet::new_in(Global), // alloc: the plane's, once
             abandoned: HashSet::new_in(Global),
+            held: HashSet::new_in(Global),
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
             folds: Folds::new(),
             again: Again::new(),
@@ -1072,6 +1122,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     fn settled(&mut self, id: NodeId) {
         self.replays.remove(&id);
+        self.held.remove(&id);
+        self.loops.remove(&id);
         self.again.forget(u64::from(id.0));
         let Some((&first, batch)) = self.batches.range_mut(..=id.0).next_back() else { return };
         let Some(task) = batch.tasks.get_mut((id.0 - first) as usize) else { return };
@@ -1253,8 +1305,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
             .unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
     }
 
-    /// The executor cannot yet post this reader. Return its unused core to admission.
+    /// The executor cannot yet post or run this task. Return its unused core to admission.
     pub fn hold(&mut self, at: Duration, id: NodeId) {
+        self.held.insert(id);
+        self.loops.remove(&id);
         self.step(PlaneInput::Held { at_ns: ns(at), id })
             .unwrap_or_else(|error| panic!("the plane refused to hold task {id}: {error}"));
     }
@@ -1262,8 +1316,19 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// The prerequisite is available: let normal admission start the held task, or skip it
     /// when cancelled. Never post straight to a worker without first reacquiring its core.
     pub fn release_held(&mut self, at: Duration, id: NodeId) {
+        self.held.remove(&id);
         self.step(PlaneInput::Yielded { at_ns: ns(at), id })
             .unwrap_or_else(|error| panic!("the plane refused to release held task {id}: {error}"));
+    }
+
+    /// Whether `id` is currently held behind a prerequisite with no core or thread running it.
+    pub fn is_held(&self, id: NodeId) -> bool {
+        self.held.contains(&id)
+    }
+
+    /// Whether `id` belongs to a batch whose tasks read the front end.
+    pub fn batch_reads(&self, id: NodeId) -> bool {
+        self.task(id).is_some_and(|(batch, _)| batch.reads)
     }
 
     /// A thread task of [`Happened::Post`] posted with the readers the loop made for it.
@@ -1290,6 +1355,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// A thread task of [`Happened::Post`] the loop has no readers for: it ends failed.
     pub fn refuse(&mut self, at: Duration, task: Posting, why: String) {
+        self.held.remove(&task.id);
         let input = PlaneInput::Done {
             at_ns: ns(at),
             id: task.id,
@@ -1308,9 +1374,12 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// that never comes, `serve::stuck`). Its request goes on without it and ends failed with
     /// `why`; its task's end, if the thread ever comes back, is dropped ([`Plane::poll`]).
     /// `false`, doing nothing, when `id` is no thread task that runs now (it ended since the
-    /// watchdog looked, or is a loop task, which the loop's own guard bounds).
+    /// watchdog looked, is held outside the pool awaiting a write, or is a loop task, which the
+    /// loop's own guard bounds).
     pub fn abandon(&mut self, at: Duration, id: NodeId, why: String) -> bool {
-        if !matches!(self.task(id), Some((_, Task::Thread { .. }))) || self.abandoned.contains(&id)
+        if !matches!(self.task(id), Some((_, Task::Thread { .. })))
+            || self.abandoned.contains(&id)
+            || self.held.contains(&id)
         {
             return false;
         }
@@ -1332,6 +1401,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.step(input)
             .unwrap_or_else(|error| panic!("the plane refused the end of stuck task {id}: {error}"));
         self.abandoned.insert(id);
+        self.runner.abandon(id);
         true
     }
 
@@ -1440,9 +1510,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
         std::mem::swap(&mut self.happened, into);
     }
 
-    /// Whether a thread task ended and waits to be taken.
+    /// Whether a thread task ended and waits to be taken, or plane outputs wait to be drained.
     pub fn ready(&self) -> bool {
-        self.runner.ready()
+        self.runner.ready() || !self.happened.is_empty()
     }
 
     /// How many thread tasks run.

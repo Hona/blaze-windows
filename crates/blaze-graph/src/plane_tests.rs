@@ -1875,6 +1875,57 @@ fn a_held_reader_does_not_own_the_core_its_writer_needs() {
     built(&mut plane, 302);
 }
 
+/// Multiple held readers and a live reader beside a writer: holding is idempotent, frees each
+/// held reader's slot for the writer without oversubscribing on release, and agrees with the
+/// reference model on every step.
+#[test]
+fn held_readers_beside_a_second_reader_and_writer_match_the_reference() {
+    // 2 cores: reader 1 runs, reader 2 is held while a writer arrives, writer takes the freed
+    // slot beside reader 1, and releasing reader 2 waits until a slot opens.
+    let cfg = config(1, 2);
+    let mut plane = Plane::new(cfg.clone()).unwrap();
+    let mut model = reference::Plane::new(cfg).unwrap();
+    let mut step = |input: PlaneInput| {
+        let got = plane.step(input.clone()).unwrap();
+        let want = model.step(input).unwrap();
+        assert_eq!(got, want, "plane and reference diverged on held reader schedule");
+        got
+    };
+    step(PlaneInput::Open { at_ns: 0, request: RequestId(1), weight: 1, keep_going: true, idle: false });
+    step(PlaneInput::Open { at_ns: 0, request: RequestId(2), weight: 1, keep_going: true, idle: false });
+    let start = step(PlaneInput::Add {
+        at_ns: 0,
+        request: RequestId(1),
+        nodes: vec![work(1, &[], 1), work(2, &[], 1), work(3, &[], 1)],
+    });
+    assert_eq!(runs(&start), [1, 2]);
+    // Node 2 is held (and holding twice is idempotent): its core goes to node 3, which is also
+    // held, freeing the core for writer 100 in request 2.
+    let after_hold_2 = step(PlaneInput::Held { at_ns: 1, id: NodeId(2) });
+    assert_eq!(runs(&after_hold_2), [3]);
+    assert!(runs(&step(PlaneInput::Held { at_ns: 1, id: NodeId(2) })).is_empty());
+    assert!(runs(&step(PlaneInput::Held { at_ns: 2, id: NodeId(3) })).is_empty());
+    let writer = step(PlaneInput::Add {
+        at_ns: 3,
+        request: RequestId(2),
+        nodes: vec![work(100, &[], 1)],
+    });
+    assert_eq!(runs(&writer), [100], "writer takes the slot freed by held readers");
+    // Reader 1 finishes; releasing 2 and 3 starts at most one (writer 100 holds the other core).
+    assert!(runs(&step(done(1, Outcome::Built, Vec::new()))).is_empty());
+    let rel_2 = step(PlaneInput::Yielded { at_ns: 4, id: NodeId(2) });
+    assert_eq!(runs(&rel_2), [2]);
+    let rel_3 = step(PlaneInput::Yielded { at_ns: 5, id: NodeId(3) });
+    assert!(runs(&rel_3).is_empty(), "releasing a second held reader must not oversubscribe");
+    // Writer finishes -> node 3 runs now.
+    let after_writer = step(done(100, Outcome::Built, Vec::new()));
+    assert_eq!(runs(&after_writer), [3]);
+    step(done(2, Outcome::Built, Vec::new()));
+    step(done(3, Outcome::Built, Vec::new()));
+    let closed = step(PlaneInput::Close { at_ns: 6, request: RequestId(1) });
+    assert_eq!(finished(&closed), [(1, true)]);
+}
+
 /// A task not idle that waits only for the thread of running idle tasks has the newest of
 /// them asked to give way, once, and as few as it takes; given way, the idle task's node is
 /// ready again and the thread is the other's. One that ends before it gives way frees its

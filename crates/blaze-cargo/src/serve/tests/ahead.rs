@@ -122,6 +122,7 @@ fn a_request_is_answered_of_the_save_whatever_is_built_ahead() {
 /// the core held, or what the oracle of the invariant above caught (an answer that is not
 /// the save's).
 fn asked_while_built_ahead(seed: u64, plant: Option<super::super::ahead::Plant>) -> Result<u64, String> {
+    use blaze_graph::admission::kinds;
     super::super::ahead::PLANTED.set(plant);
     let faults = Faults { max_latency: std::time::Duration::from_millis(seed % 4), ..Faults::default() };
     let mut sim = Sim::new(seed, faults);
@@ -134,11 +135,20 @@ fn asked_while_built_ahead(seed: u64, plant: Option<super::super::ahead::Plant>)
     client.wait(&mut daemon, first);
     pass(&mut daemon, 2_000);
     let before = daemon.built_ahead();
+    // Hold the build ahead's lowering on the inline runner so it stays in flight across turns
+    // as a real worker-thread build does (otherwise `direct::lend` finishes the whole inline
+    // check inside the turn that starts it, before the client's request can arrive).
+    daemon.hold_tasks_for_test(kinds::LOWER, true);
     daemon.driver().change(&name("w/Cargo.toml"), b"saved\n");
     turn_until(&mut daemon, "a build ahead of the save sent", |daemon| {
         daemon.built_ahead().started > before.started
     });
     let id = client.send(&mut daemon, check());
+    turn_until(&mut daemon, "the request held behind its build ahead", |daemon| {
+        client.take(daemon);
+        daemon.built_ahead().held > before.held || client.done(id)
+    });
+    daemon.hold_tasks_for_test(kinds::LOWER, false);
     let got = client.wait(&mut daemon, id);
     let held = daemon.built_ahead().held;
     super::super::ahead::PLANTED.set(None);

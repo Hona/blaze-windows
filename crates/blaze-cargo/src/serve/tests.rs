@@ -86,6 +86,8 @@ thread_local! {
     /// How many of a writer's applies ran outside a write's task (`job::IN_WRITE_TASK`): on
     /// the loop, in its turn.
     static LOOP_APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// How many of a writer's applies with something to apply ran in no `blaze_mem` frame.
+    static FRAMELESS_APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The build script's run whose write fails with an error as it is applied, as a real
@@ -1044,6 +1046,11 @@ impl Writer<Fake> for FakeWriter {
         // A write with something to apply, as `UnitWriter::apply` does only then.
         if !super::job::IN_WRITE_TASK.get() {
             LOOP_APPLIES.with(|it| it.set(it.get() + 1));
+        }
+        // A real apply serves dependencies from the store, which reads in the running task's
+        // frame (`blaze_mem::frame::current`) and panics outside one.
+        if !blaze_mem::frame::in_task() {
+            FRAMELESS_APPLIES.with(|it| it.set(it.get() + 1));
         }
         if FAILS_APPLY.get() {
             return Err(ApiError::new(
@@ -5438,12 +5445,15 @@ fn a_wave_of_build_scripts_waits_for_the_readers_before_it_and_is_one_write() {
     let id = client
         .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     turn_until(&mut daemon, |_| ASKED.get() == SCRIPTS);
-    for _ in 0..500 {
+    // Stay under `still::WRITE_STILL_FOR` (10 s; each idle turn advances 50 ms): holding a
+    // reader with nothing running past that bound is the stuck-write stall.
+    for _ in 0..100 {
         daemon.turn();
     }
     assert_eq!(APPLIES.get(), 0, "a write waits for the reader posted before it");
     assert_eq!(seen(), vec![(0, Vec::new())], "no reading task is posted while a write waits");
 
+    KEEP.set(false);
     HOLD.with(|it| it.borrow_mut().clear());
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
@@ -6401,6 +6411,262 @@ fn a_lost_wake_fails_its_build_with_the_stuck_line_and_the_next_build_is_served(
         .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, second);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the next build is served: {got:#?}");
+}
+
+/// A job that reads its view's front end unbuilt (a query, an edit, a reach) applies every
+/// front-end write on a write task inside a frame, never on the loop — including the last
+/// write asked as the view's units finish (`Jobs::units_applied`), and without stalling even
+/// on a single work core (held readers release their core for `Does::Write`).
+#[test]
+fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds() {
+    for threads in [1usize, 2] {
+        for seed in 0..32 {
+            EDITED.with(|it| it.borrow_mut().clear());
+            LOOP_APPLIES.set(0);
+            FRAMELESS_APPLIES.set(0);
+            let mut sim = Sim::new(seed, Faults::default());
+            checkout(&mut sim, "proc macro\n");
+            let steps = Arc::new(Fake::default());
+            crate::release::for_tests();
+            let opts = Options { threads, ..options() };
+            let mut daemon =
+                Daemon::start(sim, opts, steps.clone(), Runner::Inline(Inline::new(seed)))
+                    .unwrap_or_else(|why| panic!("{why}"));
+            let mut client = dial(&mut daemon);
+            let open = client
+                .send(&mut daemon, Request::Open { view: ViewRef::Head("/w".into()) });
+            let opened = client.wait(&mut daemon, open);
+            let root = opened
+                .iter()
+                .find_map(|it| match it {
+                    Response::Opened { root } => Some(*root),
+                    _ => None,
+                })
+                .expect("the open said a root");
+            let id = client.send(
+                &mut daemon,
+                Request::Edit { base: root, head: "/w".into(), edits: Vec::new() },
+            );
+            let got = client.wait(&mut daemon, id);
+            assert_eq!(LOOP_APPLIES.get(), 0, "threads={threads} seed={seed}: apply ran on loop");
+            assert_eq!(
+                FRAMELESS_APPLIES.get(),
+                0,
+                "threads={threads} seed={seed}: apply ran outside a frame"
+            );
+            assert_eq!(
+                got.last(),
+                Some(&Response::Done { ok: true }),
+                "threads={threads} seed={seed}: {got:#?}"
+            );
+            assert_eq!(
+                EDITED.with(|it| it.take()),
+                vec![vec![3]],
+                "threads={threads} seed={seed}: the query read the build script's run applied"
+            );
+        }
+    }
+}
+
+/// On one work core (`BLAZE_CORES=1`, matching the `withdeps` ladder), a first reader active
+/// beside a wave of build scripts and a second reader held behind the write never starves the
+/// write task.
+#[test]
+fn a_held_reader_with_a_second_reader_and_one_core_never_stalls_the_writer() {
+    const SCRIPTS: usize = 3;
+    for seed in 0..16 {
+        SEEN.with(|it| it.borrow_mut().clear());
+        APPLIES.set(0);
+        ASKED.set(0);
+        KEEP.set(false);
+        HOLD.with(|it| it.borrow_mut().clear());
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, &format!("wave {SCRIPTS}\n"));
+        let steps = Arc::new(Fake::default());
+        crate::release::for_tests();
+        let opts = Options { threads: 1, ..options() };
+        let mut daemon = Daemon::start(sim, opts, steps.clone(), Runner::Inline(Inline::new(seed)))
+            .unwrap_or_else(|why| panic!("{why}"));
+        if seed % 2 == 0 {
+            KEEP.set(true);
+        }
+        let mut client = dial(&mut daemon);
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
+        if seed % 2 == 0 {
+            turn_until(&mut daemon, |_| ASKED.get() == SCRIPTS);
+            for _ in 0..20 {
+                daemon.turn();
+            }
+            assert_eq!(APPLIES.get(), 0, "seed {seed}: write waits for the held first reader");
+            KEEP.set(false);
+            HOLD.with(|it| it.borrow_mut().clear());
+        }
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        let all: Vec<usize> = (1..=SCRIPTS).collect();
+        assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)], "seed {seed}");
+    }
+}
+
+/// A front-end write arriving while the task watchdog abandons a live reading task of the same
+/// build fails that build cleanly naming the abandoned reader (instead of stalling the whole
+/// daemon), and the daemon goes on to serve the next build.
+#[test]
+fn a_writer_arriving_while_the_watchdog_abandons_a_reader_fails_cleanly_and_serves_the_next_build() {
+    use blaze_graph::admission::kinds;
+    use super::pulse::StuckSaid;
+    PHASES.with(|it| it.borrow_mut().clear());
+    ASKED.set(0);
+    APPLIES.set(0);
+    SLOW_SCRIPT.set(Some((2, Duration::from_millis(50))));
+    let mut sim = Sim::new(91, Faults::default());
+    checkout(&mut sim, "links scripts\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 91);
+    let mut client = dial(&mut daemon);
+    let first = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    // Let both build scripts compile while dep's run (unit 2) sits on its 50 ms timer.
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        PHASES.with(|it| {
+            let ran = it.borrow();
+            ran.contains(&(1, Phase::Store)) && ran.contains(&(3, Phase::Store))
+        }) || client.done(first)
+    });
+    // Now hold `UNIT_NAMES` so dep's library (unit 0, unlocked after unit 2's write applies)
+    // stays posted as a live reader while app's build script (unit 4) finishes and asks a write.
+    daemon.hold_tasks_for_test(kinds::UNIT_NAMES, true);
+    SLOW_SCRIPT.set(Some((4, Duration::from_millis(50))));
+    let mut running = Vec::new();
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        running = daemon.running_thread_tasks_for_test();
+        (ASKED.get() == 2 && !running.is_empty()) || client.done(first)
+    });
+    let Some(&(request, node)) = running.first() else {
+        panic!("expected a live reading task while write waited: {:#?}", client.of(first));
+    };
+    let said = blaze_protocol::now::Stuck {
+        what: "compile of dep 1.0.0".into(),
+        cycle: Vec::new(),
+        waits: "signal test.lost_reader".into(),
+        for_ms: 240_000,
+        inside: None,
+        held_by: None,
+    };
+    daemon.pulse().say_stuck(StuckSaid {
+        build: request.0,
+        node: Some(u64::from(node.0)),
+        lost: true,
+        said,
+    });
+    // The build fails cleanly on the abandoned reader without waiting for `WRITE_STILL_FOR`.
+    let got = client.wait(&mut daemon, first);
+    daemon.hold_tasks_for_test(kinds::UNIT_NAMES, false);
+    SLOW_SCRIPT.set(None);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let all = format!("{got:?}");
+    assert!(
+        all.contains("abandoned reader") && all.contains("signal test.lost_reader"),
+        "expected the build's error to name the abandoned reader: {got:#?}"
+    );
+    daemon.driver().change(&name("w/Cargo.toml"), b"[package]\n");
+    let second = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, second);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the next build is served: {got:#?}");
+}
+
+/// A held reader waiting behind a front-end write is not running on a worker thread: the live
+/// task query omits it, a watchdog `say_stuck` naming it is ignored, and releasing it once the
+/// write finishes never panics with `NotRunning`.
+#[test]
+fn a_watchdog_word_for_a_held_reader_never_panics_on_release() {
+    use super::pulse::StuckSaid;
+    const SCRIPTS: usize = 3;
+    SEEN.with(|it| it.borrow_mut().clear());
+    APPLIES.set(0);
+    ASKED.set(0);
+    HOLD.with(|it| it.borrow_mut().clear());
+    KEEP.set(true);
+    let mut sim = Sim::new(92, Faults::default());
+    checkout(&mut sim, &format!("wave {SCRIPTS}\n"));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 92);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    turn_until(&mut daemon, |_| ASKED.get() == SCRIPTS);
+    for _ in 0..20 {
+        daemon.turn();
+    }
+    assert!(
+        daemon.running_thread_tasks_for_test().is_empty(),
+        "a held reader is not a running thread task"
+    );
+    for node in 0..32u64 {
+        let said = blaze_protocol::now::Stuck {
+            what: "held reader probe".into(),
+            cycle: Vec::new(),
+            waits: "signal test.held".into(),
+            for_ms: 240_000,
+            inside: None,
+            held_by: None,
+        };
+        daemon.pulse().say_stuck(StuckSaid { build: 1, node: Some(node), lost: true, said });
+    }
+    for _ in 0..10 {
+        daemon.turn();
+    }
+    KEEP.set(false);
+    HOLD.with(|it| it.borrow_mut().clear());
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert_eq!(APPLIES.get(), 1, "the write applied cleanly after release");
+    let all: Vec<usize> = (1..=SCRIPTS).collect();
+    assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)]);
+}
+
+/// When nothing can move an open build (here a leaked reader keeps a waiting write from ever
+/// running while the dependent task is held), the client receives a named stall error within a
+/// bounded time, never hanging silently.
+#[test]
+fn a_waiting_write_that_cannot_run_fails_the_client_within_its_bound() {
+    ASKED.set(0);
+    APPLIES.set(0);
+    HOLD.with(|it| it.borrow_mut().clear());
+    KEEP.set(true);
+    let mut sim = Sim::new(93, Faults::default());
+    checkout(&mut sim, "wave 2\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 93);
+    let mut client = dial(&mut daemon);
+    let began = daemon.driver().now();
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait_for_the_pool(&mut daemon, id);
+    let took = daemon.driver().now().saturating_sub(began);
+    KEEP.set(false);
+    HOLD.with(|it| it.borrow_mut().clear());
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let stalled = got.iter().any(|it| {
+        matches!(
+            it,
+            Response::Error(error)
+                if error.at.as_deref() == Some("stall")
+                    && error.what.contains("blaze stalled")
+                    && error.what.contains("waited 10000 ms")
+        )
+    });
+    assert!(stalled, "the client gets the named stall error: {got:#?}");
+    assert!(
+        took <= Duration::from_secs(15),
+        "the client failed within a bounded simulated time, not silently: {took:?}"
+    );
 }
 
 #[test]

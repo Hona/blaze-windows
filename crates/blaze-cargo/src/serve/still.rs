@@ -94,6 +94,9 @@ pub(super) enum Turn {
 #[derive(Debug, Default)]
 pub(super) struct Stillness {
     since: Option<u64>,
+    /// The wake deadline already armed on the driver for this stretch, so a stretch turning
+    /// into a young write's arms one timer for the write's bound, never one per turn.
+    armed_until: Option<u64>,
 }
 
 impl Stillness {
@@ -111,6 +114,7 @@ impl Stillness {
         let why = match why(facts, stuck) {
             None => {
                 self.since = None;
+                self.armed_until = None;
                 return Turn::Moves;
             }
             Some(why) => why,
@@ -124,8 +128,10 @@ impl Stillness {
             if !open() {
                 return Turn::Holds;
             }
+            let after = STILL_FOR.max(young);
             self.since = Some(now_ns);
-            return Turn::Began { after: STILL_FOR.max(young) };
+            self.armed_until = Some(deadline_ns(now_ns, after));
+            return Turn::Began { after };
         };
         let quiet_ns = now_ns.saturating_sub(since);
         if nanos(quiet_ns) < STILL_FOR {
@@ -133,7 +139,12 @@ impl Stillness {
         }
         if !young.is_zero() {
             // The stretch turned into a young write's after its timer was armed: wake again
-            // at the write's bound, one timer a wake.
+            // at the write's bound, one timer per bound.
+            let due = deadline_ns(now_ns, young);
+            if self.armed_until.is_some_and(|it| it >= due) {
+                return Turn::Holds;
+            }
+            self.armed_until = Some(due);
             return Turn::Began { after: young };
         }
         Turn::Still { quiet_ns, why }
@@ -142,7 +153,12 @@ impl Stillness {
     /// Starts over: what the loop found still had nothing to name.
     pub(super) fn reset(&mut self) {
         self.since = None;
+        self.armed_until = None;
     }
+}
+
+fn deadline_ns(now_ns: u64, after: Duration) -> u64 {
+    now_ns.saturating_add(u64::try_from(after.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// Why nothing can move the build, or `None` when something can.
@@ -341,5 +357,36 @@ mod tests {
         assert!(matches!(stillness.tick(4_000 * MS, &lost, || false, || true), Turn::Still { .. }));
         // Nothing open is nothing to move.
         assert_eq!(Stillness::default().tick(0, &lost, || false, || false), Turn::Holds);
+    }
+
+    /// A young waiting write arms one timer for its bound rather than one every turn between
+    /// [`STILL_FOR`] and [`WRITE_STILL_FOR`].
+    #[test]
+    fn a_young_write_arms_one_timer_per_bound() {
+        let mut stillness = Stillness::default();
+        let mut armed = 0usize;
+        let mut ended = None;
+        for turn in 0..=250 {
+            let now = turn * 50 * MS;
+            match stillness.tick(now, &held_at(now), || false, || true) {
+                Turn::Began { .. } => armed += 1,
+                Turn::Still { .. } => {
+                    ended = Some(now);
+                    break;
+                }
+                Turn::Moves | Turn::Holds => {}
+            }
+        }
+        assert_eq!(armed, 1, "one timer armed for the whole wait");
+        assert_eq!(ended, Some(WRITE_MS * MS), "still fires at WRITE_STILL_FOR");
+    }
+
+    /// A ready node that admission cannot dispatch with no task running fails at [`STILL_FOR`].
+    #[test]
+    fn an_undispatched_ready_node_is_still_at_still_for() {
+        let none = Facts { pool_idle: true, ..Facts::default() };
+        let (at, turn) = run(none, false).expect("still fires within STILL_FOR");
+        assert_eq!(at, 2_000 * MS);
+        assert_eq!(turn, Turn::Still { quiet_ns: 2_000 * MS, why: Why::NoTask });
     }
 }
