@@ -3299,6 +3299,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // back, once a stretch, on the purger's thread and the workers' own as they park
         // ([`super::idle`]).
         let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        // Past the memory ceiling, the guard asks a rung of what the loop keeps
+        // ([`super::relief`]): answered here, on the loop that alone owns it.
+        if let Some((seq, rung)) = super::relief::CHANNEL.pending() {
+            let _span = tracing::info_span!(target: "blaze", "memory relief", rung = rung.name()).entered();
+            let given = self.jobs.relieve(&self.steps, rung);
+            tracing::warn!(target: "blaze", rung = rung.name(), ?given, "past the memory ceiling: gave back");
+            super::relief::CHANNEL.answer(seq, rung, given);
+        }
         if self.idle.look(now, working) {
             tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
             blaze_mem::frame::ask_spare_trim();

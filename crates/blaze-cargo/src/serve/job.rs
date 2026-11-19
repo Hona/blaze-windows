@@ -6156,6 +6156,29 @@ impl<S: Steps> Jobs<S> {
         self.paths.evict_images()
     }
 
+    /// On the loop, past the memory ceiling ([`super::relief`]): gives back what `rung` names
+    /// of what the loop keeps between builds. Kept link images that no running program maps,
+    /// or each kept front end's compiled code or values; a front end out being stored is
+    /// passed over (its task holds it).
+    pub(crate) fn relieve(&mut self, steps: &S, rung: super::relief::Rung) -> super::relief::Given {
+        use super::relief::{Given, Rung};
+        let mut given = Given::default();
+        match rung {
+            Rung::Purge => {}
+            Rung::Images => {
+                let (images, bytes) = self.paths.evict_images();
+                given.images = images;
+                given.image_bytes = bytes;
+            }
+            Rung::Compiled | Rung::Values => {
+                for front in self.roots.fronts.iter_mut().flatten() {
+                    given.add(steps.relieve_kept(front, rung));
+                }
+            }
+        }
+        given
+    }
+
     /// Lock-free summary of query storage bytes across every active build and kept front end:
     /// `(databases, total_bytes, top_owners)`. Sound while queries run (atomic counters only).
     pub fn query_memory_summary(&self) -> (usize, u64, Vec<(&'static str, u64)>) {

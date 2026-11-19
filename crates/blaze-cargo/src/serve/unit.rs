@@ -538,6 +538,30 @@ impl Steps for Real {
         end.release(&mut kept.lowered);
     }
 
+    fn relieve_kept(&self, kept: &mut KeptLowered, rung: crate::serve::relief::Rung) -> crate::serve::relief::Given {
+        use crate::serve::relief::{Given, Rung};
+        let mut given = Given { fronts: 1, ..Given::default() };
+        match rung {
+            Rung::Purge | Rung::Images => return Given::default(),
+            Rung::Compiled => {
+                given.walked = kept.walks.let_go();
+                let db = kept.lowered.served_db();
+                let dropped = hir::evict::drop_crates_after_store(db, &[], true);
+                given.values = dropped.mir + dropped.const_eval;
+            }
+            Rung::Values => {
+                use blaze_query::db::Database as _;
+                let db = kept.lowered.served_db();
+                let before = db.storage().held_bytes();
+                hir_ty::evict::drop_all(db);
+                // Every weighed (`lru`) value goes: a cap of 0 bytes for each tag.
+                db.storage_mut().sweep_values(&[0; blaze_mem::Tag::COUNT]);
+                given.query_bytes = before.saturating_sub(db.storage().held_bytes());
+            }
+        }
+        given
+    }
+
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
@@ -1676,6 +1700,8 @@ impl Writer<Real> for UnitWriter {
         deps::item_errors(&self.session)?;
         let mut said: Vec<blaze_api::Diagnostic> =
             codegen::unapplied(&self.job, ok, built)?.into_iter().map(warning).collect();
+        // What the daemon let go past its memory ceiling since the last build said it.
+        said.extend(crate::serve::relief::CHANNEL.take_notes().into_iter().map(warning));
         let job = Arc::clone(&self.job);
         said.extend(configs::report(&job, || self.final_reader(), ok, built)?);
         Ok(said)

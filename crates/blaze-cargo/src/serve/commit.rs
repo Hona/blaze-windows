@@ -33,23 +33,67 @@ impl Guard {
             Err(error) => anyhow::bail!("{VAR}: {error}"),
         };
         let (quit, stop) = mpsc::channel();
-        let mut watch = super::pulse::CeilingWatch::default();
-        let worker = thread::Builder::new().name("blaze-commit-guard".into()).spawn(move || loop {
-            let bytes = crate::raw::memory::own_footprint_now();
-            use super::pulse::CeilingLook;
-            match bytes.map(|n| watch.look(n, ceiling)) {
-                Some(CeilingLook::Purge) => { crate::raw::memory::purger().ask(); }
-                Some(CeilingLook::Near | CeilingLook::Eased) => super::said::logged!(WARN, "blaze serve: private commit {bytes:?}, limit {ceiling} bytes"),
-                Some(CeilingLook::Under) => {}
-                None | Some(CeilingLook::Passed) => {
-                    super::said::logged!(ERROR, "blaze serve: pid {} stopped at its memory ceiling: private commit {bytes:?}, limit {ceiling} bytes", std::process::id());
-                    super::daemon::log_memory(&blaze_mem::tag::snapshot());
-                    std::process::exit(Exit::MemoryCeiling.code());
+        let worker = thread::Builder::new()
+            .name("blaze-commit-guard".into())
+            .spawn(move || guard(ceiling, &stop, &super::relief::CHANNEL))
+            .context("starting the private commit guard")?;
+        Ok(Self { quit, worker: Some(worker) })
+    }
+}
+
+/// The guard's loop: every 100 ms a reading of the private commit; past the ceiling, the next
+/// rung of [`super::relief::Ladder`] (a purge on this thread, the rest asked of the daemon's
+/// loop and waited for at most [`super::relief::ANSWER_WITHIN`], then a purge so what they
+/// freed leaves the commit), and the daemon ends only once every rung was given and the
+/// commit is still past the ceiling. A reading the system refuses ends it at once: nothing
+/// can then say the ceiling holds.
+fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Channel) {
+    use super::{pulse::CeilingLook, relief::{Ladder, Rung, Step}};
+    let mut ladder = Ladder::default();
+    let mut watch = super::pulse::CeilingWatch::default();
+    loop {
+        let Some(bytes) = crate::raw::memory::own_footprint_now() else {
+            super::said::logged!(ERROR, "blaze serve: pid {} stopped: its private commit could not be read, so no memory ceiling holds", std::process::id());
+            std::process::exit(Exit::MemoryCeiling.code());
+        };
+        let was = ladder.given();
+        match ladder.look(bytes, ceiling) {
+            Step::Under => {
+                if !was.is_empty() {
+                    super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes, back under its limit of {ceiling} after giving back {was:?}");
+                    channel.relieved(was, bytes, ceiling);
+                }
+                if matches!(watch.look(bytes, ceiling), CeilingLook::Near | CeilingLook::Eased) {
+                    super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes, limit {ceiling} bytes");
                 }
             }
-            if stop.recv_timeout(Duration::from_millis(100)) != Err(mpsc::RecvTimeoutError::Timeout) { break; }
-        }).context("starting the private commit guard")?;
-        Ok(Self { quit, worker: Some(worker) })
+            Step::Give(rung) => {
+                super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes past its limit of {ceiling}: giving back {}", rung.name());
+                if rung != Rung::Purge {
+                    let ticket = channel.ask(rung);
+                    let deadline = std::time::Instant::now() + super::relief::ANSWER_WITHIN;
+                    while !channel.answered(ticket) && std::time::Instant::now() < deadline {
+                        if stop.recv_timeout(Duration::from_millis(10)) != Err(mpsc::RecvTimeoutError::Timeout) {
+                            return;
+                        }
+                    }
+                    if !channel.answered(ticket) {
+                        super::said::logged!(WARN, "blaze serve: the loop did not give back {} within {:?}: measuring anyway", rung.name(), super::relief::ANSWER_WITHIN);
+                    }
+                }
+                crate::raw::memory::purge();
+                // Measured again at once: the next look is the next rung or the end.
+                continue;
+            }
+            Step::Exit => {
+                super::said::logged!(ERROR, "blaze serve: pid {} stopped at its memory ceiling: private commit {bytes} bytes, limit {ceiling} bytes, after giving back every rung ({:?})", std::process::id(), Rung::ALL);
+                super::daemon::log_memory(&blaze_mem::tag::snapshot());
+                std::process::exit(Exit::MemoryCeiling.code());
+            }
+        }
+        if stop.recv_timeout(Duration::from_millis(100)) != Err(mpsc::RecvTimeoutError::Timeout) {
+            break;
+        }
     }
 }
 
@@ -64,18 +108,57 @@ impl Drop for Guard {
 mod tests {
     use super::*;
 
+    /// The "still over" exit: a guard armed below what the process already commits gives back
+    /// every rung (no loop answers here, so each waits its bound), measures it still over, and
+    /// only then ends the process with 77, saying every rung was tried.
     #[test]
     fn an_engine_over_its_commit_limit_stops_even_if_the_loop_is_stuck() {
         const CHILD: &str = "BLAZE_TEST_COMMIT_GUARD";
         if std::env::var_os(CHILD).is_some() {
             let _guard = Guard::arm().unwrap();
-            thread::park_timeout(Duration::from_secs(5));
+            thread::park_timeout(Duration::from_secs(60));
             panic!("a guard armed below this process's existing private commit did not stop it");
         }
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "serve::commit::tests::an_engine_over_its_commit_limit_stops_even_if_the_loop_is_stuck", "--nocapture"])
             .env(CHILD, "1").env(VAR, "0.000001").output().unwrap();
         assert_eq!(result.status.code(), Some(Exit::MemoryCeiling.code()));
-        assert!(String::from_utf8_lossy(&result.stderr).contains("private commit"));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("private commit"), "{stderr}");
+        assert!(stderr.contains("after giving back every rung"), "exit only after the ladder: {stderr}");
+        for rung in super::super::relief::Rung::ALL {
+            assert!(stderr.contains(rung.name()), "rung {rung:?} was tried before the exit: {stderr}");
+        }
+    }
+
+    /// A loop that answers: the guard asks it each of the loop's rungs in order (images, then
+    /// compiled code, then values), each answered within the bound, and exits only after the
+    /// last, still over. The child's "loop" records each rung it is asked into stderr.
+    #[test]
+    fn the_guard_asks_an_answering_loop_for_each_rung_in_order_before_it_exits() {
+        use super::super::relief::{CHANNEL, Given};
+        const CHILD: &str = "BLAZE_TEST_COMMIT_GUARD_LOOP";
+        if std::env::var_os(CHILD).is_some() {
+            thread::spawn(|| loop {
+                if let Some((seq, rung)) = CHANNEL.pending() {
+                    eprintln!("loop asked: {rung:?}");
+                    CHANNEL.answer(seq, rung, Given::default());
+                }
+                thread::sleep(Duration::from_millis(5));
+            });
+            let _guard = Guard::arm().unwrap();
+            thread::park_timeout(Duration::from_secs(60));
+            panic!("the guard did not stop the process");
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "serve::commit::tests::the_guard_asks_an_answering_loop_for_each_rung_in_order_before_it_exits", "--nocapture"])
+            .env(CHILD, "1").env(VAR, "0.000001").output().unwrap();
+        assert_eq!(result.status.code(), Some(Exit::MemoryCeiling.code()));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let at = |what: &str| stderr.find(what).unwrap_or_else(|| panic!("no `{what}` in: {stderr}"));
+        assert!(at("loop asked: Images") < at("loop asked: Compiled"), "{stderr}");
+        assert!(at("loop asked: Compiled") < at("loop asked: Values"), "{stderr}");
+        assert!(at("loop asked: Values") < at("after giving back every rung"), "{stderr}");
+        assert!(!stderr.contains("measuring anyway"), "an answering loop is never passed over: {stderr}");
     }
 }

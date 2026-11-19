@@ -880,6 +880,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
     fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
         let _ = (kept, wanted);
     }
+    /// On the loop, past the memory ceiling ([`super::relief`]): lets go of what `rung` names
+    /// of the kept front end `kept`, every value keeping its memo so a read makes it again.
+    /// What went. Steps with no front end give nothing.
+    fn relieve_kept(&self, kept: &mut Self::KeptFront, rung: super::relief::Rung) -> super::relief::Given {
+        let _ = (kept, rung);
+        super::relief::Given::default()
+    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// before [`Steps::release_kept`]: the first calls of the checkout's launched runs that no
     /// bind record answers, made with the front end (`run::needs`), until `wanted` is set,
