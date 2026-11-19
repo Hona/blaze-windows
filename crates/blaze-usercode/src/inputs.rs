@@ -410,12 +410,7 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
 /// (`/C:/a`, which a proc macro's reads are noted by) at [`blaze_core::platform::path::host`]'s,
 /// any other as it is. The name stays the key.
 fn on_disk(path: &Path) -> std::borrow::Cow<'_, Path> {
-    match path.to_str() {
-        Some(name) if cfg!(windows) && name.starts_with('/') => {
-            std::borrow::Cow::Owned(blaze_core::platform::path::host(name))
-        }
-        _ => std::borrow::Cow::Borrowed(path),
-    }
+    blaze_core::platform::path::host_if_daemon(path)
 }
 
 impl Files {
@@ -498,7 +493,8 @@ impl Files {
         // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
         // the look kept by the build it was made for, with what it said.
         let (answer, settled) = self.look(path)?;
-        looks.push(path, LookKind::File, answer);
+        let disk = on_disk(path);
+        looks.push(&disk, LookKind::File, answer);
         if settled {
             match (known, found) {
                 (Some(known), _) => known.write(generation, answer),
@@ -604,7 +600,8 @@ impl Files {
         }
         let generation = self.dirs.generation();
         let plain = path.parent().is_some_and(|dir| {
-            let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+            let canonical = std::fs::canonicalize(dir)
+                .is_ok_and(|it| blaze_core::platform::path::canonical_matches(dir, &it));
             if canonical && kept.is_none() {
                 self.dirs.watch_name(path);
             }
@@ -903,6 +900,8 @@ impl Inputs for Now<'_> {
     }
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
+        let host = on_disk(path);
+        let path = host.as_ref();
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
@@ -959,7 +958,10 @@ impl Inputs for Now<'_> {
         if self.looks.keeps() {
             self.looks.push(path, LookKind::Listing, Some(listing(listed.iter().map(|it| it.0.as_os_str()))));
         }
-        if !links && std::fs::canonicalize(path).is_ok_and(|it| it == path) {
+        if !links
+            && std::fs::canonicalize(path)
+                .is_ok_and(|it| blaze_core::platform::path::canonical_matches(path, &it))
+        {
             if kept.is_none() {
                 self.files.dirs.watch_name(&asked);
             }

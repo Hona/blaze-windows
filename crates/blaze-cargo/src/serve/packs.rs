@@ -168,13 +168,13 @@ pub(crate) fn home_places() -> Result<super::unit::portable::Places, String> {
     let builds = super::builds().map_err(said)?;
     let sources = super::sources().map_err(said)?;
     let std = super::machine().map_err(said)?.join("std");
-    Ok(super::unit::portable::Places::new(
-        "",
-        &builds.to_string_lossy(),
-        &std.to_string_lossy(),
-        Path::new(""),
-        Path::new(""),
-        &sources,
+    Ok(super::unit::portable::Places::of_host(
+        None,
+        Some(&builds),
+        Some(&std),
+        None,
+        None,
+        Some(&sources),
     ))
 }
 

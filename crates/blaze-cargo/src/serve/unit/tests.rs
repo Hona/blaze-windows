@@ -82,14 +82,13 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
 /// The directories of the builds these tests lower ([`super::portable::Places`]): the
 /// workspace at `/w`, its build directory in it, the daemon's own under `/s`.
 fn test_places() -> super::portable::Places {
-    use std::path::Path;
-    super::portable::Places::new(
-        "/w",
-        "/w/target",
-        "/s/std",
-        Path::new("/s/tools"),
-        Path::new("/s/blaze"),
-        Path::new("/s/sources"),
+    super::portable::Places::of_daemon(
+        Some("/w"),
+        Some("/w/target"),
+        Some("/s/std"),
+        Some("/s/tools"),
+        Some("/s/blaze"),
+        Some("/s/sources"),
     )
 }
 

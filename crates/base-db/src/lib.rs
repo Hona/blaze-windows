@@ -299,14 +299,14 @@ pub fn given_value<'v>(name: &str, value: &'v str) -> std::borrow::Cow<'v, str> 
         name,
         "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "OUT_DIR" | "CARGO_TARGET_TMPDIR"
     ) || name.starts_with("CARGO_BIN_EXE_");
-    let named = value.starts_with('/') && cfg!(windows);
-    match path && named {
-        true => std::borrow::Cow::Owned(
-            // alloc: a path a program reads, once per read
-            blaze_core::platform::path::host(value).to_string_lossy().into_owned(),
-        ),
-        false => std::borrow::Cow::Borrowed(value),
+    if path && cfg!(windows)
+        && let Some(host) = blaze_core::platform::path::DaemonPath::parse(value)
+            .and_then(blaze_core::platform::path::DaemonPath::try_host)
+    {
+        // alloc: a path a program reads, once per read
+        return std::borrow::Cow::Owned(host.as_path().to_string_lossy().into_owned());
     }
+    std::borrow::Cow::Borrowed(value)
 }
 
 /// A path a program names a file by (`include!`, `include_str!`, `include_bytes!`) as the
@@ -581,10 +581,8 @@ impl IncludedFile {
     pub fn read_now(path: &std::path::Path, looks: &Looks) -> Result<std::sync::Arc<[u8]>, ReadError> {
         // Apply the view first (the caller), then use the system name for both the
         // read and its observation. A daemon name such as /C:/x is not a Win32 path.
-        #[cfg(windows)]
-        let on_host = path.to_str().map(blaze_core::platform::path::host);
-        #[cfg(windows)]
-        let path = on_host.as_deref().unwrap_or(path);
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
+        let path = on_host.as_ref();
         let read = std::fs::read(path);
         if looks.keeps() {
             match &read {
@@ -614,6 +612,8 @@ impl IncludedFile {
     /// with nothing changed walked 5,305 units for one path a registry crate's `#[path]`
     /// names that is not there. A look made is pushed to `looks` ([`IncludedFile::read_now`]).
     pub fn content_now(path: &std::path::Path, looks: &Looks) -> ContentId {
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
+        let path = on_host.as_ref();
         let kept = VOUCHED.lock().get(path).copied();
         if let Some((generation, id)) = kept
             && (generation == HELD || blaze_vfs::outside::name_unchanged_since(path, generation))
@@ -626,8 +626,11 @@ impl IncludedFile {
         // only a file whose name has no link in it (the file itself, when it is there, and
         // its directory) is kept; any other is looked at each time.
         let plain = match std::fs::canonicalize(path) {
-            Ok(it) => it == path,
-            Err(_) => path.parent().is_some_and(|dir| std::fs::canonicalize(dir).is_ok_and(|it| it == dir)),
+            Ok(it) => blaze_core::platform::path::canonical_matches(path, &it),
+            Err(_) => path.parent().is_some_and(|dir| {
+                std::fs::canonicalize(dir)
+                    .is_ok_and(|it| blaze_core::platform::path::canonical_matches(dir, &it))
+            }),
         };
         if plain && kept.is_none() {
             blaze_vfs::outside::watch_name(path);
@@ -648,8 +651,9 @@ impl IncludedFile {
     /// of reth), their directory hearing blaze's own restore of them, so no watch vouched and
     /// the build was never answered again without a walk.
     pub fn hold(path: &std::path::Path, content: ContentId) {
+        let on_host = blaze_core::platform::path::host_if_daemon(path);
         // alloc: once per held file, its path as the key
-        VOUCHED.lock().insert(path.to_path_buf(), (HELD, content));
+        VOUCHED.lock().insert(on_host.into_owned(), (HELD, content));
     }
 
     pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(

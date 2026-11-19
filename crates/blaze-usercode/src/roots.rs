@@ -44,8 +44,10 @@
 //! or a root whose links resolve elsewhere than when its map was made. A kept value never
 //! embeds another checkout's path.
 //!
-//! On Windows a run has no roots (a path's bytes there are UTF-16 units, which the ports here
-//! don't read): its keys are absolute, so nothing is shared between checkouts there.
+//! On Windows, native build-script runs have no host roots yet (their keys hash UTF-16
+//! `os_bytes` and declared inputs), while logical daemon-name roots (`Namespace::Daemon`,
+//! `Roots::daemon`, `port::Dirs`, proc-macro expansion roots) work on every platform and convert
+//! across `blaze_core::platform::path` for host-spelling porting, link resolution and leak scans.
 //!
 //! [`Rooted`] is what a kept run's shape is checked through: its placeholders resolved against
 //! this run's roots, its marks answered with this run's root paths, and each variable's value
@@ -60,7 +62,7 @@ use std::{
 
 use aho_corasick::AhoCorasick;
 
-use blaze_core::Traced;
+use blaze_core::{Traced, platform::path::DaemonPath};
 use blaze_ids::ContentId;
 use blaze_vfs::outside::{LookKind, Looks};
 
@@ -176,16 +178,42 @@ impl RoleSet {
 /// The byte a placeholder starts with: no path or variable has it, and one printed is doubled.
 const MARK: u8 = 0;
 
+/// Second byte of a Windows host-path placeholder (`\0h<tag>`): distinct from every lowercase
+/// [`Role::tag`] and every uppercase sentinel (`\0OUT`, `\0INCLUDED`, `\0ROOT`, `\0PKG`), so a
+/// daemon root (`/C:/a` -> `\0w`) and its native Windows host spelling (`C:\a` -> `\0hw`) both
+/// round-trip injectively. Unused on Unix.
+const HOST_MARK: u8 = b'h';
+
 /// The last name of a mark's path ([`Roots::mark`]): no file has it, a name being a C string.
 pub const ROOT: &str = "\0root";
 
 /// What a mark's hash, a root's path, is hashed under.
 const ROOT_DOMAIN: &str = "blaze v2 root path 1";
 
+/// Which path namespace a set of roots belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Namespace {
+    /// Native host filesystem paths (`C:\Users\a\ws` on Windows, `/home/a/ws` on Unix): what
+    /// native build scripts see and trace. On Windows, native build-script keys carry UTF-16
+    /// `os_bytes` and declared inputs, so host-namespace roots stay empty there.
+    #[default]
+    Host,
+    /// Logical daemon names (`/C:/Users/a/ws` on Windows, `/home/a/ws` on Unix): what the VFS,
+    /// front end, unit keys, unit records and proc-macro expansion traces use. Active on every
+    /// platform, converting across [`blaze_core::platform::path`] for host-path spellings, link
+    /// resolution and leak detection.
+    Daemon,
+}
+
 /// A run's roots, owned: what a run's spec keeps, and lends as [`Roots`].
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct RootMap {
+    namespace: Namespace,
     roots: Vec<(Role, String)>,
+    /// On Windows for [`Namespace::Daemon`], each root's native host spelling (`C:\Users\a\ws`),
+    /// sorted longest first (ties by role), for injective `\0h<tag>` porting and leak detection.
+    /// Empty on Unix.
+    host_roots: Vec<(Role, String)>,
     /// Each root's other spellings ([`spellings`]): looked for in what a run wrote, never
     /// ported.
     aliases: Vec<(Role, String)>,
@@ -200,24 +228,86 @@ pub struct RootMap {
 }
 
 impl RootMap {
+    /// An empty map for logical daemon-name roots (`Namespace::Daemon`), active on every
+    /// platform including Windows.
+    pub fn daemon() -> RootMap {
+        RootMap { namespace: Namespace::Daemon, ..RootMap::default() }
+    }
+
     /// `role`'s root is `path`, in place of any it had, with its other spellings: the path its
     /// links resolve to (read once, here, at setup) and the forms of each that [`spellings`]
     /// names. A path that is not UTF-8, not absolute or the file system's root names no root:
-    /// what is under it stays absolute in keys. On Windows nothing is a root. Each look at
+    /// what is under it stays absolute in keys. On Windows, host-namespace roots stay empty;
+    /// daemon-namespace maps ([`RootMap::daemon`]) use [`RootMap::set_daemon`]. Each look at
     /// the disk that resolving the path's links makes is pushed to `looks`, the list of the
     /// build the map is made for ([`resolve`]).
     pub fn set(&mut self, role: Role, path: &Path, looks: &Looks) -> &mut RootMap {
+        if self.namespace == Namespace::Daemon {
+            self.roots.retain(|it| it.0 != role);
+            self.host_roots.retain(|it| it.0 != role);
+            self.aliases.retain(|it| it.0 != role);
+            self.resolved.retain(|it| it.0 != role);
+            if let Some(named) = path.to_str().and_then(DaemonPath::parse) {
+                self.set_daemon(role, named, looks);
+            }
+            return self;
+        }
         self.roots.retain(|it| it.0 != role);
+        self.host_roots.retain(|it| it.0 != role);
         self.aliases.retain(|it| it.0 != role);
         self.resolved.retain(|it| it.0 != role);
-        if let Some(path) = path.to_str().map(trim).filter(|it| usable(it)) {
-            let resolved = resolve(path, looks);
+        if let Some(path) = path.to_str().map(trim).filter(|it| usable_host(it)) {
+            let resolved = resolve_host(path, looks);
             for alias in spellings(path, resolved.as_deref()) {
                 self.aliases.push((role, alias));
             }
             self.resolved.push((role, resolved));
             self.roots.push((role, path.to_owned())); // alloc: setup, once per root of a run
         }
+        self
+    }
+
+    /// Sets `role`'s root to the daemon name `path` in a [`Namespace::Daemon`] map, resolving
+    /// links through [`DaemonPath::try_host`] and recording its Windows host spelling when it
+    /// addresses a host volume.
+    pub fn set_daemon(&mut self, role: Role, path: DaemonPath<'_>, looks: &Looks) -> &mut RootMap {
+        self.namespace = Namespace::Daemon;
+        self.roots.retain(|it| it.0 != role);
+        self.host_roots.retain(|it| it.0 != role);
+        self.aliases.retain(|it| it.0 != role);
+        self.resolved.retain(|it| it.0 != role);
+        let path = path.trim_end_slash();
+        if path.is_volume_root() {
+            return self;
+        }
+        let resolved = resolve_daemon(path, looks);
+        let host = path.host_spelling();
+        let resolved_host = resolved
+            .as_deref()
+            .and_then(DaemonPath::parse)
+            .and_then(DaemonPath::host_spelling);
+        for alias in spellings(path.as_str(), resolved.as_deref()) {
+            self.aliases.push((role, alias));
+        }
+        for extra in host.iter().chain(resolved_host.iter()) {
+            for candidate in [
+                extra.as_str(),
+                &escaped(extra),
+                &escaped_keep_colon(extra),
+            ] {
+                if candidate != path.as_str()
+                    && !self.aliases.iter().any(|it| it.0 == role && it.1 == candidate)
+                {
+                    self.aliases.push((role, candidate.to_owned())); // alloc: setup, host spelling of a root
+                }
+            }
+        }
+        if let Some(host) = host {
+            self.host_roots.push((role, host));
+            sort_host_roots(&mut self.host_roots);
+        }
+        self.resolved.push((role, resolved));
+        self.roots.push((role, path.as_str().to_owned())); // alloc: setup, once per root of a run
         self
     }
 
@@ -235,10 +325,37 @@ impl RootMap {
         self
     }
 
+    /// [`RootMap::set_daemon`], by value.
+    pub fn with_daemon(mut self, role: Role, path: DaemonPath<'_>, looks: &Looks) -> RootMap {
+        self.set_daemon(role, path, looks);
+        self
+    }
+
     /// `dir` is machine-wide: a read under it is of the same file in every checkout.
+    /// In a [`Namespace::Daemon`] map, a host path is converted through
+    /// [`blaze_core::platform::path::daemon`] so it compares against daemon-named trace entries.
     pub fn with_machine(mut self, dir: &Path) -> RootMap {
-        if dir.is_absolute() && dir.parent().is_some() {
-            self.machine.push(dir.to_owned()); // alloc: setup, once per machine-wide directory
+        match self.namespace {
+            Namespace::Host => {
+                if dir.is_absolute() && dir.parent().is_some() {
+                    self.machine.push(dir.to_owned()); // alloc: setup, once per machine-wide directory
+                }
+            }
+            Namespace::Daemon => {
+                if let Ok(named) = blaze_core::platform::path::daemon(dir) {
+                    if let Some(parsed) = DaemonPath::parse(&named)
+                        && !parsed.is_volume_root()
+                    {
+                        // alloc: setup, once per machine-wide directory
+                        self.machine.push(PathBuf::from(parsed.trim_end_slash().as_str()));
+                    }
+                } else if let Some(parsed) = dir.to_str().and_then(DaemonPath::parse)
+                    && !parsed.is_volume_root()
+                {
+                    // alloc: setup, synthetic daemon-named machine directory in tests
+                    self.machine.push(PathBuf::from(parsed.trim_end_slash().as_str()));
+                }
+            }
         }
         self
     }
@@ -247,29 +364,79 @@ impl RootMap {
     /// registry packages and git checkouts, machine-wide ([`RootMap::with_machine`]), the
     /// place every registry and git package of a build is.
     pub fn with_sources(self, sources: &Path) -> RootMap {
+        if self.namespace == Namespace::Daemon {
+            let base = blaze_core::platform::path::daemon(sources)
+                .ok()
+                .and_then(|s| blaze_core::platform::path::DaemonPathBuf::parse(s))
+                .or_else(|| {
+                    sources
+                        .to_str()
+                        .and_then(DaemonPath::parse)
+                        .map(DaemonPath::to_owned)
+                });
+            return match base {
+                Some(base) => {
+                    let reg = base.as_daemon().join("registry");
+                    let git = base.as_daemon().join("git");
+                    self.with_machine(Path::new(reg.as_str()))
+                        .with_machine(Path::new(git.as_str()))
+                }
+                None => self,
+            };
+        }
         self.with_machine(&sources.join("registry")).with_machine(&sources.join("git"))
     }
 
     pub fn view(&self) -> Roots<'_> {
-        Roots {
+        let mut out = Roots {
+            namespace: self.namespace,
+            roots: [(Role::Package, ""); Role::ALL.len()],
+            len: 0,
+            host_roots: &self.host_roots,
             aliases: &self.aliases,
             machine: &self.machine,
             resolved: &self.resolved,
             given: self.given,
-            ..Roots::new(self.roots.iter().map(|(role, path)| (*role, path.as_str())))
+        };
+        for (role, path) in &self.roots {
+            out.insert(*role, path.as_str());
         }
+        out.sort();
+        out
     }
+}
+
+/// Sorts host-path root spellings longest first, ties by role, matching [`Roots::sort`].
+pub(crate) fn sort_host_roots(roots: &mut [(Role, String)]) {
+    roots.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
 }
 
 /// The path `root`'s links resolve to, when it is there and UTF-8. For a root that is not
 /// there, or that a link leads away from, each name the resolution rests on is asked of as an
 /// entry and its look pushed to `looks` ([`look_through`]): no watch of the root's own
 /// directory hears a link above it pointed elsewhere.
-fn resolve(root: &str, looks: &Looks) -> Option<String> {
+fn resolve_host(root: &str, looks: &Looks) -> Option<String> {
     let resolved = std::fs::canonicalize(root).ok();
     let resolved = resolved.as_deref().and_then(Path::to_str).map(|it| trim(it).to_owned()); // alloc: setup, once per root of a run
     if resolved.as_deref() != Some(root) && looks.keeps() {
         look_through(Path::new(root), looks);
+    }
+    resolved
+}
+
+/// Resolves a daemon-named root on the host filesystem (when [`DaemonPath::try_host`] says it
+/// addresses one), returning its canonical daemon name. On Windows, strips the verbatim `\\?\`
+/// prefix via [`blaze_core::platform::path::daemon`] so an ordinary directory without symlinks
+/// agrees with `root` and does not push [`UNASKABLE`].
+fn resolve_daemon(root: DaemonPath<'_>, looks: &Looks) -> Option<String> {
+    let host = root.try_host()?;
+    let canonical = std::fs::canonicalize(host.as_path()).ok();
+    let resolved = canonical
+        .as_deref()
+        .and_then(|it| blaze_core::platform::path::daemon(it).ok())
+        .map(|it| it.trim_end_matches('/').to_owned()); // alloc: setup, once per root of a run
+    if resolved.as_deref() != Some(root.as_str()) && looks.keeps() {
+        look_through(host.as_path(), looks);
     }
     resolved
 }
@@ -294,15 +461,24 @@ fn look_through(root: &Path, looks: &Looks) {
     let mut now = Now { files: Files::shared(), env: &env, looks };
     // alloc: setup, once per root named through a link: the parts not yet resolved, last first
     let mut left: Vec<std::ffi::OsString> = Vec::new();
-    for part in root.components().rev() {
+    let mut at = PathBuf::new(); // alloc: setup, as above
+    let mut saw_root = false;
+    for part in root.components() {
         match part {
-            Component::RootDir | Component::CurDir => {}
+            Component::Prefix(prefix) => at.push(prefix.as_os_str()),
+            Component::RootDir => {
+                at.push(part.as_os_str());
+                saw_root = true;
+            }
+            Component::CurDir => {}
             Component::ParentDir => left.push("..".into()), // alloc: setup, as above
             Component::Normal(name) => left.push(name.to_owned()), // alloc: setup, as above
-            Component::Prefix(_) => return looks.push(root, LookKind::Entry, Some(UNASKABLE)),
         }
     }
-    let mut at = PathBuf::from("/"); // alloc: setup, as above
+    if !saw_root {
+        return looks.push(root, LookKind::Entry, Some(UNASKABLE));
+    }
+    left.reverse();
     let mut links = 0;
     // Bounded: each turn takes one part, and only a link, of which at most `MOST_LINKS` are
     // followed, adds any.
@@ -314,7 +490,20 @@ fn look_through(root: &Path, looks: &Looks) {
         }
         let name = at.join(&part); // alloc: setup, as above
         match now.entry(&name) {
-            Ok(Entry::Dir) => at = name,
+            Ok(Entry::Dir) => {
+                #[cfg(windows)]
+                {
+                    // Directory junctions and mount points carry FILE_ATTRIBUTE_REPARSE_POINT
+                    // (0x400) while reporting as directories; treat them as unaskable.
+                    use std::os::windows::fs::MetadataExt as _;
+                    if std::fs::symlink_metadata(&name)
+                        .is_ok_and(|meta| meta.file_attributes() & 0x400 != 0)
+                    {
+                        return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                    }
+                }
+                at = name;
+            }
             Ok(Entry::File(_, blaze_vfs::Mode::Symlink)) => {
                 links += 1;
                 let target = match links <= MOST_LINKS {
@@ -324,17 +513,31 @@ fn look_through(root: &Path, looks: &Looks) {
                 let Some(target) = target else {
                     return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
                 };
-                for part in target.components().rev() {
+                let mut reset = PathBuf::new();
+                let mut tail = Vec::new(); // alloc: setup, link target components
+                let mut has_root = false;
+                for part in target.components() {
                     match part {
-                        Component::RootDir => at = PathBuf::from("/"), // alloc: setup, as above
-                        Component::CurDir => {}
-                        Component::ParentDir => left.push("..".into()), // alloc: setup, as above
-                        Component::Normal(name) => left.push(name.to_owned()), // alloc: setup, as above
-                        Component::Prefix(_) => {
-                            return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                        Component::Prefix(prefix) => reset.push(prefix.as_os_str()),
+                        Component::RootDir => {
+                            reset.push(part.as_os_str());
+                            has_root = true;
                         }
+                        Component::CurDir => {}
+                        Component::ParentDir => tail.push("..".into()),
+                        Component::Normal(name) => tail.push(name.to_owned()),
                     }
                 }
+                if has_root {
+                    if cfg!(windows) && !reset.is_absolute() {
+                        return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                    }
+                    at = reset;
+                } else if !reset.as_os_str().is_empty() {
+                    // Drive-relative target like `C:foo`.
+                    return looks.push(&name, LookKind::Entry, Some(UNASKABLE));
+                }
+                left.extend(tail.into_iter().rev());
             }
             // Nothing is below a file or a name that is not there: the walk ends here.
             Ok(Entry::File(..) | Entry::Missing) => return,
@@ -396,6 +599,9 @@ fn spellings(root: &str, resolved: Option<&str>) -> Vec<String> {
     let mut out = plain.clone(); // clone: as above, each spelling escaped too
     for it in std::iter::once(root).chain(plain.iter().map(String::as_str)) {
         add(&mut out, &escaped(it));
+        if it.contains(':') {
+            add(&mut out, &escaped_keep_colon(it));
+        }
     }
     out
 }
@@ -403,12 +609,22 @@ fn spellings(root: &str, resolved: Option<&str>) -> Vec<String> {
 /// `path` as a `file://` URL's path has it: each byte but a letter, digit, `-._~` and `/` as
 /// `%XX`.
 fn escaped(path: &str) -> String {
+    escaped_with(path, false)
+}
+
+/// [`escaped`], leaving `:` unescaped as `file:///C:/...` URLs do.
+fn escaped_keep_colon(path: &str) -> String {
+    escaped_with(path, true)
+}
+
+fn escaped_with(path: &str, keep_colon: bool) -> String {
     let mut out = String::with_capacity(path.len()); // alloc: setup, a root's spelling
     for byte in path.bytes() {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 out.push(char::from(byte))
             }
+            b':' if keep_colon => out.push(':'),
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -420,7 +636,10 @@ fn trim(path: &str) -> &str {
     path.trim_end_matches(|it| it == '/' || (cfg!(windows) && it == '\\'))
 }
 
-fn usable(path: &str) -> bool {
+/// Whether `path` is usable as a native host-filesystem root ([`Namespace::Host`]).
+/// On Windows, native build-script keys carry UTF-16 `os_bytes` and declared inputs, so native
+/// host roots stay disabled there; daemon-name roots go through [`Roots::daemon`] instead.
+fn usable_host(path: &str) -> bool {
     !cfg!(windows)
         && !path.is_empty()
         && Path::new(path).is_absolute()
@@ -454,13 +673,26 @@ fn word_end(byte: Option<u8>) -> bool {
     }
 }
 
+/// What [`Roots::occurrence`] matched at a byte offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Matched {
+    /// Daemon-form (or Unix) root: emits `\0<tag>`.
+    Daemon(Role, usize),
+    /// Windows host-path spelling of a daemon root: emits `\0h<tag>`.
+    Host(Role, usize),
+}
+
 /// A run's roots, lent: what keys, shapes and kept values are written against. At most one
 /// root a role, longest first, so a path under two is written against the nearer; made with no
 /// allocation, as a proc macro's key is.
 #[derive(Clone, Copy, Debug)]
 pub struct Roots<'a> {
+    namespace: Namespace,
     roots: [(Role, &'a str); Role::ALL.len()],
     len: usize,
+    /// On Windows for [`Namespace::Daemon`], the host-path spellings (`C:\Users\a\w`) of the
+    /// roots, sorted longest first, ties by role. Borrowed from [`RootMap`] or [`port::Dirs`].
+    host_roots: &'a [(Role, String)],
     /// The roots' other spellings, from a [`RootMap`]: none for roots made with [`Roots::new`].
     aliases: &'a [(Role, String)],
     /// Machine-wide directories besides [`MACHINE`].
@@ -475,8 +707,10 @@ impl<'a> Roots<'a> {
     /// No roots: every path stays absolute.
     pub fn none() -> Roots<'a> {
         Roots {
+            namespace: Namespace::Host,
             roots: [(Role::Package, ""); Role::ALL.len()],
             len: 0,
+            host_roots: &[],
             aliases: &[],
             machine: &[],
             resolved: &[],
@@ -484,13 +718,67 @@ impl<'a> Roots<'a> {
         }
     }
 
-    /// These roots, owned, with their other spellings ([`RootMap::set`]) and `machine`, the
-    /// machine-wide directories: what a run made with [`Roots::new`] is kept through.
-    /// `looks` as [`RootMap::set`]'s.
+    fn insert(&mut self, role: Role, path: &'a str) {
+        match self.roots[..self.len].iter_mut().find(|it| it.0 == role) {
+            Some(it) => it.1 = path,
+            None => {
+                self.roots[self.len] = (role, path);
+                self.len += 1;
+            }
+        }
+    }
+
+    fn sort(&mut self) {
+        // Longest first; a tie (a workspace that is its one package) by role, the same in every
+        // checkout.
+        self.roots[..self.len].sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    }
+
+    /// The daemon-name roots `roots` names (`Namespace::Daemon`), active on every platform
+    /// including Windows; the last of a role is kept, and a volume root (`/`, `/C:`,
+    /// `/UNC/server/share`) is ignored.
+    pub fn daemon(roots: impl IntoIterator<Item = (Role, DaemonPath<'a>)>) -> Roots<'a> {
+        let mut out = Roots { namespace: Namespace::Daemon, ..Roots::none() };
+        for (role, path) in roots {
+            let path = path.trim_end_slash();
+            if path.is_volume_root() {
+                continue;
+            }
+            out.insert(role, path.as_str());
+        }
+        out.sort();
+        out
+    }
+
+    /// Daemon-name roots with precomputed Windows host-path spellings (for [`port::Dirs`]).
+    pub(crate) fn daemon_with_host(
+        roots: impl IntoIterator<Item = (Role, DaemonPath<'a>)>,
+        host_roots: &'a [(Role, String)],
+    ) -> Roots<'a> {
+        let mut out = Roots::daemon(roots);
+        out.host_roots = host_roots;
+        out
+    }
+
+    /// These roots, owned, with their other spellings ([`RootMap::set`] / [`RootMap::set_daemon`])
+    /// and `machine`, the machine-wide directories: what a run made with [`Roots::new`] or
+    /// [`Roots::daemon`] is kept through. `looks` as [`RootMap::set`]'s.
     pub fn to_map(&self, machine: impl FnOnce(RootMap) -> RootMap, looks: &Looks) -> RootMap {
-        let mut map = RootMap::default();
+        let mut map = match self.namespace {
+            Namespace::Daemon => RootMap::daemon(),
+            Namespace::Host => RootMap::default(),
+        };
         for &(role, root) in &self.roots[..self.len] {
-            map.set(role, Path::new(root), looks);
+            match self.namespace {
+                Namespace::Daemon => {
+                    if let Some(named) = DaemonPath::parse(root) {
+                        map.set_daemon(role, named, looks);
+                    }
+                }
+                Namespace::Host => {
+                    map.set(role, Path::new(root), looks);
+                }
+            }
         }
         machine(map)
     }
@@ -504,27 +792,15 @@ impl<'a> Roots<'a> {
         all
     }
 
-    /// The roots `roots` names, the last of a role kept; one that is not absolute or is the
-    /// file system's root is none.
+    /// The daemon-name roots `roots` names, the last of a role kept; one that is not a valid
+    /// daemon name (`/`) or is a volume root is none. Active on every platform (including
+    /// Windows), unlike native host-filesystem [`RootMap::default`].
     pub fn new(roots: impl IntoIterator<Item = (Role, &'a str)>) -> Roots<'a> {
-        let mut out = Roots::none();
-        for (role, path) in roots {
-            let path = trim(path);
-            if !usable(path) {
-                continue;
-            }
-            match out.roots[..out.len].iter_mut().find(|it| it.0 == role) {
-                Some(it) => it.1 = path,
-                None => {
-                    out.roots[out.len] = (role, path);
-                    out.len += 1;
-                }
-            }
-        }
-        // Longest first; a tie (a workspace that is its one package) by role, the same in every
-        // checkout.
-        out.roots[..out.len].sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-        out
+        Roots::daemon(
+            roots
+                .into_iter()
+                .filter_map(|(role, path)| Some((role, DaemonPath::parse(path)?))),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -600,6 +876,16 @@ impl<'a> Roots<'a> {
             .map(|(role, root)| (*role, root.len()))
     }
 
+    /// The Windows host-path root spelling `bytes` start with, ended where `ends` says one may.
+    fn at_host(&self, bytes: &[u8], ends: fn(Option<u8>) -> bool) -> Option<(Role, usize)> {
+        self.host_roots
+            .iter()
+            .find(|(_, root)| {
+                bytes.starts_with(root.as_bytes()) && ends(bytes.get(root.len()).copied())
+            })
+            .map(|(role, root)| (*role, root.len()))
+    }
+
     /// The root of the tag `tag`, or the error that `what`, which names it, is not of this run.
     fn root_of(&self, tag: u8, what: &[u8]) -> Result<&'a str, NoRoot> {
         Role::of(tag).and_then(|role| self.get(role)).ok_or_else(|| NoRoot {
@@ -608,24 +894,61 @@ impl<'a> Roots<'a> {
         })
     }
 
+    /// The Windows host-path spelling of `tag`, or [`NoRoot`] if this run has none.
+    fn host_root_of(&self, tag: u8, what: &[u8]) -> Result<&'a str, NoRoot> {
+        Role::of(tag)
+            .and_then(|role| {
+                self.host_roots.iter().find(|it| it.0 == role).map(|it| it.1.as_str())
+            })
+            .ok_or_else(|| NoRoot {
+                what: String::from_utf8_lossy(what).into_owned(), // alloc: error path
+                why: "it names a root this run has none of: the store's bytes or the run's key are wrong",
+            })
+    }
+
+    /// The Windows host spelling (`C:\...`) of `(role, root)` when `self` is in
+    /// [`Namespace::Daemon`]: borrowed from `self.host_roots` when present, else computed via
+    /// [`DaemonPath::host_spelling`] so even a bare [`Roots::daemon`] detects native leaks.
+    fn host_spelling_of(&self, role: Role, root: &str) -> Option<Cow<'a, str>> {
+        if let Some((_, host)) = self.host_roots.iter().find(|it| it.0 == role) {
+            return Some(Cow::Borrowed(host.as_str()));
+        }
+        if self.namespace == Namespace::Daemon {
+            return DaemonPath::parse(root).and_then(DaemonPath::host_spelling).map(Cow::Owned);
+        }
+        None
+    }
+
     /// `bytes` ported, given to `emit` piece by piece: each `\0` doubled and each root in it,
     /// wherever it starts and ended where no name goes on, its placeholder. What a key hashes in
     /// place ([`crate::Given::ported`]) and [`Roots::ported`] collects.
     pub fn port(&self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
         let (mut from, mut at) = (0, 0);
         while at < bytes.len() {
-            let (piece, skip) = if bytes[at] == MARK {
-                ([MARK, MARK], 1)
-            } else if let Some((role, len)) = self.occurrence(bytes, at) {
-                ([MARK, role.tag()], len)
-            } else {
+            if bytes[at] == MARK {
+                emit(&bytes[from..at]);
+                emit(&[MARK, MARK]);
                 at += 1;
+                from = at;
                 continue;
-            };
-            emit(&bytes[from..at]);
-            emit(&piece);
-            at += skip;
-            from = at;
+            }
+            match self.occurrence(bytes, at) {
+                Some(Matched::Daemon(role, len)) => {
+                    emit(&bytes[from..at]);
+                    emit(&[MARK, role.tag()]);
+                    at += len;
+                    from = at;
+                }
+                Some(Matched::Host(role, len)) => {
+                    emit(&bytes[from..at]);
+                    emit(&[MARK, HOST_MARK, role.tag()]);
+                    at += len;
+                    from = at;
+                }
+                None => {
+                    at += 1;
+                }
+            }
         }
         emit(&bytes[from..]);
     }
@@ -637,12 +960,16 @@ impl<'a> Roots<'a> {
     /// stays as it is, and a run whose output, traced variables or given strings hold it
     /// ([`Roots::left`]) is kept here alone: its marks cover its key and its trace, and no
     /// copy is made for another checkout ([`Roots::kept`]).
-    fn occurrence(&self, bytes: &[u8], at: usize) -> Option<(Role, usize)> {
-        let found = self.at(&bytes[at..], word_end)?;
-        match at.checked_sub(1).map(|it| bytes[it]) {
-            Some(before) if path_byte(before) => None,
-            _ => Some(found),
+    fn occurrence(&self, bytes: &[u8], at: usize) -> Option<Matched> {
+        if let Some(before) = at.checked_sub(1).map(|it| bytes[it])
+            && path_byte(before)
+        {
+            return None;
         }
+        if let Some((role, len)) = self.at(&bytes[at..], word_end) {
+            return Some(Matched::Daemon(role, len));
+        }
+        self.at_host(&bytes[at..], word_end).map(|(role, len)| Matched::Host(role, len))
     }
 
     /// Whether [`Roots::port`] changes `bytes`.
@@ -678,19 +1005,28 @@ impl<'a> Roots<'a> {
         // alloc: a kept string with a placeholder in it, once as it is reused
         let mut out = Vec::with_capacity(bytes.len());
         let mut rest = bytes;
+        let short = || NoRoot {
+            what: String::from_utf8_lossy(bytes).into_owned(), // alloc: error path
+            why: "it ends inside a root's placeholder: it is not a ported string",
+        };
         while let Some(at) = rest.iter().position(|it| *it == MARK) {
             out.extend_from_slice(&rest[..at]);
             match rest.get(at + 1).copied() {
-                Some(MARK) => out.push(MARK),
-                Some(tag) => out.extend_from_slice(self.root_of(tag, bytes)?.as_bytes()),
-                None => {
-                    return Err(NoRoot {
-                        what: String::from_utf8_lossy(bytes).into_owned(), // alloc: error path
-                        why: "it ends inside a root's placeholder: it is not a ported string",
-                    });
+                Some(MARK) => {
+                    out.push(MARK);
+                    rest = &rest[at + 2..];
                 }
+                Some(HOST_MARK) => {
+                    let tag = rest.get(at + 2).copied().ok_or_else(short)?;
+                    out.extend_from_slice(self.host_root_of(tag, bytes)?.as_bytes());
+                    rest = &rest[at + 3..];
+                }
+                Some(tag) => {
+                    out.extend_from_slice(self.root_of(tag, bytes)?.as_bytes());
+                    rest = &rest[at + 2..];
+                }
+                None => return Err(short()),
             }
-            rest = &rest[at + 2..];
         }
         out.extend_from_slice(rest);
         Ok(Cow::Owned(out))
@@ -714,17 +1050,24 @@ impl<'a> Roots<'a> {
     /// its placeholder and the rest; lent when it is under none (or is not UTF-8).
     pub fn path<'p>(&self, path: &'p Path) -> Cow<'p, Path> {
         let Some(text) = path.to_str() else { return Cow::Borrowed(path) };
-        match self.at(text.as_bytes(), separator) {
-            Some((role, len)) => {
-                // alloc: a path under a root, once as it is keyed or kept
-                let mut ported = String::with_capacity(2 + text.len() - len);
-                ported.push(char::from(MARK));
-                ported.push(char::from(role.tag()));
-                ported.push_str(&text[len..]);
-                Cow::Owned(PathBuf::from(ported))
-            }
-            None => Cow::Borrowed(path),
+        if let Some((role, len)) = self.at(text.as_bytes(), separator) {
+            // alloc: a path under a root, once as it is keyed or kept
+            let mut ported = String::with_capacity(2 + text.len() - len);
+            ported.push(char::from(MARK));
+            ported.push(char::from(role.tag()));
+            ported.push_str(&text[len..]);
+            return Cow::Owned(PathBuf::from(ported));
         }
+        if let Some((role, len)) = self.at_host(text.as_bytes(), separator) {
+            // alloc: a Windows host path under a root, once as it is keyed or kept
+            let mut ported = String::with_capacity(3 + text.len() - len);
+            ported.push(char::from(MARK));
+            ported.push(char::from(HOST_MARK));
+            ported.push(char::from(role.tag()));
+            ported.push_str(&text[len..]);
+            return Cow::Owned(PathBuf::from(ported));
+        }
+        Cow::Borrowed(path)
     }
 
     /// The path in this checkout that `path`, written against some checkout's roots, names:
@@ -739,8 +1082,15 @@ impl<'a> Roots<'a> {
         let text = path
             .to_str()
             .ok_or_else(|| bad("a path written against a root is UTF-8, and this is not"))?;
-        let root = self.root_of(bytes.get(1).copied().unwrap_or(MARK), bytes)?;
-        let rest = text.get(2..).ok_or_else(|| bad("a root's placeholder is cut short"))?;
+        let (root, rest) = if bytes.get(1) == Some(&HOST_MARK) {
+            let root = self.host_root_of(bytes.get(2).copied().unwrap_or(MARK), bytes)?;
+            let rest = text.get(3..).ok_or_else(|| bad("a root's placeholder is cut short"))?;
+            (root, rest)
+        } else {
+            let root = self.root_of(bytes.get(1).copied().unwrap_or(MARK), bytes)?;
+            let rest = text.get(2..).ok_or_else(|| bad("a root's placeholder is cut short"))?;
+            (root, rest)
+        };
         if !separator(rest.as_bytes().first().copied()) {
             return Err(bad("a root's placeholder goes on with no separator after it"));
         }
@@ -794,18 +1144,72 @@ impl<'a> Roots<'a> {
         trace::normalize(traced);
     }
 
+    /// Calls `visit` for every byte spelling of `(role, root)` that [`Roots::embedded`] and
+    /// [`Scan::of`] look for: the root itself, its [`RootMap`] aliases, its `%`-escaped form
+    /// when no aliases were precomputed, and (for Windows [`Namespace::Daemon`] roots) its native
+    /// host spelling and `%`-escaped host forms.
+    fn for_each_spelling(&self, role: Role, root: &str, mut visit: impl FnMut(&str)) {
+        visit(root);
+        let mut had_alias = false;
+        for (_, alias) in self.aliases.iter().filter(|it| it.0 == role) {
+            had_alias = true;
+            visit(alias.as_str());
+        }
+        if !had_alias
+            && root.bytes().any(|b| {
+                !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/'))
+            })
+        {
+            visit(&escaped(root));
+            if root.contains(':') {
+                visit(&escaped_keep_colon(root));
+            }
+        }
+        if let Some(host) = self.host_spelling_of(role, root) {
+            visit(&host);
+            if !had_alias {
+                visit(&escaped(&host));
+                visit(&escaped_keep_colon(&host));
+            }
+        }
+    }
+
+    /// Calls `visit` for every string form of `(role, root)` whose UTF-16LE and UTF-16BE bytes
+    /// [`Roots::embedded`] and [`Scan::of`] look for: the root itself, plus on Windows its
+    /// native `\`-separated and `/`-separated host spellings.
+    fn for_each_wide(&self, role: Role, root: &str, mut visit: impl FnMut(&str)) {
+        visit(root);
+        if let Some(host) = self.host_spelling_of(role, root) {
+            visit(&host);
+            if host.contains('\\') {
+                visit(&host.replace('\\', "/"));
+            }
+        }
+    }
+
     /// The roots whose path is anywhere in `bytes`, whatever is around it and however it is
     /// spelled: as it is or as any of its other spellings ([`RootMap::set`]), with separators
     /// doubled, turned or escaped (`//`, `\\`, `\/`) and in any case ([`spelled_in`]), or in
-    /// UTF-16. What has one can't be given to another checkout, and is kept against where its
-    /// roots are. Wider than [`Roots::port`] matches, never narrower.
+    /// UTF-16 (for both daemon and native Windows host spellings). What has one can't be given
+    /// to another checkout, and is kept against where its roots are. Wider than [`Roots::port`]
+    /// matches, never narrower.
     pub fn embedded(&self, bytes: &[u8]) -> RoleSet {
         let mut found = RoleSet::default();
         for &(role, root) in &self.roots[..self.len] {
-            let aliased = self.aliases.iter().filter(|it| it.0 == role).map(|it| it.1.as_str());
-            if std::iter::once(root).chain(aliased).any(|it| spelled_in(bytes, it.as_bytes()))
-                || utf16_in(bytes, root)
-            {
+            let mut hit = false;
+            self.for_each_spelling(role, root, |spelling| {
+                if !hit && spelled_in(bytes, spelling.as_bytes()) {
+                    hit = true;
+                }
+            });
+            if !hit {
+                self.for_each_wide(role, root, |text| {
+                    if !hit && utf16_in(bytes, text) {
+                        hit = true;
+                    }
+                });
+            }
+            if hit {
                 found.insert(role);
             }
         }
@@ -839,13 +1243,24 @@ impl<'a> Roots<'a> {
     fn outside(&self, path: &Path) -> bool {
         let bytes = path.as_os_str().as_encoded_bytes();
         let checkout = [Role::Package, Role::OutDir, Role::Target, Role::Workspace];
+        let starts = |candidate: &Path, dir: &Path| {
+            if self.namespace == Namespace::Daemon
+                && let (Some(c), Some(d)) = (
+                    candidate.to_str().and_then(DaemonPath::parse),
+                    dir.to_str().and_then(DaemonPath::parse),
+                )
+            {
+                return c.starts_with(d);
+            }
+            candidate.starts_with(dir)
+        };
         let holds_root = |dir: &Path| {
             checkout
                 .iter()
                 .filter_map(|role| self.get(*role))
-                .any(|root| Path::new(root).starts_with(dir))
+                .any(|root| starts(Path::new(root), dir))
         };
-        let wide = |dir: &Path| path.starts_with(dir) && !holds_root(dir);
+        let wide = |dir: &Path| starts(path, dir) && !holds_root(dir);
         bytes.first() != Some(&MARK)
             && !MACHINE.iter().any(|dir| wide(Path::new(dir)))
             && !self.machine.iter().any(|dir| wide(dir.as_path()))
@@ -863,7 +1278,15 @@ impl<'a> Roots<'a> {
     /// the map's making resolved, whose looks the map's build holds ([`look_through`]).
     pub fn relinked(&self) -> bool {
         self.resolved.iter().any(|(role, then)| {
-            self.get(*role).is_some_and(|root| resolve(root, &Looks::none()) != *then)
+            self.get(*role).is_some_and(|root| {
+                let now = match self.namespace {
+                    Namespace::Daemon => {
+                        DaemonPath::parse(root).and_then(|it| resolve_daemon(it, &Looks::none()))
+                    }
+                    Namespace::Host => resolve_host(root, &Looks::none()),
+                };
+                now != *then
+            })
         })
     }
 
@@ -942,7 +1365,13 @@ impl<'a> Roots<'a> {
                 Cow::Owned(it) => Some(it),
             };
             let kept = ported.as_deref().unwrap_or(link.as_bytes());
-            if !(kept.first() == Some(&MARK) && kept.get(1).is_some_and(|it| *it != MARK)) {
+            let starts_placeholder = kept.first() == Some(&MARK)
+                && match kept.get(1).copied() {
+                    Some(HOST_MARK) => kept.get(2).is_some_and(|it| *it != MARK),
+                    Some(tag) => tag != MARK,
+                    None => false,
+                };
+            if !starts_placeholder {
                 left = left.union(self.all());
             }
             if let Some(ported) = ported {
@@ -1030,21 +1459,22 @@ impl Scan {
         let (mut paths, mut path_roles, mut wide, mut wide_roles) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new()); // alloc: once per run kept that wrote files, its patterns
         for &(role, root) in &roots.roots[..roots.len] {
-            let aliased = roots.aliases.iter().filter(|it| it.0 == role).map(|it| it.1.as_str());
-            for spelling in std::iter::once(root).chain(aliased) {
+            roots.for_each_spelling(role, root, |spelling| {
                 let folded = separators_folded(spelling.as_bytes()).into_owned(); // alloc: as above
                 if !folded.is_empty() {
                     paths.push(folded);
                     path_roles.push(one(role));
                 }
-            }
-            let units: Vec<u16> = root.encode_utf16().collect(); // alloc: as above
-            if !units.is_empty() {
-                wide.push(units.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>()); // alloc: as above
-                wide_roles.push(one(role));
-                wide.push(units.iter().flat_map(|it| it.to_be_bytes()).collect::<Vec<u8>>()); // alloc: as above
-                wide_roles.push(one(role));
-            }
+            });
+            roots.for_each_wide(role, root, |text| {
+                let units: Vec<u16> = text.encode_utf16().collect(); // alloc: as above
+                if !units.is_empty() {
+                    wide.push(units.iter().flat_map(|it| it.to_le_bytes()).collect::<Vec<u8>>()); // alloc: as above
+                    wide_roles.push(one(role));
+                    wide.push(units.iter().flat_map(|it| it.to_be_bytes()).collect::<Vec<u8>>()); // alloc: as above
+                    wide_roles.push(one(role));
+                }
+            });
         }
         for &(from, from_root) in &roots.roots[..roots.len] {
             for &(to, to_root) in &roots.roots[..roots.len] {
@@ -1150,12 +1580,23 @@ fn spelled_in(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The path from the directory `from` to `to`, both absolute: a `..` for each of `from`'s
-/// names below the two's common part, then `to`'s names below it.
+/// names below the two's common part, then `to`'s names below it. Two Windows roots on
+/// different drives (`/C:/...` vs `/D:/...`) have no relative path between them.
 fn relative(from: &str, to: &str) -> String {
     fn names(path: &str) -> Vec<&str> {
         path.split('/').filter(|name| !name.is_empty()).collect() // alloc: a scan as a run is kept
     }
+    fn is_drive(part: &str) -> bool {
+        matches!(part.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+    }
     let (from, to) = (names(from), names(to));
+    if let (Some(&a), Some(&b)) = (from.first(), to.first())
+        && is_drive(a)
+        && is_drive(b)
+        && !a.eq_ignore_ascii_case(b)
+    {
+        return String::new();
+    }
     let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
     let mut out = String::new(); // alloc: as above
     for _ in common..from.len() {
@@ -1333,6 +1774,5 @@ where
 pub mod port;
 pub mod verify;
 
-// Windows has no roots: every key there is absolute.
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests;

@@ -3,7 +3,7 @@
 //! machine directory; a difference that matters still gives another key; and a record that
 //! holds a directory is told apart.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use blaze_units::{
     query::{BuildConfig, Command, Invocation, Mount, Origin, Units},
@@ -43,13 +43,13 @@ impl Where {
     }
 
     fn places(&self) -> Places {
-        Places::new(
-            self.checkout,
-            &self.target(),
-            &format!("{}/std/m", self.machine),
-            Path::new(&format!("{}/tools", self.home)),
-            Path::new(&format!("{}/bin/blaze", self.home)),
-            Path::new(&format!("{}/sources", self.home)),
+        Places::of_daemon(
+            Some(self.checkout),
+            Some(&self.target()),
+            Some(&format!("{}/std/m", self.machine)),
+            Some(&format!("{}/tools", self.home)),
+            Some(&format!("{}/bin/blaze", self.home)),
+            Some(&format!("{}/sources", self.home)),
         )
     }
 }
@@ -316,7 +316,7 @@ fn a_value_is_written_against_the_directories_and_back() {
     assert!(first.cbor(&[0x62, b'a'], &mut Vec::new()).is_err(), "a string cut short");
     assert!(first.cbor(&[0x01, 0x01], &mut Vec::new()).is_err(), "bytes after the value");
     // A placeholder of a directory the reading build has none of is an error.
-    let none = Places::new("/w", "relative", "", Path::new(""), Path::new(""), Path::new(""));
+    let none = Places::of_daemon(Some("/w"), Some("relative"), Some(""), None, None, None);
     assert!(none.cbor_real(&kept, &mut Vec::new()).is_err());
 }
 
@@ -345,4 +345,90 @@ fn a_tied_record_is_under_its_key_here() {
     assert_eq!(first.here(base), FIRST.places().here(base), "the same directories: the same key");
     let moved = Where { machine: "/var/cache/blaze", ..FIRST };
     assert_ne!(first.here(base), moved.places().here(base), "each directory is in it");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_places_convert_host_roots_port_run_env_and_detect_all_leaks() {
+    use std::path::Path;
+    let first = Places::new(
+        "/C:/Users/Alice/w",
+        "/C:/Users/Alice/.blaze/build/0123",
+        "/C:/Users/Alice/.cache/blaze/std/m",
+        Path::new(r"C:\Users\Alice\.blaze\tools"),
+        Path::new(r"C:\Users\Alice\.blaze\bin\blaze.exe"),
+        Path::new(r"C:\Users\Alice\.blaze\sources"),
+    );
+    let second = Places::new(
+        "/D:/work/bob/checkouts/w",
+        "/D:/work/bob/blaze/build/0123",
+        "/D:/work/bob/cache/blaze/std/m",
+        Path::new(r"D:\work\bob\blaze\tools"),
+        Path::new(r"D:\work\bob\blaze\bin\blaze.exe"),
+        Path::new(r"D:\work\bob\blaze\sources"),
+    );
+
+    assert_eq!(&*first.real(b"\0l").unwrap(), b"/C:/Users/Alice/.blaze/bin/blaze.exe");
+    assert_eq!(&*first.real(b"\0hl").unwrap(), br"C:\Users\Alice\.blaze\bin\blaze.exe");
+
+    let value = |ws_d: &str, tgt_d: &str, ws_h: &str, tgt_h: &str, launcher_h: &str| {
+        let mut planned = plan("-0001", &[]);
+        planned.outputs = vec![format!("{tgt_d}/debug/deps/liba-0001.rlib")];
+        planned.env = vec![
+            ("CARGO".to_owned(), launcher_h.to_owned()),
+            ("CARGO_MANIFEST_DIR".to_owned(), format!(r"{ws_h}\a")),
+            ("PATH".to_owned(), format!(r"{tgt_h}\debug\deps;{tgt_h}\debug")),
+            ("PKG".to_owned(), format!("path+file://{ws_d}/a#0.1.0")),
+        ];
+        blaze_protocol::cbor::to_vec(&planned).unwrap()
+    };
+    let a = value(
+        "/C:/Users/Alice/w",
+        "/C:/Users/Alice/.blaze/build/0123",
+        r"C:\Users\Alice\w",
+        r"C:\Users\Alice\.blaze\build\0123",
+        r"C:\Users\Alice\.blaze\bin\blaze.exe",
+    );
+    let b = value(
+        "/D:/work/bob/checkouts/w",
+        "/D:/work/bob/blaze/build/0123",
+        r"D:\work\bob\checkouts\w",
+        r"D:\work\bob\blaze\build\0123",
+        r"D:\work\bob\blaze\bin\blaze.exe",
+    );
+    let (mut kept_a, mut kept_b) = (Vec::new(), Vec::new());
+    first.cbor(&a, &mut kept_a).unwrap();
+    second.cbor(&b, &mut kept_b).unwrap();
+    assert_eq!(kept_a, kept_b, "mixed daemon/host CBOR must port identically across Windows checkouts");
+    assert!(!first.tied(&kept_a) && !second.tied(&kept_b), "no directory of either checkout in ported bytes");
+
+    let mut back_b = Vec::new();
+    second.cbor_real(&kept_a, &mut back_b).unwrap();
+    assert_eq!(back_b, b, "cbor_real restores both daemon outputs and native host run_env");
+
+    // Native, daemon, forward-slashed and UTF-16LE spellings all tie the record.
+    let wide: Vec<u8> = r"C:\Users\Alice\w".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    for leak in [
+        br"-IC:\Users\Alice\w\inc".as_slice(),
+        b"-IC:/Users/Alice/w/inc",
+        b"-I/C:/Users/Alice/w/inc",
+        &wide,
+    ] {
+        assert!(first.tied(leak), "Places::tied missed Windows leak: {:?}", String::from_utf8_lossy(leak));
+    }
+
+    // `of_host` (used by `serve::packs::home_places`) converts host paths into daemon+host roots.
+    let home = Places::of_host(
+        None,
+        Some(Path::new(r"C:\Users\Alice\.blaze\build")),
+        Some(Path::new(r"C:\Users\Alice\AppData\Local\blaze\std")),
+        None,
+        None,
+        Some(Path::new(r"C:\Users\Alice\.blaze\sources")),
+    );
+    assert!(home.tied(br"C:\Users\Alice\.blaze\sources\registry\foo"));
+    assert!(home.tied(b"/C:/Users/Alice/.blaze/sources/registry/foo"));
+    let wide_src: Vec<u8> =
+        r"C:\Users\Alice\.blaze\sources".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    assert!(home.tied(&wide_src));
 }

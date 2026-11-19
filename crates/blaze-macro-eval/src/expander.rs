@@ -1239,9 +1239,17 @@ impl Evaluated {
         tracked: &'a mut Vec<String>,
     ) -> impl Iterator<Item = (Seen, &'a str)> {
         tracked.clear();
+        let base = blaze_core::platform::path::DaemonPath::parse(dir);
         tracked.extend(ran.tracked.iter().map(|path| {
             // alloc: once per tracked path, as an expansion is kept
-            std::path::Path::new(dir).join(path).to_string_lossy().into_owned()
+            let path = crate::os::host::guest_path(path);
+            match (base, blaze_core::platform::path::DaemonPath::parse(&path)) {
+                (_, Some(abs)) => abs.as_str().to_owned(),
+                (Some(base), None) => base.join(&path).into_string(),
+                (None, None) => {
+                    std::path::Path::new(dir).join(&*path).to_string_lossy().into_owned()
+                }
+            }
         }));
         // alloc: once per included file, as an expansion is kept
         tracked.extend(included.iter().map(|path| path.to_string_lossy().into_owned()));

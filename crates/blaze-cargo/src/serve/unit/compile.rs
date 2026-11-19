@@ -350,7 +350,7 @@ pub(crate) mod header {
         for _ in 0..natives {
             let hash: [u8; 32] = *read.array().ok()?;
             let path = read.str_u32().ok()?;
-            if file(&blaze_core::platform::path::host(path))? != hash {
+            if file(std::path::Path::new(path))? != hash {
                 return None;
             }
         }
@@ -1496,7 +1496,12 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
                 |env, shape| job.input.macros.keeps().reads_now(env, shape),
                 // Said for `blaze why`, of a record already missed: a look no output rests on,
                 // kept by no build.
-                |path| base_db::IncludedFile::content_now(std::path::Path::new(path), &base_db::Looks::none()),
+                |path| {
+                    base_db::IncludedFile::content_now(
+                        &blaze_core::platform::path::host(path),
+                        &base_db::Looks::none(),
+                    )
+                },
                 |slot| read.bytes(slot),
             );
             match slots {
@@ -2347,7 +2352,8 @@ fn found<'f>(
     let mut on_disk = machine_file(&mut disk);
     let mut file = |path: &std::path::Path| {
         let real = places.real(path.as_os_str().as_encoded_bytes()).ok()?;
-        on_disk(std::path::Path::new(std::str::from_utf8(&real).ok()?))
+        let real = std::str::from_utf8(&real).ok()?;
+        on_disk(&blaze_core::platform::path::host_if_daemon(std::path::Path::new(real)))
     };
     let has = |key: &Key| store.has(guard, key) || crate::serve::packs::missed(key);
     let body = header::check(&entry, has, &mut file);

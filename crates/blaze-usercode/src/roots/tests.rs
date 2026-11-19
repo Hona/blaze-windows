@@ -1,8 +1,10 @@
+#[cfg(not(windows))]
+mod host_tests {
 use std::collections::BTreeMap;
 
 use blaze_cas::Key;
 
-use super::*;
+use super::super::*;
 use crate::{
     Given, RunKey, RunKind,
     index::{self, Found, Shape},
@@ -596,7 +598,6 @@ fn opened(sim: &mut blaze_core::sim::Sim) -> blaze_cas::Store {
         tags: 1 << 48,
         load_tags: (1 << 48) + (1 << 32),
         loader: blaze_cas::Loader::Pumped,
-        sharing: blaze_core::Sharing::Blocks,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
@@ -858,7 +859,7 @@ fn the_written_file_scan_finds_every_spelling_embedded_does() {
         }],
     };
     let wide: Vec<u8> = "/opt/tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let relative = super::relative("/h/ws/p", "/ta/target");
+    let relative = super::super::relative("/h/ws/p", "/ta/target");
     for bytes in [
         b"-B//OPT\\Tools/bin".to_vec(),
         wide,
@@ -1037,4 +1038,186 @@ fn a_kept_link_into_the_package_is_the_other_checkouts_package_where_it_is_reuse
     let (stored, left) = unrooted.view().stored(&wrote("/h/ws/p/vendor/gmp")).unwrap();
     assert_eq!(stored.files[0].link.as_deref(), Some("/h/ws/p/vendor/gmp"));
     assert!(left.contains(Role::Target), "{left:?}");
+}
+}
+
+mod daemon_roots_tests {
+    use super::super::{Role, Roots, port::Dirs, relative};
+    use std::path::Path;
+
+    #[test]
+    fn daemon_roots_port_and_unport_on_every_platform() {
+        let first = Dirs::new([
+            (Role::Workspace, Some("/home/a/w")),
+            (Role::Target, Some("/home/a/.blaze/build/0123")),
+            (Role::Launcher, Some("/home/a/.blaze/bin/blaze")),
+        ]);
+        let second = Dirs::new([
+            (Role::Workspace, Some("/Users/someone/src/w")),
+            (Role::Target, Some("/Users/someone/Library/blaze/build/0123")),
+            (Role::Launcher, Some("/Users/someone/Library/blaze/bin/blaze")),
+        ]);
+        let a = first.text(b"path+file:///home/a/w/p#0.1.0");
+        let b = second.text(b"path+file:///Users/someone/src/w/p#0.1.0");
+        assert_eq!(a, b);
+        assert_eq!(&*second.real(&a).unwrap(), b"path+file:///Users/someone/src/w/p#0.1.0");
+        assert_eq!(&*first.real(b"\0l").unwrap(), b"/home/a/.blaze/bin/blaze");
+
+        let roots = Roots::new([(Role::Package, "/w/pkg")]);
+        assert_eq!(&*roots.path(Path::new("/w/pkg/data/schema.json")), Path::new("\0p/data/schema.json"));
+        assert_eq!(
+            &*roots.real_path(Path::new("\0p/data/schema.json")).unwrap(),
+            Path::new("/w/pkg/data/schema.json")
+        );
+    }
+
+    #[test]
+    fn volume_roots_and_invalid_names_are_rejected_as_daemon_roots() {
+        let dirs = Dirs::new([
+            (Role::Workspace, Some("/")),
+            (Role::Target, Some("relative/dir")),
+            (Role::Tools, Some("")),
+            (Role::Launcher, Some(r"C:\raw\host\path")),
+        ]);
+        assert!(dirs.view().is_empty(), "none of these are valid non-root daemon names");
+        assert_eq!(relative("/C:/a/ws", "/D:/cache/target"), "");
+        assert_eq!(relative("/C:/a/ws", "/C:/cache/target"), "../../cache/target");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_namespace_root_map_stays_empty_for_utf16_build_scripts() {
+        use super::super::RootMap;
+        use blaze_vfs::outside::Looks;
+        let map = RootMap::default()
+            .with(Role::Workspace, Path::new(r"C:\Users\a\w"), &Looks::none())
+            .with(Role::Target, Path::new(r"C:\Users\a\w\target"), &Looks::none());
+        assert!(map.view().is_empty(), "native build-script Host RootMap stays empty on Windows");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_roots_port_both_daemon_and_host_spellings_and_detect_all_leaks() {
+        use super::super::Scan;
+        use base_db::Port as _;
+        let first = Dirs::new([
+            (Role::Workspace, Some("/C:/Users/Alice/my proj")),
+            (Role::Target, Some("/C:/Users/Alice/.blaze/build/0123")),
+            (Role::Launcher, Some("/C:/Users/Alice/.blaze/bin/blaze.exe")),
+            (Role::Sources, Some("/C:/Users/Alice/.blaze/sources")),
+        ]);
+        let second = Dirs::new([
+            (Role::Workspace, Some("/D:/work/bob/repo")),
+            (Role::Target, Some("/D:/work/bob/blaze/build/0123")),
+            (Role::Launcher, Some("/D:/work/bob/blaze/bin/blaze.exe")),
+            (Role::Sources, Some("/D:/work/bob/blaze/sources")),
+        ]);
+
+        // Daemon names and host paths both port injectively and agree across checkouts.
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                b"path+file:///C:/Users/Alice/my proj/a#0.1.0",
+                b"path+file:///D:/work/bob/repo/a#0.1.0",
+            ),
+            (
+                br"CARGO_MANIFEST_DIR=C:\Users\Alice\my proj\a",
+                br"CARGO_MANIFEST_DIR=D:\work\bob\repo\a",
+            ),
+            (
+                br"C:\Users\Alice\.blaze\sources\registry\lib/src/assets.rs",
+                br"D:\work\bob\blaze\sources\registry\lib/src/assets.rs",
+            ),
+            (
+                br"PATH=C:\Users\Alice\.blaze\build\0123\debug\deps;C:\Users\Alice\.blaze\bin\blaze.exe",
+                br"PATH=D:\work\bob\blaze\build\0123\debug\deps;D:\work\bob\blaze\bin\blaze.exe",
+            ),
+        ];
+        for &(a, b) in cases {
+            let ported_a = first.text(a);
+            let ported_b = second.text(b);
+            assert_eq!(ported_a, ported_b, "ported forms must agree for {}", String::from_utf8_lossy(a));
+            assert!(first.held(&ported_a).is_none(), "ported bytes must not hold a root");
+            assert_eq!(&*first.real(&ported_a).unwrap(), a, "round-trip in first checkout");
+            assert_eq!(&*second.real(&ported_a).unwrap(), b, "unport into second checkout");
+        }
+
+        // Literal bytes containing `\0h` or `\0OUT` round-trip without colliding with placeholders.
+        for literal in [b"a\0hw\0b".as_slice(), b"\0OUT 0\0", b"\0INCLUDED/a"] {
+            let ported = first.text(literal);
+            assert_eq!(&*first.real(&ported).unwrap(), literal);
+        }
+
+        // Bare drive and UNC share roots are rejected.
+        let bare = Dirs::new([
+            (Role::Workspace, Some("/C:/")),
+            (Role::Target, Some("/UNC/srv/share")),
+        ]);
+        assert!(bare.view().is_empty());
+
+        // Leak detection catches daemon, native, forward-slash, case, verbatim, URL-escaped and UTF-16 spellings.
+        let view = first.view();
+        let scan = Scan::of(&view).unwrap();
+        let utf16_le = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let utf16_be = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        let leaks: Vec<Vec<u8>> = vec![
+            b"-I/C:/Users/Alice/my proj/inc".to_vec(),
+            br"-IC:\Users\Alice\my proj\inc".to_vec(),
+            b"-IC:/Users/Alice/my proj/inc".to_vec(),
+            br"\\?\C:\Users\Alice\my proj\src".to_vec(),
+            br"c:\users\alice\my proj\src".to_vec(),
+            b"file:///C:/Users/Alice/my%20proj/src".to_vec(),
+            utf16_le(r"C:\Users\Alice\my proj"),
+            utf16_be(r"C:\Users\Alice\my proj"),
+            utf16_le("C:/Users/Alice/my proj"),
+            utf16_le("/C:/Users/Alice/my proj"),
+        ];
+        for bytes in &leaks {
+            assert!(
+                view.embedded(bytes).contains(Role::Workspace),
+                "embedded missed leak: {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert!(
+                scan.first(bytes).is_some_and(|roles| roles.contains(Role::Workspace)),
+                "Scan missed leak: {:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert_eq!(first.held(bytes), Some("workspace"));
+        }
+        assert!(view.embedded(b"plain bytes without any root").is_empty());
+        assert_eq!(scan.first(b"plain bytes without any root"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_root_map_resolves_real_dir_without_unaskable_and_maps_sources() {
+        use super::super::RootMap;
+        use blaze_core::platform::path::DaemonPath;
+        use blaze_vfs::outside::Looks;
+        use std::path::PathBuf;
+        let dir = blaze_core::temp::TempDir::for_test("blaze-roots-win-");
+        let pkg = dir.join("ws/pkg");
+        let sources = dir.join("sources");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(sources.join("registry/src")).unwrap();
+        let canonical_pkg = std::fs::canonicalize(&pkg).unwrap();
+        let pkg_daemon = blaze_core::platform::path::daemon(&canonical_pkg).unwrap();
+        let sources_daemon = blaze_core::platform::path::daemon(&sources).unwrap();
+
+        let looks = Looks::new();
+        let map = RootMap::daemon()
+            .with_daemon(Role::Package, DaemonPath::parse(&pkg_daemon).unwrap(), &looks)
+            .with_sources(&sources);
+        assert!(
+            looks.all().is_empty(),
+            "a canonical Windows directory has no symlinks and must not push UNASKABLE looks: {:?}",
+            looks.all()
+        );
+        let view = map.view();
+        assert!(!view.relinked());
+        let reg_file = PathBuf::from(format!("{sources_daemon}/registry/src/foo/lib.rs"));
+        assert!(!view.outside(&reg_file), "registry file under daemon-converted sources must be machine-wide");
+        let stray = PathBuf::from("/C:/other/stray.txt");
+        assert!(view.outside(&stray), "stray path outside roots and sources must be outside");
+    }
 }

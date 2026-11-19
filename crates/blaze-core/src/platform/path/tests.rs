@@ -64,3 +64,61 @@ fn a_daemon_name_is_no_absolute_path_to_the_system() {
 fn a_relative_name_stays_relative() {
     assert!(!host("a/b").is_absolute());
 }
+
+#[test]
+fn daemon_path_lexical_operations_never_use_backslashes() {
+    let manifest = DaemonPath::parse("/C:/Users/a/ws/pkg/Cargo.toml").unwrap();
+    let dir = manifest.parent().unwrap();
+    assert_eq!(dir.as_str(), "/C:/Users/a/ws/pkg");
+    let lean = dir.join("lean");
+    assert_eq!(lean.as_str(), "/C:/Users/a/ws/pkg/lean");
+    let root = DaemonPath::parse("/C:/Users/a/ws").unwrap();
+    assert_eq!(lean.as_daemon().strip_prefix(root), Some("pkg/lean"));
+    assert!(lean.as_daemon().starts_with(root));
+    assert!(!DaemonPath::parse("/C:/Users/a/ws2").unwrap().starts_with(root));
+    assert_eq!(DaemonPath::parse("/").unwrap().parent(), None);
+    assert!(DaemonPath::parse(r"C:\Users\a").is_none());
+    assert!(DaemonPath::parse("/a\0b").is_none());
+    assert!(DaemonPath::parse("relative/path").is_none());
+}
+
+#[test]
+fn windows_daemon_names_distinguish_volumes_and_non_host_paths() {
+    assert_eq!(windows_host_of("/C:/Users/a/ws").as_deref(), Some(r"C:\Users\a\ws"));
+    assert_eq!(windows_host_of("/C:").as_deref(), Some(r"C:\"));
+    assert_eq!(windows_host_of("/UNC/srv/share/a").as_deref(), Some(r"\\srv\share\a"));
+    assert_eq!(windows_host_of("/UNC/srv/share").as_deref(), Some(r"\\srv\share"));
+    assert_eq!(windows_host_of("/C:rel"), None);
+    assert_eq!(windows_host_of("/UNC/srv"), None);
+    assert_eq!(windows_host_of("/home/a/ws"), None);
+    assert!(is_windows_volume_root("/C:"));
+    assert!(is_windows_volume_root("/UNC/srv/share"));
+    assert!(!is_windows_volume_root("/C:/a"));
+    assert!(!is_windows_volume_root("/UNC/srv/share/a"));
+}
+
+#[cfg(windows)]
+#[test]
+fn typed_daemon_and_host_paths_convert_at_the_one_boundary() {
+    let win = DaemonPath::parse("/C:/Users/a/ws").unwrap();
+    assert!(!win.is_volume_root());
+    assert_eq!(win.host_spelling().as_deref(), Some(r"C:\Users\a\ws"));
+    assert_eq!(win.try_host().unwrap().as_path(), Path::new(r"C:\Users\a\ws"));
+    assert_eq!(win.to_host().to_daemon().unwrap().as_str(), "/C:/Users/a/ws");
+
+    assert!(DaemonPath::parse("/C:/").unwrap().is_volume_root());
+    assert_eq!(DaemonPath::parse("/C:/").unwrap().host_spelling(), None);
+    assert!(DaemonPath::parse("/UNC/srv/share").unwrap().is_volume_root());
+    assert_eq!(DaemonPath::parse("/UNC/srv/share").unwrap().host_spelling(), None);
+
+    let synthetic = DaemonPath::parse("/home/a/w").unwrap();
+    assert!(!synthetic.is_volume_root());
+    assert_eq!(synthetic.try_host(), None);
+    assert_eq!(synthetic.host_spelling(), None);
+    assert_eq!(&*host_if_daemon(Path::new("/home/a/w")), Path::new("/home/a/w"));
+    assert_eq!(&*host_if_daemon(Path::new("/C:/Users/a/ws")), Path::new(r"C:\Users\a\ws"));
+    assert_eq!(&*host_if_daemon(Path::new(r"C:\Users\a\ws")), Path::new(r"C:\Users\a\ws"));
+
+    assert!(canonical_matches(Path::new(r"C:\Users\a\ws"), Path::new(r"\\?\C:\Users\a\ws")));
+    assert!(!canonical_matches(Path::new(r"C:\Users\a\link"), Path::new(r"\\?\C:\Users\a\real")));
+}

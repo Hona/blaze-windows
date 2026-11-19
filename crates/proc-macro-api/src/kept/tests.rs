@@ -128,7 +128,6 @@ fn a_changed_variable_name_or_directory_gives_another_key() {
 
 /// The calling crate's variables and directory are written against its package and
 /// `OUT_DIR`: the same call on the same crate in another checkout has the same key.
-#[cfg(not(windows))] // Windows has no roots (`blaze_usercode::roots`).
 #[test]
 fn the_same_call_in_another_checkout_gives_the_same_key() {
     let at = |home: &str| {
@@ -157,7 +156,6 @@ fn the_same_call_in_another_checkout_gives_the_same_key() {
 
 /// What an expansion read, written against its crate's roots, is the same in two checkouts
 /// while the files are, and not once one under the root changed.
-#[cfg(not(windows))] // Windows has no roots (`blaze_usercode::roots`).
 #[test]
 fn a_file_read_under_the_crates_package_is_keyed_by_its_place_in_it() {
     let run = RunKey { code: ContentId::of(LIBRARY, b"lib"), given: Inputs::new().key() };
