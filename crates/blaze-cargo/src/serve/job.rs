@@ -6174,6 +6174,16 @@ impl<S: Steps> Jobs<S> {
                 for front in self.roots.fronts.iter_mut().flatten() {
                     given.add(steps.relieve_kept(front, rung));
                 }
+                // A running build's front end is shared with its tasks: asked as a write of
+                // its own, applied once its readers end ([`Writer::ask_release`]).
+                for &id in &self.order {
+                    if let Some(Job { stage: Stage::Units(build), .. }) = self.jobs.get_mut(key_of(id))
+                        && let Some(writer) = build.writer.here_mut()
+                        && writer.ask_release(rung)
+                    {
+                        given.builds += 1;
+                    }
+                }
             }
         }
         given

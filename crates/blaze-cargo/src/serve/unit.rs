@@ -811,6 +811,7 @@ impl Steps for Real {
                     broken: false,
                     retractions,
                     end,
+                    release_asked: None,
                 };
                 Ok((writer, puts, misses))
             },
@@ -1343,6 +1344,47 @@ pub struct UnitWriter {
     retractions: u64,
     /// What the build's end lets go of its front end, told as its units compile ([`BuildEnd`]).
     end: BuildEnd,
+    /// A give-back past the memory ceiling asked of this running build ([`Writer::ask_release`]):
+    /// a write of its own, applied once its readers end.
+    release_asked: Option<crate::serve::relief::Rung>,
+}
+
+/// The give-back past the memory ceiling ([`crate::serve::relief`]) of a running build's front
+/// end, with it exclusive: for [`Rung::Compiled`](crate::serve::relief::Rung), every MIR and
+/// constant value and the inference of the dependency crates finished; for
+/// [`Rung::Values`](crate::serve::relief::Rung) every evictable value too (inference of every
+/// body, every weighed value). Each keeps its memo: what a unit still to compile reads is made
+/// again. Bytes of query storage let go.
+fn release_now(lowered: &mut Lowered, end: &mut BuildEnd, rung: crate::serve::relief::Rung) -> u64 {
+    use crate::serve::relief::Rung;
+    use blaze_query::db::Database as _;
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end release past the memory ceiling, of a running build",
+        rung = rung.name(),
+        freed = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let before = lowered.served_db().storage().held_bytes();
+    let crates = {
+        let db: &base_db::Db = &*lowered.served_db();
+        end.newly_finished(db)
+    };
+    let db = lowered.served_db();
+    match rung {
+        Rung::Purge | Rung::Images => {}
+        Rung::Compiled => {
+            hir::evict::drop_crates_after_store(db, &crates, true);
+        }
+        Rung::Values => {
+            hir::evict::drop_crates_after_store(db, &crates, true);
+            hir_ty::evict::drop_all(db);
+            db.storage_mut().sweep_values(&[0; blaze_mem::Tag::COUNT]);
+        }
+    }
+    let freed = before.saturating_sub(lowered.served_db().storage().held_bytes());
+    span.record("freed", freed);
+    freed
 }
 
 /// The most crates a build may make and still be an edit's ([`BuildEnd::release`]): the crate
@@ -1607,7 +1649,20 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty()
+        !self.runs.is_empty()
+            || !self.macros.is_empty()
+            || !self.msls.is_empty()
+            || self.release_asked.is_some()
+    }
+
+    fn ask_release(&mut self, rung: crate::serve::relief::Rung) -> bool {
+        // The dearer of two asks stands: values include compiled code.
+        let dearer = match self.release_asked {
+            Some(asked) if (asked as u8) >= (rung as u8) => asked,
+            _ => rung,
+        };
+        self.release_asked = Some(dearer);
+        true
     }
 
     fn idle(&self) -> bool {
@@ -1648,6 +1703,13 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
+        if let Some(rung) = self.release_asked.take() {
+            let freed = release_now(lowered, &mut self.end, rung);
+            crate::serve::relief::CHANNEL.note_running(rung, freed);
+            if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
+                return Ok(true);
+            }
+        }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
         let touched: Vec<u32> = self

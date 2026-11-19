@@ -55,6 +55,10 @@ impl Rung {
 /// How long the guard waits for the loop to answer a rung before it measures anyway.
 pub(crate) const ANSWER_WITHIN: Duration = Duration::from_secs(5);
 
+/// How long the guard waits, past every rung, for running builds asked to give back at their
+/// next write (their readers end first) before it ends the daemon.
+pub(crate) const RUNNING_WITHIN: Duration = Duration::from_secs(60);
+
 /// What a look at the footprint against the ceiling asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Step {
@@ -109,6 +113,7 @@ impl Given {
         self.values += other.values;
         self.walked += other.walked;
         self.query_bytes += other.query_bytes;
+        self.builds += other.builds;
     }
 }
 
@@ -127,6 +132,8 @@ pub(crate) struct Given {
     pub(crate) walked: usize,
     /// What the kept front ends' query storage held less after the give.
     pub(crate) query_bytes: u64,
+    /// Running builds asked to give back at their next write.
+    pub(crate) builds: usize,
 }
 
 /// The guard thread's question to the loop and the loop's answer: one rung at a time.
@@ -139,6 +146,8 @@ pub(crate) struct Channel {
     /// What the loop's answers gave back since the last build took them, for that build's client.
     #[expect(clippy::disallowed_types, reason = "a few notes a ceiling event, taken once a build")]
     notes: blaze_core::lock::Lock<Vec<String>>,
+    /// Running builds asked to give back and not yet done ([`Channel::asked_running`]).
+    running: std::sync::atomic::AtomicUsize,
 }
 
 /// The daemon's one channel.
@@ -152,6 +161,7 @@ impl Channel {
             ask_seq: AtomicU64::new(0),
             done_seq: AtomicU64::new(0),
             notes: blaze_core::lock::Lock::new("serve.relief.notes", Vec::new()),
+            running: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -197,6 +207,30 @@ impl Channel {
         ));
     }
 
+    /// Running builds were asked to give back at their next write (`Given::builds`).
+    pub(crate) fn asked_running(&self, builds: usize) {
+        self.running.fetch_add(builds, Ordering::AcqRel);
+    }
+
+    /// Running builds asked and not yet given back: what the guard waits for, at most
+    /// [`RUNNING_WITHIN`], before it ends the daemon.
+    pub(crate) fn running_pending(&self) -> usize {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// A running build gave back `rung` of its front end at its write: `freed` bytes of query
+    /// storage. Said to the client of the next build that ends.
+    pub(crate) fn note_running(&self, rung: Rung, freed: u64) {
+        let _ = self.running.fetch_update(Ordering::AcqRel, Ordering::Acquire, |it| it.checked_sub(1));
+        let mib = freed as f64 / f64::from(1u32 << 20);
+        // alloc: once per running build's give past the ceiling
+        self.notes.lock().push(format!(
+            "memory: past its ceiling, a running build let go of {} ({mib:.0} MiB of query storage); it is made \
+             again from its memos when read",
+            rung.name()
+        ));
+    }
+
     /// What the loop gave back since the last take, for a build's client to be told.
     pub(crate) fn take_notes(&self) -> Vec<String> {
         std::mem::take(&mut *self.notes.lock())
@@ -213,6 +247,7 @@ fn note(rung: Rung, given: Given) -> Option<String> {
             given.images,
             mib(given.image_bytes)
         )),
+        Rung::Compiled | Rung::Values if given.fronts == 0 && given.builds > 0 => None,
         Rung::Compiled | Rung::Values if given.fronts > 0 => Some(format!(
             "memory: past its ceiling, blaze let go of {} of {} kept front ends ({} values, {} walked functions, \
              {:.0} MiB of query storage); they are made again from their memos when read",
@@ -318,5 +353,22 @@ mod tests {
         channel.answer(seq, rung, Given::default());
         assert!(channel.answered(ticket));
         assert!(channel.take_notes().is_empty(), "a purge makes nothing again: nothing to tell");
+    }
+
+    /// A running build asked to give back is pending until its write gives back, and is then
+    /// told to the next client; a give with no ask never goes below none.
+    #[test]
+    fn a_running_build_asked_is_pending_until_its_write_gives_back() {
+        let channel = Channel::new();
+        channel.asked_running(2);
+        assert_eq!(channel.running_pending(), 2);
+        channel.note_running(Rung::Compiled, 64 << 20);
+        assert_eq!(channel.running_pending(), 1);
+        channel.note_running(Rung::Compiled, 0);
+        channel.note_running(Rung::Compiled, 0);
+        assert_eq!(channel.running_pending(), 0, "never below none");
+        let notes = channel.take_notes();
+        assert_eq!(notes.len(), 3);
+        assert!(notes[0].contains("64 MiB"), "{}", notes[0]);
     }
 }

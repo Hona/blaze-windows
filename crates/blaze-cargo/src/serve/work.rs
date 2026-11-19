@@ -1159,6 +1159,14 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// Whether a write was asked for and is not applied yet: the loop posts no reading task
     /// of the job until [`Writer::apply`] applied it.
     fn waiting(&self) -> bool;
+    /// Past the memory ceiling ([`super::relief`]): asks this running build to give back what
+    /// `rung` names of its front end, as a write of its own once its readers end (new reading
+    /// tasks are held until then, as for any write). Whether it was asked: a writer with no
+    /// front end gives nothing.
+    fn ask_release(&mut self, rung: super::relief::Rung) -> bool {
+        let _ = rung;
+        false
+    }
     /// Whether no reader of the front end is alive, every task's dropped: one load of a
     /// reference count. The loop posts the write [`Writer::waiting`] asks for, as a task that
     /// holds the writer, only then (`job::Does::Write`), so [`Writer::apply`] runs off the loop
