@@ -97,6 +97,33 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
     }
 }
 
+/// The front-end tags whose weighed (`lru`) query values are kept under a byte cap on Windows.
+const VALUE_TAGS: [blaze_mem::Tag; 4] =
+    [blaze_mem::Tag::Parse, blaze_mem::Tag::Nameres, blaze_mem::Tag::Expand, blaze_mem::Tag::Infer];
+
+/// Each [`VALUE_TAGS`] tag's cap on its weighed values for a machine of `physical` bytes: a
+/// thirty-second of it, at least 256 MiB. On a 32 GB machine 1 GiB a tag.
+pub(super) fn value_budget(physical: u64) -> u64 {
+    (physical / 32).max(256 << 20)
+}
+
+/// Caps the weighed query values of the front-end tags ([`value_budget`]): with no cap (none
+/// set since admission's budgets went, 2026-11-13) a storage keeps every parse tree, body,
+/// source map and expansion of every crate a build touched, and its values grow with the
+/// workspace; under one, each view boundary lets go of the least recently verified past it,
+/// made again from their memos when read. Windows only, where every committed byte is charged:
+/// the other systems keep what they did. A cap set already (a test's) is kept.
+pub(super) fn set_value_budgets() -> anyhow::Result<()> {
+    let physical = blaze_mem::address_capacity()?.physical;
+    let each = value_budget(physical);
+    for tag in VALUE_TAGS {
+        if blaze_mem::tag::budget(tag) == u64::MAX {
+            blaze_mem::tag::set_budget(tag, each);
+        }
+    }
+    Ok(())
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = self.quit.send(());
@@ -107,6 +134,12 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machines_value_budget_is_a_thirty_second_of_it_with_a_floor() {
+        assert_eq!(value_budget(32 << 30), 1 << 30, "a 32 GiB machine caps each tag at 1 GiB");
+        assert_eq!(value_budget(4 << 30), 256 << 20, "the floor holds on a small machine");
+    }
 
     /// The "still over" exit: a guard armed below what the process already commits gives back
     /// every rung (no loop answers here, so each waits its bound), measures it still over, and
