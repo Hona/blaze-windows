@@ -57,6 +57,25 @@ pub fn volume(path: &Path) -> io::Result<Volume> {
     Ok(Volume { system, sharing })
 }
 
+/// What a Windows volume's persistent state says of it ([`dev_drive`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DevDrive {
+    /// It is a Dev Drive.
+    pub dev: bool,
+    /// It is a Dev Drive the system trusts: Defender scans it in performance mode.
+    pub trusted: bool,
+}
+
+/// Whether the volume `path` is on (judged as [`volume`] judges it) is a Dev Drive, and a
+/// trusted one. An error names the path.
+#[cfg(windows)]
+pub fn dev_drive(path: &Path) -> io::Result<DevDrive> {
+    let at = existing(path)?;
+    let (dev, trusted) = crate::iocp::files::dev_drive(at).map_err(|error| named(at, error))?;
+    Ok(DevDrive { dev, trusted })
+}
+
 fn named(path: &Path, error: io::Error) -> io::Error {
     // alloc: an error path.
     io::Error::new(error.kind(), format!("the volume of {}: {error}", path.display()))

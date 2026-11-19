@@ -26,7 +26,9 @@ use windows_sys::Win32::{
     System::{
         IO::DeviceIoControl,
         Ioctl::{
-            DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            DUPLICATE_EXTENTS_DATA, FILE_FS_PERSISTENT_VOLUME_INFORMATION, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+            FSCTL_QUERY_PERSISTENT_VOLUME_STATE, PERSISTENT_VOLUME_STATE_DEV_VOLUME,
+            PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME,
             FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
             FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER, FSCTL_SET_SPARSE,
         },
@@ -623,6 +625,32 @@ pub(crate) fn volume(dir: &Path) -> io::Result<(String, bool)> {
         )
     };
     file_system(&sys::owned(handle)?)
+}
+
+/// Whether `dir` (a directory or file that exists) is on a Dev Drive, and whether that Dev
+/// Drive is trusted (`FSCTL_QUERY_PERSISTENT_VOLUME_STATE`): a trusted one has Defender scan in
+/// performance mode, after the open, not before it.
+pub(crate) fn dev_drive(dir: &Path) -> io::Result<(bool, bool)> {
+    let wide = sys::path(dir)?;
+    // SAFETY: a NUL-terminated path; no security attributes or template.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    let handle = sys::owned(handle)?;
+    let mask = PERSISTENT_VOLUME_STATE_DEV_VOLUME | PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME;
+    let asked = FILE_FS_PERSISTENT_VOLUME_INFORMATION { FlagMask: mask, Version: 1, ..Default::default() };
+    let mut said = FILE_FS_PERSISTENT_VOLUME_INFORMATION::default();
+    control(&handle, FSCTL_QUERY_PERSISTENT_VOLUME_STATE, Some(&asked), Some(&mut said))?;
+    let dev = said.VolumeFlags & PERSISTENT_VOLUME_STATE_DEV_VOLUME != 0;
+    Ok((dev, dev && said.VolumeFlags & PERSISTENT_VOLUME_STATE_TRUSTED_VOLUME != 0))
 }
 
 /// The name of the file system `handle` is on, and whether it shares blocks between files.

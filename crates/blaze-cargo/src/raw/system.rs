@@ -78,6 +78,106 @@ pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
     (done == 0).then_some(free)
 }
 
+/// The bytes free to this user on the volume `path` is on (`GetDiskFreeSpaceExW`'s, which
+/// counts this user's quota), None when it can't be asked.
+#[cfg(windows)]
+pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect(); // alloc: once per doctor
+    let mut free = 0u64;
+    // SAFETY: `wide` is a NUL-terminated path live for the call, which only reads it; `free`
+    // is a live, exclusive `u64` it writes; the other two counts are not asked for (null).
+    let done = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (done != 0).then_some(free)
+}
+
+/// What the registry says of the paths Microsoft Defender does not scan.
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum Exclusions {
+    /// No key of Defender's is there: it is not installed, or another antivirus replaced it.
+    NoDefender,
+    /// The excluded paths, as written (they may hold `%VARIABLE%`s), of the user's settings
+    /// and of policy.
+    Read(Vec<String>),
+    /// The keys are there and this user may not read them (only an administrator may).
+    Unreadable,
+}
+
+/// The paths Defender excludes from its scans, from the value names of
+/// `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths` and of its policy twin.
+#[cfg(windows)]
+pub fn defender_exclusions() -> Exclusions {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+        System::Registry::{HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, RegCloseKey, RegEnumValueW, RegOpenKeyExW},
+    };
+    const KEYS: [&str; 2] = [
+        r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths",
+        r"SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Paths",
+    ];
+    let mut paths = Vec::new(); // alloc: once per doctor
+    let (mut found, mut denied) = (false, false);
+    for key in KEYS {
+        let wide: Vec<u16> = key.encode_utf16().chain([0]).collect(); // alloc: once per key
+        let mut handle: HKEY = std::ptr::null_mut();
+        // SAFETY: a predefined root key, a NUL-terminated subkey live for the call, and a live
+        // `HKEY` it writes on success.
+        let opened = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide.as_ptr(), 0, KEY_READ | KEY_WOW64_64KEY, &raw mut handle) };
+        match opened {
+            ERROR_SUCCESS => found = true,
+            ERROR_FILE_NOT_FOUND => continue,
+            ERROR_ACCESS_DENIED => {
+                found = true;
+                denied = true;
+                continue;
+            }
+            _ => {
+                denied = true;
+                continue;
+            }
+        }
+        let mut name = [0u16; 1024];
+        for index in 0..10_000u32 {
+            let mut len = name.len() as u32;
+            // SAFETY: an open key; `name` is writable for `len` UTF-16 units, the count it
+            // writes back; type and data are not asked for (null).
+            let got = unsafe {
+                RegEnumValueW(
+                    handle,
+                    index,
+                    name.as_mut_ptr(),
+                    &raw mut len,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if got != ERROR_SUCCESS {
+                // ERROR_NO_MORE_ITEMS, or one too long to be a path: either ends the list.
+                break;
+            }
+            let len = (len as usize).min(name.len());
+            paths.push(String::from_utf16_lossy(&name[..len])); // alloc: a path a value
+        }
+        // SAFETY: the key opened above, closed once.
+        unsafe { RegCloseKey(handle) };
+    }
+    match (found, denied) {
+        (false, false) => Exclusions::NoDefender,
+        (_, true) if paths.is_empty() => Exclusions::Unreadable,
+        _ => Exclusions::Read(paths),
+    }
+}
+
 /// The per-user cache directory of macOS, as the system names it.
 #[cfg(target_os = "macos")]
 pub fn user_cache_dir() -> Option<std::ffi::OsString> {

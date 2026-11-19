@@ -43,6 +43,9 @@ use serde::Serialize;
 
 use super::say;
 
+#[cfg_attr(not(windows), allow(dead_code, reason = "the checks are Windows'; their tests run everywhere"))]
+mod machine;
+
 const USAGE: &str = "blaze doctor [--json]";
 
 /// The version of [`Report`]'s JSON: bumped when a field changes meaning or goes away.
@@ -66,7 +69,7 @@ pub struct Report {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Check {
     /// The section it is in: `version`, `agents`, `daemon`, `state`, `toolchain`, `project`,
-    /// `tools`.
+    /// `machine` (Windows), `tools`.
     pub section: &'static str,
     /// What was checked: `daemon image`, `profile history`, `pin`, ...
     pub what: &'static str,
@@ -364,9 +367,9 @@ pub fn examine_all(state: &Path, now: u64) -> Report {
     checks.extend(state_checks);
     let mut budget = WALK_BUDGET;
     let used = size_of(state, &mut budget);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let free = crate::raw::system::free_bytes(state);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let free = None;
     checks.push(disk_check(state, used, free));
     if let Some(root) = state.parent() {
@@ -414,6 +417,12 @@ pub fn examine_all(state: &Path, now: u64) -> Report {
             Ok(meta) => stamps_check(&manifest, stamp_of(&meta)),
             Err(error) => Check::new("project", "file times", &manifest, Verdict::Warn, format!("it cannot be read: {error}")),
         });
+    }
+
+    // machine
+    #[cfg(windows)]
+    if let Some(root) = state.parent() {
+        checks.extend(machine::checks(root, project.as_deref()));
     }
 
     // tools
