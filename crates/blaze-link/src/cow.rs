@@ -592,20 +592,6 @@ impl<T: Chunked> CowVec<T> {
         out
     }
 
-    /// Chunk `chunk` to write in place (up to [`CHUNK`] live elements), copying it first while
-    /// shared. One tree walk for every element in the chunk.
-    pub(crate) fn chunk_mut(&mut self, chunk: usize) -> &mut [T] {
-        let start = chunk * CHUNK;
-        assert!(start < self.len, "chunk {chunk} past column length {}", self.len);
-        let len = (self.len - start).min(CHUNK);
-        &mut self
-            .chunks
-            .entry_mut(chunk)
-            .as_mut()
-            .expect("a chunk below the length")
-            .items_mut()[..len]
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         let len = self.len;
         (0..len.div_ceil(CHUNK)).flat_map(move |chunk| {
@@ -864,37 +850,6 @@ impl<A: Allocator + Copy> IdSet<A> {
         for id in ids {
             self.insert(id);
         }
-    }
-
-    /// Inserts every id in `start..end`, setting bitset words in bulk when the range is fresh.
-    pub(crate) fn insert_range(&mut self, start: u32, end: u32) {
-        if start >= end {
-            return;
-        }
-        let fresh = self.list.is_empty()
-            || (start as usize >= self.listed.words().len() * 64
-                && start as usize >= self.bits.words().len() * 64);
-        if fresh {
-            self.bits.grow(end as usize);
-            self.bits.insert_range(start..end);
-            self.listed.grow(end as usize);
-            self.listed.insert_range(start..end);
-            self.list.extend(start..end);
-            self.len += (end - start) as usize;
-            return;
-        }
-        self.bits.grow(end as usize);
-        self.listed.grow(end as usize);
-        self.list.reserve((end - start) as usize);
-        for id in start..end {
-            self.insert(id);
-        }
-    }
-
-    /// The ids ever listed, in first-insertion order (a member may later have been removed:
-    /// check [`IdSet::contains`]).
-    pub(crate) fn listed_slice(&self) -> &[u32] {
-        &self.list
     }
 }
 
@@ -1696,7 +1651,7 @@ mod tests {
             assert_eq!(a.get(CHUNK * 2 + 17 + at), Some(&want));
         }
         let snap = a.clone();
-        a.chunk_mut(1)[5] = 999;
+        *a.get_mut(CHUNK + 5).unwrap() = 999;
         assert_eq!(a.get(CHUNK + 5), Some(&999));
         assert_eq!(snap.get(CHUNK + 5), Some(&42));
 
@@ -1713,13 +1668,6 @@ mod tests {
             r.chunk += base;
             assert_eq!(list_a.get(r), &want[..]);
         }
-
-        let mut ids = IdSet::default();
-        ids.insert_range(0, 130);
-        ids.insert_range(130, 300);
-        ids.insert_range(250, 350);
-        assert_eq!(ids.len(), 350);
-        assert_eq!(ids.iter().collect::<Vec<_>>(), (0..350u32).collect::<Vec<_>>());
     }
 
     /// Of `Chunked` for the tests alone, so no other test shares its pools.

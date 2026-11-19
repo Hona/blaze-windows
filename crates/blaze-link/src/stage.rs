@@ -200,6 +200,8 @@ pub(crate) struct Stage<'a> {
     pub layout: crate::layout::Pass<'a>,
     /// Whether [`Stage::thunks`] ran in an earlier placement round of this stage.
     pub thunked: bool,
+    /// The first piece [`Stage::make`] left off the referrer lists ([`Stage::defer_refs`]).
+    pub unreferred: Option<PieceId>,
     /// The thunk island an incremental stage gave its new thunks ([`crate::thunk`]).
     pub island: Option<u32>,
     /// A full link's code class as its last layout cut it into segments ([`Stage::islands`]).
@@ -340,7 +342,10 @@ impl<'a> Stage<'a> {
 
     /// Adds a piece with its contents, defining its own symbol at its start.
     pub fn make(&mut self, piece: &NewPiece<'_>, content: Content<'a>) -> PieceId {
-        let id = self.new.add(piece);
+        let id = match self.unreferred {
+            Some(_) => self.new.add_unreferred(piece),
+            None => self.new.add(piece),
+        };
         self.contents.insert(id, content);
         self.fresh.insert(id);
         self.write.insert(id);
@@ -348,8 +353,24 @@ impl<'a> Stage<'a> {
         id
     }
 
+    /// From here until [`Stage::refer_made`], the pieces [`Stage::make`] makes are not yet on
+    /// the referrer lists of what they refer to: a first link's native sections, which are most
+    /// of its pieces, are put on them at once, in parallel. Nothing may read a referrer list,
+    /// or remove a piece, in between.
+    pub fn defer_refs(&mut self) {
+        debug_assert!(self.unreferred.is_none());
+        self.unreferred = Some(self.new.piece_count());
+    }
+
+    /// Puts the pieces made since [`Stage::defer_refs`] on the referrer lists.
+    pub fn refer_made(&mut self) {
+        let first = self.unreferred.take().expect("references deferred");
+        self.new.refer_since(first);
+    }
+
     /// Removes a piece; [`Stage::sweep`] counts what it referred to.
     pub fn unmake(&mut self, id: PieceId) {
+        debug_assert!(self.unreferred.is_none(), "a piece removed while references are deferred");
         if !self.new.remove(id) {
             return;
         }

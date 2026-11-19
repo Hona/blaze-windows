@@ -900,6 +900,15 @@ impl State {
 
     /// Adds a piece, live and not placed, and its references; the caller defines its symbols.
     pub fn add(&mut self, piece: &NewPiece<'_>) -> PieceId {
+        let id = self.add_unreferred(piece);
+        let lists = *self.piece_lists.get(id as usize).expect("just added");
+        self.refer(id, lists.fixups);
+        id
+    }
+
+    /// [`State::add`] without the references: [`State::refer_since`] adds those of every piece
+    /// added from one on, before anything reads a referrer list.
+    pub fn add_unreferred(&mut self, piece: &NewPiece<'_>) -> PieceId {
         let id = self.hot.len() as PieceId;
         let align_log2 = piece.align.max(1).next_power_of_two().trailing_zeros() as u8;
         self.hot.push(Hot {
@@ -922,8 +931,102 @@ impl State {
         self.piece_lists.push(lists);
         self.loader.push(Loader::default());
         self.users.push(0);
-        self.refer(id, lists.fixups);
         id
+    }
+
+    /// Adds every piece from `first` on, made by [`State::add_unreferred`], to the referrer
+    /// lists of what its fixups refer to, once each: the lists [`State::refer`] on each piece in
+    /// id order makes, each in the order its referrers started to. The pairs are gathered by
+    /// fixed runs of pieces and each symbol shard's lists made on its own, so nothing here
+    /// depends on the number of workers; a list that grows is put anew, its old room garbage.
+    pub fn refer_since(&mut self, first: PieceId) {
+        const RUN: usize = 4096;
+        let end = self.hot.len();
+        let first = first as usize;
+        if first >= end {
+            return;
+        }
+        let (fixups, lists) = (&self.fixups, &self.piece_lists);
+        // alloc: once per first link, each run's pairs by symbol shard
+        let runs: Vec<[Vec<(u32, PieceId)>; SHARDS]> =
+            blaze_graph::par::map(0..(end - first).div_ceil(RUN), |run| {
+                let mut out: [Vec<(u32, PieceId)>; SHARDS] = std::array::from_fn(|_| Vec::new());
+                let from = first + run * RUN;
+                for id in from..(from + RUN).min(end) {
+                    let list = lists.get(id).expect("a piece's lists").fixups;
+                    for fixup in fixups.get(list) {
+                        for sym in std::iter::once(fixup.target).chain(fixup.minus) {
+                            let (shard, at) = Symbols::split(sym);
+                            out[shard].push((at as u32, id as PieceId));
+                        }
+                    }
+                }
+                out
+            });
+        let (cold, items) = (&self.cold, &self.ref_items);
+        // alloc: once per first link, each shard's grown lists
+        let shards: Vec<(CowList<PieceId>, Vec<(u32, ListRef, u32)>, Vec<ListRef>)> =
+            blaze_graph::par::map(0..SHARDS, |shard| {
+                let mut pairs: Vec<(u32, PieceId)> =
+                    Vec::with_capacity(runs.iter().map(|it| it[shard].len()).sum());
+                for run in &runs {
+                    pairs.extend_from_slice(&run[shard]);
+                }
+                // Stable: a symbol's new referrers stay in id order.
+                radix::sort_copy_by_key(&mut pairs, |it| it.0);
+                let mut local = CowList::default();
+                let mut set = Vec::new();
+                let mut freed = Vec::new();
+                let mut grown: Vec<PieceId> = Vec::new();
+                let mut at = 0;
+                while at < pairs.len() {
+                    let sym_at = pairs[at].0;
+                    let was = cold[shard].get(sym_at as usize).copied().unwrap_or(COLD);
+                    grown.clear();
+                    grown.extend_from_slice(items.get(was.refs));
+                    while at < pairs.len() && pairs[at].0 == sym_at {
+                        let id = pairs[at].1;
+                        if grown.last() != Some(&id) {
+                            grown.push(id);
+                        }
+                        at += 1;
+                    }
+                    let len = grown.len();
+                    let room = len.next_power_of_two().max(4);
+                    grown.resize(room, PieceId::MAX);
+                    let list = local.push(&grown);
+                    if was.room > 0 {
+                        freed.push(ListRef { len: was.room, ..was.refs });
+                    }
+                    set.push((sym_at, ListRef { len: len as u32, ..list }, room as u32));
+                }
+                (local, set, freed)
+            });
+        drop(runs);
+        // alloc: once per first link, each shard's lists' chunk base
+        let mut bases = Vec::with_capacity(SHARDS);
+        let mut sets = Vec::with_capacity(SHARDS);
+        for (local, set, freed) in shards {
+            bases.push(self.ref_items.append_list(local));
+            for list in freed {
+                self.ref_items.free(list);
+            }
+            sets.push(set);
+        }
+        blaze_graph::par::for_each(
+            blaze_graph::par::zip(&mut self.cold[..], blaze_graph::par::zip(&bases[..], &sets[..])),
+            |(cold, (base, set))| {
+                for &(at, list, room) in set {
+                    let at = at as usize;
+                    if cold.len() <= at {
+                        cold.set(at, COLD, || COLD);
+                    }
+                    let it = cold.get_mut(at).expect("grown to it");
+                    it.refs = ListRef { chunk: list.chunk + base, ..list };
+                    it.room = room;
+                }
+            },
+        );
     }
 
     /// Undefines `sym` when it is defined in piece `id`.

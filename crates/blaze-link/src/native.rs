@@ -56,7 +56,7 @@ use crate::stage::{Content, Stage, error};
 use crate::state::{Def, Input, PieceId, State, What};
 use crate::symbols::{NameId, Obj, SHARDS, SymKey, Symbols, Wide};
 use crate::unwind;
-use crate::{Change, Format, LinkError, NativeKind, OutputKind};
+use crate::{Change, Format, LinkError, NativeKind, Output, OutputKind};
 
 const NONE: u32 = u32::MAX;
 const NONE64: u64 = u64::MAX;
@@ -2852,8 +2852,183 @@ impl Build {
 #[derive(Default)]
 struct Scratch {
     fixups: Vec<Fixup>,
-    weak: Vec<Sym>,
-    defines: Vec<Sym>,
+    made: Prepared,
+}
+
+/// What [`prepare_section`] read of kept sections, for [`Stage::make_prepared`]: each one's
+/// fixups as the image's, the weak targets among them and the symbols it defines, in buffers
+/// shared by the sections of one input.
+#[derive(Default)]
+struct Prepared {
+    sections: Vec<PreparedSection>,
+    fixups: Vec<Fixup>,
+    syms: Vec<Sym>,
+    /// One section's weak targets or definitions, sorted and deduplicated before they join
+    /// [`Prepared::syms`].
+    sorted: Vec<Sym>,
+}
+
+impl Prepared {
+    fn clear(&mut self) {
+        self.sections.clear();
+        self.fixups.clear();
+        self.syms.clear();
+    }
+}
+
+struct PreparedSection {
+    section: u32,
+    zeroed: bool,
+    fixups: Range<usize>,
+    weak: Range<usize>,
+    defines: Range<usize>,
+}
+
+/// Reads kept section `section` of `load` into `out` when it makes a piece: what
+/// [`Stage::make_section`] needs, read without the stage, so a first link reads every input's
+/// in parallel.
+fn prepare_section(
+    graph: &Graph,
+    output: &Output,
+    new: &State,
+    load: u32,
+    section: u32,
+    out: &mut Prepared,
+) -> Result<(), LinkError> {
+    let it = &graph.loads[load as usize];
+    let parsed = &it.parsed;
+    let object = parsed.object();
+    let s = &object.sections[section as usize];
+    let class = match &s.what {
+        SectionKind::Alloc(class, _) | SectionKind::Unwind(class) => class,
+        SectionKind::Dropped | SectionKind::EhFrame => return Ok(()),
+    };
+    let zeroed = crate::model::zeroed(class);
+    if zeroed && !matches!(s.data, Data::Zero(_)) {
+        let name = &new.inputs[it.input as usize].name;
+        // alloc: error path
+        return Err(error(
+            None,
+            format!("{name}: {} has bytes, in a zeroed section", object.name(s.name)),
+        ));
+    }
+    let fixups_from = out.fixups.len();
+    let weak_from = out.syms.len();
+    out.sorted.clear();
+    for f in object.section_fixups(s) {
+        let target = parsed.sym(f.symbol);
+        let symbol = &object.symbols[f.symbol as usize];
+        if symbol.binding == Binding::Weak && symbol.def == SymbolDef::Undefined {
+            out.sorted.push(target);
+        }
+        out.fixups.push(Fixup {
+            at: f.at,
+            apply: crate::reloc::in_output(f.apply, output.format, &output.kind),
+            target,
+            addend: f.addend,
+            minus: f.minus.map(|m| parsed.sym(m)),
+        });
+    }
+    out.sorted.sort_unstable();
+    out.sorted.dedup();
+    out.syms.extend_from_slice(&out.sorted);
+    let defines_from = out.syms.len();
+    out.sorted.clear();
+    let own = parsed.section_sym(section);
+    for symbol in parsed.defs.row(section as usize) {
+        let sym = parsed.sym(*symbol);
+        if sym != own && (is_local(&object.symbols[*symbol as usize]) || graph.wins(load, *symbol))
+        {
+            out.sorted.push(sym);
+        }
+    }
+    out.sorted.sort_unstable();
+    out.sorted.dedup();
+    out.syms.extend_from_slice(&out.sorted);
+    out.sections.push(PreparedSection {
+        section,
+        zeroed,
+        fixups: fixups_from..out.fixups.len(),
+        weak: weak_from..defines_from,
+        defines: defines_from..out.syms.len(),
+    });
+    Ok(())
+}
+
+/// [`prepare_section`] of every section of `load` the collection kept that has no piece yet.
+fn prepare_load(
+    graph: &Graph,
+    output: &Output,
+    new: &State,
+    marks: &Marks,
+    load: u32,
+) -> Result<Prepared, LinkError> {
+    let mut out = Prepared::default();
+    let parsed = &graph.loads[load as usize].parsed;
+    let object = parsed.object();
+    for s in 0..object.sections.len() as u32 {
+        if !marks.sections.get(graph.flat(load, s))
+            || !makes_piece(&object.sections[s as usize].what)
+            || piece_in(new, parsed.section_sym(s)).is_some()
+        {
+            continue;
+        }
+        prepare_section(graph, output, new, load, s, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Of one input whose definitions are set again: each local symbol's definition, and the
+/// pieces whose definition lists changed, each with its new list in `syms`.
+struct LoadDefs {
+    defs: Vec<(Sym, Def)>,
+    lists: Vec<(PieceId, Range<usize>)>,
+    syms: Vec<Sym>,
+}
+
+/// [`LoadDefs`] of `load`, read without the stage.
+fn load_defs(graph: &Graph, new: &State, load: u32) -> LoadDefs {
+    let parsed = &graph.loads[load as usize].parsed;
+    let object = parsed.object();
+    let mut out = LoadDefs { defs: Vec::new(), lists: Vec::new(), syms: Vec::new() };
+    for (at, symbol) in object.symbols.iter().enumerate() {
+        if !is_local(symbol) {
+            continue;
+        }
+        let sym = parsed.sym(at as u32);
+        let def = match symbol.def {
+            SymbolDef::Section { section, value, .. } => {
+                if sym == parsed.section_sym(section) {
+                    continue;
+                }
+                piece_in(new, parsed.section_sym(section))
+                    .map_or(Def::None, |piece| Def::Piece { piece, offset: value })
+            }
+            SymbolDef::Absolute(value) if symbol.kind == SymbolKind::Tls => Def::TlsOffset(value),
+            SymbolDef::Absolute(value) => Def::Absolute(value),
+            _ => Def::None,
+        };
+        out.defs.push((sym, def));
+    }
+    let mut defines = Vec::new();
+    for s in 0..object.sections.len() as u32 {
+        let Some(piece) = piece_in(new, parsed.section_sym(s)) else { continue };
+        section_defines(graph, load, s, &mut defines);
+        if new.piece(piece).is_some_and(|it| it.defines() != defines.as_slice()) {
+            let from = out.syms.len();
+            out.syms.extend_from_slice(&defines);
+            out.lists.push((piece, from..out.syms.len()));
+        }
+    }
+    out
+}
+
+/// The live piece `sym` is the start of ([`Stage::piece_of`]).
+fn piece_in(new: &State, sym: Sym) -> Option<PieceId> {
+    match new.def(sym) {
+        Def::Piece { piece, .. } if new.piece(piece).is_some() => Some(piece),
+        _ => None,
+    }
 }
 
 impl<'a> Stage<'a> {
@@ -3604,56 +3779,44 @@ impl<'a> Stage<'a> {
         section: u32,
         scratch: &mut Scratch,
     ) -> Result<(), LinkError> {
-        let it = &graph.loads[load as usize];
-        let parsed = &it.parsed;
+        let mut made = std::mem::take(&mut scratch.made);
+        made.clear();
+        let read = prepare_section(graph, self.output, &self.new, load, section, &mut made);
+        if read.is_ok()
+            && let Some(it) = made.sections.first()
+        {
+            self.make_prepared(graph, load, it, &made);
+        }
+        // The buffers are the scratch's to keep across sections.
+        scratch.made = made;
+        read
+    }
+
+    /// Makes a kept section's piece from what [`prepare_section`] read of it.
+    fn make_prepared(&mut self, graph: &Graph, load: u32, it: &PreparedSection, made: &Prepared) {
+        let input = &graph.loads[load as usize];
+        let parsed = &input.parsed;
         let object = parsed.object();
+        let section = it.section;
         let s = &object.sections[section as usize];
         let (class, rank, unwind) = match &s.what {
             SectionKind::Alloc(class, rank) => (class, *rank, false),
             SectionKind::Unwind(class) => (class, 0, true),
-            SectionKind::Dropped | SectionKind::EhFrame => return Ok(()),
+            SectionKind::Dropped | SectionKind::EhFrame => unreachable!("prepared sections make pieces"),
         };
-        let zeroed = crate::model::zeroed(class);
-        if zeroed && !matches!(s.data, Data::Zero(_)) {
-            let name = &self.new.inputs[it.input as usize].name;
-            // alloc: error path
-            return Err(error(
-                None,
-                format!("{name}: {} has bytes, in a zeroed section", object.name(s.name)),
-            ));
-        }
-        scratch.fixups.clear();
-        scratch.weak.clear();
-        for f in object.section_fixups(s) {
-            let target = parsed.sym(f.symbol);
-            let symbol = &object.symbols[f.symbol as usize];
-            if symbol.binding == Binding::Weak && symbol.def == SymbolDef::Undefined {
-                scratch.weak.push(target);
-            }
-            scratch.fixups.push(Fixup {
-                at: f.at,
-                apply: crate::reloc::in_output(f.apply, self.output.format, &self.output.kind),
-                target,
-                addend: f.addend,
-                minus: f.minus.map(|m| parsed.sym(m)),
-            });
-        }
-        scratch.weak.sort_unstable();
-        scratch.weak.dedup();
-        section_defines(graph, load, section, &mut scratch.defines);
-        let content = if zeroed {
+        let content = if it.zeroed {
             Content::Zero
         } else {
-            self.content(object, &s.data, it.input, parsed.base, 0..s.data.len() as usize)
+            self.content(object, &s.data, input.input, parsed.base, 0..s.data.len() as usize)
         };
-        let order = self.new.inputs[it.input as usize].order;
+        let order = self.new.inputs[input.input as usize].order;
         let what = What::Native { obj: parsed.obj, section, unwind };
         let mut piece = self.piece(
             parsed.section_sym(section),
             class,
             s.align,
             s.data.len(),
-            &scratch.fixups,
+            &made.fixups[it.fixups.clone()],
             what,
         );
         piece.rank = rank;
@@ -3662,11 +3825,10 @@ impl<'a> Stage<'a> {
         let placed =
             tie_of(object, section).filter(|tie| tie.ordered).map_or(section, |tie| tie.to);
         piece.order = [order, parsed.obj.member, placed];
-        piece.zero = zeroed;
-        piece.weak = scratch.weak.as_slice();
-        piece.defines = scratch.defines.as_slice();
+        piece.zero = it.zeroed;
+        piece.weak = &made.syms[it.weak.clone()];
+        piece.defines = &made.syms[it.defines.clone()];
         self.make(&piece, content);
-        Ok(())
     }
 
     /// Makes a kept frame record's piece: an FDE's CIE pointer is a fixup to its CIE's piece.
@@ -4553,21 +4715,30 @@ impl<'a> Stage<'a> {
             }
         }
 
-        // What came.
+        // What came. Each input's kept sections are read in parallel, a wave of inputs at a
+        // time so that only a wave's fixups are held twice, and made in input order. A first
+        // link's pieces go on the referrer lists all at once after.
         let mut scratch = Scratch::default();
+        let first_link = !self.old.laid_out;
+        if first_link {
+            self.defer_refs();
+        }
+        let wave = (par::threads() * 4).max(16);
+        let mut prepared: Vec<Result<Prepared, LinkError>> = Vec::new();
         for (load, it) in graph.loads.iter().enumerate() {
+            if load % wave == 0 {
+                let (output, new, marks, graph) = (self.output, &self.new, &marks, &graph);
+                let to = (load + wave).min(graph.loads.len());
+                prepared = par::map(load..to, |at| prepare_load(graph, output, new, marks, at as u32));
+                prepared.reverse();
+            }
+            let made = prepared.pop().expect("a wave's input")?;
             let load = load as u32;
-            let object = it.parsed.object();
-            for s in 0..object.sections.len() as u32 {
-                if !marks.sections.get(graph.flat(load, s))
-                    || !makes_piece(&object.sections[s as usize].what)
-                {
-                    continue;
-                }
-                if self.piece_of(it.parsed.section_sym(s)).is_none() {
-                    self.make_section(&graph, load, s, &mut scratch)?;
-                    affected.set(load as usize);
-                }
+            for section in &made.sections {
+                self.make_prepared(&graph, load, section, &made);
+            }
+            if !made.sections.is_empty() {
+                affected.set(load as usize);
             }
             for f in 0..it.parsed.frames.len() as u32 {
                 if marks.frames.get((it.frames + f) as usize)
@@ -4579,6 +4750,9 @@ impl<'a> Stage<'a> {
         }
         for (name, size, align) in fresh_commons {
             self.make_common(name, size, align);
+        }
+        if first_link {
+            self.refer_made();
         }
 
         // Every symbol's definition.
@@ -4598,43 +4772,22 @@ impl<'a> Stage<'a> {
                 affected.set(load);
             }
         }
-        for (load, it) in graph.loads.iter().enumerate() {
-            if !affected.get(load) {
-                continue;
-            }
-            let load = load as u32;
-            let parsed = &it.parsed;
-            let object = parsed.object();
-            for (at, symbol) in object.symbols.iter().enumerate() {
-                if !is_local(symbol) {
-                    continue;
+        // Each affected input's local definitions and its pieces' changed definition lists,
+        // read in parallel and set in input order.
+        // alloc: once per graph built, the affected inputs' indices
+        let affected_loads: Vec<u32> =
+            (0..graph.loads.len() as u32).filter(|it| affected.get(*it as usize)).collect();
+        for loads in affected_loads.chunks(wave) {
+            let found: Vec<LoadDefs> = {
+                let (new, graph) = (&self.new, &graph);
+                par::map(loads, |load| load_defs(graph, new, *load))
+            };
+            for found in found {
+                for (sym, def) in found.defs {
+                    self.define(sym, def);
                 }
-                let sym = parsed.sym(at as u32);
-                let def = match symbol.def {
-                    SymbolDef::Section { section, value, .. } => {
-                        if sym == parsed.section_sym(section) {
-                            continue;
-                        }
-                        self.piece_of(parsed.section_sym(section))
-                            .map_or(Def::None, |piece| Def::Piece { piece, offset: value })
-                    }
-                    SymbolDef::Absolute(value) if symbol.kind == SymbolKind::Tls => {
-                        Def::TlsOffset(value)
-                    }
-                    SymbolDef::Absolute(value) => Def::Absolute(value),
-                    _ => Def::None,
-                };
-                self.define(sym, def);
-            }
-            for s in 0..object.sections.len() as u32 {
-                let Some(piece) = self.piece_of(parsed.section_sym(s)) else { continue };
-                section_defines(&graph, load, s, &mut scratch.defines);
-                if self
-                    .new
-                    .piece(piece)
-                    .is_some_and(|it| it.defines() != scratch.defines.as_slice())
-                {
-                    self.new.set_defines(piece, &scratch.defines);
+                for (piece, defines) in found.lists {
+                    self.new.set_defines(piece, &found.syms[defines]);
                 }
             }
         }

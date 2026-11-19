@@ -721,6 +721,7 @@ impl Image {
             lazy: self.lazy.as_ref(),
             layout: layout::Pass::new(change.heat, &change.cold),
             thunked: false,
+            unreferred: None,
             island: None,
             text: None,
         };
