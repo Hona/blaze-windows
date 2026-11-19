@@ -39,6 +39,17 @@ pub const ROWS: u64 = 4;
 pub const EXEC_TO_MAIN: &str = "client: exec to main";
 pub const SOLO_CHECK: &str = "client: solo check";
 pub const CONNECT: &str = "client: connect";
+/// From `main`'s first line to `run`: the words, the environment's names and the launcher's
+/// kept pin lookup (`main.rs`, `decide`). With the three below, the client's time before it
+/// connects, named in parts (B5: 59 ms outside the request on Windows, unnamed).
+pub const ROUTE_AND_PIN: &str = "client: route and pin";
+/// The request made: `config.toml`, the environment, the workspace's place and its config
+/// files (`main.rs`).
+pub const REQUEST_MADE: &str = "client: request made";
+/// What the answer is shown on: the terminal's size and capabilities (`main.rs`).
+pub const SCREEN_FOUND: &str = "client: screen found";
+/// The homes and the engine beside this program, resolved (`main.rs`).
+pub const ENGINE_FOUND: &str = "client: engine found";
 pub const ON_THE_WIRE: &str = "client: request on the wire";
 
 /// What the command timed of itself, on the profile's clock (`blaze_profile::clock::mono_ns`,

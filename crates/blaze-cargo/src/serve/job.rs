@@ -8422,14 +8422,36 @@ impl<S: Steps> Jobs<S> {
             _ => vec![u64::MAX; all.len()], // alloc: once a plan
         };
         let mut sized = 0u32;
+        // alloc: once per build, a slot a unit, filled only for units that stand
+        let mut waits_of: Vec<Option<Box<[u32]>>> = vec![None; all.len()];
         for offset in 0..built {
             let at = unit_at(offset);
             let unit = &all[at];
             node_name(&mut name, unit, &packages);
             deps.clear();
-            deps.extend(
-                unit.dependencies.iter().map(|dep| NodeId(first.0 + last[dep.index as usize])),
-            );
+            // A unit that stands is one task whose record is complete in itself: it waits for
+            // what its crate's identity is made from (the runs and device MSL of its closure),
+            // never for the standing units below it, so a chain of them (std's) is posted at
+            // once and not one loop turn and worker wake a level (B5, the barrier behind kept
+            // units). Every other unit waits for its dependencies and, through each that
+            // stands, for all of that one's standing closure, as the chain gave it before.
+            let built_dep = |d: u32| (last[d as usize] != u32::MAX).then(|| NodeId(first.0 + last[d as usize]));
+            if one_task(all, &hops, at) {
+                let below = stood_closure(all, &hops, at, &mut waits_of);
+                deps.extend(below.iter().filter(|&&d| !one_task(all, &hops, d as usize)).filter_map(|&d| built_dep(d)));
+            } else {
+                deps.extend(
+                    unit.dependencies.iter().map(|dep| NodeId(first.0 + last[dep.index as usize])),
+                );
+                for dep in &unit.dependencies {
+                    if one_task(all, &hops, dep.index) {
+                        let below = stood_closure(all, &hops, dep.index, &mut waits_of);
+                        deps.extend(below.iter().filter_map(|&d| built_dep(d)));
+                    }
+                }
+                deps.sort_unstable_by_key(|it| it.0);
+                deps.dedup();
+            }
             let phases = phases_of(at, unit);
             if phases.is_empty() {
                 let task = Task::Loop { kind: loops::SCRIPT_RUN };
@@ -11518,6 +11540,41 @@ fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
         Stage::Certify => "checking its request certificate",
         Stage::Over => "over",
     }
+}
+
+/// Whether unit `at` of `all` is one task that stands ([`standing`]) with nothing of its own
+/// that its dependents' crates are made from: no build script's run and no device unit (whose
+/// MSL is applied to the front end as a run is, `serve::unit::graph::Waits`).
+fn one_task(all: &[blaze_units::schema::Unit], hops: &[bool], at: usize) -> bool {
+    hops.get(at) == Some(&true)
+        && all[at].mode != UnitMode::RunCustomBuild
+        && !all[at].for_device()
+}
+
+/// Every unit in `at`'s closure reached through units that stand as one task ([`one_task`]),
+/// `at` itself not among them, sorted: the standing units below it, and the frontier where
+/// that ends (a run, a device unit). Memoized by unit in `memo`; as deep as the graph.
+fn stood_closure(
+    all: &[blaze_units::schema::Unit],
+    hops: &[bool],
+    at: usize,
+    memo: &mut [Option<Box<[u32]>>],
+) -> Box<[u32]> {
+    if let Some(done) = &memo[at] {
+        return done.clone(); // clone: a unit's closure, once per dependent that asks
+    }
+    let mut set = Vec::new(); // alloc: once per standing unit a build, its closure
+    for dep in &all[at].dependencies {
+        set.push(u32::try_from(dep.index).expect("under 2^32 units"));
+        if one_task(all, hops, dep.index) {
+            set.extend_from_slice(&stood_closure(all, hops, dep.index, memo));
+        }
+    }
+    set.sort_unstable();
+    set.dedup();
+    let set = set.into_boxed_slice();
+    memo[at] = Some(set.clone()); // clone: kept for the next dependent that asks
+    set
 }
 
 /// The tasks and dependent build script runs a job held for a write ended unposted: the job

@@ -571,7 +571,8 @@ fn developer_prompt(
         .ok_or_else(|| format!("blaze runs on {}, which has no MSVC tools", std::env::consts::ARCH))?;
     let developer = job.msvc.get_or_init(|| {
         let _span = tracing::info_span!(target: "blaze", "build script: discover the MSVC installation").entered();
-        msvc::find()
+        // Kept for the daemon's life, found again only when what it read changed.
+        msvc::found()
     }).as_ref().map_err(|why| {
         format!(
             "the build script of `{}` for {} is started with a Visual Studio developer prompt's \

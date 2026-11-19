@@ -146,14 +146,86 @@ fn newest_sdk(kits: &Path, target: &str) -> Result<String, String> {
     })
 }
 
-/// The newest Visual Studio with the MSVC x64 tools (as `vswhere -latest` says) and its
-/// default tools' version, and the newest whole Windows SDK the registry's `KitsRoot10` names:
-/// an error naming what is missing where, as a developer prompt fails to open.
+/// How a file or directory [`find`] read stood: its length and last write, `None` when absent.
+pub type Stood = Option<(u64, std::time::SystemTime)>;
+
+/// How `path` stands now, as [`Kept::still`] compares it.
+pub fn stood(path: &Path) -> Stood {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// What [`find`] found, with what it read: the inputs it is valid for. `vswhere` reads Visual
+/// Studio's setup records (a directory an instance per install under
+/// `ProgramData\Microsoft\VisualStudio\Packages\_Instances`, each one's `state.json`); the
+/// rest is the tools' default version file, the SDK directories it listed and the files it
+/// checked. A directory's last write moves when an entry is added, removed or renamed in it,
+/// so an install, an update or a removal of Visual Studio or an SDK is a changed read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub developer: Developer,
+    /// `ProgramFiles(x86)`, where `vswhere` was looked for.
+    pub programs: OsString,
+    /// The registry's `KitsRoot10`.
+    pub kits_root: PathBuf,
+    pub reads: Vec<(PathBuf, Stood)>,
+}
+
+impl Kept {
+    /// Whether what was found still stands: the same `programs` and `kits_root`, and every
+    /// read as it stood (`stat` says how a path stands now).
+    pub fn still(
+        &self,
+        programs: &std::ffi::OsStr,
+        kits_root: &Path,
+        stat: impl Fn(&Path) -> Stood,
+    ) -> bool {
+        self.programs == programs
+            && self.kits_root == kits_root
+            && self.reads.iter().all(|(path, was)| stat(path) == *was)
+    }
+}
+
+/// [`find`], kept for the process's life and found again only when something it read has
+/// changed ([`Kept::still`]): a warm edit stats a dozen paths and reads one registry value
+/// where `find` starts `vswhere` (about 48 ms a build on a warm daemon, `lanes\backend.md`).
+/// An error is never kept: the next ask finds again, so a user who installs the tools needs
+/// no restart.
 #[cfg(windows)]
-pub fn find() -> Result<Developer, String> {
+pub fn found() -> Result<Developer, String> {
+    static KEPT: crate::lock::Lock<Option<Kept>> = crate::lock::Lock::new("platform.msvc.kept", None);
     let programs = std::env::var_os("ProgramFiles(x86)")
         .ok_or("ProgramFiles(x86), where vswhere is, is not set")?;
+    let kits = kits_root()?;
+    if let Some(kept) = KEPT.lock().as_ref()
+        && kept.still(&programs, &kits, stood)
+    {
+        return Ok(kept.developer.clone()); // clone: a few paths, once per job
+    }
+    let kept = find_kept()?;
+    let developer = kept.developer.clone(); // clone: a few paths, once per find
+    *KEPT.lock() = Some(kept);
+    Ok(developer)
+}
+
+/// The newest Visual Studio with the MSVC x64 tools (as `vswhere -latest` says) and its
+/// default tools' version, and the newest whole Windows SDK the registry's `KitsRoot10` names:
+/// an error naming what is missing where, as a developer prompt fails to open. Found anew on
+/// every call; [`found`] keeps it.
+#[cfg(windows)]
+pub fn find() -> Result<Developer, String> {
+    find_kept().map(|it| it.developer)
+}
+
+/// [`find`] with what it read.
+#[cfg(windows)]
+fn find_kept() -> Result<Kept, String> {
+    let programs = std::env::var_os("ProgramFiles(x86)")
+        .ok_or("ProgramFiles(x86), where vswhere is, is not set")?;
+    // Read before `vswhere` runs, so a change while it runs is a change the next ask sees.
+    let mut reads = setup_records();
     let vswhere = Path::new(&programs).join(r"Microsoft Visual Studio\Installer\vswhere.exe");
+    reads.push((vswhere.clone(), stood(&vswhere))); // clone: a path, once per find
     let said = super::command::command(&vswhere, Path::new(&programs))
         .args(["-latest", "-products", "*", "-requires"])
         .arg("Microsoft.VisualStudio.Component.VC.Tools.x86.x64")
@@ -172,18 +244,52 @@ pub fn find() -> Result<Developer, String> {
         ));
     }
     let default = install.join(r"VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt");
+    reads.push((default.clone(), stood(&default))); // clone: a path, once per find
     let tools = std::fs::read_to_string(&default)
         .map_err(|error| format!("{}: {error}", default.display()))?
         .trim()
         .to_owned();
     let kits = kits_root()?;
+    for dir in ["Include", "Lib"] {
+        let dir = kits.join(dir);
+        reads.push((dir.clone(), stood(&dir))); // clone: a path, once per find
+    }
     let sdk = newest_sdk(&kits, "x64")?;
-    let found = Developer { install, tools, kits, sdk };
+    for file in [
+        kits.join("Include").join(&sdk).join(r"um\windows.h"),
+        kits.join("Lib").join(&sdk).join(r"um\x64\kernel32.lib"),
+    ] {
+        let was = stood(&file);
+        reads.push((file, was));
+    }
+    let found = Developer { install, tools, kits: kits.clone(), sdk }; // clone: a path, once per find
     let cl = found.vc_tools().join(r"bin\Hostx64\x64\cl.exe");
     if !cl.is_file() {
         return Err(format!("{} is not a file: the MSVC tools are not whole", cl.display()));
     }
-    Ok(found)
+    let was = stood(&cl);
+    reads.push((cl, was));
+    Ok(Kept { developer: found, programs, kits_root: kits, reads })
+}
+
+/// Visual Studio's setup records as `vswhere` reads them: the instances' directory under
+/// `ProgramData` and each instance's `state.json`, each as it stands now. With no
+/// `ProgramData`, the one read is its absence, which stands until it is set.
+#[cfg(windows)]
+fn setup_records() -> Vec<(PathBuf, Stood)> {
+    let mut reads = Vec::new(); // alloc: a dozen paths, once per find
+    let Some(data) = std::env::var_os("ProgramData") else { return reads };
+    let instances = Path::new(&data).join(r"Microsoft\VisualStudio\Packages\_Instances");
+    reads.push((instances.clone(), stood(&instances))); // clone: a path, once per find
+    if let Ok(entries) = std::fs::read_dir(&instances) {
+        for entry in entries.flatten() {
+            let state = entry.path().join("state.json");
+            let was = stood(&state);
+            reads.push((state, was));
+        }
+    }
+    reads.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    reads
 }
 
 /// `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`' `KitsRoot10`, which the SDK's

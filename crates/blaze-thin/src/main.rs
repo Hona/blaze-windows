@@ -283,6 +283,7 @@ mod native {
     /// before anything was written and before anything was asked of the daemon that the
     /// engine would not ask again.
     fn run(decided: Decided, words: &[OsString], started: Instant, main_ns: i64) -> Result<ExitCode, String> {
+        let run_ns = kernel::mono_ns();
         let Decided { asked, home, cwd, found } = decided;
         let Some(asked) = asked else {
             let this = std::env::current_exe()
@@ -316,6 +317,7 @@ mod native {
             width,
         };
         let request = request::request(&asked, sent);
+        let made_ns = kernel::mono_ns();
 
         // What an answer shows is the screen's (docs/terminal.md), as the engine shows it: what
         // stderr is, found before the daemon is talked to.
@@ -343,9 +345,11 @@ mod native {
             terminal: detected,
             size: blaze_thin::answer::on_disk,
         };
+        let shown_ns = kernel::mono_ns();
 
         let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
         let engine = Engine::beside()?;
+        let engine_ns = kernel::mono_ns();
         let spoken = talk::Spoken {
             asked: &asked,
             request: &request,
@@ -357,6 +361,10 @@ mod native {
         let mut timings = Timings::default();
         let started_ns = kernel::started_ns()?;
         timings.span(talk::EXEC_TO_MAIN, started_ns, main_ns);
+        timings.span(talk::ROUTE_AND_PIN, main_ns, run_ns);
+        timings.span(talk::REQUEST_MADE, run_ns, made_ns);
+        timings.span(talk::SCREEN_FOUND, made_ns, shown_ns);
+        timings.span(talk::ENGINE_FOUND, shown_ns, engine_ns);
         // Nothing changed since the daemon's last answer to this request: its slot says so,
         // and the client answers with no daemon asked (`solo`); anything else is the daemon's.
         #[cfg(unix)]

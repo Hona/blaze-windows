@@ -54,6 +54,58 @@ fn the_variables_are_a_developer_prompts() {
     );
 }
 
+/// The invariant of [`found`]'s cache: what was found stands exactly while every read stands
+/// as it did and `ProgramFiles(x86)` and `KitsRoot10` are the same; any one changed read (an
+/// SDK added to `Include`, a Visual Studio update rewriting its `state.json`, a removed
+/// `cl.exe`) finds again. Control: a cache that compares nothing would keep all four.
+#[test]
+fn what_was_found_stands_until_a_read_changes() {
+    use std::time::{Duration, SystemTime};
+    let at = |secs: u64| Some((10, SystemTime::UNIX_EPOCH + Duration::from_secs(secs)));
+    let reads = vec![
+        (PathBuf::from(r"C:\Data\_Instances"), at(1)),
+        (PathBuf::from(r"C:\Data\_Instances\a\state.json"), at(2)),
+        (PathBuf::from(r"C:\Kits\10\Include"), at(3)),
+        (PathBuf::from(r"C:\VS\cl.exe"), at(4)),
+    ];
+    let kept = Kept {
+        developer: developer(),
+        programs: OsString::from(r"C:\PF86"),
+        kits_root: PathBuf::from(r"C:\Kits\10"),
+        reads: reads.clone(),
+    };
+    let now = |reads: &[(PathBuf, Stood)]| {
+        let reads = reads.to_vec();
+        move |path: &Path| reads.iter().find(|it| it.0 == path).and_then(|it| it.1)
+    };
+    let (programs, kits) = (std::ffi::OsStr::new(r"C:\PF86"), Path::new(r"C:\Kits\10"));
+    assert!(kept.still(programs, kits, now(&reads)), "nothing changed");
+    assert!(!kept.still(std::ffi::OsStr::new(r"D:\PF86"), kits, now(&reads)));
+    assert!(!kept.still(programs, Path::new(r"D:\Kits\10"), now(&reads)));
+    for changed in 0..reads.len() {
+        let mut moved = reads.clone();
+        moved[changed].1 = at(100);
+        assert!(!kept.still(programs, kits, now(&moved)), "read {changed} moved");
+        let mut gone = reads.clone();
+        gone[changed].1 = None;
+        assert!(!kept.still(programs, kits, now(&gone)), "read {changed} gone");
+    }
+}
+
+/// On a machine with the tools, [`found`] twice is [`find`] once: the same answer, kept.
+#[cfg(windows)]
+#[test]
+fn found_twice_is_find_once() {
+    match (find(), found(), found()) {
+        (Ok(fresh), Ok(first), Ok(second)) => {
+            assert_eq!(fresh, first);
+            assert_eq!(first, second);
+        }
+        (Err(why), ..) => eprintln!("no MSVC here: {why}"),
+        other => panic!("find and found disagree: {other:?}"),
+    }
+}
+
 /// On a machine with Visual Studio's C++ tools, they are found whole; on one without, the
 /// error names what is missing.
 #[cfg(windows)]
