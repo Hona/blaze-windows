@@ -1018,6 +1018,7 @@ mod tests {
 
     /// A run on a Windows host for `x86_64-pc-windows-msvc`, its package and `OUT_DIR` named as
     /// the daemon names them, with the toolchain of a developer prompt in its `LIB`.
+    #[cfg(windows)]
     fn windows_ran(system: &'static [PathBuf]) -> Ran<'static> {
         Ran {
             package_dir: Path::new("/C:/src/app"),
@@ -1030,6 +1031,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn windows_system() -> &'static [PathBuf] {
         let env: Vec<(OsString, OsString)> = vec![
             (
@@ -1129,6 +1131,7 @@ mod tests {
         assert_eq!(refused(unix.as_bytes(), &ran_unix_target()).len(), 1);
     }
 
+    #[cfg(windows)]
     fn ran_unix_target() -> Ran<'static> {
         Ran { msvc: false, ..windows_ran(&[]) }
     }

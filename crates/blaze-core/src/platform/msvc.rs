@@ -119,6 +119,7 @@ impl Developer {
 }
 
 /// The newest SDK version under `kits` with `um\windows.h` and `target`'s `kernel32.lib`.
+#[cfg(windows)]
 fn newest_sdk(kits: &Path, target: &str) -> Result<String, String> {
     let include = kits.join("Include");
     let entries =
