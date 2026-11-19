@@ -1332,6 +1332,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::Timer { .. }
         | Effect::Watch { .. }
         | Effect::Journal { .. }
+        | Effect::AlsoJournal { .. }
         | Effect::Unwatch { .. }
         | Effect::Flush { .. }
         | Effect::Spawn { .. }
@@ -2084,6 +2085,8 @@ impl Driver for Threads {
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
                 }
+                // alloc: an error path.
+                Effect::AlsoJournal { tag, .. } => self.tell(tag, Done::Failed(IoError(crate::JOURNAL_PER_DIRECTORY.to_owned()))),
                 Effect::Unwatch { tag } => {
                     if !self.unwatch(tag) {
                         // alloc: an error path.

@@ -611,6 +611,11 @@ pub struct Options {
     pub unheld: Option<Duration>,
     /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
     pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
+    /// Whether the directories outside views are heard through one reader of each volume's
+    /// journal ([`blaze_vfs::outside::Outside::journaled`]) rather than a watch each: the
+    /// caller's to say (the daemon on Windows), never the host's, so a simulation runs alike on
+    /// every system.
+    pub outside_journaled: bool,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
@@ -2100,7 +2105,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             std,
             plane,
             mounts,
-            heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
+            heads: Heads::new(FLUSHES, WATCHERS, RUNS, match options.outside_journaled {
+                // One reader of each volume's journal (Windows: its directory watch has no
+                // barrier, so nothing outside a checkout was ever vouched for).
+                true => Outside::journaled(options.outside, "/", OUTSIDE),
+                false => Outside::new(options.outside, "/", OUTSIDE),
+            }),
             images: Images::new(image, IMAGE, on_disk, texts, text_pin),
             jobs,
             steps,

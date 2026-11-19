@@ -2648,6 +2648,9 @@ impl Driver for Uring {
                         None
                     })
                 }
+                Effect::AlsoJournal { .. } => {
+                    Err(io::Error::new(io::ErrorKind::Unsupported, crate::JOURNAL_PER_DIRECTORY))
+                }
                 // No name to stamp: answered here, with no stamper woken for it.
                 Effect::Stamp { files, .. } if files.is_empty() => {
                     Ok(Some(Done::Stamped(Vec::new())))

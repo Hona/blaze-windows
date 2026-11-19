@@ -232,6 +232,8 @@ enum Place {
     Unnameable(u32),
     Outside,
     Gone,
+    /// The system would not say where it is: under any watched directory. Never kept.
+    Unknown,
 }
 
 /// What a record's reasons say of its names.
@@ -260,12 +262,14 @@ impl How {
 }
 
 /// Makes names of records: the directories met (by reference number) and where they are, and
-/// the names and losses of the batch being gathered.
+/// the names and losses of the batch being gathered. One reader of a volume's journal serves
+/// every directory watched on it ([`crate::Effect::AlsoJournal`]): each is a root, and a
+/// record is named under the root it is in.
 pub(super) struct Names {
-    dir: FileName,
-    root: u128,
+    /// Each watched directory's reference number, its name at the same index of `paths`.
+    roots: Vec<u128>,
     dirs: HashMap<u128, Place, Global>,
-    /// The names [`Place`]s point at; the watched directory's is the first.
+    /// The names [`Place`]s point at; the watched directories' are the first, in `roots`' order.
     paths: Vec<FileName>,
     /// Files of this read already named where they are now.
     seen: HashSet<u128, Global>,
@@ -282,10 +286,9 @@ impl Names {
         dirs.insert(root, Place::Under(0));
         // alloc: setup, once per watch; the buffers are reused for its life.
         Names {
-            // clone: setup.
-            paths: vec![dir.clone()],
-            dir,
-            root,
+            paths: vec![dir],
+            // alloc: setup.
+            roots: vec![root],
             dirs,
             seen: HashSet::new_in(Global),
             // alloc: setup.
@@ -297,6 +300,32 @@ impl Names {
         }
     }
 
+    /// `dir`, of reference number `root`, watched from now too. What was found outside every
+    /// watched directory may be under this one, so it is asked again.
+    pub(super) fn add_root(&mut self, dir: FileName, root: u128) {
+        if self.roots.contains(&root) {
+            return;
+        }
+        self.dirs.retain(|_, place| *place != Place::Outside);
+        // The roots' names lead `paths`: the one after the last root's moves to the end.
+        let at = self.roots.len();
+        self.paths.insert(at, dir);
+        for place in self.dirs.values_mut() {
+            if let Place::Under(it) | Place::Unnameable(it) = place
+                && *it as usize >= at
+            {
+                *it += 1;
+            }
+        }
+        self.roots.push(root);
+        self.dirs.insert(root, Place::Under(at as u32));
+    }
+
+    /// The index of the watched directory of reference number `id`, if it is one.
+    fn root_at(&self, id: u128) -> Option<u32> {
+        self.roots.iter().position(|it| *it == id).map(|it| it as u32)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.files.is_empty() && self.lost.is_empty()
     }
@@ -305,10 +334,12 @@ impl Names {
         self.files.len() + self.lost.len()
     }
 
-    /// The watched directory, as a whole, `lost`.
+    /// Every watched directory, as a whole, `lost`.
     pub(super) fn lose_all(&mut self, lost: Lost) {
-        // clone: a name the batch owns, once per loss of the whole watch.
-        self.lost.push((self.dir.clone(), lost));
+        for at in 0..self.roots.len() {
+            // clone: a name the batch owns, once per loss of the whole watch.
+            self.lost.push((self.paths[at].clone(), lost));
+        }
     }
 
     /// What was gathered, each once, sorted, and the gathering begun again.
@@ -327,11 +358,12 @@ impl Names {
     pub(super) fn read_done(&mut self) {
         self.seen.clear();
         if self.paths.len() > 64 + 4 * self.dirs.len() {
+            let roots = self.roots.len();
             // clone: amortized, once the names outgrow the directories four times over.
-            let mut paths = vec![self.dir.clone()];
+            let mut paths = self.paths[..roots].to_vec();
             for place in self.dirs.values_mut() {
                 if let Place::Under(at) | Place::Unnameable(at) = place {
-                    if *at != 0 {
+                    if *at as usize >= roots {
                         // clone: as above.
                         paths.push(self.paths[*at as usize].clone());
                         *at = (paths.len() - 1) as u32;
@@ -353,8 +385,8 @@ impl Names {
             Found::Unnameable(name) => Place::Unnameable(self.intern(name)),
             Found::Outside => Place::Outside,
             Found::Gone => Place::Gone,
-            // Nothing under the watched directory can be ruled out.
-            Found::Unknown => Place::Unnameable(0),
+            // Nothing under any watched directory can be ruled out.
+            Found::Unknown => Place::Unknown,
         }
     }
 
@@ -399,21 +431,24 @@ impl Names {
         FileName::new(&self.text)
     }
 
-    /// Every directory known at `path` or under it forgotten.
+    /// Every directory known at `path` or under it forgotten, but the watched ones.
     fn forget_below(&mut self, path: &FileName) {
+        let roots = self.roots.len() as u32;
         let paths = &self.paths;
         self.dirs.retain(|_, place| match place {
             Place::Under(at) | Place::Unnameable(at) => {
-                *at == 0 || !paths[*at as usize].is_under(path)
+                *at < roots || !paths[*at as usize].is_under(path)
             }
-            Place::Outside | Place::Gone => true,
+            Place::Outside | Place::Gone | Place::Unknown => true,
         });
     }
 
-    /// Every directory known under the watched one forgotten, but it.
+    /// Every directory known under the watched ones forgotten, but them.
     fn forget_all(&mut self) {
         self.dirs.retain(|_, place| matches!(place, Place::Outside | Place::Gone));
-        self.dirs.insert(self.root, Place::Under(0));
+        for (at, root) in self.roots.iter().enumerate() {
+            self.dirs.insert(*root, Place::Under(at as u32));
+        }
         // A record still holds its parent's Place while this forgets a moved directory.
         // Path indices stay valid throughout the read; read_done alone compacts the arena.
     }
@@ -427,11 +462,11 @@ impl Names {
     ) {
         let is_dir = record.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         let how = How::of(record.reason);
-        if record.id == self.root {
+        if let Some(at) = self.root_at(record.id) {
             match how.gone || how.arrived {
                 true => self.root_changed(),
                 // clone: a name the batch owns, as `Journaled::files` holds them.
-                false => self.files.push(self.dir.clone()),
+                false => self.files.push(self.paths[at as usize].clone()),
             }
             return;
         }
@@ -451,6 +486,7 @@ impl Names {
         }
         match parent {
             Place::Gone => {}
+            Place::Unknown => self.lose_all(Lost::Rescan),
             Place::Outside => {
                 if is_dir && how.arrived {
                     self.dirs.insert(record.id, Place::Outside);
@@ -555,32 +591,81 @@ impl Names {
     }
 }
 
-/// What the watch asks of the volume: names of reference numbers, through a handle of the
-/// watched directory, which every `OpenFileById` is relative to and which follows the
-/// directory wherever it moves.
-struct Volume {
+/// A watched directory as the volume sees it: a handle that follows it wherever it moves, and
+/// its NT path when the watch found it (`\Device\HarddiskVolume3\...`, normalized, no NUL),
+/// which every path found is compared with.
+pub(super) struct Root {
     hint: OwnedHandle,
-    /// The watched directory's NT path (`\Device\HarddiskVolume3\...`, normalized, no NUL),
-    /// which every path found is compared with. No mount point is looked up to make it.
-    root: Vec<u16>,
+    nt: Vec<u16>,
     dir: FileName,
+    /// The volume's serial number and the directory's reference number.
+    serial: u64,
+    id: u128,
+}
+
+impl Root {
+    /// `dir` under the driver's `root` opened as a watched directory. Blocks: for the driver's
+    /// threads. Every error names the directory.
+    pub(super) fn open(root: &Path, dir: &FileName) -> io::Result<Root> {
+        let path = root.join(dir.as_str());
+        let context = |what: &str, error: io::Error| {
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("the USN journal of {}: {what}: {error}", path.display()))
+        };
+        let wide = sys::path(&path)?;
+        let hint = open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS)
+            .map_err(|it| context("opening it", it))?;
+        let (serial, id) = file_id(&hint).map_err(|it| context("its file ID", it))?;
+        // alloc: setup, once per watched directory.
+        let mut nt = Vec::with_capacity(512);
+        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut nt)
+            .map_err(|it| context("its path", it))?;
+        let share = r"\Device\Mup\";
+        if share.encode_utf16().eq(nt.iter().copied().take(share.len())) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                // alloc: an error path.
+                format!("{} is on a network share, whose changes are in no journal blaze can read", path.display()),
+            ));
+        }
+        // clone: setup, the root's own name.
+        Ok(Root { hint, nt, dir: dir.clone(), serial, id })
+    }
+}
+
+/// What the watch asks of the volume: names of reference numbers, through a handle of the
+/// first watched directory, which every `OpenFileById` is relative to (any handle on the
+/// volume is), and the watched directories, against which every path found is compared.
+struct Volume {
+    roots: Vec<Root>,
     scratch: Vec<u16>,
     text: String,
 }
 
 impl Volume {
-    /// What the path in `scratch` is, against the watched directory's.
+    /// What the path in `scratch` is, against the watched directories': under the one whose
+    /// path is the longest prefix of it.
     fn relative(&mut self) -> Found {
-        let Some(rest) = self.scratch.strip_prefix(&self.root[..]) else { return Found::Outside };
-        let rest = match rest {
+        let mut best: Option<(usize, usize)> = None;
+        for (at, root) in self.roots.iter().enumerate() {
+            let Some(rest) = self.scratch.strip_prefix(&root.nt[..]) else { continue };
+            if !(rest.is_empty() || rest[0] == BACKSLASH) {
+                continue;
+            }
+            if best.is_none_or(|(_, len)| root.nt.len() > len) {
+                best = Some((at, root.nt.len()));
+            }
+        }
+        let Some((at, len)) = best else { return Found::Outside };
+        let dir = &self.roots[at].dir;
+        let rest = match &self.scratch[len..] {
             // clone: a name the batch owns.
-            [] => return Found::Under(self.dir.clone()),
-            [first, rest @ ..] if *first == BACKSLASH => rest,
-            _ => return Found::Outside,
+            [] => return Found::Under(dir.clone()),
+            [_, rest @ ..] => rest,
         };
         let text = &mut self.text;
         text.clear();
-        text.push_str(self.dir.as_str());
+        text.push_str(dir.as_str());
         for part in rest.split(|&it| it == BACKSLASH) {
             let len = text.len();
             text.push('/');
@@ -603,7 +688,7 @@ impl System for Volume {
         // An observer's handle (`super::observe`): a name asked of a file just made is never in
         // the way of its maker's rename of the directory it is in. Its attributes alone are
         // asked, as an oplock needs.
-        let at = observe::At::Id { root: self.hint.as_raw_handle(), id };
+        let at = observe::At::Id { root: self.roots[0].hint.as_raw_handle(), id };
         let opened = observe::open(at, Open { access: FILE_READ_ATTRIBUTES, link_itself: true });
         let handle = match opened {
             Ok(handle) => handle,
@@ -627,10 +712,16 @@ impl System for Volume {
     }
 
     fn root_moved(&mut self) -> bool {
-        match final_path(&self.hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
-            Ok(()) => self.scratch != self.root,
-            Err(_) => true,
+        for at in 0..self.roots.len() {
+            let moved = match final_path(&self.roots[at].hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut self.scratch) {
+                Ok(()) => self.scratch != self.roots[at].nt,
+                Err(_) => true,
+            };
+            if moved {
+                return true;
+            }
         }
+        false
     }
 }
 
@@ -814,33 +905,22 @@ impl Journal {
             )
         };
         let refuse = |why: String| io::Error::new(io::ErrorKind::Unsupported, why);
-        let wide = sys::path(&path)?;
-        let hint = open(&wide, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS)
-            .map_err(|it| context("opening it", it))?;
-        let (serial, root_id) = file_id(&hint).map_err(|it| context("its file ID", it))?;
+        let first = Root::open(root, dir)?;
+        let (serial, root_id) = (first.serial, first.id);
+        let hint = &first.hint;
         // alloc: setup, the watch's scratch for every path it asks for.
         let mut scratch = Vec::with_capacity(512);
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, &mut scratch)
+        final_path(hint, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, &mut scratch)
             .map_err(|it| context("its path", it))?;
         let shown = String::from_utf16_lossy(&scratch); // alloc: setup.
         // alloc: setup.
         let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown).to_owned();
-        let mut root_nt = Vec::with_capacity(scratch.len() + 16);
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &mut root_nt)
-            .map_err(|it| context("its path", it))?;
-        let share = r"\Device\Mup\";
-        if share.encode_utf16().eq(root_nt.iter().copied().take(share.len())) {
-            // alloc: an error path.
-            return Err(refuse(format!(
-                "{shown} is on a network share, whose changes are in no journal blaze can read"
-            )));
-        }
         // The volume's flags do not say whether it keeps a journal: Windows 11 (26200) reports
         // none of `FILE_SUPPORTS_USN_JOURNAL` on NTFS volumes that answer the query, so the query
         // itself is the test.
-        let (system, _) = volume_info(&hint).map_err(|it| context("its volume", it))?;
+        let (system, _) = volume_info(hint).map_err(|it| context("its volume", it))?;
         // `\\?\Volume{GUID}\...`: the volume is its first component, opened as a device.
-        final_path(&hint, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &mut scratch)
+        final_path(hint, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &mut scratch)
             .map_err(|it| context("its volume", it))?;
         let end = scratch
             .iter()
@@ -891,7 +971,7 @@ impl Journal {
         let mut journal = Box::new(Journal {
             names,
             // alloc: setup.
-            volume: Volume { hint, root: root_nt, dir: dir.clone(), scratch, text: String::new() },
+            volume: Volume { roots: vec![first], scratch, text: String::new() },
             reader,
             querier,
             shown,
@@ -915,6 +995,23 @@ impl Journal {
     /// The volume handle the reads are on: what the port is told of and a cancel names.
     pub(super) fn raw(&self) -> HANDLE {
         self.reader.as_raw_handle()
+    }
+
+    /// `root` watched by this reader from its next read on: every record after the journal's
+    /// position now that is under it is named under it. One of another volume is refused,
+    /// naming both: each volume has a reader of its own.
+    pub(super) fn add_root(&mut self, root: Root) -> Result<(), String> {
+        if root.serial != self.serial {
+            // alloc: an error path.
+            return Err(format!(
+                "{} is on another volume than {}: each volume's journal is read by a watch of its own",
+                root.dir, self.shown
+            ));
+        }
+        // clone: the root's name, kept by the names and the volume both.
+        self.names.add_root(root.dir.clone(), root.id);
+        self.volume.roots.push(root);
+        Ok(())
     }
 
     /// The synchronous handle of the volume a flush's [`mark`] is asked through.
@@ -1347,6 +1444,73 @@ mod tests {
         let moved = record(9, 2, USN_REASON_RENAME_OLD_NAME, DIR);
         let (_, lost) = run(&mut names, &mut system, &[(moved, None)]);
         assert_eq!(lost, [(name("w/src"), Lost::Unnamed)]);
+    }
+
+    /// The invariant (one reader a volume, B15): a directory added to a journal's watch is a
+    /// root of its own: what changes under it is named under it, what changes under the first
+    /// root is named as before, and a directory met before it was added (then outside every
+    /// root, and kept so) is asked again, since it may be under the new one.
+    #[test]
+    fn a_root_added_names_what_is_under_it_and_asks_again_of_what_was_outside() {
+        const SDK: u128 = 100;
+        let mut names = Names::new(name("w"), ROOT);
+        let mut system = Fake::default().at(2, "w/src").at(3, "w/src/a.rs");
+        system.now.insert(101, Found::Outside);
+        let sdk_write = record(102, 101, USN_REASON_DATA_EXTEND, 0);
+        let (files, lost) = run(&mut names, &mut system, &[(sdk_write, None)]);
+        assert!(files.is_empty() && lost.is_empty(), "outside every root before the add");
+        assert_eq!(system.asked, [101]);
+        names.add_root(name("C:/sdk"), SDK);
+        system.now.insert(101, Found::Under(name("C:/sdk/lib")));
+        system.now.insert(102, Found::Under(name("C:/sdk/lib/ucrt.lib")));
+        let (files, lost) = run(
+            &mut names,
+            &mut system,
+            &[(sdk_write, None), (record(3, 2, USN_REASON_DATA_EXTEND, 0), None), (record(SDK, 99, USN_REASON_BASIC_INFO_CHANGE, DIR), None)],
+        );
+        assert_eq!(files, self::files(&["C:/sdk", "C:/sdk/lib/ucrt.lib", "w/src/a.rs"]));
+        assert!(lost.is_empty(), "{lost:?}");
+        assert_eq!(&system.asked[1..], [101, 102, 2, 3], "the directory kept as outside is asked again");
+        // The same root twice is one.
+        names.add_root(name("C:/sdk"), SDK);
+        assert_eq!(names.roots, [ROOT, SDK]);
+    }
+
+    /// Where the system would not say where a record's directory is, nothing under any root
+    /// can be ruled out: every root is looked at again, never only the first.
+    #[test]
+    fn an_unknown_directory_is_every_roots_loss() {
+        let mut names = Names::new(name("w"), ROOT);
+        names.add_root(name("C:/sdk"), 100);
+        let mut system = Fake::default();
+        system.now.insert(7, Found::Unknown);
+        let (files, lost) = run(&mut names, &mut system, &[(record(8, 7, USN_REASON_DATA_EXTEND, 0), None)]);
+        assert!(files.is_empty());
+        assert_eq!(lost, [(name("C:/sdk"), Lost::Rescan), (name("w"), Lost::Rescan)]);
+    }
+
+    /// The roots' names survive the compaction of the names a long watch met, and so do the
+    /// places of the directories under them.
+    #[test]
+    fn the_roots_names_survive_a_compaction() {
+        let mut names = Names::new(name("w"), ROOT);
+        names.add_root(name("C:/sdk"), 100);
+        let mut system = Fake::default().at(2, "C:/sdk/lib");
+        for at in 0..200u128 {
+            system.now.insert(1000 + at, Found::Under(name(&format!("C:/sdk/lib/d{at}"))));
+            run(&mut names, &mut system, &[(record(1000 + at, 2, USN_REASON_FILE_CREATE, DIR), None)]);
+        }
+        assert!(names.paths.len() > 200, "every directory made is named: {}", names.paths.len());
+        // A directory never met moves away from under a root: every place known is forgotten,
+        // and the names compacted at the read's end.
+        run(&mut names, &mut system, &[(record(20, ROOT, USN_REASON_RENAME_OLD_NAME, DIR), None)]);
+        assert_eq!(names.paths, [name("w"), name("C:/sdk")], "compacted to the roots");
+        let (files, _) = run(
+            &mut names,
+            &mut system,
+            &[(record(100, 99, USN_REASON_BASIC_INFO_CHANGE, DIR), None), (record(ROOT, 99, USN_REASON_BASIC_INFO_CHANGE, DIR), None)],
+        );
+        assert_eq!(files, self::files(&["C:/sdk", "w"]));
     }
 
     #[test]

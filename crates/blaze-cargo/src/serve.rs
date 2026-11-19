@@ -1244,6 +1244,7 @@ pub(crate) fn engine(
     let options = Options {
         unheld: unheld.filter(|_| paths.socket.is_some()),
         ntfs_edit,
+        outside_journaled: cfg!(windows),
         state: file_name(&paths.state)?,
         std: file_name(&std)?,
         builds: file_name(&builds()?)?,

@@ -540,10 +540,17 @@ impl Dirs {
         same
     }
 
-    /// The changes `files` (each named from `root`, the driver's) were heard at `generation`:
-    /// each directory asked of whole at or above one is changed, and each name's directory
-    /// ([`Dirs::watch_name`]) one names, or names an entry of. Whether any was.
-    fn heard(&self, root: &Path, files: &[FileName], generation: u64, path: &mut PathBuf) -> bool {
+    /// The changes `files` (each named as the driver names it, made a path by `path_of`) were
+    /// heard at `generation`: each directory asked of whole at or above one is changed, and
+    /// each name's directory ([`Dirs::watch_name`]) one names, or names an entry of. Whether any
+    /// was.
+    fn heard(
+        &self,
+        path_of: impl Fn(&FileName, &mut PathBuf),
+        files: &[FileName],
+        generation: u64,
+        path: &mut PathBuf,
+    ) -> bool {
         let mut hit = false;
         let mut names = self.names.lock();
         for file in files {
@@ -551,9 +558,7 @@ impl Dirs {
             // path then ([`Dirs::only_since`]), for whoever knows it is beside what it
             // rests on. A file that hit nothing moved nothing, and is not kept.
             let before = std::mem::replace(&mut hit, false);
-            path.clear();
-            path.push(root);
-            path.push(file.as_str());
+            path_of(file, path);
             let bytes = trimmed(path);
             prefixes(bytes, |end, tag| {
                 if let Some(dir) = self.find(&bytes[..end], tag)
@@ -1135,14 +1140,67 @@ pub fn want(dir: &Path) {
     DIRS.want(dir)
 }
 
-/// How many tags a driver uses: four per directory (its watch, its stat, its flush).
+/// How many tags a driver uses: four per directory (its watch, its stat, its flush), and from
+/// [`VOLUMES`] two per volume a journal mode reads (its journal, its flush).
 pub const TAGS: u64 = 1 << 32;
 const WATCH: u64 = 0;
 const STAT: u64 = 1;
 const FLUSH: u64 = 2;
+/// Where the volumes' tags start, past every directory's (at most [`MOST`] of them, four each).
+const VOLUMES: u64 = 1 << 31;
+const _: () = assert!((MOST as u64) << 2 <= VOLUMES);
+/// The most volumes a journal mode reads: drive letters and shares.
+const MOST_VOLUMES: usize = 64;
 /// The most rounds a directory whose watch or stat failed waits before it is asked again; the
 /// wait doubles from one with each failure in a row.
 const MOST_BACKOFF: u64 = 1024;
+
+/// How a driver hears what changes under the directories ([`Outside::new`],
+/// [`Outside::journaled`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// One [`Effect::Watch`] a directory, flushed one by one: inotify's and fanotify's,
+    /// FSEvents', where a watch has a barrier ([`Effect::Flush`]).
+    Watch,
+    /// One reader of each volume's journal of changes ([`Effect::Journal`]) for every
+    /// directory on it ([`Effect::AlsoJournal`]), flushed once a volume: NTFS's USN journal,
+    /// the one barrier Windows has (`ReadDirectoryChangesW` has none).
+    Journal,
+}
+
+/// A volume's journal, read once for every directory on it ([`Mode::Journal`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reading {
+    /// Not read: never asked, failed, or ended.
+    Idle,
+    /// Its [`Effect::Journal`] is asked and has not caught up: it names nothing yet.
+    Opening,
+    Open,
+}
+
+/// A volume's journal as the driver reads it.
+struct Volume {
+    /// What names it: the first part of a directory's name, or `UNC/server/share`.
+    key: String,
+    reading: Reading,
+    /// The directory its [`Effect::Journal`] was asked of, confirmed once it caught up.
+    first: Option<usize>,
+    /// Directories asked while it opens, added once it is open.
+    waiting: Vec<usize>,
+    /// The round its flush in flight was asked in.
+    flush: Option<u64>,
+    /// It owes the round under way a flush asked in it.
+    due: bool,
+}
+
+/// The volume a directory's name is on: its first part (a drive, `C:`), or `UNC` with the
+/// server and share after it.
+fn volume_of(file: &FileName) -> &str {
+    let name = file.as_str();
+    let parts = if name.starts_with("UNC/") { 3 } else { 1 };
+    let end = name.match_indices('/').nth(parts - 1).map_or(name.len(), |(at, _)| at);
+    &name[..end]
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -1170,6 +1228,9 @@ struct Watch {
     restart: bool,
     /// A directory above it, which this driver watches, covers it: it is not watched again.
     retired: bool,
+    /// Its directory is being added to its volume's journal ([`Mode::Journal`]): its stat is
+    /// asked only once every change after that is told, never before.
+    opening: bool,
     /// The round before which a failed watch or stat is not asked again, and the next wait.
     retry: u64,
     backoff: u64,
@@ -1185,23 +1246,56 @@ pub struct Outside<'d> {
     /// A changed file's whole path, as it is looked up: one buffer, grown to the longest.
     heard: PathBuf,
     tags: u64,
+    mode: Mode,
     /// One per directory of the table, by its number; never removed (a retired one stays).
     watches: RegionVec<Watch>,
+    /// Each watch's volume ([`Mode::Journal`]), by the directory's number.
+    on: RegionVec<u32>,
+    /// The volumes' journals ([`Mode::Journal`]), at most [`MOST_VOLUMES`].
+    volumes: Vec<Volume>,
     round: u64,
     /// The flushes the round under way waits for.
     left: u32,
 }
 
 impl<'d> Outside<'d> {
-    /// The driver of `dirs`' watches, through a driver whose files are under `root` (`/`, so
-    /// that every directory is nameable). One drives a table at a time. Stops when the address
-    /// space for its watches cannot be had.
+    /// The driver of `dirs`' watches, one [`Effect::Watch`] a directory, through a driver whose
+    /// files are under `root` (`/`, so that every directory is nameable). One drives a table at
+    /// a time. Stops when the address space for its watches cannot be had. The mode is the
+    /// caller's to choose ([`Outside::journaled`]), never the host's: a simulation runs the same
+    /// on every system.
     pub fn new(dirs: &'d Dirs, root: impl Into<PathBuf>, tags: u64) -> Outside<'d> {
+        Outside::with(dirs, root.into(), tags, Mode::Watch)
+    }
+
+    /// [`Outside::new`], hearing changes through one reader of each volume's journal
+    /// ([`Effect::Journal`], [`Effect::AlsoJournal`]), flushed once a volume a round: for
+    /// Windows, whose directory watch has no barrier, so no flush, so nothing outside was ever
+    /// vouched for and every request stamped the SDK's and the toolchain's files again.
+    pub fn journaled(dirs: &'d Dirs, root: impl Into<PathBuf>, tags: u64) -> Outside<'d> {
+        Outside::with(dirs, root.into(), tags, Mode::Journal)
+    }
+
+    fn with(dirs: &'d Dirs, root: PathBuf, tags: u64, mode: Mode) -> Outside<'d> {
         let watches = RegionVec::new(MOST as usize, blaze_mem::Tag::Vfs)
             .unwrap_or_else(|error| panic!("the watches of directories outside views: {error}"));
+        let on = RegionVec::new(MOST as usize, blaze_mem::Tag::Vfs)
+            .unwrap_or_else(|error| panic!("the volumes of directories outside views: {error}"));
         assert!(!dirs.driven.swap(true, Ordering::AcqRel), "another Outside drives this table");
-        // alloc: once a driver, the buffer a changed file's path is looked up in
-        Outside { dirs, root: root.into(), heard: PathBuf::with_capacity(1024), tags, watches, round: 0, left: 0 }
+        Outside {
+            dirs,
+            root,
+            // alloc: once a driver, the buffer a changed file's path is looked up in
+            heard: PathBuf::with_capacity(1024),
+            tags,
+            mode,
+            watches,
+            on,
+            // alloc: once a driver, grown to the volumes it reads (a few)
+            volumes: Vec::new(),
+            round: 0,
+            left: 0,
+        }
     }
 
     /// Whether a completion is of an effect this asked for.
@@ -1228,9 +1322,11 @@ impl<'d> Outside<'d> {
                 confirmed: false,
                 restart: false,
                 retired: false,
+                opening: false,
                 retry: 0,
                 backoff: 1,
             });
+            self.on.push(u32::MAX);
         }
         // A directory that covers one added with it comes after it: all are in first.
         for at in first..len {
@@ -1270,18 +1366,37 @@ impl<'d> Outside<'d> {
         self.left = 0;
         self.dirs.settle(false);
         let round = self.round;
+        for volume in &mut self.volumes {
+            volume.due = false;
+        }
         for at in 0..self.watches.len() {
             self.watches[at].due = false;
             if self.retire(at, effects) {
                 continue;
             }
+            let journal = self.mode == Mode::Journal;
             let watch = &mut self.watches[at];
             if watch.file.is_none() || watch.restart {
                 continue;
             }
-            let idle = !watch.stat && watch.flush.is_none();
+            let idle = !watch.stat && watch.flush.is_none() && !watch.opening;
             match watch.state {
                 State::Idle if idle && watch.retry <= round => self.watch(at, effects),
+                // A journal is flushed once a volume, for every directory on it confirmed.
+                State::Watching if watch.confirmed && journal => {
+                    let v = self.on[at] as usize;
+                    let tag = self.volume_tag(v, FLUSH_VOLUME);
+                    let watch_tag = self.volume_tag(v, JOURNAL);
+                    let volume = &mut self.volumes[v];
+                    if volume.reading == Reading::Open && !volume.due {
+                        volume.due = true;
+                        self.left += 1;
+                        if volume.flush.is_none() {
+                            volume.flush = Some(round);
+                            effects.push(Effect::Flush { watch: watch_tag, tag });
+                        }
+                    }
+                }
                 State::Watching if watch.confirmed => {
                     watch.due = true;
                     self.left += 1;
@@ -1293,7 +1408,9 @@ impl<'d> Outside<'d> {
                         });
                     }
                 }
-                State::Watching if !watch.stat && watch.retry <= round => self.stat(at, effects),
+                State::Watching if !watch.stat && !watch.opening && watch.retry <= round => {
+                    self.stat(at, effects)
+                }
                 _ => {}
             }
         }
@@ -1305,7 +1422,14 @@ impl<'d> Outside<'d> {
     /// Takes a completion of its own.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) {
         let offset = completion.tag.0 - self.tags;
+        if offset >= VOLUMES {
+            let (v, kind) = (((offset - VOLUMES) >> 1) as usize, (offset - VOLUMES) & 1);
+            return self.volume_told(v, kind, completion.done, effects);
+        }
         let (at, kind) = ((offset >> 2) as usize, offset & 3);
+        if self.mode == Mode::Journal && kind == WATCH {
+            return self.added(at, completion.done, effects);
+        }
         let dirs = self.dirs;
         let dir = dirs.dir(at as u32);
         let round = self.round;
@@ -1329,7 +1453,8 @@ impl<'d> Outside<'d> {
                 // Each file that moved something is kept by its path ([`Dirs::heard`],
                 // [`Dirs::only_since`]).
                 let generation = dirs.bump();
-                if dirs.heard(&self.root, &files, generation, &mut self.heard) || lost {
+                let (root, heard) = (&self.root, &mut self.heard);
+                if dirs.heard(|file, into| path_of(root, file, into), &files, generation, heard) || lost {
                     dirs.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
                 }
                 if lost {
@@ -1375,6 +1500,7 @@ impl<'d> Outside<'d> {
                         if meta.dir
                             && watch.state == State::Watching
                             && !watch.confirmed
+                            && !watch.opening
                             && !watch.restart
                             && !watch.retired =>
                     {
@@ -1428,6 +1554,11 @@ impl<'d> Outside<'d> {
         }
         if watch.retired {
             if watch.state == State::Watching {
+                // A journal's directory stays one of its reader's: nothing to end.
+                if self.mode == Mode::Journal {
+                    watch.state = State::Idle;
+                    return;
+                }
                 watch.state = State::Ending;
                 effects.push(Effect::Unwatch { tag: self.tag(at, WATCH) });
             }
@@ -1446,7 +1577,9 @@ impl<'d> Outside<'d> {
         }
     }
 
-    /// Watches the directory `at`, and asks right after for the stat that confirms it.
+    /// Watches the directory `at`, and asks right after for the stat that confirms it; in
+    /// [`Mode::Journal`], adds it to its volume's journal (opened for it when none is), and asks
+    /// the stat only once the journal names every change under it ([`Outside::added`]).
     fn watch(&mut self, at: usize, effects: &mut Vec<Effect>) {
         let tag = self.tag(at, WATCH);
         let watch = &mut self.watches[at];
@@ -1454,8 +1587,214 @@ impl<'d> Outside<'d> {
         let file = watch.file.clone().expect("a directory the driver names");
         watch.state = State::Watching;
         watch.confirmed = false;
-        effects.push(Effect::Watch { dir: file, tag });
-        self.stat(at, effects);
+        if self.mode == Mode::Watch {
+            effects.push(Effect::Watch { dir: file, tag });
+            return self.stat(at, effects);
+        }
+        watch.opening = true;
+        let key = volume_of(&file);
+        let v = match self.volumes.iter().position(|it| it.key == key) {
+            Some(v) => v,
+            None => {
+                assert!(self.volumes.len() < MOST_VOLUMES, "more than {MOST_VOLUMES} volumes read outside every view");
+                self.volumes.push(Volume {
+                    // alloc: once a volume, its name.
+                    key: key.to_owned(),
+                    reading: Reading::Idle,
+                    first: None,
+                    // alloc: none until a directory waits for the volume to open.
+                    waiting: Vec::new(),
+                    flush: None,
+                    due: false,
+                });
+                self.volumes.len() - 1
+            }
+        };
+        self.on[at] = v as u32;
+        let journal = self.volume_tag(v, JOURNAL);
+        let volume = &mut self.volumes[v];
+        match volume.reading {
+            Reading::Idle => {
+                volume.reading = Reading::Opening;
+                volume.first = Some(at);
+                effects.push(Effect::Journal { dir: file, since: blaze_core::Cursor::None, tag: journal });
+            }
+            // alloc: grown once to the directories asked while it opens.
+            Reading::Opening => volume.waiting.push(at),
+            Reading::Open => effects.push(Effect::AlsoJournal { watch: journal, dir: file, tag }),
+        }
+    }
+
+    /// The tag of a volume's `kind` ([`JOURNAL`], [`FLUSH_VOLUME`]).
+    fn volume_tag(&self, v: usize, kind: u64) -> Tag {
+        Tag(self.tags + VOLUMES + ((v as u64) << 1) + kind)
+    }
+
+    /// A directory's add to its volume's journal ([`Effect::AlsoJournal`]) answered: once
+    /// every change under it is told, its stat confirms it; one that failed is asked again
+    /// later.
+    fn added(&mut self, at: usize, done: Done, effects: &mut Vec<Effect>) {
+        let round = self.round;
+        let watch = &mut self.watches[at];
+        watch.opening = false;
+        match done {
+            Done::Flushed if watch.state == State::Watching && !watch.retired => self.stat(at, effects),
+            Done::Flushed => {}
+            Done::Failed(_) => {
+                unconfirm(self.dirs, self.dirs.dir(at as u32), watch);
+                watch.state = State::Idle;
+                back_off(watch, round);
+            }
+            done => unreachable!("a directory's add to its journal completed with {done:?}"),
+        }
+    }
+
+    /// A completion of the journal of volume `v` (`kind` [`JOURNAL`]: a batch or its end) or of
+    /// its flush ([`FLUSH_VOLUME`]).
+    fn volume_told(&mut self, v: usize, kind: u64, done: Done, effects: &mut Vec<Effect>) {
+        let round = self.round;
+        match (kind, done) {
+            (JOURNAL, Done::Journaled(batch)) => {
+                let volume = &mut self.volumes[v];
+                if volume.reading == Reading::Opening && batch.caught_up {
+                    volume.reading = Reading::Open;
+                    let first = volume.first;
+                    let waiting = std::mem::take(&mut volume.waiting);
+                    let journal = self.volume_tag(v, JOURNAL);
+                    if let Some(first) = first {
+                        self.added(first, Done::Flushed, effects);
+                    }
+                    for at in waiting {
+                        let watch = &self.watches[at];
+                        if watch.state == State::Watching && watch.opening && !watch.retired {
+                            // clone: the effect owns its name, once a directory added.
+                            let dir = watch.file.clone().expect("a directory the driver names");
+                            effects.push(Effect::AlsoJournal { watch: journal, dir, tag: self.tag(at, WATCH) });
+                        }
+                    }
+                }
+                self.batch_told(v, *batch, effects);
+            }
+            (JOURNAL, done @ (Done::Unwatched | Done::Failed(_))) => {
+                let volume = &mut self.volumes[v];
+                volume.reading = Reading::Idle;
+                volume.first = None;
+                volume.waiting.clear();
+                // Every directory read through it stops vouching, and is watched again.
+                for at in 0..self.watches.len() {
+                    if self.on[at] as usize != v || self.watches[at].state != State::Watching {
+                        continue;
+                    }
+                    let watch = &mut self.watches[at];
+                    unconfirm(self.dirs, self.dirs.dir(at as u32), watch);
+                    watch.state = State::Idle;
+                    watch.opening = false;
+                    if matches!(done, Done::Failed(_)) {
+                        back_off(watch, round);
+                    }
+                }
+            }
+            (JOURNAL, done) => unreachable!("a volume's journal completed with {done:?}"),
+            (_, done) => {
+                let volume = &mut self.volumes[v];
+                let asked = volume.flush.take().expect("a volume's flush in flight");
+                let open = volume.reading == Reading::Open;
+                let failed = matches!(done, Done::Failed(_));
+                if failed {
+                    // Nothing read through it is known heard: each directory on it is asked again.
+                    self.confirm_again(v, effects);
+                }
+                let volume = &mut self.volumes[v];
+                if volume.due {
+                    if asked == round || !open || failed {
+                        volume.due = false;
+                        self.left -= 1;
+                        if self.left == 0 {
+                            self.dirs.settle(true);
+                        }
+                    } else {
+                        // Asked in a round before this one: it covers less than this one needs.
+                        volume.flush = Some(round);
+                        effects.push(Effect::Flush { watch: self.volume_tag(v, JOURNAL), tag: self.volume_tag(v, FLUSH_VOLUME) });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every directory of volume `v` stops vouching and is confirmed again by a stat asked now:
+    /// what its journal read may not be all that changed.
+    fn confirm_again(&mut self, v: usize, effects: &mut Vec<Effect>) {
+        for at in 0..self.watches.len() {
+            let watch = &self.watches[at];
+            if self.on[at] as usize != v || watch.state != State::Watching || watch.opening || watch.retired {
+                continue;
+            }
+            let watch = &mut self.watches[at];
+            unconfirm(self.dirs, self.dirs.dir(at as u32), watch);
+            if !watch.stat {
+                self.stat(at, effects);
+            }
+        }
+    }
+
+    /// A batch of volume `v`'s journal: what it names moved, as a watch's change does, each
+    /// directory it names itself looked at again (made, replaced or removed, or its attributes
+    /// changed); a subtree whose names it could not give moved whole, which no caller sets
+    /// aside; and a loss of what changed (dropped, truncated, reset, the root changed)
+    /// confirms every directory on the volume again. A batch that names nothing (a cursor's
+    /// advance) is no change.
+    fn batch_told(&mut self, v: usize, batch: blaze_core::Journaled, effects: &mut Vec<Effect>) {
+        let blaze_core::Journaled { files, mut lost, .. } = batch;
+        if JOURNAL_LOSS_IGNORED.get() {
+            lost.clear();
+        }
+        if files.is_empty() && lost.is_empty() {
+            return;
+        }
+        let dirs = self.dirs;
+        if !files.is_empty() {
+            let generation = dirs.bump();
+            let (root, heard) = (&self.root, &mut self.heard);
+            if dirs.heard(|file, into| path_of(root, file, into), &files, generation, heard) {
+                dirs.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
+            }
+            for at in 0..self.watches.len() {
+                let watch = &self.watches[at];
+                let named = self.on[at] as usize == v
+                    && watch.state == State::Watching
+                    && !watch.opening
+                    && !watch.retired
+                    && watch.file.as_ref().is_some_and(|it| files.binary_search(it).is_ok());
+                if named {
+                    let watch = &mut self.watches[at];
+                    unconfirm(dirs, dirs.dir(at as u32), watch);
+                    if !watch.stat {
+                        self.stat(at, effects);
+                    }
+                }
+            }
+        }
+        let mut whole = false;
+        for (under, why) in &lost {
+            match why {
+                // Names in it, or under it, changed and the journal could not say which: it
+                // moved whole, as one change no caller can set aside.
+                blaze_core::Lost::Unnamed | blaze_core::Lost::Rescan => {
+                    let generation = dirs.bump();
+                    let (root, heard) = (&self.root, &mut self.heard);
+                    dirs.heard(|file, into| path_of(root, file, into), std::slice::from_ref(under), generation, heard);
+                    dirs.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
+                    dirs.hear(generation, None);
+                }
+                _ => whole = true,
+            }
+        }
+        if whole {
+            let generation = dirs.disturb();
+            dirs.hear(generation, None);
+            self.confirm_again(v, effects);
+        }
     }
 
     fn stat(&mut self, at: usize, effects: &mut Vec<Effect>) {
@@ -1471,8 +1810,16 @@ impl<'d> Outside<'d> {
         Tag(self.tags + ((at as u64) << 2) + kind)
     }
 
-    /// `path` as the driver names it, when its root can.
+    /// `path` as the driver names it, when its root can. On Windows a driver rooted at `/` names
+    /// every volume (`C:/sdk`, `UNC/server/share/a`, [`blaze_core::platform::path::daemon`]),
+    /// which a host path never strips `/` from: until 2026-11-19 no directory outside the
+    /// checkout was nameable there, so none was ever watched.
     fn name(&self, path: &Path) -> Option<FileName> {
+        #[cfg(windows)]
+        if self.root == Path::new("/") && path.is_absolute() {
+            let name = blaze_core::platform::path::daemon(path).ok()?;
+            return FileName::new(name.strip_prefix('/')?);
+        }
         let rest = path.strip_prefix(&self.root).ok()?.to_str()?;
         if std::path::MAIN_SEPARATOR != '/' && rest.contains(std::path::MAIN_SEPARATOR) {
             return FileName::new(&rest.replace(std::path::MAIN_SEPARATOR, "/"));
@@ -1504,6 +1851,13 @@ thread_local! {
     pub static EMPTY_WAKE_IS_A_CHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: what a journal's batch says it lost is taken as
+    /// nothing, so a dropped change is never heard. Never set outside a test.
+    #[doc(hidden)]
+    pub static JOURNAL_LOSS_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Every directory stops vouching once nothing drives it.
 impl Drop for Outside<'_> {
     fn drop(&mut self) {
@@ -1513,6 +1867,30 @@ impl Drop for Outside<'_> {
         }
         self.dirs.driven.store(false, Ordering::Release);
     }
+}
+
+/// A volume's journal ([`Outside::volume_tag`]): its batches and its end.
+const JOURNAL: u64 = 0;
+/// A volume's flush.
+const FLUSH_VOLUME: u64 = 1;
+
+/// The path a driver rooted at `root` names `file`: under it, or, on Windows with `/` as the
+/// root, the host's path of a name of a volume ([`blaze_core::platform::path::host`]), the
+/// spelling [`Dirs::want`] keeps (`C:\sdk`).
+fn path_of(root: &Path, file: &FileName, into: &mut PathBuf) {
+    into.clear();
+    #[cfg(windows)]
+    if root == Path::new("/") {
+        let name = file.as_str();
+        let first = name.split('/').next().unwrap_or("");
+        if first.ends_with(':') || first == "UNC" {
+            // alloc: a changed file's path, once per change heard.
+            into.push(blaze_core::platform::path::host(&format!("/{name}")));
+            return;
+        }
+    }
+    into.push(root);
+    into.push(file.as_str());
 }
 
 fn unconfirm(dirs: &Dirs, dir: Dir<'_>, watch: &mut Watch) {

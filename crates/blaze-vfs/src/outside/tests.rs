@@ -959,3 +959,394 @@ fn outside_looks_of_no_build_keep_nothing() {
     none.extend(&Looks::new().all());
     assert!(!none.keeps() && none.is_empty() && none.all().is_empty());
 }
+
+// ---- One reader of each volume's journal (B15) --------------------------------------------
+//
+// The first attempt (`perf-scratch/outside-experiment.patch`, 2026-11-14) switched the driver to
+// one `Effect::Journal` per directory with `cfg!(windows)` inside this core: every simulation
+// test of the watch driver ran journals when run on Windows and 4 of 26 failed, and the real
+// daemon opened a reader of the whole volume's journal for every directory outside the
+// checkout. The mode is now the caller's (`Outside::journaled`), one reader serves a volume,
+// a directory is confirmed only once its journal names every change after the confirmation,
+// a quiet batch is no change, and every kind of loss is handled. Each case has its test here.
+
+/// The journal tag of the `v`th volume a journaled driver reads, and of its flush.
+fn volume_tag(v: u64, kind: u64) -> Tag {
+    Tag(TAGS + super::VOLUMES + (v << 1) + kind)
+}
+
+/// `/c/tc` and `/c/sdk` on volume `c`, `/d/x` on volume `d`, each with a file in it.
+fn journaled_world(dirs: &Dirs, seed: u64, faults: Faults) -> (Sim, Outside<'_>, Vec<Effect>) {
+    let mut sim = Sim::new(seed, faults);
+    sim.change(&name("c/tc/lib/a.h"), b"int a;");
+    sim.change(&name("c/sdk/lib/ucrt.lib"), b"ucrt");
+    sim.change(&name("d/x/y.h"), b"y");
+    dirs.want(path("/c/tc"));
+    dirs.want(path("/c/sdk"));
+    dirs.want(path("/d/x"));
+    (sim, Outside::journaled(dirs, "/", TAGS), Vec::new())
+}
+
+/// What a driver asked, in order, as kinds and names, each with the completions handed to it
+/// before (a step of the log is `(asked, handed so far)`).
+fn pump_logged(sim: &mut Sim, outside: &mut Outside<'_>, effects: &mut Vec<Effect>, log: &mut Vec<(String, usize)>, handed: &mut Vec<(Tag, String)>) {
+    let mut done = Vec::new();
+    loop {
+        for effect in effects.iter() {
+            let said = match effect {
+                Effect::Journal { dir, .. } => format!("journal {dir}"),
+                Effect::AlsoJournal { dir, .. } => format!("add {dir}"),
+                Effect::Stat { file, .. } => format!("stat {file}"),
+                Effect::Flush { .. } => "flush".to_owned(),
+                Effect::Watch { dir, .. } => format!("watch {dir}"),
+                Effect::Unwatch { .. } => "unwatch".to_owned(),
+                other => format!("{other:?}"),
+            };
+            log.push((said, handed.len()));
+        }
+        sim.submit(effects);
+        if sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 {
+            return;
+        }
+        for completion in done.drain(..) {
+            let kind = match &completion.done {
+                Done::Journaled(_) => "journaled",
+                Done::Flushed => "flushed",
+                Done::Stat(_) => "stat",
+                _ => "other",
+            };
+            handed.push((completion.tag, kind.to_owned()));
+            outside.complete(completion, effects);
+        }
+    }
+}
+
+/// A journaled round run to its end.
+fn journaled_round(sim: &mut Sim, outside: &mut Outside<'_>, effects: &mut Vec<Effect>) {
+    outside.flush(effects);
+    pump(sim, outside, effects);
+    assert!(outside.flushed());
+}
+
+/// The invariant: a volume's journal is read once for every directory on it: one
+/// `Effect::Journal` a volume, of the first directory asked on it, every other directory added
+/// to that reader (`Effect::AlsoJournal`), and one flush a volume a round; and what changes
+/// under one directory is heard as its change alone.
+#[test]
+fn a_journaled_driver_reads_each_volume_once_for_every_directory_on_it() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 1, Faults::default());
+    outside.flush(&mut effects);
+    let (mut log, mut handed) = (Vec::new(), Vec::new());
+    pump_logged(&mut sim, &mut outside, &mut effects, &mut log, &mut handed);
+    let asked: Vec<&str> = log.iter().map(|it| it.0.as_str()).collect();
+    assert_eq!(asked.iter().filter(|it| it.starts_with("journal")).count(), 2, "{asked:?}");
+    assert!(asked.contains(&"journal c/tc") && asked.contains(&"journal d/x"), "{asked:?}");
+    assert_eq!(asked.iter().filter(|it| it.starts_with("add")).collect::<Vec<_>>(), [&"add c/sdk"], "{asked:?}");
+    assert!(!asked.iter().any(|it| it.starts_with("watch")), "no directory watch on a journaled driver: {asked:?}");
+    for at in 0..3 {
+        assert!(dirs.dir(at).since() < UNCONFIRMED, "{} confirmed", dirs.dir(at).path().display());
+    }
+    outside.flush(&mut effects);
+    let flushes = effects.iter().filter(|it| matches!(it, Effect::Flush { .. })).count();
+    assert_eq!(flushes, 2, "one flush a volume: {effects:?}");
+    pump(&mut sim, &mut outside, &mut effects);
+    assert!(outside.flushed());
+    let generation = dirs.generation();
+    for file in ["/c/tc/lib/a.h", "/c/sdk/lib/ucrt.lib", "/d/x/y.h"] {
+        assert!(dirs.unchanged_since(path(file), generation), "{file}");
+    }
+    sim.change(&name("c/sdk/lib/ucrt.lib"), b"ucrt 2");
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation), "the change is heard through the shared reader");
+    assert!(dirs.unchanged_since(path("/c/tc/lib/a.h"), generation), "a sibling directory of the volume is not moved by it");
+    assert!(dirs.unchanged_since(path("/d/x/y.h"), generation));
+}
+
+/// The invariant (the first attempt confirmed a directory as its journal was asked for): a
+/// directory's stat is asked only after its volume's journal has caught up, for the first
+/// directory, or after its add was answered, for the others: never before every change after
+/// the confirmation is one the journal tells.
+#[test]
+fn a_directory_is_stat_ed_only_once_its_journal_names_every_change_after() {
+    for seed in 0..32 {
+        let dirs = Dirs::new();
+        let faults = Faults { max_latency: Duration::from_millis(5), ..Faults::default() };
+        let (mut sim, mut outside, mut effects) = journaled_world(&dirs, seed, faults);
+        outside.flush(&mut effects);
+        assert!(effects.iter().all(|it| matches!(it, Effect::Journal { .. })), "seed {seed}: only the journals at first: {effects:?}");
+        let (mut log, mut handed) = (Vec::new(), Vec::new());
+        pump_logged(&mut sim, &mut outside, &mut effects, &mut log, &mut handed);
+        let at = |what: &str| log.iter().find(|it| it.0 == what).map(|it| it.1).unwrap_or_else(|| panic!("seed {seed}: {what} never asked: {log:?}"));
+        let first = |tag: Tag, kind: &str| handed.iter().position(|it| it.0 == tag && it.1 == kind).unwrap_or_else(|| panic!("seed {seed}: no {kind} of {tag:?}"));
+        // `c` is the first volume (its first directory was wanted first), `d` the second.
+        assert!(at("stat c/tc") > first(volume_tag(0, super::JOURNAL), "journaled"), "seed {seed}: {log:?}");
+        assert!(at("stat d/x") > first(volume_tag(1, super::JOURNAL), "journaled"), "seed {seed}: {log:?}");
+        assert!(at("stat c/sdk") > first(outside.tag(1, WATCH), "flushed"), "seed {seed}: {log:?}");
+        assert!(at("add c/sdk") > first(volume_tag(0, super::JOURNAL), "journaled"), "seed {seed}: added once the reader is open");
+    }
+}
+
+/// A journal's batch that names nothing and lost nothing (the reader's cursor moving on, which
+/// the USN journal tells every megabyte of the volume's records) is no change: what was
+/// vouched for still is, and the table is still quiet.
+fn vouched_after_a_quiet_batch() -> bool {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 2, Faults::default());
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    let quiet = blaze_core::Journaled { files: Vec::new(), lost: Vec::new(), cursor: blaze_core::Cursor::None, caught_up: true };
+    outside.complete(Completion { tag: volume_tag(0, super::JOURNAL), done: Done::Journaled(Box::new(quiet)) }, &mut effects);
+    assert!(effects.is_empty(), "nothing asked for a quiet batch: {effects:?}");
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    dirs.unchanged_since(path("/c/tc/lib/a.h"), generation) && dirs.quiet_since(generation)
+}
+
+#[test]
+fn a_quiet_journal_batch_is_no_change() {
+    assert!(vouched_after_a_quiet_batch());
+}
+
+/// The invariant: a change made before a journaled round is heard once the round is in, under
+/// every interleaving the latency draws, and nothing vouches while the round is out: the
+/// volume's flush is the barrier (`ReadDirectoryChangesW`, which the first attempt kept, has
+/// none, so on Windows no round ever settled with a directory vouched for).
+#[test]
+fn a_change_made_before_a_journaled_round_is_seen_once_it_completes() {
+    for seed in 0..64 {
+        let dirs = Dirs::new();
+        let faults = Faults { max_latency: Duration::from_millis(5), ..Faults::default() };
+        let (mut sim, mut outside, mut effects) = journaled_world(&dirs, seed, faults);
+        journaled_round(&mut sim, &mut outside, &mut effects);
+        journaled_round(&mut sim, &mut outside, &mut effects);
+        let generation = dirs.generation();
+        assert!(dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation), "seed {seed}");
+        sim.change(&name("c/sdk/lib/ucrt.lib"), b"ucrt 2");
+        outside.flush(&mut effects);
+        assert!(!outside.flushed(), "seed {seed}: a round waits for its volumes' flushes");
+        let mut done = Vec::new();
+        while !outside.flushed() {
+            sim.submit(&mut effects);
+            assert!(sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) > 0, "seed {seed}: the flush never came");
+            for completion in done.drain(..) {
+                outside.complete(completion, &mut effects);
+            }
+            assert!(outside.flushed() || !dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation), "seed {seed}: vouched while the round is out");
+        }
+        assert!(!dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation), "seed {seed}");
+        pump(&mut sim, &mut outside, &mut effects);
+    }
+}
+
+/// The invariant: names in a directory that the journal could not give (NTFS's unprivileged
+/// read: `Lost::Unnamed`) move that directory whole, as a change no caller can set aside; the
+/// reader goes on, nothing is watched again, and what it vouches for afterwards it vouches.
+#[test]
+fn names_a_journal_could_not_give_move_their_directory_and_nothing_restarts() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 3, Faults::default());
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    let since = dirs.dir(0).since();
+    let unnamed = blaze_core::Journaled {
+        files: Vec::new(),
+        lost: vec![(name("c/tc/lib"), blaze_core::Lost::Unnamed)],
+        cursor: blaze_core::Cursor::None,
+        caught_up: true,
+    };
+    outside.complete(Completion { tag: volume_tag(0, super::JOURNAL), done: Done::Journaled(Box::new(unnamed)) }, &mut effects);
+    assert!(effects.is_empty(), "nothing is watched again: {effects:?}");
+    assert!(!dirs.unchanged_since(path("/c/tc/lib/a.h"), generation), "the directory moved whole");
+    assert!(!dirs.only_since(generation, |_| true), "no caller sets an unnamed change aside");
+    assert!(dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation), "another directory of the volume did not move");
+    assert_eq!(dirs.dir(0).since(), since, "still confirmed: the reader goes on");
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    assert!(dirs.unchanged_since(path("/c/tc/lib/a.h"), dirs.generation()));
+}
+
+/// The invariant: a journal that dropped changes (or was truncated or reset under its reader)
+/// leaves every directory read through it unconfirmed until a stat asked after the loss
+/// confirms it again: nothing from before the loss is vouched for, and the reader is not opened
+/// again.
+#[test]
+fn dropped_changes_confirm_every_directory_of_the_volume_again() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 4, Faults::default());
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    let dropped = blaze_core::Journaled {
+        files: Vec::new(),
+        lost: vec![(name("c/tc"), blaze_core::Lost::Dropped), (name("c/sdk"), blaze_core::Lost::Dropped)],
+        cursor: blaze_core::Cursor::None,
+        caught_up: true,
+    };
+    outside.complete(Completion { tag: volume_tag(0, super::JOURNAL), done: Done::Journaled(Box::new(dropped)) }, &mut effects);
+    assert_eq!(dirs.dir(0).since(), UNCONFIRMED);
+    assert_eq!(dirs.dir(1).since(), UNCONFIRMED);
+    assert!(dirs.dir(2).since() < UNCONFIRMED, "another volume's directory is not moved by it");
+    assert!(effects.iter().all(|it| matches!(it, Effect::Stat { .. })) && effects.len() == 2, "a stat of each, no reader again: {effects:?}");
+    pump(&mut sim, &mut outside, &mut effects);
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/c/tc/lib/a.h"), generation));
+    assert!(!dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), generation));
+    assert!(dirs.unchanged_since(path("/d/x/y.h"), generation));
+    assert!(dirs.unchanged_since(path("/c/tc/lib/a.h"), dirs.generation()), "confirmed again after the loss");
+}
+
+/// The invariant: a volume's journal that ends (failed, or its watched directory moved, which
+/// ends a USN reader) stops every directory read through it vouching; the volume's reader is
+/// opened again, its directories added again, and each confirmed again.
+#[test]
+fn a_volumes_journal_that_fails_is_read_again_for_every_directory_on_it() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 5, Faults::default());
+    journaled_round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    let failed = Done::Failed(blaze_core::IoError("injected: the watched directory was moved".into()));
+    outside.complete(Completion { tag: volume_tag(0, super::JOURNAL), done: failed }, &mut effects);
+    assert_eq!((dirs.dir(0).since(), dirs.dir(1).since()), (UNCONFIRMED, UNCONFIRMED));
+    assert!(!dirs.unchanged_since(path("/c/tc/lib/a.h"), generation));
+    let (mut log, mut handed) = (Vec::new(), Vec::new());
+    for _ in 0..3 {
+        outside.flush(&mut effects);
+        pump_logged(&mut sim, &mut outside, &mut effects, &mut log, &mut handed);
+    }
+    let asked: Vec<&str> = log.iter().map(|it| it.0.as_str()).collect();
+    assert_eq!(asked.iter().filter(|it| it.starts_with("journal")).collect::<Vec<_>>(), [&"journal c/tc"], "{asked:?}");
+    assert!(asked.contains(&"add c/sdk"), "{asked:?}");
+    assert!(dirs.dir(0).since() > generation && dirs.dir(1).since() > generation);
+    assert!(dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), dirs.generation()));
+}
+
+/// The invariant: a directory whose add to its volume's reader failed is not confirmed, and is
+/// added again after its back-off, while the volume's other directories go on vouching.
+#[test]
+fn a_directory_whose_add_failed_is_added_again_later() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, 6, Faults::default());
+    outside.flush(&mut effects);
+    // The reader of `c` opens; the add of `c/sdk` it asks is answered failed by the test.
+    let mut done = Vec::new();
+    let mut failed_once = false;
+    loop {
+        sim.submit(&mut effects);
+        if sim.poll(&mut done, blaze_core::wait::Deadline::NEVER) == 0 {
+            break;
+        }
+        for mut completion in done.drain(..) {
+            if completion.tag == outside.tag(1, WATCH) && !failed_once {
+                failed_once = true;
+                completion.done = Done::Failed(blaze_core::IoError("injected".into()));
+            }
+            outside.complete(completion, &mut effects);
+        }
+    }
+    assert!(failed_once, "the add was asked");
+    assert_eq!(dirs.dir(1).since(), UNCONFIRMED);
+    assert!(dirs.dir(0).since() < UNCONFIRMED);
+    for _ in 0..3 {
+        journaled_round(&mut sim, &mut outside, &mut effects);
+    }
+    assert!(dirs.dir(1).since() < UNCONFIRMED, "added again and confirmed");
+    assert!(dirs.unchanged_since(path("/c/sdk/lib/ucrt.lib"), dirs.generation()));
+}
+
+/// The cause of the first attempt's 4 failing simulation cases: the mode came from the host
+/// (`cfg!(windows)`). A driver made by `Outside::new` watches each directory, whatever the
+/// system the test runs on; only `Outside::journaled` reads journals.
+#[test]
+fn the_mode_is_the_callers_never_the_hosts() {
+    let dirs = Dirs::new();
+    dirs.want(path("/tc"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    outside.flush(&mut effects);
+    assert!(matches!(effects[..], [Effect::Watch { .. }, Effect::Stat { .. }]), "{effects:?}");
+    drop(outside);
+    let dirs = Dirs::new();
+    dirs.want(path("/tc"));
+    let mut outside = Outside::journaled(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    outside.flush(&mut effects);
+    assert!(matches!(effects[..], [Effect::Journal { .. }]), "{effects:?}");
+}
+
+/// A name's volume: its first part, or a share's server and name.
+#[test]
+fn a_names_volume_is_its_drive_or_its_share() {
+    assert_eq!(super::volume_of(&name("C:/Program Files (x86)/Windows Kits")), "C:");
+    assert_eq!(super::volume_of(&name("C:")), "C:");
+    assert_eq!(super::volume_of(&name("UNC/server/share/sdk/lib")), "UNC/server/share");
+    assert_eq!(super::volume_of(&name("c/tc/lib")), "c");
+}
+
+/// On Windows a driver rooted at `/` names a drive's and a share's directories, and a change it
+/// names is the path `Dirs::want` keeps: before, no directory outside the checkout was
+/// nameable, so none was ever watched and every request stamped them again.
+#[cfg(windows)]
+#[test]
+fn a_drive_or_share_directory_is_nameable_and_heard_as_the_hosts_path() {
+    let dirs = Dirs::new();
+    let outside = Outside::journaled(&dirs, "/", TAGS);
+    assert_eq!(outside.name(Path::new(r"C:\sdk\lib")), Some(name("C:/sdk/lib")));
+    assert_eq!(outside.name(Path::new(r"\\server\share\sdk")), Some(name("UNC/server/share/sdk")));
+    let mut into = std::path::PathBuf::new();
+    super::path_of(Path::new("/"), &name("C:/sdk/lib/ucrt.lib"), &mut into);
+    assert_eq!(into, Path::new(r"C:\sdk\lib\ucrt.lib"));
+    super::path_of(Path::new("/"), &name("UNC/server/share/sdk/a.h"), &mut into);
+    assert_eq!(into, Path::new(r"\\server\share\sdk\a.h"));
+}
+
+/// One run of the journaled driver under faults (latency, dropped changes, failed flushes and
+/// adds), changing the three directories' files between rounds: whether a vouching was ever
+/// wrong, naming it. The oracle: after every settled round, each file a generation read after
+/// an earlier settled round says unchanged holds the bytes it held then.
+fn journaled_life(seed: u64) -> Result<(), String> {
+    let dirs = Dirs::new();
+    let faults = Faults { max_latency: Duration::from_millis(3), lose_change_one_in: 6, fail_one_in: 9, ..Faults::default() };
+    let (mut sim, mut outside, mut effects) = journaled_world(&dirs, seed, faults);
+    let files = ["c/tc/lib/a.h", "c/sdk/lib/ucrt.lib", "d/x/y.h"];
+    let mut kept: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
+    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for step in 0..40u32 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        if rng % 3 != 0 {
+            let file = files[(rng >> 8) as usize % files.len()];
+            sim.change(&name(file), format!("{file} {step}").as_bytes());
+        }
+        journaled_round(&mut sim, &mut outside, &mut effects);
+        for (generation, contents) in &kept {
+            for (file, content) in files.iter().zip(contents) {
+                if dirs.unchanged_since(path(&format!("/{file}")), *generation) && sim.contents(&name(file)) != *content {
+                    return Err(format!("seed {seed}, step {step}: /{file} vouched unchanged since generation {generation} and it changed"));
+                }
+            }
+        }
+        kept.push((dirs.generation(), files.iter().map(|it| sim.contents(&name(it))).collect()));
+    }
+    Ok(())
+}
+
+/// The invariant, under faults: a journaled driver never vouches for a file that changed since
+/// the generation it is asked of, whatever was dropped, failed or delayed.
+#[test]
+fn a_journaled_driver_never_vouches_for_a_changed_file() {
+    for seed in 0..48 {
+        journaled_life(seed).unwrap_or_else(|why| panic!("{why}"));
+    }
+}
+
+/// The control: with what a batch says it lost ignored, some seed's dropped change is never
+/// heard, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_journal_loss_ignored() {
+    super::JOURNAL_LOSS_IGNORED.set(true);
+    let caught = (0..48).find_map(|seed| journaled_life(seed).err());
+    super::JOURNAL_LOSS_IGNORED.set(false);
+    assert!(caught.is_some(), "planted: a dropped change is never heard, and no seed showed it");
+}

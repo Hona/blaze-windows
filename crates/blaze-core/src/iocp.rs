@@ -415,6 +415,12 @@ enum Back {
         flush: Tag,
         mark: io::Result<At>,
     },
+    /// A directory opened to be added to the journal `journal` ([`Effect::AlsoJournal`] `add`).
+    Rooted {
+        journal: Tag,
+        add: Tag,
+        root: io::Result<usn::Root>,
+    },
 }
 
 /// What the driver's threads are given.
@@ -444,6 +450,13 @@ enum Work {
         flush: Tag,
         querier: Arc<OwnedHandle>,
     },
+    /// The directory `dir`, to be added to the journal `journal` by [`Effect::AlsoJournal`]
+    /// `add`, opened as a watched directory.
+    Root {
+        journal: Tag,
+        add: Tag,
+        dir: FileName,
+    },
 }
 
 /// A journal's watch: whether its read is in flight (its request) or its journal is on the
@@ -467,6 +480,9 @@ struct Journaling {
     /// may stop short of it.
     asked_after_marks: bool,
     barrier: Barrier,
+    /// Directories opened to be added ([`Effect::AlsoJournal`]), each with its ask's tag: added
+    /// as soon as the journal is in hand (not in flight, not on the threads).
+    roots: Vec<(Tag, usn::Root)>,
 }
 
 impl Journaling {
@@ -482,6 +498,8 @@ impl Journaling {
             idle: None,
             asked_after_marks: false,
             barrier: Barrier::new(),
+            // alloc: none until a directory is added.
+            roots: Vec::new(),
         }
     }
 }
@@ -1025,6 +1043,25 @@ impl Iocp {
                 self.to_threads(Work::Open { tag, dir, since });
                 Ok(())
             }
+            // The directory opened on the threads, then added once the journal is in hand
+            // (`Iocp::rooted`, `Iocp::journaled`).
+            Effect::AlsoJournal { watch, dir, tag } => match self.journals.get(&watch) {
+                Some(journaling) if !journaling.stopping => {
+                    self.to_threads(Work::Root { journal: watch, add: tag, dir });
+                    Ok(())
+                }
+                Some(_) => Err(io::Error::other(format!(
+                    // alloc: an error path.
+                    "adding {dir} to the watch {watch:?}: it is being stopped"
+                ))),
+                None if self.watches.contains_key(&watch) => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    // alloc: an error path.
+                    format!("adding {dir} to the watch {watch:?}: it is no journal (Effect::Journal)"),
+                )),
+                // alloc: an error path.
+                None => Err(io::Error::other(format!("adding {dir} to the watch {watch:?}: nothing is watched as it"))),
+            },
             Effect::Watch { dir, tag } => {
                 if self.watches.contains_key(&tag) || self.journals.contains_key(&tag) {
                     return Err(watched_already(tag));
@@ -2180,6 +2217,7 @@ impl Iocp {
                 }
                 Back::Journal { tag, journal, taken } => self.journaled(tag, journal, taken),
                 Back::Marked { journal, flush, mark } => self.marked(journal, flush, mark),
+                Back::Rooted { journal, add, root } => self.rooted(journal, add, root),
             }
         }
         while self.at_threads < WORK {
@@ -2187,6 +2225,38 @@ impl Iocp {
             self.send_work(work);
         }
         out.append(&mut self.ready);
+    }
+
+    /// A directory to add to the journal `tag` opened (or not): added at once if the journal
+    /// is in hand (waiting for its doorbell), else when it next is ([`Iocp::journaled`]).
+    fn rooted(&mut self, tag: Tag, add: Tag, root: io::Result<usn::Root>) {
+        let Some(journaling) = self.journals.get_mut(&tag) else {
+            return self.fail(add, format_args!("adding a directory to the watch {tag:?}: the watch ended first"));
+        };
+        let root = match root {
+            Ok(root) => root,
+            Err(error) => return self.fail(add, format_args!("adding a directory to the watch {tag:?}: {error}")),
+        };
+        journaling.roots.push((add, root));
+        if let Some(mut journal) = journaling.idle.take() {
+            self.add_roots(tag, &mut journal);
+            if let Some(journaling) = self.journals.get_mut(&tag) {
+                journaling.idle = Some(journal);
+            }
+        }
+    }
+
+    /// The directories waiting to be added to the journal `tag`, added to `journal`, now in
+    /// hand: each ask is told once its directory is named by every read after this.
+    fn add_roots(&mut self, tag: Tag, journal: &mut usn::Journal) {
+        let Some(journaling) = self.journals.get_mut(&tag) else { return };
+        for (add, root) in std::mem::take(&mut journaling.roots) {
+            let done = match journal.add_root(root) {
+                Ok(()) => Done::Flushed,
+                Err(why) => Done::Failed(IoError(why)),
+            };
+            self.ready.push(Completion { tag: add, done });
+        }
     }
 
     /// A journal the threads handed back: its batch told, its flushes told what they may be,
@@ -2230,8 +2300,10 @@ impl Iocp {
         }
         let hurry = journaling.barrier.hurried();
         self.decide(tag);
-        let journal =
+        let mut journal =
             journal.expect("a journal handed back without an end is handed back with it");
+        // In hand: the directories asked to be added are, before its next read.
+        self.add_roots(tag, &mut journal);
         // At the journal's end with no flush waiting: the journal waits for its doorbell, and
         // nothing of it is in flight on the port.
         if stalled && journal.caught_up() && !hurry {
@@ -2353,6 +2425,9 @@ impl Iocp {
     /// The journal `tag` ended (`why`): let go, and its flushes, marked or not, failed first.
     fn unjournal(&mut self, tag: Tag, why: &str) {
         let Some(mut journaling) = self.journals.remove(&tag) else { return };
+        for (add, _) in std::mem::take(&mut journaling.roots) {
+            self.ready.push(failed(add, format_args!("adding a directory to the watch {tag:?}: the watch ended first: {why}")));
+        }
         journaling.barrier.end(why);
         for decision in journaling.barrier.take_decisions() {
             if let Decision::Failed { tag: flush, why } = decision {
@@ -2674,6 +2749,10 @@ fn work_on(
             Work::Mark { journal, flush, querier } => {
                 let mark = guarded_work("marking a USN flush", || usn::mark(&querier));
                 back.send(Back::Marked { journal, flush, mark })
+            }
+            Work::Root { journal, add, dir } => {
+                let root = guarded_work("opening a directory for a USN journal", || usn::Root::open(root, &dir));
+                back.send(Back::Rooted { journal, add, root })
             }
         };
         if sent.is_err() {
@@ -3983,6 +4062,69 @@ mod tests {
         run_until_idle(&mut driver, &mut effects, |it, _| {
             assert!(matches!(it.done, Done::Journaled(_) | Done::Unwatched), "{it:?}");
         }).expect("the effects end");
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The invariant (B15, one reader a volume): a directory added to a journal's watch
+    /// ([`Effect::AlsoJournal`]) is told `Flushed` only after every change under it made
+    /// before the add, and from then on what changes under it is named under it by the same
+    /// reader, beside what changes under the first directory.
+    #[test]
+    fn a_directory_added_to_a_journal_is_heard_by_the_same_reader() {
+        let root = dir("journal-also");
+        let (src, sdk) = (root.join("src"), root.join("sdk"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(sdk.join("lib")).unwrap();
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        let mut out = Vec::new();
+        let mut until = |driver: &mut Iocp, wanted: Tag, heard: &mut Vec<FileName>| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "{wanted:?} was never told; heard {heard:?}");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+                let mut told = false;
+                for it in out.drain(..) {
+                    match (it.tag, it.done) {
+                        (Tag(7), Done::Journaled(batch)) => heard.extend(batch.files),
+                        (tag, Done::Flushed) if tag == wanted => told = true,
+                        other => panic!("{other:?}"),
+                    }
+                }
+                if told {
+                    return;
+                }
+            }
+        };
+        let mut heard = Vec::new();
+        driver.submit(&mut vec![
+            Effect::Journal { dir: name("src"), since: Cursor::None, tag: Tag(7) },
+            Effect::Flush { watch: Tag(7), tag: Tag(8) },
+        ]);
+        until(&mut driver, Tag(8), &mut heard);
+        driver.submit(&mut vec![Effect::AlsoJournal { watch: Tag(7), dir: name("sdk"), tag: Tag(9) }]);
+        until(&mut driver, Tag(9), &mut heard);
+        for round in 0..10u64 {
+            heard.clear();
+            let (a, b) = (format!("sdk/lib/u-{round}.lib"), format!("src/s-{round}.rs"));
+            std::fs::write(root.join(&a), b"lib").unwrap();
+            std::fs::write(root.join(&b), b"fn s() {}").unwrap();
+            let flush = Tag(100 + round);
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: flush }]);
+            until(&mut driver, flush, &mut heard);
+            assert!(heard.contains(&name(&a)) && heard.contains(&name(&b)), "round {round}: {heard:?}");
+        }
+        // An add to a watch that is not a journal's is refused, naming it.
+        driver.submit(&mut vec![Effect::AlsoJournal { watch: Tag(70), dir: name("sdk"), tag: Tag(71) }]);
+        let mut effects = vec![Effect::Unwatch { tag: Tag(7) }];
+        let mut refused = false;
+        run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag, &it.done) {
+            (Tag(71), Done::Failed(_)) => refused = true,
+            _ => assert!(matches!(it.done, Done::Journaled(_) | Done::Unwatched), "{it:?}"),
+        })
+        .expect("the effects end");
+        assert!(refused, "the add to no journal was refused");
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();

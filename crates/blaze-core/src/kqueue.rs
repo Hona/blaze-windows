@@ -598,6 +598,10 @@ impl Kqueue {
             }
             Effect::Watch { dir, tag } => self.watch(dir, None, tag),
             Effect::Journal { dir, since, tag } => self.watch(dir, Some(since), tag),
+            // FSEvents streams one directory each.
+            Effect::AlsoJournal { .. } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, crate::JOURNAL_PER_DIRECTORY))
+            }
             // Told through the watches' channel by the stream, after the changes it heard first.
             Effect::Flush { watch, tag } => {
                 match self.watch_tags.get(&watch).and_then(|&id| self.watches.get(id)) {
