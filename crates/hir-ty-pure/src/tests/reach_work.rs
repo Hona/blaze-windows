@@ -171,3 +171,53 @@ fn work_grows_near_linearly_with_the_body() {
     // work(24) / steps(24) <= 5/4 * work(12) / steps(12), in integers.
     assert!(4 * long.work * short.steps <= 5 * short.work * long.steps, "{said}");
 }
+
+/// A wide enum `match` of `arms` arms with per-arm temporaries and a drop flag, matching the
+/// shape of `dispatch_action` (where dense `locals / 64` liveness and per-arm fact scans
+/// caused quadratic work growth).
+fn wide_dispatch(arms: usize) -> String {
+    let mut variants = String::new(); // alloc: a test's text
+    let mut fields = String::new(); // alloc: a test's text
+    let mut body = String::new(); // alloc: a test's text
+    for i in 0..arms {
+        variants += &format!("A{i}(P, bool), "); // alloc: a test's text
+        fields += &format!("h{i}: Option<fn(u32) -> bool>, "); // alloc: a test's text
+        // alloc: a test's text
+        body += &format!(
+            "Action::A{i}(p, b) => {{ let Some(f) = node(s, p.0).and_then(|n| n.h{i}) else {{ return false }}; let k = p.0; if b {{ s.held = {i}; s.keep = Some(p); }} f(k) }}\n"
+        );
+    }
+    // alloc: a test's fixture
+    format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub enum Action {{ {variants} }}\n\
+         pub struct Node {{ {fields} }}\n\
+         pub struct P(u32);\nimpl Drop for P {{ fn drop(&mut self) {{}} }}\n\
+         pub struct S {{ nodes: Option<Node>, held: u32, keep: Option<P> }}\n\
+         fn node(s: &S, p: u32) -> Option<&Node> {{ if p == 0 {{ None }} else {{ match &s.nodes {{ Some(n) => Some(n), None => None }} }} }}\n\
+         pub fn probe(s: &mut S, a: Action) -> bool {{\n\
+         let repeat = match a {{ Action::A1(..) => true, _ => false }};\n\
+         let ran = match a {{\n{body}}};\n\
+         ran && !repeat\n}}\n"
+    )
+}
+
+/// Near-linear work growth on a wide dispatch: doubling the arms (40 -> 80 -> 160) raises
+/// work per step by at most `5/4`, and every proof is deterministic and well within its bound.
+#[test]
+fn wide_dispatch_work_grows_near_linearly() {
+    let w40 = work_checked(&wide_dispatch(40)).unwrap_or_else(|what| panic!("{what}"));
+    let w80 = work_checked(&wide_dispatch(80)).unwrap_or_else(|what| panic!("{what}"));
+    let w160 = work_checked(&wide_dispatch(160)).unwrap_or_else(|what| panic!("{what}"));
+    // alloc: a test's message
+    let said = format!(
+        "(steps, work, bound): 40=({}, {}, {}), 80=({}, {}, {}), 160=({}, {}, {})",
+        w40.steps, w40.work, w40.bound, w80.steps, w80.work, w80.bound, w160.steps, w160.work, w160.bound,
+    );
+    assert!(
+        w40.stopped.is_none() && w80.stopped.is_none() && w160.stopped.is_none(),
+        "{said}"
+    );
+    assert!(4 * w80.work * w40.steps <= 5 * w40.work * w80.steps, "40->80 grew > 5/4: {said}");
+    assert!(4 * w160.work * w80.steps <= 5 * w80.work * w160.steps, "80->160 grew > 5/4: {said}");
+}
