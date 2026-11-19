@@ -185,8 +185,21 @@ fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
 /// The directory every daemon of the user shares (`blaze_core::platform::home`'s `machine`:
 /// `blaze` in the user's cache directory, `%LOCALAPPDATA%\blaze` on Windows), absolute.
 fn user_shared() -> anyhow::Result<Option<PathBuf>> {
-    let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
-    let Some(dir) = found.machine else { return Ok(None) };
+    #[cfg(windows)]
+    let dir = {
+        let found = blaze_core::platform::home::homes(|name| std::env::var_os(name)).map_err(anyhow::Error::msg)?;
+        let Some(dir) = found.machine else { return Ok(None) };
+        dir
+    };
+    // `~` is `blaze_core::home::user`: `HOME`, else the system's record of the user, as the
+    // root's is (`blaze_manifest::home::root`); `platform::home::homes` reads `HOME` alone.
+    #[cfg(not(windows))]
+    let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
+        Some(caches) => PathBuf::from(caches).join("blaze"),
+        None => blaze_core::home::user()
+            .context("no XDG_CACHE_HOME says where this machine's daemons share the standard library")?
+            .join(".cache/blaze"),
+    };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
     std::path::absolute(&dir).map(Some).with_context(|| {
