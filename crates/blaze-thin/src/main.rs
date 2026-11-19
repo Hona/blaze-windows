@@ -533,10 +533,34 @@ mod native {
         }
         rows.send(exec_ns);
         let mut command = std::process::Command::new(&exec.program);
-        command
-            .args(&exec.args)
-            .envs(exec.env.iter().map(|(name, value)| (name, value)))
-            .current_dir(&exec.cwd);
+        command.args(&exec.args).current_dir(&exec.cwd);
+        let dylib = match std::env::consts::OS {
+            "windows" => "PATH",
+            "macos" | "ios" | "tvos" | "watchos" | "visionos" => "DYLD_FALLBACK_LIBRARY_PATH",
+            "aix" => "LIBPATH",
+            _ => "LD_LIBRARY_PATH",
+        };
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        for (name, value) in &exec.env {
+            let is_dylib = if cfg!(windows) {
+                name.eq_ignore_ascii_case(dylib)
+            } else {
+                name == dylib
+            };
+            if is_dylib
+                && let Some(existing) = std::env::var_os(name)
+                && !existing.is_empty()
+                && !existing.as_encoded_bytes().starts_with(value.as_bytes())
+            {
+                let mut joined = OsString::with_capacity(value.len() + sep.len() + existing.len());
+                joined.push(value);
+                joined.push(sep);
+                joined.push(existing);
+                command.env(name, joined);
+            } else {
+                command.env(name, value);
+            }
+        }
         // This process becomes the program, which ends the command as it ends.
         #[cfg(windows)]
         return Ok(sys::run(&mut command).unwrap_or_else(|why| error(&why.to_string())));

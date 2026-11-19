@@ -208,6 +208,31 @@ fn an_error_with_its_cause() {
     );
 }
 
+#[test]
+fn cli_run_prepends_dylib_search_path_without_wiping_parent_path() {
+    let joined = joined_dylib_env(
+        "PATH",
+        r"C:\w\target\debug\deps;C:\w\target\debug",
+        "windows",
+        |k| (k == "PATH").then(|| OsString::from(r"C:\Windows\System32")),
+    );
+    assert_eq!(
+        joined,
+        OsString::from(r"C:\w\target\debug\deps;C:\w\target\debug;C:\Windows\System32")
+    );
+    let already = joined_dylib_env(
+        "PATH",
+        r"C:\w\target\debug\deps",
+        "windows",
+        |_| Some(OsString::from(r"C:\w\target\debug\deps;C:\Windows\System32")),
+    );
+    assert_eq!(already, OsString::from(r"C:\w\target\debug\deps;C:\Windows\System32"));
+    let other = joined_dylib_env("CARGO_PKG_NAME", "app", "windows", |_| {
+        Some(OsString::from("ignored"))
+    });
+    assert_eq!(other, OsString::from("app"));
+}
+
 /// The invariant, on Windows: a program `blaze run` runs ends the command with its whole exit
 /// code (an NTSTATUS too, said by name), and nothing it started outlives it: what is left in
 /// its job when the run ends is ended (the job ends with the run). The control, the job taken

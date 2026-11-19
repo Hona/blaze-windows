@@ -26,7 +26,7 @@
 
 #![forbid(unsafe_code)]
 
-mod artifact;
+pub(crate) mod artifact;
 mod checks;
 mod codegen;
 mod compile;

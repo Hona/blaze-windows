@@ -130,16 +130,28 @@ pub(crate) fn process_env(
     os: &str,
 ) -> Vec<(OsString, OsString)> {
     let var = super::artifact::dylib_var(os);
-    let separator = match os {
-        "windows" => ";",
-        _ => ":",
+    let windows = os == "windows";
+    let separator = match windows {
+        true => ";",
+        false => ":",
     };
+    let same = |a: &str, b: &str| if windows { a.eq_ignore_ascii_case(b) } else { a == b };
     let mut env: HashMap<String, String, Global> = job.iter().cloned().collect();
     for (name, value) in &artifact.env {
-        let joined = match env.get(name).filter(|_| name == var) {
-            Some(theirs) if theirs.starts_with(value.as_str()) => theirs.clone(),
+        // Windows environment variable names are case-insensitive (`Path` vs `PATH`): look up
+        // and replace any existing spelling so prepending `deps` joins the user's `Path` rather
+        // than leaving duplicate `Path`/`PATH` entries in the child's environment block.
+        let existing_key = if windows {
+            env.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned()
+        } else {
+            env.contains_key(name).then(|| name.clone())
+        };
+        let existing_val = existing_key.as_ref().and_then(|k| env.remove(k));
+        let is_dylib = same(name, var);
+        let joined = match existing_val.as_deref().filter(|_| is_dylib) {
+            Some(theirs) if theirs.starts_with(value.as_str()) => theirs.to_owned(),
             Some(theirs) if !theirs.is_empty() => format!("{value}{separator}{theirs}"),
-            _ if name == var && os == "macos" => {
+            _ if is_dylib && os == "macos" => {
                 let mut dirs = vec![value.clone()];
                 if let Some(home) = env.get("HOME") {
                     dirs.push(format!("{home}/lib"));
@@ -149,7 +161,7 @@ pub(crate) fn process_env(
             }
             _ => value.clone(),
         };
-        env.insert(name.clone(), joined);
+        env.insert(existing_key.unwrap_or_else(|| name.clone()), joined);
     }
     let mut env: Vec<(String, String)> = env.into_iter().collect();
     env.sort_unstable_by(|a, b| a.0.cmp(&b.0));

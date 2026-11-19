@@ -86,7 +86,7 @@ mod unheld;
 // How edited outputs are placed on NTFS (`BLAZE_NTFS_EDIT`).
 #[blaze::sans_io]
 mod ntfs_edit;
-mod unit;
+pub(crate) mod unit;
 pub mod why;
 mod work;
 

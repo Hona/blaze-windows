@@ -121,11 +121,57 @@ impl Exec {
 
     pub fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
+        command.args(&self.args).current_dir(&self.cwd);
+        for (name, value) in &self.env {
+            let value = joined_dylib_env(name, value, std::env::consts::OS, |key| {
+                std::env::var_os(key)
+            });
+            command.env(name, value);
+        }
         command
-            .args(&self.args)
-            .envs(self.env.iter().map(|(name, value)| (name, value)))
-            .current_dir(&self.cwd);
-        command
+    }
+}
+
+/// Joins an artifact's dynamic-library search variable (`PATH` on Windows, `LD_LIBRARY_PATH`
+/// on Linux, `DYLD_FALLBACK_LIBRARY_PATH` on macOS) ahead of the parent process's value so
+/// `blaze run` / `blaze test` adds `deps` without wiping `C:\Windows\System32` or user paths.
+pub(crate) fn joined_dylib_env(
+    name: &str,
+    value: &str,
+    os: &str,
+    parent: impl Fn(&str) -> Option<OsString>,
+) -> OsString {
+    let var = crate::serve::unit::artifact::dylib_var(os);
+    let is_dylib = if os == "windows" { name.eq_ignore_ascii_case(var) } else { name == var };
+    if !is_dylib {
+        return OsString::from(value);
+    }
+    let sep = if os == "windows" { ";" } else { ":" };
+    match parent(name) {
+        Some(existing) if !existing.is_empty() => {
+            let prefix = OsString::from(value);
+            if existing.as_encoded_bytes().starts_with(prefix.as_encoded_bytes()) {
+                return existing;
+            }
+            let mut out = OsString::with_capacity(value.len() + sep.len() + existing.len());
+            out.push(value);
+            out.push(sep);
+            out.push(existing);
+            out
+        }
+        _ if os == "macos" => {
+            let mut out = OsString::from(value);
+            if let Some(home) = parent("HOME")
+                && !home.is_empty()
+            {
+                out.push(":");
+                out.push(home);
+                out.push("/lib");
+            }
+            out.push(":/usr/local/lib:/usr/lib");
+            out
+        }
+        _ => OsString::from(value),
     }
 }
 
