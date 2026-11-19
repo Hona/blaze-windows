@@ -50,6 +50,7 @@ pub(super) fn given(
     roots: &[PathBuf],
     mut mutable: Vec<PathBuf>,
     portable: &Roots<'_>,
+    caches: &[(String, PathBuf)],
 ) -> Result<ContentId, String> {
     let env = script::script_env(unit, inherited).map_err(|it| it.0)?;
     let get = |n: &str| env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v);
@@ -63,8 +64,9 @@ pub(super) fn given(
     }
     // Explicitly configured link search paths, not the whole machine library search path.
     // Repository config permits linking, not reads by the daemon on the script's behalf.
-    let mut links = crate::directives::link_dirs(&job.units().link_dirs, inherited)?;
-    links.extend(crate::directives::machine_link_dirs(inherited)?);
+    let given = super::grants::with_caches(inherited, caches);
+    let mut links = crate::directives::link_dirs(&job.units().link_dirs, &given)?;
+    links.extend(crate::directives::machine_link_dirs(&given)?);
     for dir in links {
         h.part(&ported(portable, &dir));
         if granted(&dir, roots).map_err(|e| e.to_string())? {

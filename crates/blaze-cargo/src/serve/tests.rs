@@ -656,6 +656,8 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
         build_dir: format!("{root}/target"),
         finished: FINISHED.into(),
         link_dirs: Vec::new(),
+        script_tools: Vec::new(),
+        script_caches: Vec::new(),
         native: Vec::new(),
     }
 }

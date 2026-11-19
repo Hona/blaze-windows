@@ -1309,6 +1309,8 @@ impl Query for HostMacros {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
+                script_tools: built.script_tools,
+                script_caches: built.script_caches,
                 native: built.native,
             }),
             super::Staged::Needs(fetches) => Planned::Needs(fetches),

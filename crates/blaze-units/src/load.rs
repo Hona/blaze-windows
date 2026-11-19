@@ -389,7 +389,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 11");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 12");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -419,6 +419,8 @@ impl Query for Plan {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
+                script_tools: built.script_tools,
+                script_caches: built.script_caches,
                 native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),

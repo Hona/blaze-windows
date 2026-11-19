@@ -996,6 +996,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         build_dir,
         finished,
         link_dirs,
+        script_tools,
+        script_caches,
         native,
     } = kept;
     if graph != &now.graph {
@@ -1018,6 +1020,10 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the profile"
     } else if link_dirs != &now.link_dirs {
         "the build-script link directories"
+    } else if script_tools != &now.script_tools {
+        "the build-script tools"
+    } else if script_caches != &now.script_caches {
+        "the build-script caches"
     } else if native != &now.native {
         "the pinned native inputs"
     } else {

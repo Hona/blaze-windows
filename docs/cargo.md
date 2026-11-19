@@ -797,11 +797,32 @@ registry can be named in:
 unsandboxed-build-scripts = ["libghostty-vt-sys", "flecs_ecs_sys"]   # by package name
 build-script-link-dirs = ["/opt/vendor/lib", "${OPENSSL_DIR}/lib"]   # rustc-link-search may name
 build-script-env = ["OPENSSL_DIR"]                                   # a ${NAME} above must be listed here
+build-script-tools = ["nasm"]                                        # programs scripts run, by name
+build-script-caches = ["GHOSTTY_VT_CACHE_DIR"]                       # directories scripts keep, by variable
 ```
 
 An entry that starts `${NAME}` is under the variable's value in the environment the script runs
-in, for a library whose place differs by machine; `build-script-env` must list `NAME`, and a
-script run where it is unset, or is no absolute path, fails naming it.
+in, for a library whose place differs by machine; `build-script-env` or `build-script-caches`
+must list `NAME`, and a script run where it is unset, or is no absolute path, fails naming it.
+
+What a fresh clone's scripts need of the machine is the project's to say in these two keys, so
+no one sets `BLAZE_SCRIPT_READ` or `BLAZE_SCRIPT_CACHES` to build it ([below](#a-build-scripts-own-writable-state)).
+Each names a thing, never a place, so a checkout can't grant its scripts a file it chose:
+
+- `build-script-tools`: programs by name (no directory). Each is the file the command's own
+  `PATH` finds first (on Windows `.com`, `.exe`, `.bat`, then `.cmd`; a Scoop shim's program
+  too), which every build script may read and run and whose bytes are in its run's key. Only
+  that file: a tool that needs files beside it is given them with `BLAZE_SCRIPT_READ`. A name
+  `PATH` lacks fails the run, naming it.
+- `build-script-caches`: variables by name, as a pinned input's `env` may be named. Every build
+  script is given each, naming `<BLAZE_HOME>/script-caches/<checkout>/<VARIABLE>`, a directory
+  of this checkout alone (`<checkout>` a hash of its root) that it may read and write and that
+  is kept across runs; where the caller's `BLAZE_SCRIPT_CACHES` names the variable, its
+  directory is the one. A cache's contents are in no key, as the caller's are.
+
+A cache fills only from what a script can reach in its sandbox, which has no network: a script
+that downloads on a cold machine (rune-desktop's terminal fetches Zig to build Ghostty) needs
+what it downloads as a [pinned native input](#pinned-native-inputs) instead.
 
 The table may also have `unsandboxed-proc-macros`, `build-script-env` and `wasi-build-scripts`,
 each a list of names, which v1 read: v2 checks that each is a list of strings and does nothing
@@ -2086,8 +2107,10 @@ A script writes its `OUT_DIR`, whose files are its run's and kept under its key,
 temporary directory of its run alone. Nothing else it writes outlives the run: on Windows its
 `LOCALAPPDATA` is the run's own AppContainer profile, made fresh and removed after it.
 
-A download cache, which a script fills once and reads in later runs, is declared by whoever
-runs blaze, never by the project: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
+A cache, which a script fills once and reads in later runs, is declared by the project
+(`build-script-caches`, a directory of blaze's home of that checkout alone,
+[above](#build-scripts-and-proc-macros-run-in-a-sandbox)) or by whoever runs blaze, who also
+says where: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
 entries are each `VARIABLE=DIRECTORY`, such as
 `GHOSTTY_VT_CACHE_DIR=C:\Users\me\AppData\Local\seer\ghostty-vt` for rune-desktop's terminal.
 Every build script is told each variable, naming its directory, which blaze makes if missing

@@ -1200,6 +1200,9 @@ pub(crate) struct Start {
     unit: bs::Unit,
     /// The environment it is started in, which its output is read with.
     env: Vec<(OsString, OsString)>,
+    /// The caches it is given by variable ([`grants::declared_caches`]), which a
+    /// `build-script-link-dirs` entry `${VARIABLE}/rest` may name.
+    caches: Vec<(String, PathBuf)>,
     /// The machine's files and the run's environment, as what it read is checked against:
     /// made once per run, so no check sorts the environment again or takes a shared lock. Its
     /// environment is the run's own key's check ([`Prepared::env`]: the given names left out),
@@ -1347,9 +1350,15 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let env = started_in(job, run, &unit)
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
+    // Each declared cache is read and written where the caller says, or where blaze keeps the
+    // workspace's ([`Place::caches`]): not a read root of its key.
+    let invocation = &job.input.config.invocation;
+    let caches = grants::declared_caches(&invocation.env, &units.script_caches, &invocation.root, || {
+        blaze_manifest::user_config::home().map_err(|why| why.to_string())
+    })?;
     let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new(), &job.input.looks);
-        return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
+        return Ok(Some(Start { unit, env, caches, disk, how: How::Inert, elided }));
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
@@ -1393,9 +1402,13 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             read.push(resolved);
         }
     }
-    // Each declared cache is read and written where the caller says ([`Place::caches`]): not a
-    // read root of its key.
-    let caches = declared_caches(&job.input.config.invocation.env)?;
+    // The programs the workspace says its scripts run (`build-script-tools`), each the file
+    // the caller's PATH finds, read and in the key as `BLAZE_SCRIPT_READ`'s are.
+    for tool in grants::declared_tools(&units.script_tools, &invocation.env)? {
+        #[cfg(windows)]
+        mutable.push(tool.clone()); // clone: a path, once a tool a run
+        read.push(tool);
+    }
     // Each pinned native input it is given is read where it is laid out, and its digest is
     // part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
@@ -1411,7 +1424,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         let why = |what| ApiError::new(what, Some(unit.package.descr()));
         let roots = declared::roots(&read).map_err(why)?;
         let portable = run_roots(job, &unit);
-        let host = declared::given(job, run, &unit, &env, &roots, mutable, &portable.view()).map_err(why)?;
+        let host = declared::given(job, run, &unit, &env, &roots, mutable, &portable.view(), &caches)
+            .map_err(why)?;
         Some((host, roots))
     };
     #[cfg(windows)]
@@ -1422,7 +1436,8 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         code,
         read,
         pinned,
-        caches,
+        // clone: the run's few caches, kept with its start for the check of what it printed
+        caches: caches.clone(),
         network: false,
         memory: None,
         mode: match (declared, rechecks(job)?) {
@@ -1477,7 +1492,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         }
         false => How::Sandboxed(prepared),
     };
-    Ok(Some(Start { unit, env, disk, how, elided }))
+    Ok(Some(Start { unit, env, caches, disk, how, elided }))
 }
 
 /// A build script's run, on the loop.
@@ -1899,42 +1914,6 @@ fn live_record(
 }
 
 /// `path` as the driver names it, under its root `/`.
-/// The caches the caller declares to every build script it runs (`BLAZE_SCRIPT_CACHES`, its own
-/// environment, never the project's): a list of the system's paths whose entries are each
-/// `VARIABLE=DIRECTORY`. A script is told each variable, naming its directory, which it may
-/// read and write and which is kept across runs: a download cache (rune-desktop's
-/// `GHOSTTY_VT_CACHE_DIR`). What is in one is in no key ([`Place::caches`]). Each directory is
-/// made if missing, and named as the system resolves it; an entry that is not a variable's
-/// name and an absolute directory below a volume's root, or a variable named twice, is refused,
-/// naming it.
-fn declared_caches(env: &[(String, String)]) -> Result<Vec<(String, PathBuf)>, ApiError> {
-    const NAME: &str = "BLAZE_SCRIPT_CACHES";
-    let Some((_, list)) = env.iter().find(|(name, _)| name == NAME) else { return Ok(Vec::new()) };
-    // alloc: an error path.
-    let refused = |what: String| ApiError::new(format!("{NAME}: {what}"), None);
-    let mut caches: Vec<(String, PathBuf)> = Vec::new(); // alloc: the caller's few caches, once a run
-    for entry in std::env::split_paths(list) {
-        let text = entry.to_string_lossy();
-        let Some((name, dir)) = text.split_once('=') else {
-            return Err(refused(format!("`{text}` is no VARIABLE=DIRECTORY")));
-        };
-        if name.is_empty() || !name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_') {
-            return Err(refused(format!("`{name}` is no variable's name")));
-        }
-        let dir = PathBuf::from(dir);
-        if !dir.is_absolute() || dir.parent().is_none() {
-            return Err(refused(format!("{} is not an absolute directory below a volume's root", dir.display())));
-        }
-        std::fs::create_dir_all(&dir).map_err(|error| refused(format!("making {}: {error}", dir.display())))?;
-        let dir = std::fs::canonicalize(&dir).map_err(|error| refused(format!("{}: {error}", dir.display())))?;
-        if caches.iter().any(|(it, _)| it.eq_ignore_ascii_case(name)) {
-            return Err(refused(format!("`{name}` is named twice")));
-        }
-        caches.push((name.to_owned(), dir));
-    }
-    caches.sort();
-    Ok(caches)
-}
 fn file_name(path: &Path) -> Result<FileName, String> {
     let refused = || format!("{} is not a path blaze can write cargo's files of a run at", path.display());
     let text = path.to_str().ok_or_else(refused)?;
@@ -2088,12 +2067,13 @@ impl ScriptRun {
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
-            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env).and_then(
-                |mut it| {
-                    it.extend(crate::directives::machine_link_dirs(&start.env)?);
-                    Ok(it)
-                },
-            ) {
+            _ => match (|| {
+                // A `${VARIABLE}` of a declared cache names the directory the run was given.
+                let env = grants::with_caches(&start.env, &start.caches);
+                let mut it = crate::directives::link_dirs(&job.units().link_dirs, &env)?;
+                it.extend(crate::directives::machine_link_dirs(&env)?);
+                Ok::<_, String>(it)
+            })() {
                 // The layouts of the pinned native inputs it was given may be searched and
                 // be an rpath: each is the verified unpacking of its pinned archive.
                 Ok(mut it) => {
@@ -2751,6 +2731,7 @@ impl ScriptRun {
 pub(crate) mod pure;
 #[cfg(windows)]
 mod declared;
+mod grants;
 mod said;
 
 #[cfg(test)]

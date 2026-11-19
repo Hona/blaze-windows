@@ -217,7 +217,7 @@ fn declared(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<Decla
 }
 
 /// `var` as a variable an input may be handed in: `[A-Z_][A-Z0-9_]*`, none of [`RESERVED`].
-fn variable(var: &str) -> Result<String, &'static str> {
+pub(super) fn variable(var: &str) -> Result<String, &'static str> {
     let mut chars = var.chars();
     let first_ok = chars.next().is_some_and(|it| it.is_ascii_uppercase() || it == '_');
     if !first_ok || !chars.all(|it| it.is_ascii_uppercase() || it.is_ascii_digit() || it == '_') {
