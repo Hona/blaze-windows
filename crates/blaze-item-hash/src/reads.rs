@@ -169,6 +169,14 @@ pub(crate) enum Rule {
     /// ([`values::inherent_assoc_types`]), whose value is the query's whole result by item
     /// key. Not read through: the query iterates every module of the ADT's crate.
     InherentAssocTypes,
+    /// `assoc_item_key(item)`: the hygiene key of the name of an associated item, `None` for a
+    /// name a real file or a `macro_rules!` (or a derive or an attribute macro without
+    /// def-site spans) writes, and only then a fact: the `Fields` fact of the item's impl or
+    /// trait, whose value spells for each member whether its name is keyed
+    /// (`values::member_names`), so a name that comes to be keyed in another database moves
+    /// it. A read whose answer is a context (a `macro` 2.0 name, a proc macro's
+    /// `Span::def_site`) is refused by name: no fact spells a context stably yet.
+    AssocKey,
     /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
     /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
     OwnMatchCheck,
@@ -276,24 +284,33 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("Body::has_lowering_errors", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::of", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::relative", "hir-def/src/expr_store/body.rs", Rule::LowerOnly),
-    ("ConstSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    // A signature (or a variant's fields) as `of` reads it: `served`, read from its crate's
+    // record (`None` for a crate no record serves), or `lowered`, lowered alone from its
+    // syntax. Each is the one value `of` gives, the item's signature, by two routes, so both
+    // are its `Signature` fact (`Items` asks `blaze_items::goals::fact_of_read`, which names
+    // both); whether a record serves the crate changes no answer a body reads from it.
+    ("ConstSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     // A signature lowered again with its source map (`relative`, `with_source_map`): the
-    // signature is `kept`'s (`Kept::with_map`), which the `Signature` fact hashes; the map is
+    // signature is `of`'s (`Kept::with_map`), which the `Signature` fact hashes; the map is
     // where each part is written, and no answer holds a position (inference and MIR name
     // expressions and type references by id, `mir::persist`'s spans are ids, a location
     // literal is a slot), so nothing of it reaches a kept value.
     ("ConstSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    ("ConstSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     ("ConstSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     ("CrateResolution::module", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("DefMapPair", "hir-def/src/nameres.rs", Rule::Names),
-    ("EnumSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("EnumSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("EnumSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("EnumVariants::of", "hir-def/src/signatures.rs", Rule::Fields(Of::Enum)),
     ("ExprScopes::body_expr_scopes", "hir-def/src/expr_store/scope.rs", Rule::OwnBody),
-    ("FunctionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("FunctionSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
     ("FunctionSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
+    ("FunctionSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("FunctionSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
     ("ImplItems::of", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Impl)),
-    ("ImplSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("ImplSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("ImplSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("InherentImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("InherentImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("InherentImpls::for_module", "hir-ty/src/method_resolution.rs", Rule::ModuleCrate),
@@ -311,10 +328,12 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("ScopeInput::legacy_macro", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("ScopeInput::name", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("ScopeInput::traits", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
-    ("StaticSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StaticSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StaticSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
-    ("StructSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("StructSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("StructSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("TraitImpls::blanket_in_crate_and_deps", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Trait)),
     ("TraitImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("TraitImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
@@ -325,14 +344,18 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("TraitImpls::in_crate_and_deps_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitImpls::in_crate_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitItems::query_with_diagnostics", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Trait)),
-    ("TraitSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
-    ("TypeAliasSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TraitSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("TraitSignature::served", "hir-def/src/signatures.rs", Rule::Items),
+    ("TypeAliasSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
     ("TypeAliasSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TypeAliasSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
     ("TypeAliasSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
-    ("UnionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("UnionSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("UnionSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("UnstableFeatures::query", "hir-def/src/unstable_features.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("VariantFields::field_visibilities", "hir-def/src/visibility.rs", Rule::Signature(Of::Variant)),
-    ("VariantFields::kept", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
+    ("VariantFields::lowered", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
+    ("VariantFields::served", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
     // What dropping an ADT needs live, walked to a recursion limit: its fields' types, its
     // `Drop` impl (`destructor`, the ADT's `DropCheck`) and that impl's arguments, and the
     // solver's drop glue of each field, each a fact read through.
@@ -347,6 +370,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // and refused when it is another body's or a signature's ([`Rule::OwnStep`]), and what the
     // interpreter reads (callees' MIR, another body's step fact; layouts and goals, through).
     ("anon_const_eval_query", "hir-ty/src/consteval.rs", Rule::Through),
+    ("assoc_item_key", "hir-def/src/nameres/def_site.rs", Rule::AssocKey),
     ("auto_trait_depth", "hir-ty/src/next_solver/global_goals/shape.rs", Rule::Through),
     ("bit_width_of", "hir-ty/src/layout/bits.rs", Rule::Through),
     ("bits_layout_query", "hir-ty/src/layout/bits.rs", Rule::Through),
@@ -358,6 +382,11 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // with it.
     ("borrowck_debug", "base-db/src/settings.rs", Rule::Setting),
     ("cfg_options", "base-db/src/input.rs", Rule::CrateInput),
+    // `RA_CHECK_RELATIVE_BODIES`: a body's tree is parsed again, not taken from the thread's
+    // cache, and checked against its file's. No answer depends on it (it checks, or stops the
+    // build), but a step reads it (`BodySyntax::tree`, through `body_syntax`), so it is the
+    // build's `Setting` fact of that name, as `borrowck_debug` is.
+    ("check_relative_bodies", "base-db/src/settings.rs", Rule::Setting),
     ("children", "hir-def/src/nameres.rs", Rule::Names),
     ("children", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("closure_exprs", "hir-ty/src/db.rs", Rule::OwnStore),
@@ -422,6 +451,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("fn_sig_for_fn", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_struct_constructor", "hir-ty/src/lower.rs", Rule::Items),
     ("generic_defaults_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::GenericDef)),
+    // The attribute flags of an item's generic parameters (`AttrFlags::query_generic_params`),
+    // read by the borrow check for a `Drop` impl's `#[may_dangle]`: the item's `Attrs` fact,
+    // which hashes them (`values::attrs_of`); the signature form does not.
+    ("generic_params_attr_flags", "hir-def/src/attrs.rs", Rule::Attrs(Of::GenericDef)),
     ("generic_predicates_of", "hir-ty/src/lower.rs", Rule::Items),
     ("generics_require_sized_self", "hir-ty/src/dyn_compatibility.rs", Rule::Signature(Of::GenericDef)),
     ("goal_crate_key", "blaze-items/src/goals.rs", Rule::OwnCrate(Else::WholeCrate)),
@@ -515,9 +548,21 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("row", "hir-def/src/nameres/facts/queries.rs", Rule::Names),
     ("rpit_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
     ("rpitit_item_bounds", "hir-ty/src/rpitit.rs", Rule::Items),
+    // An `async` block's MIR after the runtime passes, which the borrow check of the body it is
+    // written in reads: not in the body's `STEP_MIR` value (that hashes the built MIR alone,
+    // `body_store::value::mir_hash`), so read through: its built MIR (`OwnStep`) and what the
+    // passes read (layouts, goals), each classified for this body.
+    ("runtime_mir_body_for_coroutine_query", "hir-ty/src/providers.rs", Rule::Through),
     ("scope", "hir-def/src/nameres.rs", Rule::Names),
     ("scope", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("scope_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
+    // The slots a crate was given (`Crate::given`): read where a runtime MIR is taken from its
+    // crate's record (`check_cache::runtime::served`), under the runtime MIR a borrow check
+    // reads through. The record's entry is checked against the owner's key and is what
+    // building it gives, so for the body's own crate no answer depends on whether one was
+    // given (covered); another crate's is its `Crate` fact. A slot's `value`, read only when
+    // one was, has no rule and is refused by that name.
+    ("slots", "base-db/src/input.rs", Rule::CrateInput),
     ("specializes_query", "hir-ty/src/specialization.rs", Rule::Items),
     ("struct_flags", "hir-ty/src/layout.rs", Rule::Through),
     ("struct_tail_may_be_unsized", "hir-ty/src/layout.rs", Rule::Through),
@@ -711,6 +756,19 @@ fn apply(
             arg::<FunctionId>(db, key).and_then(|it| values::attrs(db, it.into()))
         }
         Rule::Attrs(Of::Adt) => arg::<AdtId>(db, key).and_then(|it| values::attrs(db, it.into())),
+        Rule::Attrs(Of::GenericDef) => arg::<GenericDefId>(db, key).and_then(|it| {
+            // The item whose attributes a generic definition's parameters' flags are part of.
+            let item: AttrDefId = match it {
+                GenericDefId::AdtId(it) => it.into(),
+                GenericDefId::ConstId(it) => it.into(),
+                GenericDefId::FunctionId(it) => it.into(),
+                GenericDefId::ImplId(it) => it.into(),
+                GenericDefId::StaticId(it) => it.into(),
+                GenericDefId::TraitId(it) => it.into(),
+                GenericDefId::TypeAliasId(it) => it.into(),
+            };
+            values::attrs(db, item)
+        }),
         Rule::Attrs(_) => arg::<AttrDefId>(db, key).and_then(|it| values::attrs(db, it)),
         Rule::DropCheck => {
             arg::<AdtId>(db, key).map(|adt| item_fact(db, items::DROP_CHECK, ItemId::Adt(adt)))
@@ -774,6 +832,21 @@ fn apply(
         Rule::InherentAssocTypes => {
             arg::<AdtId>(db, key).map(|adt| values::inherent_assoc_types(db, adt))
         }
+        Rule::AssocKey => match arg::<AssocItemId>(db, key) {
+            Some(item) if hir_def::nameres::assoc_item_key(db, item).is_none() => {
+                let container = match item {
+                    AssocItemId::FunctionId(it) => it.lookup(db).container,
+                    AssocItemId::ConstId(it) => it.lookup(db).container,
+                    AssocItemId::TypeAliasId(it) => it.lookup(db).container,
+                };
+                match container {
+                    ItemContainerId::ImplId(it) => Some(values::fields(db, ItemId::Impl(it))),
+                    ItemContainerId::TraitId(it) => Some(values::fields(db, ItemId::Trait(it))),
+                    ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => None,
+                }
+            }
+            _ => None,
+        },
         Rule::OwnMatchCheck => match arg::<DefWithBodyId>(db, key) {
             Some(body) if body == def => Some(values::match_check()),
             _ => None,
@@ -833,9 +906,11 @@ pub fn sealed(
     let Some(&found) = found else { return false };
     facts.push(whole_crate(db, found)); // alloc: the step's scratch list, reused
     facts.push(values::field_order()); // alloc: as above
-    match values::setting("borrowck_debug") {
-        Some(fact) => facts.push(fact), // alloc: as above
-        None => return false,
+    for name in ["borrowck_debug", "check_relative_bodies"] {
+        match values::setting(name) {
+            Some(fact) => facts.push(fact), // alloc: as above
+            None => return false,
+        }
     }
     true
 }
