@@ -358,3 +358,86 @@ fn a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked() {
         assert!(!asked.by_position(), "{asked:?}");
     }
 }
+
+#[test]
+fn cross_context_cross_item_join_stays_unasked_and_same_context_tracks_its_file() {
+    use blaze_lower::{SubRequest, SubResponse};
+    use proc_macro_api::bridge::questions::SpanJoin;
+    use span::ErasedFileAstId;
+
+    use super::{Answer, Asked};
+    use crate::guest::Stop;
+
+    struct Stub {
+        path: &'static str,
+    }
+    impl Answer for Stub {
+        fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
+            match req {
+                SubRequest::SpanJoin { ast_id_first, start_first, end_second, ctx_first, .. } => {
+                    Ok(SubResponse::SpanJoinResult {
+                        span: Some(SpanJoin {
+                            ast_id: ast_id_first,
+                            start: start_first,
+                            end: 40 + end_second,
+                            ctx: ctx_first,
+                        }),
+                    })
+                }
+                SubRequest::LocalFilePath { .. } => {
+                    Ok(SubResponse::LocalFilePathResult { name: Some(self.path.to_owned()) })
+                }
+                other => panic!("unexpected sub-request: {other:?}"),
+            }
+        }
+        fn edition(&self, _: SyntaxContext) -> Result<Edition, Stop> {
+            Ok(Edition::CURRENT)
+        }
+    }
+
+    let db = Db::new();
+    let stub = Stub { path: "/work/src/op.rs" };
+    let file_id = EditionedFileId::new(span::FileId::from_raw(3), Edition::Edition2024);
+    let first = Span {
+        range: TextRange::new(2.into(), 6.into()),
+        anchor: SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(10) },
+        ctx: SyntaxContext::root(Edition::Edition2024),
+    };
+    let other_ctx = Span {
+        range: TextRange::new(0.into(), 4.into()),
+        anchor: SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(20) },
+        ctx: SyntaxContext::root(Edition::Edition2021),
+    };
+    let same_ctx = Span { ctx: first.ctx, ..other_ctx };
+
+    let mut srv = server(&db);
+    let mut reply = Vec::new();
+    let h_first = srv.span_handle(first);
+    let h_other = srv.span_handle(other_ctx);
+    let join_cross = request(Method::SpanJoin, |w| {
+        w.handle(h_first);
+        w.handle(h_other);
+    });
+    srv.dispatch(&stub, &join_cross, &mut reply).unwrap();
+    let mut r = Reader::new(&reply);
+    assert!(r.some().unwrap());
+    assert!(r.some().unwrap());
+    assert_eq!(srv.span(r.handle().unwrap()).unwrap(), first);
+    assert_eq!(srv.asked, None, "cross-context cross-item join must not ask the database");
+    assert!(srv.tracked.is_empty());
+
+    let h_same = srv.span_handle(same_ctx);
+    let join_same = request(Method::SpanJoin, |w| {
+        w.handle(h_first);
+        w.handle(h_same);
+    });
+    srv.dispatch(&stub, &join_same, &mut reply).unwrap();
+    let mut r = Reader::new(&reply);
+    assert!(r.some().unwrap());
+    assert!(r.some().unwrap());
+    let joined = srv.span(r.handle().unwrap()).unwrap();
+    assert_eq!(joined.anchor, first.anchor, "joined span stays anchored to the input item");
+    assert_eq!(joined.range, TextRange::new(2.into(), 44.into()));
+    assert_eq!(srv.asked, Some(Asked::Join));
+    assert_eq!(srv.tracked, vec![blaze_core::platform::path::host(stub.path).to_string_lossy().into_owned()]);
+}

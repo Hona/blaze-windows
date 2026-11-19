@@ -99,6 +99,17 @@ fn a_changed_span_gives_another_key() {
     split.site = span(1, 0, 0, 9);
     split.subtree = tree("A", span(1, 5, 0, 9));
     assert_ne!(split.key(), Inputs::new().key());
+    // Two anchors in the same file vs in two different files must produce different keys:
+    // `Span::join` returns `Some` within one file and `None` across files without asking `db`.
+    let mut two_files = Inputs::new();
+    two_files.site = span(1, 0, 0, 9);
+    two_files.subtree = tree("A", span(2, 5, 0, 9));
+    assert_ne!(split.key(), two_files.key());
+    // Moving both anchors to another file while preserving same-file membership keeps the key.
+    let mut moved_pair = Inputs::new();
+    moved_pair.site = span(9, 10, 0, 9);
+    moved_pair.subtree = tree("A", span(9, 15, 0, 9));
+    assert_eq!(split.key(), moved_pair.key());
 }
 
 #[test]

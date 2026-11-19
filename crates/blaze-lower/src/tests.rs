@@ -1937,6 +1937,88 @@ fn two_spans_of_one_file_join_to_the_span_covering_both() {
     );
 }
 
+/// Joining spans anchored to two different items in the same file anchors the result to the
+/// earlier item's `ast_id` (not `ROOT_ERASED_FILE_AST_ID`), resolves to the exact covering
+/// file range, and shifts its length when the second item moves.
+#[test]
+fn two_spans_of_different_items_anchor_to_the_earlier_item_and_move_with_it() {
+    use proc_macro_api::bridge::questions::SpanJoin;
+    use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, TextRange};
+
+    use super::{SubRequest, SubResponse, answer};
+
+    let measure = |src: &'static [u8]| {
+        let u = units();
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("b/src/main.rs", Some(src))]);
+        let cfg = config(root, library(&tree));
+        let lowered = lower(Lower {
+            units: &u,
+            config: &cfg,
+            files: &tree,
+            root,
+            host_cpu: None,
+            sealed: &crate::unsealed(&u),
+        })
+        .unwrap();
+        let built = Built { lowered };
+        let db = built.lowered.db();
+        let file = krate(&built, BIN).data(db).root_file_id;
+        let editioned = base_db::EditionedFileId::new(db, file, Edition::Edition2024);
+        let file_id = editioned.span_file_id(db).as_u32();
+        let map = hir_expand::HirFileId::from(editioned).ast_id_map(db);
+        let fns: Vec<(ErasedFileAstId, TextRange)> = map
+            .entries()
+            .iter()
+            .filter(|e| syntax::SyntaxKind::from(e[2] as u16) == syntax::SyntaxKind::FN)
+            .map(|e| (ErasedFileAstId::from_raw(e[3]), TextRange::new(e[0].into(), e[1].into())))
+            .collect();
+        assert_eq!(fns.len(), 2, "two functions in main.rs");
+        let (first_id, first_range) = fns[0];
+        let (second_id, second_range) = fns[1];
+        assert_ne!(first_id, second_id);
+        let ctx = span::SyntaxContext::root(Edition::Edition2024).into_u32();
+        let SubResponse::SpanJoinResult { span: Some(SpanJoin { ast_id, start, end, ctx: out_ctx }) } =
+            answer(
+                db,
+                SubRequest::SpanJoin {
+                    file_id,
+                    ast_id_first: first_id.into_raw(),
+                    start_first: 0,
+                    end_first: 2,
+                    ctx_first: ctx,
+                    ast_id_second: second_id.into_raw(),
+                    start_second: 0,
+                    end_second: 2,
+                    ctx_second: ctx,
+                },
+            )
+        else {
+            panic!("expected SpanJoinResult");
+        };
+        assert_eq!(ast_id, first_id.into_raw(), "anchored to the earlier input item, not file root");
+        assert_eq!(out_ctx, ctx);
+        let resolved = hir_expand::resolve_span(
+            db,
+            Span {
+                range: TextRange::new(start.into(), end.into()),
+                anchor: SpanAnchor {
+                    file_id: EditionedFileId::from_raw(file_id),
+                    ast_id: ErasedFileAstId::from_raw(ast_id),
+                },
+                ctx: span::SyntaxContext::from_u32(out_ctx),
+            },
+        );
+        let want = TextRange::new(first_range.start(), second_range.start() + syntax::TextSize::from(2));
+        assert_eq!(resolved.range, want, "resolved joined span covers both items");
+        end - start
+    };
+
+    let tight = measure(b"fn first() {}\nfn second() {}\n");
+    let shifted = measure(b"fn first() {} // a comment between items\nfn second() {}\n");
+    assert!(shifted > tight, "moving the second item widens the joined span: {tight} -> {shifted}");
+}
+
 /// A server's numbers that name nothing of the build are a refusal naming the field, never a
 /// panic: the server is user code.
 #[test]

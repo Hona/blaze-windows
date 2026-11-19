@@ -75,6 +75,14 @@ pub fn join(
         if first.anchor.file_id != second.anchor.file_id {
             return None;
         }
+        // Two spans of one file in different syntax contexts join to `first` (matching
+        // `blaze_lower::answer`'s `SubRequest::SpanJoin` and the same-anchor branch below).
+        // Returning `first` directly keeps its original anchor instead of asking the database
+        // and re-anchoring to the file root, so cross-context joins (such as `serde_derive`
+        // on a `macro_rules!`-generated item) stay relative and replayable.
+        if first.ctx != second.ctx {
+            return Some(first);
+        }
         let req = SubRequest::SpanJoin {
             file_id: first.anchor.file_id.as_u32(),
             ast_id_first: first.anchor.ast_id.into_raw(),
@@ -120,5 +128,42 @@ mod tests {
         assert_eq!(subspan(it, 3 + 4 * 2, 1 + 4 * 5).unwrap().range, range(13, 16));
         assert!(subspan(it, 1 + 4 * 5, 3 + 4 * 5).is_none());
         assert!(subspan(it, 0, 3 + 4 * 11).is_none());
+    }
+
+    #[test]
+    fn joining_different_items_in_different_contexts_keeps_first_without_asking() {
+        let file = EditionedFileId::from_raw(1);
+        let first = Span {
+            range: range(2, 6),
+            anchor: SpanAnchor { file_id: file, ast_id: ErasedFileAstId::from_raw(10) },
+            ctx: SyntaxContext::root(span::Edition::Edition2021),
+        };
+        let second = Span {
+            range: range(0, 4),
+            anchor: SpanAnchor { file_id: file, ast_id: ErasedFileAstId::from_raw(20) },
+            ctx: SyntaxContext::root(span::Edition::Edition2024),
+        };
+        let mut asked = false;
+        let joined = join(first, second, |_| {
+            asked = true;
+            None
+        });
+        assert!(!asked, "cross-context same-file join must not ask the database");
+        assert_eq!(joined, Some(first));
+
+        // Different files still return `None` without asking, even across contexts.
+        let other_file = Span {
+            anchor: SpanAnchor {
+                file_id: EditionedFileId::from_raw(2),
+                ast_id: ErasedFileAstId::from_raw(20),
+            },
+            ..second
+        };
+        let joined = join(first, other_file, |_| {
+            asked = true;
+            None
+        });
+        assert!(!asked, "different-file join must not ask the database");
+        assert_eq!(joined, None);
     }
 }
