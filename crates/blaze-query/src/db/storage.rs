@@ -256,6 +256,15 @@ const CAPTURES: usize = 1 << 21;
 // A captured entry is a node or, with [`REF`] set, a capture's number: neither reaches the bit.
 const _: () = assert!(NODES <= REF as usize && CAPTURES <= REF as usize);
 
+/// The bytes budgets' passes let go ([`Storage::sweep_values`]) over the process's life.
+static PASSES_FREED: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes budgets' passes let go over the process's life, of every storage: what the caps
+/// cost a memory report names, beside [`super::eviction_totals`].
+pub fn lru_freed_bytes() -> u64 {
+    PASSES_FREED.load(Ordering::Relaxed)
+}
+
 /// Every ingredient's rows, the dependency graph and the view of one database: `Send + Sync`,
 /// read by `&` from any number of tasks, written by `&mut`.
 pub struct Storage {
@@ -1113,6 +1122,7 @@ impl Storage {
         span.record("bytes", weight);
         span.record("evicted", evicted);
         span.record("freed", freed);
+        PASSES_FREED.fetch_add(freed as u64, Ordering::Relaxed);
         values.len()
     }
 

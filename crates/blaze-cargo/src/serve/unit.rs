@@ -403,7 +403,11 @@ impl Steps for Real {
         // them, and whatever was refused before is tried once more. An edited member's pages
         // written at the build's end would be paid by the next edit and thrown away by it.
         let (which, later, deps) = match kept.stored {
-            Stored::All => return Ok(Vec::new()), // alloc: none
+            Stored::All => {
+                // Nothing to store: the library rows' edges a build made since go here.
+                let_go_durable_edges_at_end(&mut kept.lowered);
+                return Ok(Vec::new()); // alloc: none
+            }
             Stored::No => {
                 // The outcomes of the sealed crates now; a member's waits for its image,
                 // which the second store writes.
@@ -459,6 +463,8 @@ impl Steps for Real {
         // And settled: what those runs said changed leaves the next walk's start
         // (`Storage::settle_changed_set`).
         blaze_query::db::Database::storage_mut(kept.lowered.served_db()).settle_changed_set();
+        // Then, with what it stored keyed by the rows' own reads, the library rows' edges go.
+        let_go_durable_edges_at_end(&mut kept.lowered);
         Ok(puts)
     }
 
@@ -1537,8 +1543,8 @@ impl BuildEnd {
 const MIR_VALUE_BYTES: u64 = 6 << 10;
 
 /// Whether `values` MIR values, at [`MIR_VALUE_BYTES`] each, are past the `mir` tag's cap
-/// (`blaze_mem::tag::budget`, set on Windows by `serve::commit::set_value_budgets`; none
-/// elsewhere, so never).
+/// (`blaze_mem::tag::budget`, set on Windows only while the daemon is pressed, by
+/// `serve::commit`'s `press`; none otherwise, so never).
 fn mir_past_cap(values: usize, cap: u64) -> bool {
     cap != u64::MAX && (values as u64).saturating_mul(MIR_VALUE_BYTES) > cap
 }
@@ -1547,14 +1553,14 @@ fn mir_past_cap(values: usize, cap: u64) -> bool {
 /// MIR value goes (each keeps its memo, so a body a later unit's codegen reads is made again
 /// and backdated). A cold build of a large workspace otherwise holds the MIR of every body it
 /// compiled until its end (I51: 7 GiB of `mir` heap on rune-desktop). Not in a check.
-fn release_mir_past_cap(lowered: &mut Lowered, end: &BuildEnd) {
+fn release_mir_past_cap(lowered: &mut Lowered, end: &BuildEnd) -> usize {
     if !end.compiles {
-        return;
+        return 0;
     }
     let db = lowered.served_db();
     let held = hir::evict::mir_held(db);
     if !mir_past_cap(held, blaze_mem::tag::budget(blaze_mem::Tag::Mir)) {
-        return;
+        return 0;
     }
     let span = tracing::info_span!(
         target: "blaze",
@@ -1563,7 +1569,30 @@ fn release_mir_past_cap(lowered: &mut Lowered, end: &BuildEnd) {
         dropped = tracing::field::Empty,
     );
     let _entered = span.enter();
-    span.record("dropped", hir::evict::drop_mir(db));
+    let dropped = hir::evict::drop_mir(db);
+    span.record("dropped", dropped);
+    dropped
+}
+
+/// The growth of the live edges past which a pressed running build's write lets go of the
+/// durable library rows' edges: a pass reads every node, so it is paid once per 4 M edges
+/// (16 MiB) made, not on every write.
+const EDGES_MID_BUILD: u64 = 4 << 20;
+
+/// The growth of the live edges past which a build's end lets go of them: 1 M edges (4 MiB),
+/// so an edit, which makes a few thousand, pays no pass.
+const EDGES_AT_END: u64 = 1 << 20;
+
+/// At a build's end, after its store: lets go of the edges of the library rows their
+/// durability proves ([`blaze_query::db::Storage::let_go_durable_edges`]), once enough were made
+/// since the last pass ([`EDGES_AT_END`]). After the store, so what the build stored was keyed
+/// by the rows' own reads.
+fn let_go_durable_edges_at_end(lowered: &mut Lowered) {
+    use blaze_query::db::Database as _;
+    let storage = lowered.served_db().storage_mut();
+    if storage.durable_pass_due(EDGES_AT_END) {
+        storage.let_go_durable_edges();
+    }
 }
 
 /// Of `finished`, the crates that are not `local` and not in `released` (sorted), each added to
@@ -1581,17 +1610,29 @@ fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, releas
 }
 
 /// With the front end exclusive for a write that was asked anyway (a build script's run, a
-/// proc macro's load), lets go of the inference and solver caches of every dependency crate
-/// that finished compiling since the last such write ([`BuildEnd::newly_finished`]). Never a
-/// write of its own: a write stops every reader, so this only rides on one. A value read again
-/// is made again from its memo and backdated, so nothing read can differ; what a later crate's
-/// codegen still reads of a finished one (a generic's body) is made again on demand.
+/// proc macro's load), and only while the daemon is pressed (its footprint at or past
+/// [`crate::serve::relief::PRESS_AT`] of its ceiling; never on a machine with room): lets go
+/// of MIR past its cap, of the edges of the library rows their durability proves, and of the
+/// inference and solver caches of every dependency crate that finished compiling since the
+/// last such write ([`BuildEnd::newly_finished`]). Never a write of its own: a write stops
+/// every reader, so this only rides on one. A value read again is made again from its memo
+/// and backdated, so nothing read can differ; what a later crate's codegen still reads of a
+/// finished one (a generic's body) is made again on demand.
 fn release_finished(lowered: &mut Lowered, end: &mut BuildEnd) {
-    release_mir_past_cap(lowered, end);
+    use blaze_query::db::Database as _;
+    if !crate::serve::relief::pressed() {
+        return;
+    }
+    let mir = release_mir_past_cap(lowered, end);
+    let storage = lowered.served_db().storage_mut();
+    if storage.durable_pass_due(EDGES_MID_BUILD) {
+        storage.let_go_durable_edges();
+    }
     let crates = {
         let db: &base_db::Db = &*lowered.served_db();
         end.newly_finished(db)
     };
+    crate::serve::relief::note_released(crates.len(), mir);
     if crates.is_empty() {
         return;
     }

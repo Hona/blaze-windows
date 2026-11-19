@@ -1440,6 +1440,7 @@ impl PeakMemory {
                 }
             }
         }
+        let _ = write!(line, "; {}", super::relief::cost_clause());
         // logged: the info event below
         eprintln!("blaze serve: {line}");
         tracing::info!(target: "blaze", "{line}");

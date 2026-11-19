@@ -488,6 +488,22 @@ pub(crate) fn now(ingredient: u32, what: usize) -> u64 {
         .sum()
 }
 
+/// What eviction did and cost over the process's life, summed over every ingredient and thread,
+/// taken or not: values a budget's pass let go, values an explicit drop let go, and runs of a
+/// value evicted earlier and asked for again (the recomputation). For a memory report.
+pub fn eviction_totals() -> (u64, u64, u64) {
+    let ingredients = (ingredient::registered() as usize + 1).min(MAX_INGREDIENTS);
+    let (mut evicted, mut dropped, mut asked) = (0, 0, 0);
+    for block in blocks() {
+        for counters in &block.counters[..ingredients] {
+            evicted += counters.now[EVICTED].load(Ordering::Relaxed);
+            dropped += counters.now[DROPPED].load(Ordering::Relaxed);
+            asked += counters.now[EVICTED_ASKED].load(Ordering::Relaxed);
+        }
+    }
+    (evicted, dropped, asked)
+}
+
 /// What each ingredient's counts gained since the last take, summed over every thread, and the
 /// most reads one of its runs held since then, as `each(name, counts)`; an ingredient that
 /// gained nothing is left out. Process-wide: two databases' counts, and two overlapping

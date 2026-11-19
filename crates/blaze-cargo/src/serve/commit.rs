@@ -32,10 +32,11 @@ impl Guard {
             Err(std::env::VarError::NotPresent) => ceiling,
             Err(error) => anyhow::bail!("{VAR}: {error}"),
         };
+        let each = value_budget(blaze_mem::address_capacity()?.physical);
         let (quit, stop) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("blaze-commit-guard".into())
-            .spawn(move || guard(ceiling, &stop, &super::relief::CHANNEL))
+            .spawn(move || guard(ceiling, each, &stop, &super::relief::CHANNEL))
             .context("starting the private commit guard")?;
         Ok(Self { quit, worker: Some(worker) })
     }
@@ -47,9 +48,10 @@ impl Guard {
 /// freed leaves the commit), and the daemon ends only once every rung was given and the
 /// commit is still past the ceiling. A reading the system refuses ends it at once: nothing
 /// can then say the ceiling holds.
-fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Channel) {
-    use super::{pulse::CeilingLook, relief::{Ladder, Rung, Step}};
+fn guard(ceiling: u64, each: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Channel) {
+    use super::{pulse::CeilingLook, relief::{Ladder, Pressure, Rung, Step}};
     let mut ladder = Ladder::default();
+    let mut pressure = Pressure::default();
     let mut watch = super::pulse::CeilingWatch::default();
     // Whether this overshoot already waited for running builds' releases before its exit.
     let mut waited_running = false;
@@ -58,6 +60,14 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
             super::said::logged!(ERROR, "blaze serve: pid {} stopped: its private commit could not be read, so no memory ceiling holds", std::process::id());
             std::process::exit(Exit::MemoryCeiling.code());
         };
+        if let Some(on) = pressure.look(bytes, ceiling) {
+            let (verb, at) = match on {
+                true => ("pressed: caps each front-end tag's values at", super::relief::PRESS_AT),
+                false => ("eased: lifts the caps of", super::relief::EASE_AT),
+            };
+            super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes, {}/{} of its limit of {ceiling}: {verb} {each} bytes", at.0, at.1);
+            press(on, each);
+        }
         let was = ladder.given();
         match ladder.look(bytes, ceiling) {
             Step::Under => {
@@ -105,6 +115,7 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
             Step::Exit => {
                 super::said::logged!(ERROR, "blaze serve: pid {} stopped at its memory ceiling: private commit {bytes} bytes, limit {ceiling} bytes, after giving back every rung ({:?})", std::process::id(), Rung::ALL);
                 super::daemon::log_memory(&blaze_mem::tag::snapshot());
+                super::said::logged!(ERROR, "blaze serve: {}", super::relief::cost_clause());
                 std::process::exit(Exit::MemoryCeiling.code());
             }
         }
@@ -124,23 +135,20 @@ pub(super) fn value_budget(physical: u64) -> u64 {
     (physical / 32).max(256 << 20)
 }
 
-/// Caps the weighed query values of the front-end tags ([`value_budget`]): with no cap (none
-/// set since admission's budgets went, 2026-11-13) a storage keeps every parse tree, body,
-/// source map and expansion of every crate a build touched, and its values grow with the
-/// workspace; under one, each view boundary lets go of the least recently verified past it,
-/// made again from their memos when read. Windows only, where every committed byte is charged:
-/// the other systems keep what they did. A cap set already (a test's) is kept.
-pub(super) fn set_value_budgets() -> anyhow::Result<()> {
-    let physical = blaze_mem::address_capacity()?.physical;
-    let each = value_budget(physical);
+/// Presses the daemon (`on`) or eases it ([`super::relief::Pressure`]). Pressed, the weighed
+/// query values of the front-end tags are capped at `each` ([`value_budget`]): each view
+/// boundary lets go of the least recently verified past it, made again from their memos when
+/// read, and a running build's writes let go of MIR past the `mir` cap and of finished
+/// dependency crates' inference (`unit::release_finished`). Eased, no cap is set, and nothing
+/// is evicted for memory. Windows only, where every committed byte is charged.
+fn press(on: bool, each: u64) {
+    let cap = if on { each } else { u64::MAX };
     // `mir`'s values are let go only when asked: its cap is read by a write mid-build
     // (`unit::release_mir_past_cap`), never by the storage's passes.
     for tag in VALUE_TAGS.into_iter().chain([blaze_mem::Tag::Mir]) {
-        if blaze_mem::tag::budget(tag) == u64::MAX {
-            blaze_mem::tag::set_budget(tag, each);
-        }
+        blaze_mem::tag::set_budget(tag, cap);
     }
-    Ok(())
+    super::relief::set_pressed(on);
 }
 
 impl Drop for Guard {

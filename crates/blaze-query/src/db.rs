@@ -48,7 +48,7 @@ pub use capture::{
 };
 pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
 pub use census::{Blocker as DurabilityBlocker, Census as DurabilityCensus};
-pub use counts::{Counts, Validity, take as take_counts};
+pub use counts::{Counts, Validity, eviction_totals, take as take_counts};
 pub use frontier::{
     Changed, ChangedSetWork, Settled, Unknown as ChangedUnknown, changed_keys_since,
 };
@@ -65,10 +65,11 @@ pub use provenance::{
     Taken, log_runs, name_rows, take_log_in,
 };
 pub use seal::{
-    SealCensus, SealGroup, SealGroupCensus, SealKind, SealNotWhole, SealPass, SealState,
+    DurableLetGo, SealCensus, SealGroup, SealGroupCensus, SealKind, SealNotWhole, SealPass,
+    SealState, durable_let_go_totals,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
-pub use storage::{Database, Durability, Hook, Storage, Unread, View, file_ends_with};
+pub use storage::{Database, Durability, Hook, Storage, Unread, View, file_ends_with, lru_freed_bytes};
 pub use value::Value;
 pub use witness::{Witness, covered, witnessed};
 

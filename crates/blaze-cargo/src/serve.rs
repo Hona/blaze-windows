@@ -1086,8 +1086,6 @@ pub(crate) fn engine(
 ) -> anyhow::Result<Engine> {
     #[cfg(windows)]
     let commit = commit::Guard::arm()?;
-    #[cfg(windows)]
-    commit::set_value_budgets().context("capping the front end's weighed values")?;
     let state = state()?;
     std::fs::create_dir_all(&state)
         .with_context(|| format!("making the daemon's state directory {}", state.display()))?;
