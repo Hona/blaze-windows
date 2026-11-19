@@ -897,6 +897,34 @@ fn the_oracle_catches_a_patch_that_keeps_a_changed_functions_old_references() {
     assert!(found.starts_with("build 1: "), "{found}");
 }
 
+/// A durable (`Durability::HIGH`) write resets the front end's witness table to the new view,
+/// so a kept walk made before that durable write walks whole rather than asking `changed_since`
+/// for a view the new witness table no longer covers (the `withdeps` `check -> build` failure
+/// on `serde_derive` when a later build script bumped `durable_view`).
+#[test]
+fn a_durable_write_walks_whole_even_when_the_kept_walk_has_a_view() {
+    let mut program = program();
+    let kept = Kept::new();
+    program.begin_build();
+    let first = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(first.walk.whole.is_some());
+
+    // Simulate a HIGH write advancing `durable_view` and resetting the front end's witness
+    // table so `changed_since(old_view)` would answer `Changed::Unknown`.
+    program.engine.high += 1;
+    program.engine.revision += 1;
+    program.engine.loses_its_set = true;
+    program.begin_build();
+    let second = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(second.walk.whole, Some("a durable input was written since the kept walk"));
+
+    // Once the new walk is kept at the new durable view, ordinary edits patch again.
+    program.engine.loses_its_set = false;
+    program.begin_build();
+    let third = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(third.walk.whole, None);
+}
+
 /// The control of the patched walk's renaming: an edit of 4's body gives it a new key, which
 /// 2's place must name. A driver that leaves the places that named the old key builds 2
 /// calling a function the build no longer holds; the oracle says so.

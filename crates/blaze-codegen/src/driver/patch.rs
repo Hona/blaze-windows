@@ -465,7 +465,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         if walked.closes && walked.world.is_none() && self.planted != Some(Planted::PatchesClosed) {
             return Err("the kept walk is of a front end that may close dyn facts, which its describes are against");
         }
-        if walked.view != view && walked.seen.is_none() {
+        // `Witnesses` records reads below `Durability::HIGH` alone and resets its `since` view
+        // whenever a durable input is written, so a kept walk can never be patched across a
+        // durable view change (even when `walked.seen` is `Some`).
+        if walked.view != view {
             return Err("a durable input was written since the kept walk");
         }
         if self.frontend.stopped() {
