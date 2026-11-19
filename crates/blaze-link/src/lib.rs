@@ -1596,12 +1596,29 @@ fn dev_run_fits(
 /// directories is one lineage and one build id, and its file can be placed at both.
 fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     let pieces = stage.new.piece_count() as usize;
-    let mut bytes: Vec<u8> = Vec::with_capacity(pieces * 40);
-    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(pieces);
-    for piece in stage.new.live_pieces() {
-        let start = bytes.len();
-        stage.symbols.write_key(piece.sym, &mut bytes);
-        keys.push((start as u32, (bytes.len() - start) as u32));
+    let (state, symbols) = (&stage.new, &*stage.symbols);
+    // Each chunk of pieces writes its keys alone; joined in piece order they are the bytes one
+    // pass over the live pieces writes.
+    let grain = pieces.div_ceil(blaze_graph::par::threads() * 4).max(4096);
+    // alloc: once per image, at its first full link: a chunk's keys, joined below
+    let parts = blaze_graph::par::map(0..pieces.div_ceil(grain), |chunk| {
+        let ids = chunk * grain..((chunk + 1) * grain).min(pieces);
+        let mut bytes: Vec<u8> = Vec::with_capacity(ids.len() * 40);
+        let mut keys: Vec<(u32, u32)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(piece) = state.piece(id as state::PieceId) else { continue };
+            let start = bytes.len();
+            symbols.write_key(piece.sym, &mut bytes);
+            keys.push((start as u32, (bytes.len() - start) as u32));
+        }
+        (bytes, keys)
+    });
+    let mut bytes: Vec<u8> = Vec::with_capacity(parts.iter().map(|it| it.0.len()).sum());
+    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(parts.iter().map(|it| it.1.len()).sum());
+    for (part, part_keys) in parts {
+        let base = bytes.len() as u32;
+        bytes.extend_from_slice(&part);
+        keys.extend(part_keys.into_iter().map(|(at, len)| (base + at, len)));
     }
     let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
     let order = lineage_order(&keys, key);

@@ -1840,19 +1840,35 @@ impl<'a> Stage<'a> {
         let mut cells: FrameVec<'a, (GotKind, Sym)> = Vec::new_in(arena);
         let mut plt: FrameVec<'a, Sym> = Vec::new_in(arena);
         let mut got_specials: FrameVec<'a, (Sym, u32)> = Vec::new_in(arena);
-        for id in self.write.iter() {
-            let Some(piece) = self.new.piece(id) else { continue };
-            for fixup in piece.fixups() {
-                if let Some(kind) = reloc::got_kind(fixup.apply) {
-                    cells.push((kind, self.got_target(fixup)));
-                } else if self.through_plt(fixup) {
-                    plt.push(fixup.target);
-                } else if let Some((sym, at)) = special_at(&self.new, fixup.target) {
-                    if matches!(self.new.specials.get(at as usize), Some(Special::Got { .. })) {
-                        got_specials.push((sym, at));
+        // A first link writes every piece, each of its placement rounds again: the fixups are
+        // read in parallel chunks, and what they need is sorted and deduplicated below, so the
+        // chunks' order does not reach the image.
+        let ids: FrameVec<'a, PieceId> = collect_in(self.write.iter(), arena);
+        let (state, symbols, got_by_library) = (&self.new, &*self.symbols, self.plan.got_by_library);
+        let grain = ids.len().div_ceil(par::threads() * 8).max(256);
+        // alloc: one triple of lists per chunk, joined into the arena's below
+        let found = par::map(par::chunks(&ids, grain), |ids| {
+            let mut found = (Vec::new(), Vec::new(), Vec::new());
+            for &id in ids {
+                let Some(piece) = state.piece(id) else { continue };
+                for fixup in piece.fixups() {
+                    if let Some(kind) = reloc::got_kind(fixup.apply) {
+                        found.0.push((kind, crate::write::got_target(symbols, fixup)));
+                    } else if through_plt_in(state, got_by_library, fixup) {
+                        found.1.push(fixup.target);
+                    } else if let Some((sym, at)) = special_at(state, fixup.target)
+                        && matches!(state.specials.get(at as usize), Some(Special::Got { .. }))
+                    {
+                        found.2.push((sym, at));
                     }
                 }
             }
+            found
+        });
+        for (c, p, g) in found {
+            cells.extend(c);
+            plt.extend(p);
+            got_specials.extend(g);
         }
         radix::sort_copy_by_key(&mut got_specials, |it| it.0.0);
         got_specials.dedup();
@@ -1965,15 +1981,8 @@ impl<'a> Stage<'a> {
     }
 
     /// The import a symbol is, through its aliases.
-    pub fn import_of(&self, mut sym: Sym) -> Option<u32> {
-        for _ in 0..64 {
-            match self.new.def(sym) {
-                Def::Import(at) => return Some(at),
-                Def::Alias(to) => sym = to,
-                _ => return None,
-            }
-        }
-        None
+    pub fn import_of(&self, sym: Sym) -> Option<u32> {
+        import_in(&self.new, sym)
     }
 
     /// The linker's symbol a symbol is, through its aliases.
@@ -1985,18 +1994,7 @@ impl<'a> Stage<'a> {
     /// and where imports are reached only through their GOT cells (PE), any reference to an
     /// imported function that is not through its cell, as link.exe's import thunk.
     pub fn through_plt(&self, fixup: &Fixup) -> bool {
-        let Some(at) = self.import_of(fixup.target) else { return false };
-        if reloc::is_branch(fixup.apply) {
-            return true;
-        }
-        self.plan.got_by_library
-            && matches!(fixup.apply, Apply::Abs64 | Apply::ImageRel32 | Apply::Rel32)
-            && self
-                .new
-                .resolved
-                .imports
-                .get(at as usize)
-                .is_some_and(|it| it.kind == crate::model::SymbolKind::Function)
+        through_plt_in(&self.new, self.plan.got_by_library, fixup)
     }
 
     /// Records that the piece `id` just made (a function's body or a static) declares what
@@ -2336,6 +2334,33 @@ fn special_at(state: &State, mut sym: Sym) -> Option<(Sym, u32)> {
         }
     }
     None
+}
+
+/// The import a symbol is, through its aliases ([`Stage::import_of`]).
+fn import_in(state: &State, mut sym: Sym) -> Option<u32> {
+    for _ in 0..64 {
+        match state.def(sym) {
+            Def::Import(at) => return Some(at),
+            Def::Alias(to) => sym = to,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether a fixup reaches its target at the target's PLT stub ([`Stage::through_plt`]).
+fn through_plt_in(state: &State, got_by_library: bool, fixup: &Fixup) -> bool {
+    let Some(at) = import_in(state, fixup.target) else { return false };
+    if reloc::is_branch(fixup.apply) {
+        return true;
+    }
+    got_by_library
+        && matches!(fixup.apply, Apply::Abs64 | Apply::ImageRel32 | Apply::Rel32)
+        && state
+            .resolved
+            .imports
+            .get(at as usize)
+            .is_some_and(|it| it.kind == crate::model::SymbolKind::Function)
 }
 
 /// A code header's read error, as the stage says it.
