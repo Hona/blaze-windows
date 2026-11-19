@@ -100,6 +100,19 @@ const LC_UUID: u32 = 0x1b;
 const S_ATTR_DEBUG: u32 = 0x0200_0000;
 const NLIST: u64 = 16;
 
+/// One resolved inlined call site within a function, for PE PDB `S_INLINESITE` and
+/// `DEBUG_S_INLINEELINES`: `ranges` indexes [`Input::inline_ranges`].
+#[derive(Clone, Debug)] // clone: tests' inputs
+pub(crate) struct Inlined<'a> {
+    pub parent: Option<u32>,
+    pub callee: &'a str,
+    pub call_file: &'a str,
+    pub call_line: u32,
+    pub decl_file: Option<&'a str>,
+    pub decl_line: u32,
+    pub ranges: Range<u32>,
+}
+
 /// A placed function as the side file records it: its rows are `lines[lines]` of
 /// [`Input::lines`].
 #[derive(Clone, Debug)] // clone: tests' inputs
@@ -109,6 +122,10 @@ pub(crate) struct Func<'a> {
     pub size: u64,
     pub name: Option<&'a str>,
     pub lines: Range<u32>,
+    /// PE PDB: optional per-function locals, types and scopes.
+    pub debug: Option<&'a blaze_codegen::debug::FunctionDebug>,
+    /// PE PDB: resolved inlined sites (`Input::inlined[inlined]`).
+    pub inlined: Range<u32>,
 }
 
 /// A line-table row with its file by name: from code offset `at` of its function.
@@ -132,6 +149,10 @@ pub(crate) struct Input<'a> {
     pub generation: u64,
     pub functions: &'a [Func<'a>],
     pub lines: &'a [Lined<'a>],
+    /// PE PDB: resolved inlined sites indexed by [`Func::inlined`].
+    pub inlined: &'a [Inlined<'a>],
+    /// PE PDB: half-open code offset ranges indexed by [`Inlined::ranges`].
+    pub inline_ranges: &'a [(u32, u32)],
     pub given: Given<'a>,
     /// PE: the native code's functions the image keeps, each `(name, address)`, which a PDB
     /// names as publics (C has no records of Rust's), with the version of the resolution they
@@ -689,8 +710,17 @@ impl Kept {
             let same = self.format == input.format && self.name == input.name;
             let why = match (self.pdb.as_mut(), self.id) {
                 (Some(model), Some(base)) if same => {
-                    let patched =
-                        model.patch(headers, input.id, input.functions, input.lines, gone, count, natives);
+                    let patched = model.patch(
+                        headers,
+                        input.id,
+                        input.functions,
+                        input.lines,
+                        input.inlined,
+                        input.inline_ranges,
+                        gone,
+                        count,
+                        natives,
+                    );
                     match patched {
                         Ok(Ok(writes)) => {
                             let len = model.len();
@@ -736,7 +766,15 @@ impl Kept {
             return Ok(None);
         }
         let why = self.asked.take().unwrap_or("no link's change was at hand");
-        let model = crate::pe::pdb::Model::new(headers, input.id, input.functions, input.lines, natives.unwrap_or(&[]))?;
+        let model = crate::pe::pdb::Model::new(
+            headers,
+            input.id,
+            input.functions,
+            input.lines,
+            input.inlined,
+            input.inline_ranges,
+            natives.unwrap_or(&[]),
+        )?;
         self.file = Bytes(std::sync::Arc::new(model.file()));
         self.pdb = Some(model);
         self.pdb_natives = input.publics.map(|it| it.0);

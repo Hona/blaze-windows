@@ -382,6 +382,8 @@ fn views_of<'a>(
             size: f.size,
             name: f.name.as_deref(),
             lines: start..lines.len() as u32,
+            debug: None,
+            inlined: 0..0,
         });
     }
     functions.sort_by_key(|it| (it.addr, it.key));
@@ -402,6 +404,8 @@ fn input_of<'a>(
         generation: program.generation,
         functions,
         lines,
+        inlined: &[],
+        inline_ranges: &[],
         given,
         publics: None,
     }
@@ -796,6 +800,8 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         generation: 3,
         functions: &functions,
         lines: &lines,
+        inlined: &[],
+        inline_ranges: &[],
         given: Given::All,
         publics: None,
     };
@@ -833,6 +839,8 @@ fn a_mach_o_side_file_carries_the_uuid_the_segments_and_the_dwarf() {
         generation: program.generation,
         functions: &functions,
         lines: &lines,
+        inlined: &[],
+        inline_ranges: &[],
         given: Given::All,
         publics: None,
     };
@@ -863,6 +871,8 @@ fn an_executable_with_no_build_id_is_refused_by_name() {
         generation: program.generation,
         functions: &functions,
         lines: &lines,
+        inlined: &[],
+        inline_ranges: &[],
         given: Given::All,
         publics: None,
     };

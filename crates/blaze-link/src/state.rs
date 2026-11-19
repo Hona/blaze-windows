@@ -236,11 +236,12 @@ struct SymCold {
 
 const COLD: SymCold = SymCold { refs: ListRef::EMPTY, room: 0, slot: u32::MAX, seen: false };
 
-/// Of each interned id: the debug name of the function it is, and the span table of the
-/// anchor it is.
+/// Of each interned id: the debug name of the function it is, optional rich per-function debug
+/// info (locals, types, scopes, inline sites for PDB), and the span table of the anchor it is.
 #[derive(Clone, Debug)]
 struct IdCold {
     debug_name: Option<NameId>,
+    debug_info: Option<Arc<blaze_codegen::debug::FunctionDebug>>,
     spans: Option<Spans>,
 }
 
@@ -1245,7 +1246,7 @@ impl State {
 
     fn id_cold_mut(&mut self, id: IdNo) -> &mut IdCold {
         let (shard, at) = Symbols::split_id(id);
-        let empty = || IdCold { debug_name: None, spans: None };
+        let empty = || IdCold { debug_name: None, debug_info: None, spans: None };
         if self.ids[shard].len() <= at {
             self.ids[shard].set(at, empty(), empty);
         }
@@ -1265,6 +1266,21 @@ impl State {
     pub fn set_debug_name(&mut self, function: IdNo, name: NameId) {
         if self.debug_name(function) != Some(name) {
             self.id_cold_mut(function).debug_name = Some(name);
+        }
+    }
+
+    /// Per-function locals, types, scopes and inline sites for PDB emission, if given.
+    pub fn debug_info(&self, function: IdNo) -> Option<&blaze_codegen::debug::FunctionDebug> {
+        self.id_cold(function)?.debug_info.as_deref()
+    }
+
+    pub fn set_debug_info(
+        &mut self,
+        function: IdNo,
+        info: Arc<blaze_codegen::debug::FunctionDebug>,
+    ) {
+        if self.debug_info(function) != Some(&*info) {
+            self.id_cold_mut(function).debug_info = Some(info);
         }
     }
 
@@ -1656,7 +1672,7 @@ mod wire {
     wire_struct!(Loader { rebase, binds });
     wire_struct!(FunctionInfo { key, id, fde, windows, lines, made });
     wire_struct!(SymCold { refs, room, slot, seen });
-    wire_struct!(IdCold { debug_name, spans });
+    wire_struct!(IdCold { debug_name, debug_info, spans });
     wire_struct!(RustName { target, weak });
     wire_struct!(Space { region, bytes, zero, offset });
 

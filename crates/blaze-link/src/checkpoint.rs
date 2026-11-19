@@ -35,7 +35,7 @@ use blaze_items::ItemKey;
 use crate::{Debug, Format, Image, LinkError, Output};
 
 /// The record's first bytes, and the layout they name: a record of another layout is refused.
-const MAGIC: &[u8; 8] = b"BLKIMG01";
+const MAGIC: &[u8; 8] = b"BLKIMG02";
 
 /// A value as the checkpoint encodes it, and back.
 pub(crate) trait Wire: Sized {
@@ -391,6 +391,42 @@ impl Wire for Line {
     }
 }
 
+mod wire_debug {
+    use blaze_codegen::debug::{
+        Aggregate, BaseEncoding, DebugType, EnumTag, EnumVariant, Field, FunctionDebug,
+        InlinedSite, Local, LocalPlace, Scope,
+    };
+
+    wire_enum!(BaseEncoding {
+        0 => Bool,
+        1 => Char,
+        2 => Signed,
+        3 => Unsigned,
+        4 => Float,
+    });
+    wire_struct!(Field { name, offset, ty });
+    wire_struct!(Aggregate { name, size, fields });
+    wire_struct!(EnumTag { offset, size, states });
+    wire_struct!(EnumVariant { name, tag, fields });
+    wire_enum!(DebugType {
+        0 => Base { name, size, encoding },
+        1 => Pointer { name, to },
+        2 => Array { of, len },
+        3 => Struct(it),
+        4 => Union(it),
+        5 => Names { name, size, names },
+        6 => Enum { of, tag, variants },
+    });
+    wire_struct!(Scope { parent, ranges });
+    wire_enum!(LocalPlace {
+        0 => Frame(offset),
+        1 => Ranges(ranges),
+    });
+    wire_struct!(Local { name, param, ty, place, scope });
+    wire_struct!(InlinedSite { parent, callee, call_site, decl, ranges });
+    wire_struct!(FunctionDebug { frame_base, types, scopes, locals, inlined });
+}
+
 impl Wire for blaze_codegen::Backend {
     fn put(&self, out: &mut Vec<u8>) {
         use blaze_codegen::Backend;
@@ -523,7 +559,7 @@ impl Image {
         let mut r = Reader::new(checkpoint);
         let fail = |what: String| refused(&to, format_args!("its checkpoint does not restore: {what}"));
         if r.array::<8>().ok() != Some(MAGIC) {
-            return Err(fail("not a checkpoint of this layout (BLKIMG01): link it from scratch".into()));
+            return Err(fail("not a checkpoint of this layout (BLKIMG02): link it from scratch".into()));
         }
         let digest = *r.array::<32>().map_err(|it| fail(it.into()))?;
         let generation = u64::take(&mut r).map_err(&fail)?;

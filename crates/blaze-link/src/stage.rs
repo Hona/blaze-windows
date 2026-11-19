@@ -482,6 +482,10 @@ impl<'a> Stage<'a> {
             let (id, name) = (self.symbols.id(&key.0), self.symbols.name(name));
             self.new.set_debug_name(id, name);
         }
+        for (key, info) in &change.debug_info {
+            let id = self.symbols.id(&key.0);
+            self.new.set_debug_info(id, Arc::clone(info));
+        }
         self.functions(&change.added, change.made)?;
         self.slots(&change.slots)?;
         for it in &change.statics {

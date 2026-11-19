@@ -133,6 +133,8 @@ pub struct Change<'a> {
     pub unnamed: Vec<String>,
     /// Names for debuggers, symbol tables and backtraces.
     pub debug_names: Vec<(InstanceKey, String)>,
+    /// Rich per-function debug metadata (locals, types, scopes, inline sites) for PE PDBs.
+    pub debug_info: Vec<(InstanceKey, std::sync::Arc<blaze_codegen::debug::FunctionDebug>)>,
     pub natives: Vec<Native<'a>>,
     pub removed_natives: Vec<ContentId>,
     /// The span side tables the positions are filled from, by anchor ([`SpanTable::encode`]).
@@ -807,11 +809,15 @@ impl Image {
             Debug::Beside => {
                 // alloc: once per stage of an image with a side file, the change's keys
                 let mut keys: Vec<InstanceKey> = Vec::with_capacity(
-                    change.added.len() + change.removed.len() + change.debug_names.len(),
+                    change.added.len()
+                        + change.removed.len()
+                        + change.debug_names.len()
+                        + change.debug_info.len(),
                 );
                 keys.extend(change.added.iter().map(|it| it.key));
                 keys.extend(change.removed.iter().copied());
                 keys.extend(change.debug_names.iter().map(|it| it.0));
+                keys.extend(change.debug_info.iter().map(|it| it.0));
                 // alloc: as above, its span tables' anchors
                 let anchors = change.spans.iter().map(|it| it.0).collect();
                 let full = finished.full || !self.state.laid_out;
@@ -1240,8 +1246,16 @@ impl Image {
                 }
                 let Some(info) = piece.function() else { continue };
                 let moved = keys.binary_search(&info.key).is_err()
-                    && (state.lines(info).iter())
-                        .any(|line| anchors.binary_search(&line.span.anchor).is_ok());
+                    && ((state.lines(info).iter())
+                        .any(|line| anchors.binary_search(&line.span.anchor).is_ok())
+                        || state.debug_info(info.id).is_some_and(|dbg| {
+                            dbg.inlined.iter().any(|site| {
+                                anchors.binary_search(&site.call_site.anchor).is_ok()
+                                    || site
+                                        .decl
+                                        .is_some_and(|d| anchors.binary_search(&d.anchor).is_ok())
+                            })
+                        }));
                 if moved {
                     views.push(piece)?;
                 }
@@ -1258,6 +1272,8 @@ impl Image {
                 generation,
                 functions: &views.functions,
                 lines: &views.lines,
+                inlined: &views.inlined,
+                inline_ranges: &views.inline_ranges,
                 given: beside::Given::Changed { gone: &gone, count },
                 publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
             };
@@ -1282,6 +1298,8 @@ impl Image {
             generation,
             functions: &views.functions,
             lines: &views.lines,
+            inlined: &views.inlined,
+            inline_ranges: &views.inline_ranges,
             given: beside::Given::All,
             publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
         };
@@ -1340,6 +1358,8 @@ struct Views<'s> {
     symbols: &'s Symbols,
     functions: Vec<beside::Func<'s>>,
     lines: Vec<beside::Lined<'s>>,
+    inlined: Vec<beside::Inlined<'s>>,
+    inline_ranges: Vec<(u32, u32)>,
     /// The span table last looked up: a function's lines are mostly of one.
     last: Option<(&'s ContentId, &'s position::Spans)>,
 }
@@ -1347,7 +1367,49 @@ struct Views<'s> {
 impl<'s> Views<'s> {
     fn new(state: &'s State, symbols: &'s Symbols) -> Views<'s> {
         // alloc: once per side file update, a view per function given and a row per line
-        Views { state, symbols, functions: Vec::new(), lines: Vec::new(), last: None }
+        Views {
+            state,
+            symbols,
+            functions: Vec::new(),
+            lines: Vec::new(),
+            inlined: Vec::new(),
+            inline_ranges: Vec::new(),
+            last: None,
+        }
+    }
+
+    fn resolve_span(
+        &mut self,
+        key: InstanceKey,
+        span_ref: &'s blaze_format::SpanRef,
+    ) -> Result<(&'s str, u32, u32), LinkError> {
+        let anchor = &span_ref.anchor;
+        let table = match self.last {
+            Some((it, table)) if it == anchor => table,
+            _ => {
+                let table = self
+                    .symbols
+                    .find_id(anchor)
+                    .and_then(|id| self.state.span_table(id))
+                    .ok_or_else(|| LinkError {
+                        function: Some(key),
+                        refusal: None,
+                        // alloc: error path
+                        what: format!(
+                            "a line in {anchor:?}, whose span table the link was not given"
+                        ),
+                    })?;
+                self.last = Some((anchor, table));
+                table
+            }
+        };
+        let span = table.span(span_ref.index).ok_or_else(|| LinkError {
+            function: Some(key),
+            refusal: None,
+            // alloc: error path
+            what: format!("span {} of {anchor:?}, past its table", span_ref.index),
+        })?;
+        Ok((table.file(span.file), span.line, span.column))
     }
 
     /// Adds `piece`, a placed function's. An error names the function whose line no span
@@ -1357,35 +1419,38 @@ impl<'s> Views<'s> {
         let Some(info) = piece.function() else { return Ok(()) };
         let start = self.lines.len() as u32;
         for line in state.lines(info) {
-            let anchor = &line.span.anchor;
-            let table = match self.last {
-                Some((it, table)) if it == anchor => table,
-                _ => {
-                    let table = symbols
-                        .find_id(anchor)
-                        .and_then(|id| state.span_table(id))
-                        .ok_or_else(|| LinkError {
-                            function: Some(info.key),
-                            refusal: None,
-                            // alloc: error path
-                            what: format!("a line in {anchor:?}, whose span table the link was not given"),
-                        })?;
-                    self.last = Some((anchor, table));
-                    table
-                }
-            };
-            let span = table.span(line.span.index).ok_or_else(|| LinkError {
-                function: Some(info.key),
-                refusal: None,
-                // alloc: error path
-                what: format!("span {} of {anchor:?}, past its table", line.span.index),
-            })?;
-            self.lines.push(beside::Lined {
-                at: line.at,
-                file: table.file(span.file),
-                line: span.line,
-                column: span.column,
-            });
+            let (file, line_no, column) = self.resolve_span(info.key, &line.span)?;
+            self.lines.push(beside::Lined { at: line.at, file, line: line_no, column });
+        }
+        let debug = state.debug_info(info.id);
+        let inl_start = self.inlined.len() as u32;
+        if let Some(dbg) = debug {
+            for site in &dbg.inlined {
+                let (call_file, call_line, _) = self.resolve_span(info.key, &site.call_site)?;
+                let (decl_file, decl_line) = match &site.decl {
+                    Some(decl) => {
+                        // Declaration span table may be absent for closures/synthetic items;
+                        // resolve when present, otherwise let the PDB derive base file/line
+                        // from the inlinee's first row.
+                        match self.resolve_span(info.key, decl) {
+                            Ok((file, line, _)) => (Some(file), line),
+                            Err(_) => (None, 0),
+                        }
+                    }
+                    None => (None, 0),
+                };
+                let r_start = self.inline_ranges.len() as u32;
+                self.inline_ranges.extend_from_slice(&site.ranges);
+                self.inlined.push(beside::Inlined {
+                    parent: site.parent,
+                    callee: &site.callee,
+                    call_file,
+                    call_line,
+                    decl_file,
+                    decl_line,
+                    ranges: r_start..self.inline_ranges.len() as u32,
+                });
+            }
         }
         self.functions.push(beside::Func {
             key: info.key,
@@ -1393,6 +1458,8 @@ impl<'s> Views<'s> {
             size: piece.size,
             name: state.debug_name(info.id).map(|it| symbols.str(it)),
             lines: start..self.lines.len() as u32,
+            debug,
+            inlined: inl_start..self.inlined.len() as u32,
         });
         Ok(())
     }

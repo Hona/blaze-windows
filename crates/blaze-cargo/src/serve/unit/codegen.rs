@@ -3013,6 +3013,7 @@ fn relink(
         weak_names,
         unnamed,
         debug_names,
+        debug_info: Vec::new(),
         // What the image holds with this change: in its build id.
         given: Some(given),
         natives: bytes_of

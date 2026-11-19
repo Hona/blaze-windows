@@ -31,6 +31,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 pub mod backend;
 pub mod blob;
 pub mod content;
+pub mod debug;
 pub mod dedupe;
 pub mod driver;
 pub mod exec;
