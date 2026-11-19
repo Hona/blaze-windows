@@ -101,10 +101,7 @@ pub(crate) fn expand(lowered: &mut Lowered, job: &Job, unit: usize) -> Result<()
     // An example's file is named by the file it is in, so its errors and panics point there.
     let named: Vec<String> = programs
         .iter()
-        .map(|it| match Path::new(&it.file).is_absolute() {
-            true => it.file.clone(), // clone: a file's name, once per example
-            false => format!("{package_dir}/{}", it.file), // alloc: as above
-        })
+        .map(|it| super::super::files::absolute_name(package_dir, &it.file)) // alloc: a file's name, once per example
         .collect(); // alloc: once per doctest unit made
     let runner_named = format!("{package_dir}/blaze-doctest-runner.rs"); // alloc: once per doctest unit made
     // A `test_harness` example is written with the harness its file last had, which lists

@@ -113,14 +113,12 @@ pub fn build_dir(builds: &Path, workspace_root: &Path) -> PathBuf {
     }
 }
 
-/// `base` joined with one part. A `/`-rooted base (the daemon's name, `/C:/a` on Windows) stays
-/// `/`-separated: `Path::join` would put a `\` in it on Windows.
+/// `base` joined with one part. A daemon name (`/C:/a` on Windows) stays `/`-separated
+/// (`blaze_core::platform::path::DaemonPath::join`): `Path::join` would put a `\` in it.
 fn joined(base: &Path, part: &str) -> PathBuf {
-    match base.to_str() {
-        Some(text) if text.starts_with('/') => {
-            PathBuf::from(format!("{}/{part}", text.trim_end_matches('/')))
-        }
-        _ => base.join(part),
+    match base.to_str().and_then(blaze_core::platform::path::DaemonPath::parse) {
+        Some(named) => PathBuf::from(named.join(part).into_string()),
+        None => base.join(part),
     }
 }
 

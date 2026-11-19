@@ -1296,10 +1296,7 @@ impl UnitReader {
             if found.iter().any(|(it, _)| it == name) || blaze_diagnostics::emit::names_text(name) {
                 continue;
             }
-            let whole = match name.starts_with('/') {
-                true => name.to_owned(),                                   // alloc: as above
-                false => format!("{}/{name}", root.trim_end_matches('/')), // alloc: as above
-            };
+            let whole = files::absolute_name(root, name);
             let Ok(whole) = base_db::AbsPathBuf::try_from(whole.as_str()) else { continue };
             if let Some(file) = db.files().included_source_file(&whole) {
                 found.push((name.to_owned(), file)); // alloc: as above

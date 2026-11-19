@@ -402,19 +402,17 @@ fn writer_of(state: &Path) -> anyhow::Result<blaze_ids::ContentId> {
     Ok(blaze_ids::Hasher::new("blaze v2 shared store writer 1").part(text.as_bytes()).finish())
 }
 
-/// An absolute path as the driver names it: the driver's root is `/`.
+/// An absolute path as the driver names it: the driver's root is `/`, so a name is the daemon's
+/// name of the path (`blaze_core::platform::path`: `C:\a` and `/C:/a` are both `/C:/a`) without
+/// its first `/`.
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
+    use blaze_core::platform::path::{DaemonPath, DaemonPathBuf};
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
-    // The driver's root / is joined with the name, and C:/dir joined to it is itself: a drive path is its own
-    // name, as the daemon's `/C:/dir` is once its root is taken off.
-    #[cfg(windows)]
-    let (text, rest) = match (path.is_absolute(), text.replace('\\', "/")) {
-        (true, name) => (text, name),
-        (false, name) if name.starts_with('/') => (text, name[1..].to_owned()),
-        (false, _) => bail!("{text} is not an absolute path"),
+    let named = match DaemonPath::parse(text) {
+        Some(named) => named.to_owned(),
+        None => DaemonPathBuf::from_host(path).map_err(|why| anyhow::anyhow!("{why}"))?,
     };
-    #[cfg(not(windows))]
-    let Some(rest) = text.strip_prefix('/') else { bail!("{text} is not an absolute path") };
+    let rest = &named.as_str()[1..];
     FileName::new(rest.trim_end_matches('/'))
         .with_context(|| format!("{text} has an empty, `.` or `..` part"))
 }

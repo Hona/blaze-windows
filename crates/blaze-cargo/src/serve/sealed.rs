@@ -234,7 +234,10 @@ impl Placed {
     /// the crate is not sealed (a path a person edits), and is built and kept in its home.
     /// `dir` is under the tree's directory or where builds mount it ([`Placed::mounted`]).
     pub fn sealed_at<'p>(placed: &'p [Placed], dir: &std::path::Path) -> Option<&'p Placed> {
-        placed.iter().find(|it| dir.starts_with(&it.dir) || it.mounts(dir))
+        // A tree is placed at a host path; a plan names a package's directory by its daemon
+        // name (`/C:/a` on Windows): compared on the host's side of the one boundary.
+        let host = blaze_core::platform::path::host_if_daemon(dir);
+        placed.iter().find(|it| host.starts_with(&it.dir) || it.mounts(dir))
     }
 
     /// The sealed tree whose mount `dir` is under, or none: of a workspace member, the one

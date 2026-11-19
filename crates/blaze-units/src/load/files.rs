@@ -721,33 +721,43 @@ fn known_file<'a>(table: impl Table<'a>, path: &str) -> bool {
 /// `path` as the load names it: absolute, `/`-separated, `.` and `..` taken out. `None` for a
 /// path that is not absolute or not UTF-8.
 pub(crate) fn normal(path: &Path) -> Option<String> {
+    // A host path with a prefix (`C:\a`, `\\server\share\a`, `\\?\C:\a`) is named first as the
+    // daemon names it, at the one boundary (`blaze_core::platform::path::daemon`): `/C:/a`.
+    if matches!(path.components().next(), Some(Component::Prefix(_))) {
+        let named = blaze_core::platform::path::daemon(path).ok()?;
+        return normal(Path::new(&named));
+    }
+    // A Windows name's volume (`C:`, `UNC/server/share`) is its root: no `..` climbs above it.
+    let floor = |parts: &[&str]| -> usize {
+        match parts.first() {
+            Some(first) if cfg!(windows) && first.len() == 2 && first.ends_with(':') => 1,
+            Some(&"UNC") if cfg!(windows) => 3,
+            _ => 0,
+        }
+    };
     let mut parts: Vec<&str> = Vec::new();
     let mut absolute = false;
-    // On Windows a host path's drive is the first part, as the daemon names it: `C:\a` is `/C:/a`.
-    let mut drive = None;
     for component in path.components() {
         match component {
             Component::RootDir => absolute = true,
             Component::CurDir => {}
             Component::ParentDir => {
-                parts.pop();
+                if parts.len() > floor(&parts) {
+                    parts.pop();
+                }
             }
             Component::Normal(part) => parts.push(part.to_str()?),
-            Component::Prefix(prefix) => match prefix.kind() {
-                std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) if cfg!(windows) => {
-                    drive = Some(char::from(letter.to_ascii_uppercase()));
-                }
-                _ => return None,
-            },
+            Component::Prefix(_) => return None,
         }
     }
     if !absolute {
         return None;
     }
-    match drive {
-        Some(letter) => Some(format!("/{letter}:/{}", parts.join("/"))),
-        None => Some(format!("/{}", parts.join("/"))),
+    // A drive's root is named with its `/` (`/C:/`), as the daemon names it.
+    if parts.len() == 1 && floor(&parts) == 1 {
+        return Some(format!("/{}/", parts[0]));
     }
+    Some(format!("/{}", parts.join("/")))
 }
 
 /// An absolute `/`-separated path without `.`, `..` or empty parts: `/a/b`, or `C:/a/b` with
@@ -777,6 +787,30 @@ pub fn normal_text(path: &str) -> String {
         out.push('/');
     }
     out
+}
+
+/// [`normal`] on Windows: a host path and its daemon name are one name, and no `..` climbs
+/// above a volume.
+#[cfg(all(test, windows))]
+mod windows_normal_tests {
+    use std::path::Path;
+
+    use super::normal;
+
+    #[test]
+    fn a_host_path_and_its_daemon_name_normalize_alike() {
+        for (path, named) in [
+            (r"C:\w\p\..\q", "/C:/w/q"),
+            (r"\\?\C:\w\p", "/C:/w/p"),
+            ("/C:/w/./p", "/C:/w/p"),
+            (r"C:\w\..\..\..", "/C:/"),
+            ("/C:/..", "/C:/"),
+            (r"\\srv\share\a\..\..", "/UNC/srv/share"),
+        ] {
+            assert_eq!(normal(Path::new(path)).as_deref(), Some(named), "`{path}`");
+        }
+        assert_eq!(normal(Path::new(r"w\p")), None, "a relative path has no name");
+    }
 }
 
 #[cfg(test)]

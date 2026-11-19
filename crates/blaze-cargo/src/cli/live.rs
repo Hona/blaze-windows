@@ -431,11 +431,8 @@ impl Runner {
         let mut names = test::Names::default();
         let mut listed_all: Vec<String, Global> = Vec::new_in(Global);
         for it in self.binaries.iter().filter(|it| it.json) {
-            let executable =
-                PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
-            let root = std::path::Path::new(&it.artifact.manifest_path)
-                .parent()
-                .map_or_else(PathBuf::new, std::path::Path::to_owned);
+            let executable = test::test_program(&it.artifact);
+            let root = test::package_root(&it.artifact);
             let exec = Exec::of(&it.artifact, executable, test::LIST.map(OsString::from), root);
             match test::Spawned.names(&exec) {
                 Ok(listed) => listed_all.extend(listed),
@@ -532,12 +529,7 @@ impl Runner {
                 ["--format", "json", "-Z", "unstable-options", "--report-time"].map(OsString::from),
             );
         }
-        let executable =
-            PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
-        let root = std::path::Path::new(&it.artifact.manifest_path)
-            .parent()
-            .map_or_else(PathBuf::new, std::path::Path::to_owned);
-        let exec = Exec::of(&it.artifact, executable, args, root);
+        let exec = Exec::of(&it.artifact, test::test_program(&it.artifact), args, test::package_root(&it.artifact));
         let mut command = exec.command();
         if let Some(threads) = self.threads {
             command.env(RUST_TEST_THREADS, threads.to_string()); // alloc: one an executable run
