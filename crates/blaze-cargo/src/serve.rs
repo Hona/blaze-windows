@@ -1469,6 +1469,9 @@ fn begin(
         None => record_code().map_err(anyhow::Error::msg)?.0,
     };
     blaze_link::target::keep_coff_requests(store, producer).map_err(anyhow::Error::msg)?;
+    // Where a stop checkpoints the kept link images, which the next daemon's first links
+    // restore and patch in place.
+    unit::keep_link_checkpoints(state()?.join("link-images"), producer).map_err(anyhow::Error::msg)?;
     // What blaze keeps on disk, collected in the background (docs/gc.md): the build dirs
     // under blaze's root and the shared stores of the machine's directory.
     let root = builds()?

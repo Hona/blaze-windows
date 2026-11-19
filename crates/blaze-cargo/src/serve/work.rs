@@ -1059,6 +1059,13 @@ pub trait Kept: Send + 'static {
     }
     /// Lets go of what it keeps only to start its next link warm, as it is kept idle.
     fn rest(&mut self);
+    /// At a stop: puts what the next daemon restores it from, so its first link after the
+    /// start patches the file at `path` ([`blaze_link::Image::checkpoint`]); whether one was
+    /// put. Nothing for an image no checkpoint holds.
+    fn checkpoint(&mut self, path: &str) -> bool {
+        let _ = path;
+        false
+    }
 }
 
 /// How a traced step read a path of the machine's files: the question its record's check

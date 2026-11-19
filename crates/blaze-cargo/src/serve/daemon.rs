@@ -2511,6 +2511,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut said = self.spare.said.pop().unwrap_or_default();
         let members = self.jobs.store_all_members(&mut world!(self, said));
         self.said(said);
+        // Every kept linker image's checkpoint, put before the store's flush below: the next
+        // daemon's first link of each path restores it and patches the file rather than laying
+        // the image out from scratch.
+        let images = {
+            let _span = tracing::info_span!(target: "blaze", "the stop checkpoints the kept link images").entered();
+            self.jobs.checkpoint_kept_images()
+        };
+        if images > 0 {
+            tracing::info!(target: "blaze", images, "the stop put the kept link images' checkpoints");
+        }
         if members > 0 {
             tracing::info!(target: "blaze", members, "the stop writes the workspace members' pages of its kept front ends");
         }

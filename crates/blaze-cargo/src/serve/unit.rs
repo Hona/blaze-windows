@@ -3067,6 +3067,12 @@ impl Front<Real> for JobFront {
     }
 }
 
+/// Kept link images are checkpointed under `dir` at a stop and restored by the next daemon's
+/// first link of each path, for blaze of code identity `producer` ([`codegen::checkpoint`]).
+pub(crate) fn keep_link_checkpoints(dir: std::path::PathBuf, producer: ContentId) -> Result<(), String> {
+    codegen::checkpoint::keep(dir, producer)
+}
+
 impl Kept for codegen::Linked {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         codegen::Linked::tables(self)
@@ -3086,6 +3092,10 @@ impl Kept for codegen::Linked {
 
     fn rest(&mut self) {
         codegen::Linked::rest(self);
+    }
+
+    fn checkpoint(&mut self, path: &str) -> bool {
+        codegen::checkpoint::put(self, path)
     }
 }
 

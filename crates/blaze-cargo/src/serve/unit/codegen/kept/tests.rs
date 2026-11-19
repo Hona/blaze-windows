@@ -422,6 +422,37 @@ fn the_oracle_catches_a_given_id_not_updated_for_a_removed_function() {
     assert!(why.contains("after step 1") && why.contains("the id kept"), "{why}");
 }
 
+/// Rows a checkpoint restored ([`Rows::restored`]) are the rows they were: the same rows and
+/// the same digest, node for node, so the same id; of no build, so the next link brings them
+/// to its build from its whole lists, and says gone and new exactly what the build changed
+/// against the restored image.
+#[test]
+fn rows_restored_from_a_checkpoint_are_the_rows_they_were() {
+    let mut program = chain();
+    let (first, entries) = built(&program, None);
+    let mut kept = Rows::default();
+    let all = Spans::All { serial: 1, tables: Vec::new() };
+    kept.apply(&first, all, &mut Work::default()).unwrap();
+    let mut restored = Rows::restored(kept.functions.clone(), kept.statics.clone(), kept.spans.clone());
+    assert_eq!(restored.digest.nodes(), kept.digest.nodes(), "the digest is canonical");
+    assert_eq!(restored.given(first.id, &[]), kept.given(first.id, &[]));
+    assert_eq!(restored.takes(&first), Err(super::NO_LINK), "the restored rows are of no build");
+    program.apply(Edit::Body(1));
+    let (second, _) = built(&program, Some(&entries));
+    let mut work = Work::default();
+    let applied = restored.apply(&second, Spans::Same, &mut work).unwrap();
+    let mut whole = Rows::default();
+    whole.apply(&second, Spans::All { serial: 1, tables: Vec::new() }, &mut Work::default()).unwrap();
+    assert_eq!(restored.functions, whole.functions);
+    assert_eq!(restored.given(second.id, &[]), whole.given(second.id, &[]));
+    assert!(work.whole.is_some(), "made from the build's whole lists");
+    assert!(
+        !applied.added.is_empty() && applied.added.len() < second.functions.len(),
+        "only what the edit changed is new: {:?}",
+        applied.added
+    );
+}
+
 /// A link the image refuses takes its rows back: they, and their id, are what they were.
 #[test]
 fn rows_taken_back_are_the_rows_before() {
