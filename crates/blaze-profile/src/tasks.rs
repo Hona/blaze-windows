@@ -47,7 +47,10 @@ pub struct Reader {
     running: Vec<Running, Global>,
     waits: Vec<WaitRow, Global>,
     parked: Vec<(u64, StallWait, Option<u64>), Global>,
-    children: Vec<(libc::pid_t, Option<u64>), Global>,
+    /// Each child a thread waits for in place, by pid (`pid_t`, an `i32` on every unix), and
+    /// its waiter: none on Windows, whose driver keeps its children in job objects it lists
+    /// nowhere.
+    children: Vec<(i32, Option<u64>), Global>,
     /// The tasks of the last look, and what the driver needs of each, index for index.
     pub seen: Vec<TaskSeen, Global>,
     pub about: Vec<About, Global>,
@@ -314,6 +317,6 @@ fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn child_cpu_ns(_pid: libc::pid_t) -> Option<u64> {
+fn child_cpu_ns(_pid: i32) -> Option<u64> {
     None
 }

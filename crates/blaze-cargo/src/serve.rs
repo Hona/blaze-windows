@@ -76,7 +76,7 @@ mod still;
 mod commit;
 #[cfg(feature = "native")]
 mod stop;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 mod stuck;
 #[cfg(test)]
 mod tests;
@@ -1526,7 +1526,6 @@ fn listen(
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     // The task watchdog: a task that makes no progress for its bound is named, with what it
     // waits on and who holds it, and its job fails (`stuck`).
-    #[cfg(unix)]
     let tasks_watch = stuck::arm(daemon.pulse(), blaze_graph::exec::shared().workers())?;
     // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
     // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
@@ -1570,7 +1569,6 @@ fn listen(
             break;
         }
     }
-    #[cfg(unix)]
     tasks_watch.disarm();
     guard.disarm();
     signals::stop_ended();
