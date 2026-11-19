@@ -348,10 +348,9 @@ fn begin(spec: &confine::Spec) -> Result<Live, String> {
         } else {
             first.push(trace::Line::new(Seen::Env, "", trace::ALL_ENV));
         }
+        // On Windows what the run read is what its processes tell as it ends, and an `X` line
+        // unless every process told ([`told`]).
         first.extend(given().into_iter().map(|why| trace::Line::new(Seen::Untraceable, "", why)));
-        if cfg!(windows) {
-            first.push(trace::Line::new(Seen::Incomplete, "", NOT_TRACED_ON_WINDOWS));
-        }
     }
     // alloc: as above.
     let text: String = first.iter().map(trace::Line::text).collect();
@@ -381,7 +380,7 @@ fn given() -> Vec<&'static str> {
     out
 }
 
-/// Windows traces nothing: the run is not whole either way ([`NOT_TRACED_ON_WINDOWS`]).
+/// Windows traces no call: what is read is told ([`super::told`]).
 #[cfg(not(unix))]
 fn given() -> Vec<&'static str> {
     Vec::with_capacity(0)
@@ -478,8 +477,30 @@ fn program_env(spec: &confine::Spec) -> std::borrow::Cow<'_, [(OsString, OsStrin
 }
 
 #[cfg(windows)]
-fn run(spec: &confine::Spec, _live: &Live) -> Result<i32, String> {
-    super::windows::run(spec, super::windows::Given::own())
+fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
+    told(live, super::windows::run_told(spec, super::windows::Given::own()))
+}
+
+/// The program's exit code of a Windows run, once what its processes told is appended to
+/// `live`: the lines of [`super::told::lines`], the record's whole say on what the run read.
+#[cfg(windows)]
+pub(super) fn told(
+    live: &Live,
+    ran: Result<(i32, Option<Vec<trace::Line>>), String>,
+) -> Result<i32, String> {
+    let (code, lines) = ran?;
+    let Some(lines) = lines else { return Ok(code) };
+    // alloc: once a traced run, the lines as the record has them
+    let text: String = lines.iter().map(trace::Line::text).collect();
+    let appended = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&live.path)
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    if let Err(error) = appended {
+        // alloc: the error, once, and the record is not whole
+        live.failed(format!("what the run's processes told: {error}"));
+    }
+    Ok(code)
 }
 
 #[cfg(not(any(unix, windows)))]

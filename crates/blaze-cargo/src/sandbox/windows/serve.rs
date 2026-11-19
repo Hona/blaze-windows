@@ -57,7 +57,9 @@ pub fn serve() -> ! {
             .name(format!("blaze-sandbox-run-{started}"))
             .spawn(move || {
                 let code =
-                    crate::sandbox::v2::launch_with(&spec, |spec, _live| super::run(spec, given));
+                    crate::sandbox::v2::launch_with(&spec, |spec, live| {
+                        crate::sandbox::v2::told(live, super::run_told(spec, given))
+                    });
                 answer(Answer { run: handed.run, code });
             });
         if let Err(error) = thread {

@@ -12,6 +12,12 @@
 //! way (a flag blaze does not know, a probe that links or names a library) fails with an error
 //! that names the command, and the script sees rustc fail.
 //!
+//! Started in a sandbox that can't see what a process reads (Windows), this tells its launcher
+//! what it read as it answers ([`blaze_cargo::sandbox::told`]): the probe's file, the library's
+//! files and directories it read, and the whole environment, which `env!` in a probe reads.
+//! Where the library is found is not told: what is read of it is by its paths, and a copy found
+//! elsewhere is other paths. What can't be answered tells nothing, and the run is not whole.
+//!
 //! What the files written are: the metadata and the IR of a probe are only seen to be there
 //! (`autocfg` removes the `.ll` it asked for, `anyhow` the whole directory, `rustix` never
 //! reads its file), so they are empty, and the dep-info names the probe's source.
@@ -27,9 +33,11 @@ use std::{
     ffi::{OsStr, OsString},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, anyhow, bail};
+use blaze_cargo::sandbox::told::Reads;
 use blaze_diagnostics::emit;
 use blaze_units::stdlib::target;
 
@@ -45,6 +53,12 @@ pub(crate) fn command() -> ! {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let code = match run(&args) {
         Ok(outcome) => {
+            // A sandbox that can't see this process's reads (Windows) hears them told; one that
+            // gets no message (it can't be sent, or this failed to answer) finds the run not
+            // whole, never wrongly whole.
+            if let Err(why) = outcome.reads.tell() {
+                blaze_report::errln!("blaze: telling the sandbox what the rustc stand-in read: {why}");
+            }
             let said = std::io::stderr()
                 .write_all(&outcome.stderr)
                 .and_then(|()| std::io::stdout().write_all(&outcome.stdout))
@@ -97,6 +111,8 @@ struct Outcome {
     code: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// What answering read of the disk, told to a launcher that hears it.
+    reads: Arc<Reads>,
 }
 
 fn run(args: &[OsString]) -> anyhow::Result<Outcome> {
@@ -126,7 +142,9 @@ fn answer(
     if blaze_cargo::answers::is_question(args) {
         let answer = blaze_cargo::answers::ours_told(args, stdin)
             .context("blaze has no answer to this question")?;
-        return Ok(Outcome { code: 0, stdout: answer.stdout, stderr: answer.stderr });
+        // Answered from what blaze knows of its release: nothing of the disk is read.
+        let reads = Arc::new(Reads::default());
+        return Ok(Outcome { code: 0, stdout: answer.stdout, stderr: answer.stderr, reads });
     }
     let args: Vec<&str> = args
         .iter()
@@ -348,6 +366,7 @@ impl<'a> Probe<'a> {
                     .context("the probe on standard input is not UTF-8")?,
             ),
             file => {
+                library.reads.read(Path::new(file));
                 (file, std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?)
             }
         };
@@ -366,7 +385,8 @@ impl<'a> Probe<'a> {
         let checked = probe::check(&asked, shown, &source, library)?;
         let stderr = checked.stderr.into_bytes();
         if checked.failed {
-            return Ok(Outcome { code: 1, stdout: Vec::new(), stderr });
+            let reads = Arc::clone(&library.reads);
+            return Ok(Outcome { code: 1, stdout: Vec::new(), stderr, reads });
         }
         let mut stdout = Vec::new();
         for (kind, path) in &self.emit {
@@ -394,6 +414,6 @@ impl<'a> Probe<'a> {
             }
             std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
-        Ok(Outcome { code: 0, stdout, stderr })
+        Ok(Outcome { code: 0, stdout, stderr, reads: Arc::clone(&library.reads) })
     }
 }
