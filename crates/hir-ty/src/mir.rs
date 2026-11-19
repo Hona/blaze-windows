@@ -1818,6 +1818,11 @@ pub struct Inlined<'db> {
     /// code on them (rule 21), so a body built against a world it no longer matches is not
     /// reused.
     pub devirtualized: Vec<[u8; 32]>,
+    /// Which object types `Devirtualize` looked up in [`devirt::World`] (including `ABSENT`
+    /// ones, and any carried from inlined callees), each once, in the order first looked up
+    /// ([`Inlined::read_devirt_object`]). Used by incremental world patching so a change to
+    /// one trait object's facts re-verifies only the consumers that read it.
+    pub devirt_objects: Vec<devirt::ObjectKey>,
     /// By block, ascending; each block once. Written by the last pass, so the blocks are the
     /// body's own; nothing that inlines this body carries them over.
     pub specialized: Vec<SpecializedCall>,
@@ -1848,6 +1853,14 @@ impl Inlined<'_> {
         }
     }
 
+    /// Records that the body looked up `key` in the program's dyn world, once however many
+    /// sites or runs looked it up.
+    pub fn read_devirt_object(&mut self, key: devirt::ObjectKey) {
+        if !self.devirt_objects.contains(&key) {
+            self.devirt_objects.push(key);
+        }
+    }
+
     /// Records that a pass changed the body because of a fact, by the fact's digest
     /// ([`crate::facts::Facts::relied`]), once however many sites relied on it.
     pub fn rely(&mut self, digest: [u8; 32]) {
@@ -1864,12 +1877,14 @@ impl Inlined<'_> {
             bindings,
             promoted,
             devirtualized,
+            devirt_objects,
             specialized,
             moved_to_frame: _,
             relied,
         } = self;
         relied.shrink_to_fit();
         devirtualized.shrink_to_fit();
+        devirt_objects.shrink_to_fit();
         callees.shrink_to_fit();
         scopes.shrink_to_fit();
         spans.shrink_to_fit();

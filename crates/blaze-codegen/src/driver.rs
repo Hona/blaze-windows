@@ -346,6 +346,11 @@ pub struct Built {
     pub deduped: Deduped,
     /// By key, each once.
     pub puts: Vec<Put>,
+    /// The records of the walk for the machine's sealed layer, by key, each once
+    /// ([`Frontend::walk_records`]): sealed code's describes and what each place the walk
+    /// entered sealed code reaches. Put where every home of the machine reads them, never
+    /// into the home alone. Empty for a build that reads no records.
+    pub shared: Vec<Put>,
     pub stats: Stats,
     /// Every instance the walk reached, compiled or found, with the code hash it was made
     /// from, by key.
@@ -3396,7 +3401,15 @@ impl<'a, B: Prepare> Build<'a, B> {
         let built = self.run_built(roots, static_roots, check, later, store);
         // alloc: per build, the records its describes made
         let made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        // alloc: per build that reads records, those for the machine's sealed layer
+        let mut shared = Vec::new();
+        if self.records.is_some() {
+            self.frontend.walk_records(&mut shared);
+        }
         let mut built = built?;
+        if !shared.is_empty() {
+            built.shared = records::sorted(shared).map_err(|why| vec![why])?;
+        }
         if made.is_empty() {
             return Ok(built);
         }
@@ -3877,6 +3890,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             tiered,
             deduped,
             puts,
+            shared: Vec::new(),
             stats,
             inputs,
             items,
@@ -5611,7 +5625,7 @@ mod progress;
 mod recursion;
 use recursion::Step;
 mod rows;
-mod support;
+pub mod support;
 mod worklist;
 pub use later::{Later, Walked, runs_at_start};
 use worklist::Worklist;

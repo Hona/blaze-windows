@@ -26,7 +26,7 @@
 
 #![forbid(unsafe_code)]
 
-mod artifact;
+pub(crate) mod artifact;
 mod checks;
 mod codegen;
 mod compile;
@@ -823,6 +823,7 @@ impl Steps for Real {
                     broken: false,
                     retractions,
                     end,
+                    release_asked: None,
                 };
                 Ok((writer, puts, misses))
             },
@@ -1007,6 +1008,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         build_dir,
         finished,
         link_dirs,
+        script_tools,
+        script_caches,
         native,
     } = kept;
     if graph != &now.graph {
@@ -1029,6 +1032,10 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the profile"
     } else if link_dirs != &now.link_dirs {
         "the build-script link directories"
+    } else if script_tools != &now.script_tools {
+        "the build-script tools"
+    } else if script_caches != &now.script_caches {
+        "the build-script caches"
     } else if native != &now.native {
         "the pinned native inputs"
     } else {
@@ -1307,10 +1314,7 @@ impl UnitReader {
             if found.iter().any(|(it, _)| it == name) || blaze_diagnostics::emit::names_text(name) {
                 continue;
             }
-            let whole = match name.starts_with('/') {
-                true => name.to_owned(),                                   // alloc: as above
-                false => format!("{}/{name}", root.trim_end_matches('/')), // alloc: as above
-            };
+            let whole = files::absolute_name(root, name);
             let Ok(whole) = base_db::AbsPathBuf::try_from(whole.as_str()) else { continue };
             if let Some(file) = db.files().included_source_file(&whole) {
                 found.push((name.to_owned(), file)); // alloc: as above
@@ -1355,6 +1359,45 @@ pub struct UnitWriter {
     retractions: u64,
     /// What the build's end lets go of its front end, told as its units compile ([`BuildEnd`]).
     end: BuildEnd,
+    /// A give-back past the memory ceiling asked of this running build ([`Writer::ask_release`]):
+    /// a write of its own, applied once its readers end.
+    release_asked: Option<crate::serve::relief::Rung>,
+}
+
+/// The give-back past the memory ceiling ([`crate::serve::relief`]) of a running build's front
+/// end, with it exclusive: for [`Rung::Compiled`](crate::serve::relief::Rung), every MIR and
+/// constant value and the inference of the dependency crates finished; for
+/// [`Rung::Values`](crate::serve::relief::Rung) every evictable value too (inference of every
+/// body, every weighed value). Each keeps its memo: what a unit still to compile reads is made
+/// again. Bytes of query storage let go.
+fn release_now(lowered: &mut Lowered, end: &mut BuildEnd, rung: crate::serve::relief::Rung) -> u64 {
+    use crate::serve::relief::Rung;
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end release past the memory ceiling, of a running build",
+        rung = rung.name(),
+        freed = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let held = |lowered: &mut Lowered| blaze_memo::Database::memo(lowered.served_db()).held() as u64;
+    let before = held(lowered);
+    let crates = {
+        let db: &base_db::Db = &*lowered.served_db();
+        end.newly_finished(db)
+    };
+    let db = lowered.served_db();
+    // On the session memo a value goes with its crate's arena, never one by one
+    // (`hir::evict`): what a running build can give back is the solver's caches and the
+    // interners' retired tables.
+    match rung {
+        Rung::Purge | Rung::Images => {}
+        Rung::Compiled | Rung::Values => {
+            hir::evict::drop_crates_after_store(db, &crates, true);
+        }
+    }
+    let freed = before.saturating_sub(held(lowered));
+    span.record("freed", freed);
+    freed
 }
 
 /// The most crates a build may make and still be an edit's ([`BuildEnd::release`]): the crate
@@ -1596,7 +1639,20 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty()
+        !self.runs.is_empty()
+            || !self.macros.is_empty()
+            || !self.msls.is_empty()
+            || self.release_asked.is_some()
+    }
+
+    fn ask_release(&mut self, rung: crate::serve::relief::Rung) -> bool {
+        // The dearer of two asks stands: values include compiled code.
+        let dearer = match self.release_asked {
+            Some(asked) if (asked as u8) >= (rung as u8) => asked,
+            _ => rung,
+        };
+        self.release_asked = Some(dearer);
+        true
     }
 
     fn idle(&self) -> bool {
@@ -1637,6 +1693,13 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
+        if let Some(rung) = self.release_asked.take() {
+            let freed = release_now(lowered, &mut self.end, rung);
+            crate::serve::relief::CHANNEL.note_running(rung, freed);
+            if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
+                return Ok(true);
+            }
+        }
         self.ready.clear();
         // alloc: once an apply, the units it writes, named on its `maintain` span
         let touched: Vec<u32> = self

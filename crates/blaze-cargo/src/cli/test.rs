@@ -267,16 +267,30 @@ fn order(artifact: &Artifact) -> (&str, &str, &str, u8, &str) {
     )
 }
 
-/// The package's directory: cargo runs a test there.
-fn package_root(artifact: &Artifact) -> PathBuf {
+/// The package's directory as the daemon names it (`/C:/w/p` on Windows), from its manifest's.
+fn package_dir_named(artifact: &Artifact) -> PathBuf {
     Path::new(&artifact.manifest_path).parent().map_or_else(PathBuf::new, Path::to_owned)
+}
+
+/// The package's directory on the host (`C:\w\p` on Windows): cargo runs a test there.
+pub(crate) fn package_root(artifact: &Artifact) -> PathBuf {
+    use blaze_core::platform::path::DaemonPath;
+    match DaemonPath::parse(&artifact.manifest_path).and_then(DaemonPath::parent) {
+        Some(dir) => dir.to_host().into_path_buf(),
+        None => package_dir_named(artifact),
+    }
+}
+
+/// The executable of a test `artifact` on the host: the artifact names it as the daemon does.
+pub(crate) fn test_program(artifact: &Artifact) -> PathBuf {
+    blaze_core::platform::path::host(artifact.executable.as_deref().unwrap_or(&artifact.path))
 }
 
 /// `unittests src/lib.rs (target/debug/deps/foo-0123abcd)`, `tests/x.rs (target/debug/deps/x-4567)`:
 /// cargo's `exe_display` of `cmd_builds`.
 pub fn running(artifact: &Artifact, cwd: &Path, kind: Kind) -> String {
     let source = Path::new(&artifact.target.src_path);
-    let root = package_root(artifact);
+    let root = package_dir_named(artifact);
     let source = source.strip_prefix(&root).unwrap_or(source).display();
     // The daemon's name of it (`/C:/w/...` on Windows) as the system names it, so it is shown
     // from `cwd` as cargo shows it (`target\debug\deps\...` there).
@@ -530,11 +544,8 @@ fn exec_of(artifact: &Artifact, asked: &Invocation, speaking: Speaking<'_>) -> E
     }
     // The artifact names its files as the daemon does (`/C:/a` on Windows); the program is
     // started at the system's paths of them, as `blaze run`'s is.
-    let executable =
-        blaze_core::platform::path::host(artifact.executable.as_deref().unwrap_or(&artifact.path));
-    let root = package_root(artifact);
-    let dir = blaze_core::platform::path::host(&root.to_string_lossy());
-    Exec::of(artifact, executable, args, dir)
+    let executable = test_program(artifact);
+    Exec::of(artifact, executable, args, package_root(artifact))
 }
 
 /// Runs one, `shown` as the command; what failed, said as cargo's `report_test_error` says it.
@@ -752,7 +763,7 @@ pub fn names_of(artifacts: &[Artifact], programs: &mut impl Programs, filters: &
     let mut names = Names::default();
     let mut listed_all = Vec::new_in(Global);
     for test in tests.into_iter().filter(|it| it.harness) {
-        let executable = PathBuf::from(test.executable.as_deref().unwrap_or(&test.path));
+        let executable = test_program(test);
         let exec = Exec::of(test, executable, LIST.map(OsString::from), package_root(test));
         let listed = programs
             .started(test, &exec)

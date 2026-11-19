@@ -292,6 +292,8 @@ pub(crate) fn unclean<'f>(cx: &Cx<'f, '_>, pieces: &Pieces<'f>, gate: PieceGate)
         by_expect = tracing::field::Empty,
         by_other = tracing::field::Empty,
         unconverted = tracing::field::Empty,
+        asked = tracing::field::Empty,
+        whole = tracing::field::Empty,
     )
     .entered();
     let mut out = Vec::with_capacity_in(list.len(), cx.frame());
@@ -303,15 +305,23 @@ pub(crate) fn unclean<'f>(cx: &Cx<'f, '_>, pieces: &Pieces<'f>, gate: PieceGate)
     }
     let db = cx.db;
     let root = cx.krate.root_file(db);
-    db.run_all(Tag::Diagnostics, list.len(), |db, at| {
-        if probed(db, root, list[at]) {
-            piece_clean(db, list[at], gate);
-        }
+    // From the sweep kept of this gate: only the memos an edit reached are asked
+    // (`crate::kept`), so a body edit asks its own piece, not the crate's.
+    let probed_list: Vec<Piece> = list.iter().copied().filter(|&it| probed(db, root, it)).collect(); // alloc: once a sweep, a word a piece
+    let swept = crate::kept::sweep(db, gate, &probed_list, |db, piece| {
+        piece_clean(db, piece, gate) == Verdict::Clean
     });
+    sweeping.record("asked", swept.asked);
+    sweeping.record("whole", swept.whole);
+    #[cfg(test)]
+    tests::SWEPT.lock().push((db.nonce(), swept.asked, swept.whole));
+    let swept_unclean: blaze_hash::HashSet<Piece, Global> =
+        blaze_hash::HashSet::from_iter_in(swept.unclean.iter().copied(), Global); // alloc: once a sweep, the unclean pieces
     let mut counts = Counts::default();
     for &piece in list {
         let declares = matches!(piece, Piece::Outline(file) if pieces.declarers.contains(&file));
         let verdict = match probed(db, root, piece) && !declares {
+            true if !swept_unclean.contains(&piece) => Verdict::Clean,
             true => piece_clean(db, piece, gate),
             false => Verdict::Beyond(Beyond::Other),
         };

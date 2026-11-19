@@ -53,6 +53,10 @@ pub(crate) struct Built {
     pub roots: Vec<(String, usize)>,
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand.
     pub link_dirs: Vec<String>,
+    /// The workspace's `build-script-tools` ([`crate::query::Units::script_tools`]).
+    pub script_tools: Vec<String>,
+    /// The workspace's `build-script-caches` ([`crate::query::Units::script_caches`]).
+    pub script_caches: Vec<String>,
     /// The pinned native inputs the graph's build script runs are given ([`crate::query::Units::native`]).
     pub native: Vec<crate::query::NativeInput>,
 }
@@ -633,6 +637,8 @@ pub(crate) fn units(
         finished: planned.finished,
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
+        script_tools: opt_out.tools,
+        script_caches: opt_out.caches,
         native,
     }))
 }

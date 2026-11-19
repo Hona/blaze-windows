@@ -542,6 +542,15 @@ pub struct Units {
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand
     /// (`blaze_cargo::directives::link_dirs`).
     pub link_dirs: Vec<String>,
+    /// The workspace's `build-script-tools`: programs by name, sorted. Every build script may
+    /// run each as the command's `PATH` finds it, the program's file and no more
+    /// (`blaze_cargo`'s `declared_tools`), so a checkout needs no `BLAZE_SCRIPT_READ` for it.
+    pub script_tools: Vec<String>,
+    /// The workspace's `build-script-caches`: variables by name, sorted. Every build script is
+    /// given each, naming a directory of blaze's home of this checkout's own that it may read
+    /// and write and that is kept across runs, unless `BLAZE_SCRIPT_CACHES` names the variable
+    /// (`blaze_cargo`'s `declared_caches`).
+    pub script_caches: Vec<String>,
     /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
     /// "Pinned native inputs") some build script run of this graph is given: one per input and
     /// target, sorted by name then target. The daemon fetches and lays out each before any

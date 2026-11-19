@@ -4,8 +4,17 @@ summary: Installing blaze: the install script, the release channels and what get
 ---
 # Installing blaze
 
+macOS and Linux:
+
 ```sh
 curl -fsSL https://ix.dev/blaze | sh
+```
+
+Windows (PowerShell, x86-64 MSVC — see [Windows](#windows) below; Windows release archives are
+not yet published on `blaze-releases.ix.dev` until the first Windows release is cut):
+
+```pwsh
+irm https://ix.dev/blaze/install.ps1 | iex
 ```
 
 Then, in a project of yours:
@@ -20,14 +29,18 @@ changed. What to do next: [usage.md](usage.md).
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has no release build and
-  the installer refuses it; v2 has not been run there (v1's port:
-  [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not supported.
+- **macOS on Apple silicon, Linux on x86-64 or ARM64, or Windows 10/11 on x86-64 (MSVC).** Intel
+  Macs and Windows ARM64 are not supported. Windows release archives are built by
+  `.github/workflows/release.yaml` in the same `.tar.xz`/`.tar.gz` layout as macOS and Linux
+  (`blaze-v<version>-x86_64-pc-windows-msvc.tar.xz`), and are not yet published on
+  `blaze-releases.ix.dev` (see [platforms.md](platforms.md#windows-x86-64-msvc)).
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.
-- **A C compiler for linking**: `gcc` (or `cc`) on Linux, Apple's command line tools on macOS
-  (`xcode-select --install`). The installer says so when it is missing.
+- **A C toolchain and platform SDK for linking**: `gcc` (or `cc`) on Linux, Apple's command line
+  tools on macOS (`xcode-select --install`), or Visual Studio Build Tools with the "Desktop
+  development with C++" workload and Windows SDK on Windows. The installer says so when it is
+  missing.
 - **User namespaces or Landlock.** Build scripts and proc macros run in a sandbox made of
   Linux namespaces ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)), or,
   where a user may not make them (Ubuntu 23.10 on), confined with Landlock (Linux 5.13 on).
@@ -55,22 +68,64 @@ with blaze's error.
 
 ## The installer
 
-The installer downloads the build for your machine from blaze's releases
+The installers (`site/install.sh` on macOS and Linux; `site/install.ps1` on Windows) download the
+build for your machine from blaze's releases
 (`https://blaze-releases.ix.dev`, an R2 bucket at Cloudflare's edge, [release.md](release.md#where-the-bytes-are);
 the [GitHub releases](https://github.com/indexable-inc/blaze/releases) list the same ones with
-their notes), checks it against the checksums
-published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
-runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
-step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
-([Updates](#updates)). Releases are dated, `0.YYYYMMDD.N`, and come in two channels
-([release.md](release.md)): **stable**, the default, is releases that passed the heavy tests
-(real projects on macOS and Linux), and **canary** is the newest release, published as soon as
-it is built and promoted to stable, unchanged, once it passes them. End the line with
+their notes), check it against the checksums
+published with it, put `blaze` and the programs it runs in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin`
+on Windows), and
+run `blaze toolchain` to download its Rust. They ask nothing. Run them again to upgrade, or run
+`blaze update` ([Updates](#updates)). Releases are dated, `0.YYYYMMDD.N`, and come in two channels
+([release.md](release.md)): **stable**, the default, is releases that passed the heavy tests,
+and **canary** is the newest release, published as soon as it is built and promoted to stable,
+unchanged, once it passes them. On macOS and Linux, end the line with
 `| sh -s -- --channel canary` (or set `BLAZE_CHANNEL=canary`) for canary, or with
-`| sh -s -- --version 0.YYYYMMDD.N` for a given release;
-`--no-toolchain` skips that download (v1 left it to the first build; v2's first build does not
-download it), and `--help` says what else it takes.
-Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
+`| sh -s -- --version 0.YYYYMMDD.N` for a given release; `--no-toolchain` skips that download,
+and `--help` says what else it takes.
+Over a blaze from before 2026-10-28, `install.sh` removes the programs with their old names and
+says so.
+
+### Windows
+
+`site/install.ps1` mirrors `install.sh` for Windows x86-64 (`x86_64-pc-windows-msvc`):
+
+```pwsh
+# Default (stable channel):
+irm https://ix.dev/blaze/install.ps1 | iex
+
+# Canary channel or explicit version:
+$env:BLAZE_CHANNEL = 'canary'; irm https://ix.dev/blaze/install.ps1 | iex
+$env:BLAZE_VERSION = '0.20261119.0'; irm https://ix.dev/blaze/install.ps1 | iex
+
+# Local script invocation (supports both -Flag and --flag forms):
+.\site\install.ps1 -Channel canary -VerboseInstall
+.\site\install.ps1 --version 0.20261119.0 --no-toolchain
+
+# Install from a local release archive (useful before the first Windows release is published):
+$env:BLAZE_ARCHIVE = 'C:\path\to\blaze-v0.20261119.0-x86_64-pc-windows-msvc.tar.xz'
+.\site\install.ps1
+```
+
+What `install.ps1` does:
+
+1. Verifies Windows x86-64 and enforces HTTPS-only downloads from `BLAZE_RELEASES` (default
+   `https://blaze-releases.ix.dev`).
+2. Reads `channels/<channel>` and `v<version>/SHA256SUMS`, prefers `.tar.xz` over `.tar.gz`
+   (unpacked with Windows' built-in `tar.exe`), and verifies the SHA-256 hash before unpacking.
+3. Installs `blaze.exe`, `blaze-engine.exe` and `explore-core.wasm` into
+   `${CARGO_HOME:-%USERPROFILE%\.cargo}\bin`, staging beside the destination and renaming aside an
+   in-use executable so a running daemon finishes undisturbed.
+4. Removes `${BLAZE_HOME:-%USERPROFILE%\.blaze}\default`, configures `[update] channel = "canary"`
+   for canary installs (unless `config.toml` already names a channel), adds `bin` to the current
+   user's `PATH` (skip with `-NoModifyPath` / `BLAZE_NO_MODIFY_PATH=1`), and runs `blaze.exe
+   toolchain` (skip with `-NoToolchain` / `BLAZE_NO_TOOLCHAIN=1`).
+5. Checks for Visual Studio Build Tools (`vswhere.exe` / `cl.exe`) and prints the `winget` install
+   command if the MSVC C++ workload is missing.
+
+Until the first Windows release is published on `blaze-releases.ix.dev`, build from source with
+MSVC Build Tools 14.5x and the pinned LLVM (`cargo +nightly-2026-10-27 install --locked
+blaze-engine`, or pass a built archive via `BLAZE_ARCHIVE`).
 
 ## Updates
 

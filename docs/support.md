@@ -1,6 +1,6 @@
 ---
 status: record
-summary: What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
+summary: What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet; v2 on Windows is in platforms.md.
 date: 2026-10-30
 ---
 # What is supported
@@ -26,7 +26,9 @@ will build: what blaze cannot build fails the build with the reason.
 
 ## Toolchain
 
-For v2 on Windows, see [build scripts on Windows](platforms.md#v2-build-scripts-on-windows).
+For v2 on Windows, see [its state on `windows/int`](platforms.md#v2-on-windows-state-on-windowsint-2026-11-19)
+and [build scripts on Windows](platforms.md#v2-build-scripts-on-windows). The table below is
+v1's; v2's Windows cells are in that section.
 
 One toolchain: the dated nightly in `harness/toolchain`, `nightly-2026-10-25` today, which
 says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a, LLVM

@@ -37,6 +37,7 @@ unicode-security.workspace = true
 
 base-db.workspace = true
 blaze-api.workspace = true
+blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
@@ -63,7 +64,6 @@ syntax.workspace = true
 tt.workspace = true
 
 [dev-dependencies]
-blaze-core.workspace = true
 blaze-alloc-count.workspace = true
 blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

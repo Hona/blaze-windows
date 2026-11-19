@@ -878,7 +878,7 @@ impl<M: Memo> Plane<M> {
         let (pool, key, yielding) = (pool_at(t.pool), t.key, t.yielding);
         t.yielding = false;
         let members = std::mem::take(&mut t.members);
-        if !t.held {
+        if !std::mem::take(&mut t.held) {
             self.running[pool] -= 1;
         }
         if yielding {

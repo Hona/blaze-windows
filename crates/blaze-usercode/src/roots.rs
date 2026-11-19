@@ -44,10 +44,11 @@
 //! or a root whose links resolve elsewhere than when its map was made. A kept value never
 //! embeds another checkout's path.
 //!
-//! On Windows, native build-script runs have no host roots yet (their keys hash UTF-16
-//! `os_bytes` and declared inputs), while logical daemon-name roots (`Namespace::Daemon`,
-//! `Roots::daemon`, `port::Dirs`, proc-macro expansion roots) work on every platform and convert
-//! across `blaze_core::platform::path` for host-spelling porting, link resolution and leak scans.
+//! On Windows both kinds of root work: native host roots (`Namespace::Host`, `C:\Users\a\ws`)
+//! for build scripts, whose key ports each path's text before it is encoded as UTF-16
+//! ([`crate::script::prepare`]), and logical daemon-name roots (`Namespace::Daemon`,
+//! `Roots::daemon`, `port::Dirs`, proc-macro expansion roots), which convert across
+//! `blaze_core::platform::path` for host-spelling porting, link resolution and leak scans.
 //!
 //! [`Rooted`] is what a kept run's shape is checked through: its placeholders resolved against
 //! this run's roots, its marks answered with this run's root paths, and each variable's value
@@ -194,8 +195,7 @@ const ROOT_DOMAIN: &str = "blaze v2 root path 1";
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Namespace {
     /// Native host filesystem paths (`C:\Users\a\ws` on Windows, `/home/a/ws` on Unix): what
-    /// native build scripts see and trace. On Windows, native build-script keys carry UTF-16
-    /// `os_bytes` and declared inputs, so host-namespace roots stay empty there.
+    /// native build scripts see and trace.
     #[default]
     Host,
     /// Logical daemon names (`/C:/Users/a/ws` on Windows, `/home/a/ws` on Unix): what the VFS,
@@ -237,8 +237,8 @@ impl RootMap {
     /// `role`'s root is `path`, in place of any it had, with its other spellings: the path its
     /// links resolve to (read once, here, at setup) and the forms of each that [`spellings`]
     /// names. A path that is not UTF-8, not absolute or the file system's root names no root:
-    /// what is under it stays absolute in keys. On Windows, host-namespace roots stay empty;
-    /// daemon-namespace maps ([`RootMap::daemon`]) use [`RootMap::set_daemon`]. Each look at
+    /// what is under it stays absolute in keys. Daemon-namespace maps ([`RootMap::daemon`])
+    /// take daemon names ([`RootMap::set_daemon`]). Each look at
     /// the disk that resolving the path's links makes is pushed to `looks`, the list of the
     /// build the map is made for ([`resolve`]).
     pub fn set(&mut self, role: Role, path: &Path, looks: &Looks) -> &mut RootMap {
@@ -260,6 +260,18 @@ impl RootMap {
             let resolved = resolve_host(path, looks);
             for alias in spellings(path, resolved.as_deref()) {
                 self.aliases.push((role, alias));
+            }
+            // A Windows host root is also written as its daemon name (`/C:/a`) and as a
+            // `file:///C:/a` URL's path: both are its spellings in what a run prints.
+            #[cfg(windows)]
+            for base in std::iter::once(path).chain(resolved.as_deref()) {
+                let Ok(named) = blaze_core::platform::path::daemon(Path::new(base)) else { continue };
+                let named = named.trim_end_matches('/');
+                for spelling in [named.to_owned(), escaped_keep_colon(named)] {
+                    if spelling != path && !self.aliases.iter().any(|it| it.0 == role && it.1 == spelling) {
+                        self.aliases.push((role, spelling)); // alloc: setup, a root's spelling
+                    }
+                }
             }
             self.resolved.push((role, resolved));
             self.roots.push((role, path.to_owned())); // alloc: setup, once per root of a run
@@ -416,8 +428,15 @@ pub(crate) fn sort_host_roots(roots: &mut [(Role, String)]) {
 /// entry and its look pushed to `looks` ([`look_through`]): no watch of the root's own
 /// directory hears a link above it pointed elsewhere.
 fn resolve_host(root: &str, looks: &Looks) -> Option<String> {
-    let resolved = std::fs::canonicalize(root).ok();
-    let resolved = resolved.as_deref().and_then(Path::to_str).map(|it| trim(it).to_owned()); // alloc: setup, once per root of a run
+    let canonical = std::fs::canonicalize(root).ok();
+    // On Windows `canonicalize` gives the verbatim spelling (`\\?\C:\a`): the same path, so
+    // compared without it (through its daemon name), or every root would read as relinked.
+    #[cfg(windows)]
+    let canonical = canonical.map(|it| match blaze_core::platform::path::daemon(&it) {
+        Ok(named) => blaze_core::platform::path::host(&named),
+        Err(_) => it,
+    });
+    let resolved = canonical.as_deref().and_then(Path::to_str).map(|it| trim(it).to_owned()); // alloc: setup, once per root of a run
     if resolved.as_deref() != Some(root) && looks.keeps() {
         look_through(Path::new(root), looks);
     }
@@ -571,6 +590,13 @@ pub const MACHINE: &[&str] = &[
     "/proc/self/mountinfo",
 ];
 
+/// [`MACHINE`] on Windows: the system's directories and the installed toolchains' (MSVC and the
+/// Windows SDK are under `Program Files`), which every checkout on the machine reads alike. A
+/// path is compared by its components as std does, so another case of a name is outside them,
+/// which only keeps a run here alone.
+#[cfg(windows)]
+pub const MACHINE_WINDOWS: &[&str] = &[r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)"];
+
 /// The other spellings of the root `root`, whose links resolve to `resolved`: that path, each
 /// of the two with `/private` taken off or put on (macOS's `/var` and `/tmp` are
 /// `/private/var` and `/private/tmp`), and each `%`-escaped as a `file://` URL has it. Doubled
@@ -636,14 +662,23 @@ fn trim(path: &str) -> &str {
     path.trim_end_matches(|it| it == '/' || (cfg!(windows) && it == '\\'))
 }
 
-/// Whether `path` is usable as a native host-filesystem root ([`Namespace::Host`]).
-/// On Windows, native build-script keys carry UTF-16 `os_bytes` and declared inputs, so native
-/// host roots stay disabled there; daemon-name roots go through [`Roots::daemon`] instead.
+/// Whether `path` is usable as a native host-filesystem root ([`Namespace::Host`]): UTF-8,
+/// absolute, no `\0`, and not a volume's root (`/`, `C:\`, `\\server\share`).
 fn usable_host(path: &str) -> bool {
-    !cfg!(windows)
-        && !path.is_empty()
-        && Path::new(path).is_absolute()
-        && !path.as_bytes().contains(&MARK)
+    if path.is_empty() || path.as_bytes().contains(&MARK) || !Path::new(path).is_absolute() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        blaze_core::platform::path::daemon(Path::new(path))
+            .ok()
+            .and_then(|named| DaemonPath::parse(&named).map(|it| !it.is_volume_root()))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 /// Whether `byte` is one of a path's: a name's or a separator.
@@ -1179,6 +1214,9 @@ impl<'a> Roots<'a> {
     /// native `\`-separated and `/`-separated host spellings.
     fn for_each_wide(&self, role: Role, root: &str, mut visit: impl FnMut(&str)) {
         visit(root);
+        if cfg!(windows) && root.contains('\\') {
+            visit(&root.replace('\\', "/"));
+        }
         if let Some(host) = self.host_spelling_of(role, root) {
             visit(&host);
             if host.contains('\\') {
@@ -1261,8 +1299,12 @@ impl<'a> Roots<'a> {
                 .any(|root| starts(Path::new(root), dir))
         };
         let wide = |dir: &Path| starts(path, dir) && !holds_root(dir);
+        #[cfg(windows)]
+        let system = MACHINE_WINDOWS;
+        #[cfg(not(windows))]
+        let system: &[&str] = &[];
         bytes.first() != Some(&MARK)
-            && !MACHINE.iter().any(|dir| wide(Path::new(dir)))
+            && !MACHINE.iter().chain(system).any(|dir| wide(Path::new(dir)))
             && !self.machine.iter().any(|dir| wide(dir.as_path()))
     }
 
@@ -1584,7 +1626,9 @@ fn spelled_in(hay: &[u8], needle: &[u8]) -> bool {
 /// different drives (`/C:/...` vs `/D:/...`) have no relative path between them.
 fn relative(from: &str, to: &str) -> String {
     fn names(path: &str) -> Vec<&str> {
-        path.split('/').filter(|name| !name.is_empty()).collect() // alloc: a scan as a run is kept
+        // A Windows host root (`C:\a\ws`) is `\`-separated; a daemon name is `/`-separated.
+        let sep = |it: char| it == '/' || (cfg!(windows) && it == '\\');
+        path.split(sep).filter(|name| !name.is_empty()).collect() // alloc: a scan as a run is kept
     }
     fn is_drive(part: &str) -> bool {
         matches!(part.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())

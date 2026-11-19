@@ -2090,6 +2090,8 @@ impl<M: Memo> Plane<M> {
         let p = pool_at(t.pool);
         if self.cold[t.runner as usize].flags & HELD == 0 {
             self.running[p] -= 1;
+        } else {
+            self.cold[t.runner as usize].flags &= !HELD;
         }
         if t.yielding {
             self.tasks[row_of(task)].yielding = false;

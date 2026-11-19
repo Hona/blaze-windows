@@ -832,6 +832,64 @@ fn empty(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("{}: making it: {error}", dir.display()))
 }
 
+/// The `ar` archive `bytes` with every member's date field 0, as `ar D` writes one: `None`
+/// when `bytes` is no archive this reads (no `!<arch>` magic, a header cut short or not ending
+/// in its mark, a size that is no number or past the end) or when every date is 0 already.
+/// Nothing else of it moves: names, owners, modes, sizes, the members' bytes and their padding.
+///
+/// Why (I33-b). A native library a build script makes again from the same sources differs
+/// only in its members' dates: two `luauast.lib`s of `mlua-sys`, 4,695,804 bytes each, apart in
+/// 33 bytes, all in the 11 member headers' date fields (`lanes\perf.md`, R26). The run's files
+/// are in its package's source root, which the crates given its `OUT_DIR` are keyed by, so each
+/// rerun moved the key of the library and of every crate above it. The archive is made the same
+/// bytes, never masked in a key: a crate may `include_bytes!` it, and a key covers what it
+/// reads (rule 21). No linker reads a member's date.
+pub fn deterministic_archive(bytes: &[u8]) -> Option<Vec<u8>> {
+    const MAGIC: &[u8] = b"!<arch>\n";
+    const HEADER: usize = 60;
+    const DATE: std::ops::Range<usize> = 16..28;
+    const SIZE: std::ops::Range<usize> = 48..58;
+    const ZERO: &[u8; 12] = b"0           ";
+    if !bytes.starts_with(MAGIC) {
+        return None;
+    }
+    let mut at = MAGIC.len();
+    let mut dated = Vec::new(); // alloc: the headers with a date, a word each, once per archive a run left
+    while at < bytes.len() {
+        let header = bytes.get(at..at + HEADER)?;
+        if &header[58..] != b"`\n" {
+            return None;
+        }
+        let size: usize = std::str::from_utf8(&header[SIZE]).ok()?.trim_end().parse().ok()?;
+        let date = std::str::from_utf8(&header[DATE]).ok()?.trim_end();
+        if !date.is_empty() && date != "0" {
+            dated.push(at);
+        }
+        at = at.checked_add(HEADER)?.checked_add(size)?.checked_add(size & 1)?;
+    }
+    // A last member's padding may be left out: past the end by more is a cut archive.
+    if at > bytes.len() + 1 || dated.is_empty() {
+        return None;
+    }
+    let mut out = bytes.to_vec(); // alloc: once per archive a run left with a member dated
+    for header in dated {
+        out[header + DATE.start..header + DATE.end].copy_from_slice(ZERO);
+    }
+    Some(out)
+}
+
+/// `bytes`, read from `path`, made deterministic ([`deterministic_archive`]), and written
+/// back to `path` when that moved them, so the file a later step reads (a linker, the next
+/// run) is the bytes the run's value keeps.
+pub fn settled_output(path: &Path, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let Some(settled) = deterministic_archive(&bytes) else { return Ok(bytes) };
+    // alloc: error path
+    std::fs::write(path, &settled).map_err(|error| {
+        format!("{}: writing the archive with its member dates 0: {error}", path.display())
+    })?;
+    Ok(settled)
+}
+
 /// What `dir` holds: every file and directory below it, by path, sorted. A link is what it
 /// leads to when that is inside `dir`. One that leads into `package`, the run's own package
 /// (a script that configures its bundled C sources out of tree links them into its `OUT_DIR`:
@@ -938,6 +996,7 @@ pub fn collect(dir: &Path, package: Option<&Path>) -> Result<Vec<OutFile>, Strin
                     // alloc: error path
                     let (executable, bytes) =
                         read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                    let bytes = settled_output(&path, bytes)?;
                     // alloc: once a file the run left, its bytes moved into the one shared
                     // allocation every holder of the value reads (the read buffer let go)
                     let bytes: std::sync::Arc<[u8]> = bytes.into();
@@ -1265,6 +1324,59 @@ mod tests {
 
     use super::*;
     use crate::trace::{DIRECTORY, listing};
+
+    /// An `ar` archive of `members`, each its name, its date field and its bytes, as `lib.exe`
+    /// and GNU `ar` write one: a 60-byte header a member, its bytes padded to an even length.
+    fn archive(members: &[(&str, &str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, date, bytes) in members {
+            let header =
+                format!("{name:<16}{date:<12}{:<6}{:<6}{:<8}{:<10}`\n", "", "", "644", bytes.len());
+            assert_eq!(header.len(), 60, "the fixture's header");
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(bytes);
+            if bytes.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    /// The invariant (I33-b): two archives a script made from the same members at other times
+    /// are the same bytes once the run's outputs are collected, and nothing but the dates
+    /// moved. The control: archives apart in a member's bytes stay apart.
+    #[test]
+    fn an_archive_made_again_at_another_time_is_the_same_bytes() {
+        let members = |date: &'static str, last: &'static [u8]| {
+            archive(&[("/", date, b"\0\0\0\x01sym"), ("a.obj/", date, b"odd"), ("b.obj/", date, last)])
+        };
+        let (monday, tuesday) = (members("1731500000", b"code"), members("1731586400", b"code"));
+        assert_ne!(monday, tuesday);
+        let (monday, tuesday) =
+            (deterministic_archive(&monday).unwrap(), deterministic_archive(&tuesday).unwrap());
+        assert_eq!(monday, tuesday, "only the dates were apart");
+        assert_eq!(monday, members("0", b"code"), "every date 0, every other byte as written");
+        assert_eq!(deterministic_archive(&monday), None, "settled already: nothing to write");
+        let other = deterministic_archive(&members("1731586400", b"more")).unwrap();
+        assert_ne!(monday, other, "a member's bytes are the archive's");
+    }
+
+    /// What is no archive this reads is left as it is: another file, a thin archive, a header
+    /// cut short or with no end mark, a size past the end.
+    #[test]
+    fn a_file_that_is_no_archive_is_left_as_it_is() {
+        let good = archive(&[("a.o/", "1731500000", b"code")]);
+        assert!(deterministic_archive(&good).is_some());
+        assert_eq!(deterministic_archive(b"pub fn gen() {}\n"), None);
+        assert_eq!(deterministic_archive(b"!<thin>\na.o/"), None);
+        assert_eq!(deterministic_archive(&good[..good.len() - 2]), None, "a member cut short");
+        assert_eq!(deterministic_archive(&good[..30]), None, "a header cut short");
+        let mut unmarked = good.clone();
+        unmarked[8 + 58] = b'!';
+        assert_eq!(deterministic_archive(&unmarked), None, "a header with no end mark");
+        let blank = archive(&[("a.o/", "", b"code")]);
+        assert_eq!(deterministic_archive(&blank), None, "no date to settle");
+    }
 
     struct Fixed {
         files: BTreeMap<PathBuf, [u8; 32]>,

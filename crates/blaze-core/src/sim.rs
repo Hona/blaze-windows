@@ -438,6 +438,9 @@ struct Spawning {
 
 struct Watching {
     dir: FileName,
+    /// The directories added to a journal watch since ([`Effect::AlsoJournal`]): its batches
+    /// name what changed under any of them, as one reader of a volume's journal does.
+    also: Vec<FileName>,
     /// Told as [`Done::Journaled`] from the disk's journal of changes.
     journal: bool,
     /// Unwatched: its end is told, and it is no longer in flight as a watch.
@@ -1465,15 +1468,29 @@ impl Sim {
         }
     }
 
-    /// Tells each journal watch the change its journal just recorded, if under its directory;
-    /// one in `lose_change_one_in` is told as dropped.
+    /// Tells each journal watch the change its journal just recorded, if under its directory or
+    /// one added to it ([`Effect::AlsoJournal`]), in one batch; one in `lose_change_one_in` is
+    /// told as dropped, every directory of the watch lost.
     fn tell_journals(&mut self) {
         for (id, tag, watch) in self.watches.iter() {
             if !watch.journal || watch.ending {
                 continue;
             }
             let dropped = self.rng.one_in(u64::from(self.faults.lose_change_one_in));
-            if let Some(batch) = self.disk.live(&watch.dir, dropped) {
+            let mut told: Option<crate::Journaled> = None;
+            for dir in std::iter::once(&watch.dir).chain(&watch.also) {
+                let Some(batch) = self.disk.live(dir, dropped) else { continue };
+                match &mut told {
+                    None => told = Some(batch),
+                    Some(it) => {
+                        it.files.extend(batch.files);
+                        it.lost.extend(batch.lost);
+                    }
+                }
+            }
+            if let Some(mut batch) = told {
+                batch.files.sort_unstable();
+                batch.files.dedup();
                 let at = self.now + latency(&mut self.rng, &self.faults);
                 let at = after_told(&self.told, at, tag, tag);
                 // alloc: the batch's payload.
@@ -2104,7 +2121,7 @@ impl Sim {
                 if self.files.contains_key(&file) {
                     Done::Failed(IoError(format!("{file}: the staged file already exists")))
                 } else {
-                    file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
+                    file_mut(&mut self.files, &file).push_op(Op::Cut(len));
                     self.changed(&file);
                     Done::Truncated
                 }
@@ -2411,6 +2428,7 @@ impl Sim {
             },
             Effect::Watch { .. }
             | Effect::Journal { .. }
+            | Effect::AlsoJournal { .. }
             | Effect::Unwatch { .. }
             | Effect::Flush { .. }
             | Effect::Kill { .. }
@@ -2446,7 +2464,8 @@ impl Sim {
     }
 
     fn watch(&mut self, tag: Tag, dir: FileName, journal: bool) -> Id<Watching> {
-        let (id, old) = self.watches.insert(tag, Watching { dir, journal, ending: false });
+        // alloc: none, an empty vector until a directory is added.
+        let (id, old) = self.watches.insert(tag, Watching { dir, also: Vec::new(), journal, ending: false });
         if old.is_some_and(|it| it.ending) {
             self.ending -= 1;
         }
@@ -2549,6 +2568,26 @@ impl Driver for Sim {
                         // alloc: the batch's payload.
                         self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
                     }
+                    continue;
+                }
+                Effect::AlsoJournal { watch, dir, tag } => {
+                    let state = self.watches.get(watch).map(|it| (it.journal, it.ending));
+                    let done = match state {
+                        Some((true, false)) => match self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+                            true => self.fail(tag).done,
+                            false => {
+                                // alloc: once per directory added to a watch.
+                                self.watches.get_mut(watch).expect("looked up above").also.push(dir);
+                                Done::Flushed
+                            }
+                        },
+                        // alloc: an error path.
+                        Some((false, false)) => Done::Failed(IoError(format!("the watch {watch:?} is no journal: a directory is added only to an Effect::Journal"))),
+                        // alloc: an error path.
+                        _ => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
+                    };
+                    // A change of the watch told by now is heard first, as a flush's.
+                    self.tell_after(watch, tag, done, Of::Flush(watch));
                     continue;
                 }
                 Effect::Pressure { tag } => {
@@ -2825,7 +2864,8 @@ impl Driver for Sim {
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::WriteAt { file, .. }
                     | Effect::WriteFrom { file, .. }
-                    | Effect::Truncate { file, .. },
+                    | Effect::Truncate { file, .. }
+                    | Effect::SparseFile { file, .. },
                     Some((dir, by)),
                 ) if file.is_under(dir) => *by,
                 _ => self.delay(),
@@ -3815,6 +3855,52 @@ mod tests {
         }
     }
 
+    /// The invariant (B15): a directory added to a journal's watch is heard by that watch,
+    /// beside its first directory, once its add is told; an add to a watch that is a
+    /// directory's, or to none, is refused.
+    #[test]
+    fn a_directory_added_to_a_journal_is_heard_after_its_add_is_told() {
+        for seed in 0..300 {
+            let faults = Faults { max_latency: Duration::from_millis(3), ..Faults::default() };
+            let mut sim = Sim::new(seed, faults);
+            let mut effects = vec![
+                Effect::Journal { dir: name("src"), since: crate::Cursor::None, tag: Tag(7) },
+                Effect::Watch { dir: name("other"), tag: Tag(8) },
+            ];
+            sim.submit(&mut effects);
+            effects.push(Effect::AlsoJournal { watch: Tag(7), dir: name("sdk"), tag: Tag(10) });
+            effects.push(Effect::AlsoJournal { watch: Tag(8), dir: name("sdk"), tag: Tag(11) });
+            effects.push(Effect::AlsoJournal { watch: Tag(99), dir: name("sdk"), tag: Tag(12) });
+            let (mut heard, mut added, mut refused) = (Vec::new(), false, 0);
+            run_until_idle(&mut sim, &mut effects, |done, _| match (done.tag.0, done.done) {
+                (7, Done::Journaled(batch)) => heard.extend(batch.files),
+                (8, Done::Changed { .. }) => {}
+                (10, Done::Flushed) => added = true,
+                (11 | 12, Done::Failed(_)) => refused += 1,
+                (20, Done::Flushed) => {}
+                other => panic!("seed {seed}: {other:?}"),
+            })
+            .expect("the effects end");
+            assert!(added && refused == 2, "seed {seed}: added {added}, refused {refused}");
+            sim.change(&name("sdk/lib/after"), b"1");
+            sim.change(&name("src/a"), b"2");
+            effects.push(Effect::Flush { watch: Tag(7), tag: Tag(20) });
+            run_until_idle(&mut sim, &mut effects, |done, _| {
+                if let (7, Done::Journaled(batch)) = (done.tag.0, done.done) {
+                    heard.extend(batch.files);
+                }
+            })
+            .expect("the effects end");
+            for wanted in ["sdk/lib/after", "src/a"] {
+                assert!(heard.contains(&name(wanted)), "seed {seed}: {wanted} in {heard:?}");
+            }
+            effects.push(Effect::Unwatch { tag: Tag(7) });
+            effects.push(Effect::Unwatch { tag: Tag(8) });
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
+            assert_eq!(sim.in_flight(), 0, "seed {seed}");
+        }
+    }
+
     #[test]
     fn a_file_system_that_cannot_share_blocks_refuses_a_clone() {
         let mut sim = Sim::new(3, Faults { no_clone: true, ..Faults::default() });
@@ -4392,6 +4478,19 @@ mod tests {
         sim.crash();
         assert_eq!(ran(&mut sim, vec![write(b"new", 5)])[&Tag(5)], Done::Written);
         assert_eq!(sim.contents(&head), b"new");
+    }
+
+    #[test]
+    fn slow_writes_delays_sparse_file_like_truncate() {
+        let mut sim = Sim::new(7, Faults::default());
+        let delay = Duration::from_millis(25);
+        sim.slow_writes(name("placed"), delay);
+        let sparse = name("placed/sparse");
+        let before = sim.now();
+        let seen = ran(&mut sim, vec![Effect::SparseFile { file: sparse.clone(), len: 64, tag: Tag(1) }]);
+        assert_eq!(seen[&Tag(1)], Done::Truncated);
+        assert_eq!(sim.now() - before, delay, "SparseFile under slow_writes must take the configured delay");
+        assert_eq!(sim.contents(&sparse).len(), 64);
     }
 
     /// Memory of the simulation's tests, registered for reads into and writes from it.

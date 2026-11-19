@@ -2771,6 +2771,10 @@ struct Making {
     puts: Vec<Put>,
     /// [`Compiled::put_of`]: what each code value codegen put is, by its key, sorted.
     put_of: Vec<(Key, Arc<PutOf>)>,
+    /// What codegen put for the machine's sealed layer (`blaze_codegen::driver::Built::shared`):
+    /// sealed code's describe and reach records, put through the layer's writer
+    /// ([`Compiled::share`]) whatever unit made them, so every home of the machine reads them.
+    shared: Vec<Put>,
     natives: Vec<(String, ContentId)>,
     links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     macros: Option<ProcMacroLoadResult>,
@@ -3486,6 +3490,12 @@ fn link(
             making.puts.push(Put { key: it.key, kind: it.kind, bytes: it.bytes });
         }
         making.put_of.sort_unstable_by_key(|it| it.0);
+        let shared = std::mem::take(&mut parts.built.shared);
+        making.shared.extend(shared.into_iter().map(|it| Put {
+            key: it.key,
+            kind: it.kind,
+            bytes: it.bytes,
+        }));
     }
     if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
         && !parts.built.misses.is_empty()
@@ -3656,6 +3666,7 @@ fn store(
         files,
         mut puts,
         put_of,
+        shared,
         natives,
         links,
         macros,
@@ -3929,7 +3940,7 @@ fn store(
         put_of,
         record: None,
         body_sessions: Vec::new(),
-        share: Vec::new(),
+        share: shared,
         outputs,
         artifact,
         macros,
@@ -3978,7 +3989,7 @@ fn store(
                         share.push(compiled.puts.remove(at));
                     }
                 }
-                compiled.share = share;
+                compiled.share.extend(share);
             }
             // An output named by its ported text ([`ported_outputs`]) by that text's key.
             let named = |at: usize, key: Key| {
@@ -4487,6 +4498,7 @@ fn assemble(
         files: Vec::new(),
         puts: Vec::new(),
         put_of: Vec::new(),
+        shared: Vec::new(),
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
@@ -4737,6 +4749,7 @@ fn assemble(
         files,
         puts: Vec::new(),
         put_of: Vec::new(),
+        shared: Vec::new(),
         natives,
         links,
         macros: None,

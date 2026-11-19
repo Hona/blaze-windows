@@ -11,6 +11,20 @@ use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
 use blaze_vfs::{Bytes, Corrupt};
 
+/// The daemon's name of `name`, a file name rustc or the front end gave, from the workspace's
+/// root `root` (a daemon name): a daemon name as it is, a host path (`C:\a` on Windows) named
+/// at the one boundary (`blaze_core::platform::path`), anything else joined to `root` by `/`.
+pub(crate) fn absolute_name(root: &str, name: &str) -> String {
+    use blaze_core::platform::path::{DaemonPath, DaemonPathBuf};
+    if let Some(named) = DaemonPath::parse(name) {
+        return named.as_str().to_owned(); // alloc: a file's name, once per name
+    }
+    if let Ok(named) = DaemonPathBuf::from_host(std::path::Path::new(name)) {
+        return named.into_string();
+    }
+    format!("{}/{name}", root.trim_end_matches('/')) // alloc: as above
+}
+
 /// The mounts of a build, to find a path's file in.
 #[derive(Clone)]
 pub(crate) struct Mounted {
@@ -95,10 +109,7 @@ impl Mounted {
 
     /// The absolute path of a name rustc gave: relative ones are from the workspace's root.
     pub(crate) fn absolute(&self, name: &str) -> String {
-        match name.starts_with('/') {
-            true => name.to_owned(),
-            false => format!("{}/{name}", self.root),
-        }
+        absolute_name(&self.root, name)
     }
 
     /// The name rustc gives absolute `path` in a diagnostic: from the workspace's root when it
@@ -157,5 +168,25 @@ fn join(a: &str, b: &str) -> String {
         (true, _) => b.to_owned(),
         (_, true) => a.to_owned(),
         _ => format!("{a}/{b}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absolute_name;
+
+    #[test]
+    fn a_name_from_the_root_is_joined_and_an_absolute_one_kept() {
+        assert_eq!(absolute_name("/w/", "src/lib.rs"), "/w/src/lib.rs");
+        assert_eq!(absolute_name("/w", "/x/lib.rs"), "/x/lib.rs");
+    }
+
+    /// rustc names a file by the host path it was given (`C:\w\src\lib.rs`): its daemon name.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_host_name_is_its_daemon_name() {
+        assert_eq!(absolute_name("/C:/w", r"C:\x\lib.rs"), "/C:/x/lib.rs");
+        assert_eq!(absolute_name("/C:/w", "/C:/x/lib.rs"), "/C:/x/lib.rs");
+        assert_eq!(absolute_name("/C:/w", "src/lib.rs"), "/C:/w/src/lib.rs");
     }
 }

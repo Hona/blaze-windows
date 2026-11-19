@@ -568,11 +568,13 @@ fn workspace(
 /// What a record's checkout is now: there, gone (not found, and its parent is there), or a
 /// refusal naming why its state cannot be told (an unmounted volume, a permission, a file).
 fn checkout_of(path: &str) -> Result<Checkout, String> {
-    let exists = match std::fs::metadata(path) {
+    // The record names the checkout as the daemon does (`/C:/w` on Windows).
+    let host = blaze_core::platform::path::host_if_daemon(Path::new(path));
+    let exists = match std::fs::metadata(&host) {
         Ok(meta) if meta.is_dir() => true,
         Ok(_) => return Err(format!("its checkout {path} is no directory")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = Path::new(path).parent();
+            let parent = host.parent();
             match parent.map(std::fs::metadata) {
                 Some(Ok(meta)) if meta.is_dir() => false,
                 _ => {
@@ -1172,8 +1174,8 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// ancestor that is there, canonical, and the rest as given. Refused, naming it, when it is
 /// relative or the rest holds `..`, which a directory not made yet cannot resolve (review C7).
 pub fn resolve(path: &Path) -> Result<PathBuf, String> {
-    let host = on_host(path);
-    let path = host.as_path();
+    let host = blaze_core::platform::path::host_if_daemon(path);
+    let path = &*host;
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
     }
@@ -1203,21 +1205,6 @@ pub fn resolve(path: &Path) -> Result<PathBuf, String> {
         }
         at = at.parent().ok_or_else(|| format!("no part of {} is there", path.display()))?;
     }
-}
-
-/// `path` as the system opens it. On Windows the daemon names `D:\a` as `/D:/a`, which the
-/// system reads as `\D:\a` on the current drive: the drive comes first again. windows: one
-/// conversion at the IO boundary belongs in one place for the whole daemon (cli::place's
-/// `host_path` is the same rule).
-fn on_host(path: &Path) -> PathBuf {
-    #[cfg(windows)]
-    if let Some(text) = path.to_str() {
-        let bytes = text.as_bytes();
-        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-            return PathBuf::from(text[1..].replace('/', "\\"));
-        }
-    }
-    path.to_path_buf()
 }
 
 /// Where `path`'s lease is: its own for a workspace or a standard library's store, its

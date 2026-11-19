@@ -211,3 +211,21 @@ fn a_daemon_nothing_holds_stops_after_its_grace_and_never_while_a_connection_is_
         assert!(caught, "the control {plant:?} is not caught");
     }
 }
+
+/// A daemon governed by `unheld` decides its exit by its grace alone, never by `idle::exit_due`:
+/// when its last connection closes shortly before `EXIT_UNWORKED` (30 s) with no build run, it
+/// still honours its full grace past 30 s and ends with `ended_unheld()`.
+#[test]
+fn an_unheld_daemon_ignores_idle_exit_past_unworked_bound() {
+    let mut daemon = start(1, Plant::None);
+    let conn = daemon.driver().dial(&Address::Unix(name(SOCKET))).expect("a client connects");
+    let mut model = Model { open: vec![conn], quiet_since: None, next_id: 1 };
+    let close_at = crate::serve::idle::EXIT_UNWORKED - Duration::from_millis(1_500);
+    assert_eq!(turn_to(&mut daemon, &model, close_at), Ok(false));
+    let closed_at = daemon.driver().now();
+    daemon.driver().peer_hangup(model.open.pop().unwrap());
+    model.quiet_since = Some(closed_at);
+    assert_eq!(turn_to(&mut daemon, &model, closed_at + GRACE + TURN * 2), Ok(true));
+    assert!(daemon.driver().now() >= closed_at + GRACE, "stopped before grace");
+    assert!(daemon.ended_unheld(), "stopped by unheld grace, not idle exit");
+}

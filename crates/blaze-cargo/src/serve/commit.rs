@@ -51,6 +51,8 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
     use super::{pulse::CeilingLook, relief::{Ladder, Rung, Step}};
     let mut ladder = Ladder::default();
     let mut watch = super::pulse::CeilingWatch::default();
+    // Whether this overshoot already waited for running builds' releases before its exit.
+    let mut waited_running = false;
     loop {
         let Some(bytes) = crate::raw::memory::own_footprint_now() else {
             super::said::logged!(ERROR, "blaze serve: pid {} stopped: its private commit could not be read, so no memory ceiling holds", std::process::id());
@@ -59,6 +61,7 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
         let was = ladder.given();
         match ladder.look(bytes, ceiling) {
             Step::Under => {
+                waited_running = false;
                 if !was.is_empty() {
                     super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes, back under its limit of {ceiling} after giving back {was:?}");
                     channel.relieved(was, bytes, ceiling);
@@ -83,6 +86,20 @@ fn guard(ceiling: u64, stop: &mpsc::Receiver<()>, channel: &super::relief::Chann
                 }
                 crate::raw::memory::purge();
                 // Measured again at once: the next look is the next rung or the end.
+                continue;
+            }
+            Step::Exit if !waited_running && channel.running_pending() > 0 => {
+                // Running builds were asked to give back at their next write: their readers
+                // end first. Wait for them, bounded, then look once more.
+                waited_running = true;
+                super::said::logged!(WARN, "blaze serve: private commit {bytes} bytes past its limit of {ceiling} after every rung: waiting at most {:?} for {} running builds to give back", super::relief::RUNNING_WITHIN, channel.running_pending());
+                let deadline = std::time::Instant::now() + super::relief::RUNNING_WITHIN;
+                while channel.running_pending() > 0 && std::time::Instant::now() < deadline {
+                    if stop.recv_timeout(Duration::from_millis(50)) != Err(mpsc::RecvTimeoutError::Timeout) {
+                        return;
+                    }
+                }
+                crate::raw::memory::purge();
                 continue;
             }
             Step::Exit => {

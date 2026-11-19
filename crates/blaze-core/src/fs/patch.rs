@@ -5,6 +5,7 @@ use std::io;
 
 /// The persistence protocol after taking custody. Both the Windows driver and the
 /// power-cut simulation interpret this order. Each boundary can fail independently.
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublishStep {
     HideDurably,
@@ -14,6 +15,7 @@ pub(crate) enum PublishStep {
     SyncName,
 }
 
+#[cfg(any(windows, test))]
 pub(crate) const PATCH_PUBLICATION: [PublishStep; 5] = {
     use PublishStep::*;
     [HideDurably, Edit, SyncBytes, Show, SyncName]

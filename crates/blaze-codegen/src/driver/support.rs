@@ -29,12 +29,12 @@ use std::{cmp::Reverse, collections::BinaryHeap};
 const OUT: u32 = u32::MAX;
 
 /// The set of everything described: what the check's roots and the build's reach.
-pub(super) const ALL: usize = 0;
+pub const ALL: usize = 0;
 /// The set of what is built: what the build's own roots reach.
-pub(super) const BUILT: usize = 1;
+pub const BUILT: usize = 1;
 const SETS: usize = 2;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Set {
     /// Per item, its level; [`OUT`] for one that is no member.
     level: Vec<u32>,
@@ -49,14 +49,14 @@ struct Set {
 /// What an edit changed of the sets ([`Graph::settle`]): per set, the items that are members
 /// now and were not, and those that were and are not, each sorted.
 #[derive(Default, Debug, PartialEq, Eq)]
-pub(super) struct Settled {
-    pub(super) entered: [Vec<u32>; SETS],
-    pub(super) left: [Vec<u32>; SETS],
+pub struct Settled {
+    pub entered: [Vec<u32>; SETS],
+    pub left: [Vec<u32>; SETS],
 }
 
 /// A graph and its sets ([`self`]).
-#[derive(Default)]
-pub(super) struct Graph {
+#[derive(Clone, Default)]
+pub struct Graph {
     /// Per item, what it refers to, in the order given, each once.
     outs: Vec<Vec<u32>>,
     /// Per item, what refers to it, sorted.
@@ -65,7 +65,7 @@ pub(super) struct Graph {
     free: Vec<u32>,
     sets: [Set; SETS],
     /// Items an edit looked at since the graph was made: entered, dropped or brought back.
-    pub(super) visited: usize,
+    pub visited: usize,
     /// The planted bug of `the_oracle_catches_a_node_dropped_while_a_cycle_supports_it`: what
     /// is dropped is never brought back.
     #[cfg(test)]
@@ -75,7 +75,7 @@ pub(super) struct Graph {
 impl Graph {
     /// A new item: no edges, a member of nothing until an edge from a member or
     /// [`Self::root`] makes it one.
-    pub(super) fn add(&mut self) -> u32 {
+    pub fn add(&mut self) -> u32 {
         if let Some(item) = self.free.pop() {
             return item;
         }
@@ -89,22 +89,22 @@ impl Graph {
         self.outs.len() as u32 - 1
     }
 
-    pub(super) fn is_member(&self, set: usize, item: u32) -> bool {
+    pub fn is_member(&self, set: usize, item: u32) -> bool {
         self.sets[set].level[item as usize] != OUT
     }
 
     /// What `item` refers to, in the order given.
-    pub(super) fn outs(&self, item: u32) -> &[u32] {
+    pub fn outs(&self, item: u32) -> &[u32] {
         &self.outs[item as usize]
     }
 
     /// What refers to `item`, sorted.
-    pub(super) fn ins(&self, item: u32) -> &[u32] {
+    pub fn ins(&self, item: u32) -> &[u32] {
         &self.ins[item as usize]
     }
 
     /// Makes `item` a root of `set`: a member whatever refers to it, with what it reaches.
-    pub(super) fn root(&mut self, set: usize, item: u32) {
+    pub fn root(&mut self, set: usize, item: u32) {
         match self.is_member(set, item) {
             true => self.sets[set].support[item as usize] += 1,
             false => {
@@ -115,7 +115,7 @@ impl Graph {
     }
 
     /// Sets what `item` refers to: `outs`, in order, a target named twice counted once.
-    pub(super) fn set_outs(&mut self, item: u32, mut outs: Vec<u32>) {
+    pub fn set_outs(&mut self, item: u32, mut outs: Vec<u32>) {
         let mut seen = 0;
         for at in 0..outs.len() {
             if !outs[..seen].contains(&outs[at]) {
@@ -204,7 +204,7 @@ impl Graph {
     /// supported, brings back those an edge from a member still reaches, and says what
     /// entered and left ([`Settled`]). An item that left [`ALL`] is in no set and refers to
     /// nothing any more: [`Self::add`] gives it again.
-    pub(super) fn settle(&mut self) -> Settled {
+    pub fn settle(&mut self) -> Settled {
         let mut settled = Settled::default();
         for set in 0..SETS {
             // alloc: per edit that removes an edge, the items it drops

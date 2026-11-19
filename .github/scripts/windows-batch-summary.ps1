@@ -4,6 +4,7 @@
 param(
     [Parameter(Mandatory)] [string] $ArtifactsDir,
     [Parameter(Mandatory)] [string] $OutDir,
+    [string] $CorpusManifest = '',
     [string] $Commit = '',
     [string] $RefName = '',
     [string] $RunUrl = '',
@@ -381,6 +382,69 @@ foreach ($fixture in $expectedFixtures) {
     })
 }
 
+# 5. Windows project corpus (B13)
+$corpusExpected = [System.Collections.Generic.List[object]]::new()
+if ($CorpusManifest -and (Test-Path -LiteralPath $CorpusManifest)) {
+    $cManifest = Read-JsonFile $CorpusManifest
+    if ($cManifest -and $cManifest.projects) {
+        foreach ($p in @($cManifest.projects)) {
+            $corpusExpected.Add([ordered]@{ name = [string]$p.name; archetype = [string]$p.archetype })
+        }
+    }
+} elseif (Test-Path -LiteralPath $ArtifactsDir) {
+    foreach ($d in @(Get-ChildItem -LiteralPath $ArtifactsDir -Directory -Filter 'result-corpus-*' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        $pName = $d.Name.Substring('result-corpus-'.Length)
+        $corpusExpected.Add([ordered]@{ name = $pName; archetype = '' })
+    }
+}
+
+$corpusSummaries = [System.Collections.Generic.List[object]]::new()
+$corpusMissing = $false
+foreach ($spec in $corpusExpected) {
+    $pName = $spec.name
+    $cDir = Join-Path $ArtifactsDir "result-corpus-$pName"
+    $cData = Read-JsonFile (Join-Path $cDir 'corpus-result.json')
+    $cMetrics = Read-JsonFile (Join-Path $cDir 'metrics.json')
+    Track-Metrics "corpus/$pName" $cMetrics
+
+    if ($null -eq $cData) {
+        $reason = if ($buildRelease -and -not $buildRelease.build_ok) { 'NOT_RUN (build-release failed)' }
+                  elseif ($cMetrics -and $cMetrics.guard_tripped) { 'MEM_GUARD' }
+                  else { $corpusMissing = $true; 'MISSING (no artifact / VM lost)' }
+        $corpusSummaries.Add([ordered]@{
+            project = $pName
+            archetype = $spec.archetype
+            status = $reason
+            ok = $false
+            elapsed_seconds = if ($cMetrics) { $cMetrics.elapsed_seconds } else { $null }
+            test_counts = $null
+            script_runs = $null
+            daemon_peak = @()
+            metrics = $cMetrics
+            steps = @()
+        })
+        continue
+    }
+
+    $guardTripped = ($null -ne $cMetrics -and [bool]$cMetrics.guard_tripped)
+    $ok = [bool]$cData.overall_ok -and (-not $guardTripped)
+    $status = if ($guardTripped) { 'MEM_GUARD' } elseif ($ok) { 'ok' } else { 'FAIL' }
+
+    $corpusSummaries.Add([ordered]@{
+        project = $pName
+        archetype = if ($cData.archetype) { [string]$cData.archetype } else { $spec.archetype }
+        status = $status
+        ok = $ok
+        elapsed_seconds = $cData.elapsed_seconds
+        test_counts = $cData.test_counts
+        script_runs = $cData.script_runs
+        daemon_peak = if ($cData.daemon_peak) { @($cData.daemon_peak) } else { @() }
+        metrics = $cMetrics
+        steps = @($cData.steps)
+    })
+}
+if ($corpusMissing) { $anyFailure = $true }
+
 # Build Markdown report
 $md = [System.Collections.Generic.List[string]]::new()
 $verdict = if ($anyFailure) { 'FAIL' } else { 'PASS' }
@@ -399,6 +463,7 @@ $regTotal = if ($regData) { $regData.total } else { 0 }
 $regDisplay = if ($regData) { "$regPassed/$regTotal passed" } else { 'missing / not run' }
 $laddersOk = @($ladderSummaries | Where-Object { $_.ok }).Count
 $unitsOk = @($unitSummaries | Where-Object { $_.ok }).Count
+$corpusOk = @($corpusSummaries | Where-Object { $_.ok }).Count
 
 function Fmt-Peak($Val, [string] $Source) {
     $num = Fmt-Num $Val ' MiB'
@@ -410,6 +475,9 @@ $md.Add('')
 $md.Add("- **Units:** $unitsOk/$($expectedCrates.Count) suites ok ($totalUnitsPassed passed, $totalUnitsFailed failed, $totalUnitsIgnored ignored)")
 $md.Add("- **Regressions:** $regDisplay")
 $md.Add("- **Ladders:** $laddersOk/$($expectedFixtures.Count) fixtures ok")
+if ($corpusSummaries.Count -gt 0) {
+    $md.Add("- **Project corpus:** $corpusOk/$($corpusSummaries.Count) projects ok (advisory; project bugs listed below, missing harness artifacts fail the run)")
+}
 $md.Add("- **Memory peaks (worst across batch):** min available RAM $(Fmt-Peak $peakStats.min_available_ram_mib $peakStats.min_available_ram_source), max committed $(Fmt-Peak $peakStats.max_committed_mib $peakStats.max_committed_source), min commit headroom $(Fmt-Peak $peakStats.min_commit_headroom_mib $peakStats.min_commit_headroom_source)$(if ($peakStats.any_guard_tripped) { ' — **MEMORY GUARD TRIPPED**' } else { '' })")
 $md.Add('')
 
@@ -505,11 +573,40 @@ foreach ($l in $ladderSummaries) {
     $md.Add('')
 }
 
-# Section 5: Complete fix list (every failure with assertion messages / tails)
+# Section 5: Windows project corpus (B13)
+if ($corpusSummaries.Count -gt 0) {
+    function Get-StepCell($Steps, [string] $Name) {
+        $st = @($Steps | Where-Object { $_.name -eq $Name } | Select-Object -First 1)
+        if ($st.Count -eq 0) { return '-' }
+        $s = $st[0]
+        if ($s.status -eq 'ok') { return "ok ($($s.seconds)s)" }
+        if ($s.status -eq 'skipped') { return 'skip' }
+        return "$($s.status) ($($s.seconds)s)"
+    }
+
+    $md.Add('## Windows project corpus')
+    $md.Add('')
+    $md.Add('| Project | Archetype | Status | Check | Build | Run | Test | Noop | Edit | Tests (p/f/i) | Script runs | Time (s) | Min RAM (MiB) | Max commit (MiB) |')
+    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|')
+    foreach ($c in $corpusSummaries) {
+        $cm = $c.metrics
+        $tc = if ($c.test_counts -and $c.test_counts.summaries -gt 0) {
+            "$($c.test_counts.passed)/$($c.test_counts.failed)/$($c.test_counts.ignored)"
+        } else { '-' }
+        $sr = if ($c.script_runs) {
+            "$(Fmt-Num $c.script_runs.build) / $(Fmt-Num $c.script_runs.noop) / $(Fmt-Num $c.script_runs.edit)"
+        } else { '-' }
+        $md.Add("| ``$($c.project)`` | $($c.archetype) | $($c.status) | $(Get-StepCell $c.steps 'check') | $(Get-StepCell $c.steps 'build') | $(Get-StepCell $c.steps 'run') | $(Get-StepCell $c.steps 'test') | $(Get-StepCell $c.steps 'noop') | $(Get-StepCell $c.steps 'edit') | $tc | $sr | $(Fmt-Num $c.elapsed_seconds) | $(Fmt-Num $(if ($cm) {$cm.min_available_ram_mib})) | $(Fmt-Num $(if ($cm) {$cm.max_committed_mib})) |")
+    }
+    $md.Add('')
+}
+
+# Section 6: Complete fix list (every failure with assertion messages / tails)
+$hasCorpusFail = (@($corpusSummaries | Where-Object { -not $_.ok }).Count -gt 0)
 $md.Add('## Failures (fix list)')
 $md.Add('')
-if (-not $anyFailure) {
-    $md.Add('None. Every build, check, unit suite, regression and ladder fixture passed.')
+if (-not $anyFailure -and -not $hasCorpusFail) {
+    $md.Add('None. Every build, check, unit suite, regression, ladder fixture and corpus project passed.')
     $md.Add('')
 } else {
     if ($buildUnits -and (-not $buildUnits.compile_ok -or -not $buildUnits.astlog_ok)) {
@@ -629,6 +726,37 @@ if (-not $anyFailure) {
         }
         $md.Add('')
     }
+
+    foreach ($c in $corpusSummaries) {
+        if ($c.ok) { continue }
+        $md.Add("### Project corpus: ``$($c.project)`` ($($c.status))")
+        $md.Add('')
+        $badSteps = @($c.steps | Where-Object { $_.status -ne 'ok' -and $_.status -ne 'skipped' })
+        if ($badSteps.Count -eq 0) {
+            $md.Add("- $($c.status) (see artifact ``result-corpus-$($c.project)``)")
+        } else {
+            foreach ($s in $badSteps) {
+                $md.Add("- **``$($s.name)``** ($($s.status), exit $($s.exit_code), $($s.seconds)s): $($s.error)")
+                if ($s.log_tail) {
+                    $md.Add('  ```text')
+                    foreach ($line in ((Strip-Ansi $s.log_tail) -split "`r?`n")) {
+                        $trimmed = if ($line.Length -gt 240) { $line.Substring(0, 240) + '...' } else { $line }
+                        $md.Add("  $trimmed")
+                    }
+                    $md.Add('  ```')
+                }
+            }
+        }
+        if ($c.test_counts -and $c.test_counts.failed_tests -and $c.test_counts.failed_tests.Count -gt 0) {
+            $md.Add("- Failing tests (first $($c.test_counts.failed_tests.Count)): " + (($c.test_counts.failed_tests | ForEach-Object { "``$_``" }) -join ', '))
+        }
+        if ($c.daemon_peak -and $c.daemon_peak.Count -gt 0) {
+            $md.Add('```text')
+            foreach ($pk in $c.daemon_peak) { $md.Add((Strip-Ansi ([string]$pk))) }
+            $md.Add('```')
+        }
+        $md.Add('')
+    }
 }
 
 $mdText = $md -join "`n"
@@ -663,6 +791,7 @@ $jsonOut = [ordered]@{
         cases = @($regCases)
     }
     ladders = @($ladderSummaries)
+    corpus = @($corpusSummaries)
 }
 $jsonOut | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $outPath 'batch-summary.json') -Encoding utf8
 

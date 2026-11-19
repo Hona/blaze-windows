@@ -243,9 +243,27 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
             _ => return Err(error(&format!("blaze does not read `-Z {name}` yet"))),
         }
     }
-    let absolute = |path: &str| match path.starts_with('/') {
-        true => path.to_owned(),
-        false => format!("{}/{path}", asked.cwd),
+    // A path the command was given: a daemon name or a host path (`C:\a` on Windows) as it is,
+    // named as the daemon names it, else from the command's directory.
+    let absolute = |path: &str| {
+        use blaze_core::platform::path::{DaemonPath, DaemonPathBuf};
+        // On Unix a name is the host path, and `\` is a byte a name may hold.
+        if !cfg!(windows) {
+            return match path.starts_with('/') {
+                true => path.to_owned(),
+                false => format!("{}/{path}", asked.cwd),
+            };
+        }
+        if let Some(named) = DaemonPath::parse(path) {
+            return named.as_str().to_owned();
+        }
+        if let Ok(named) = DaemonPathBuf::from_host(std::path::Path::new(path)) {
+            return named.into_string();
+        }
+        match DaemonPath::parse(&asked.cwd) {
+            Some(cwd) => cwd.join(&path.replace('\\', "/")).into_string(),
+            None => format!("{}/{path}", asked.cwd),
+        }
     };
     Ok(Spec {
         workspace: WorkspaceKey::view(),
@@ -371,7 +389,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 11");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 12");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -401,6 +419,8 @@ impl Query for Plan {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
+                script_tools: built.script_tools,
+                script_caches: built.script_caches,
                 native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),

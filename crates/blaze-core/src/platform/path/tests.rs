@@ -122,3 +122,31 @@ fn typed_daemon_and_host_paths_convert_at_the_one_boundary() {
     assert!(canonical_matches(Path::new(r"C:\Users\a\ws"), Path::new(r"\\?\C:\Users\a\ws")));
     assert!(!canonical_matches(Path::new(r"C:\Users\a\link"), Path::new(r"\\?\C:\Users\a\real")));
 }
+
+/// The invariant of [`link_target`]: a link's target is absolute in a tree exactly where it
+/// starts with `/`, on every system; on Windows each spelling of an absolute target is its
+/// daemon name and each relative one its `/`-separated text. The control is Unix: its bytes
+/// are the link's own, `\` and a drive-like `C:` included.
+#[test]
+fn a_link_target_is_absolute_in_a_tree_only_where_it_starts_with_a_slash() {
+    #[cfg(windows)]
+    let cases: &[(&str, &str)] = &[
+        (r"..\lib.rs", "../lib.rs"),
+        (r"src\lib.rs", "src/lib.rs"),
+        ("src/lib.rs", "src/lib.rs"),
+        (r"C:\outside\x.rs", "/C:/outside/x.rs"),
+        ("c:/outside", "/C:/outside"),
+        (r"\\?\C:\outside", "/C:/outside"),
+        (r"\\server\share\x", "/UNC/server/share/x"),
+        // Drive-relative: no daemon name, relative text. Current-drive-rooted: out of the
+        // tree, so `/`-rooted and refused there.
+        ("C:x", "C:x"),
+        (r"\x", "/x"),
+    ];
+    #[cfg(unix)]
+    let cases: &[(&str, &str)] =
+        &[("../lib.rs", "../lib.rs"), (r"a\b", r"a\b"), ("C:x", "C:x"), ("/etc/x", "/etc/x")];
+    for &(given, kept) in cases {
+        assert_eq!(link_target(given), kept, "the tree's target of a link to {given}");
+    }
+}

@@ -722,8 +722,11 @@ fn cut_under<'t>(
 /// Where in `file_id`'s live tree each body its [`FileOutline`] cuts out is, in order, with the
 /// ast id of the body's item: what a by-piece check (blaze-diagnostics' `pieces`) skips of the
 /// live tree for a body it found clean. Recomputed from the live file at each call, never kept
-/// in the outline, so the outline's equality, and its backdating at a body edit, are untouched;
-/// no query of its own, as what it gives moves with every edit.
+/// in the outline, so the outline's equality, and its backdating at a body edit, are untouched.
+/// A memo of the file: what it gives moves with every edit of the file and with no other, so a
+/// check after an edit walks the edited file's tree again and no other file's (until
+/// 2026-11-19 every check of a crate walked every file's tree here).
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn cut_bodies(db: &Db, file_id: EditionedFileId) -> Box<[(TextRange, span::ErasedFileAstId)]> {
     let file = HirFileId::from(file_id);
     let root = file.root(db);

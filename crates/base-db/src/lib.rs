@@ -604,9 +604,20 @@ pub fn other_out_dirs<'db>(db: &'db Db, krate: Crate) -> &'db [&'db str] {
     blaze_memo::keep_iter(memo, krate.out_dirs(db).iter().map(|dir| blaze_memo::keep_str(memo, dir)))
 }
 
-/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]).
-pub fn below_any(path: &str, dirs: &[&str]) -> bool {
-    dirs.iter().any(|dir| path.strip_prefix(dir).is_some_and(|rest| rest.starts_with(['/', '\\'])))
+/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]), by whole parts and with
+/// `/` and `\` the same separator, so a directory given in the system's spelling and a path
+/// in the daemon's (or a Windows path joined with `\`) compare as the one directory they are.
+pub fn below_any<D: AsRef<str>>(path: &str, dirs: &[D]) -> bool {
+    dirs.iter().any(|dir| below(path, dir.as_ref()))
+}
+
+/// Whether `path` is strictly below the directory `dir`, part by part, `/` and `\` alike.
+pub fn below(path: &str, dir: &str) -> bool {
+    let sep = |b: u8| b == b'/' || b == b'\\';
+    let (path, dir) = (path.as_bytes(), dir.trim_end_matches(['/', '\\']).as_bytes());
+    path.len() > dir.len()
+        && sep(path[dir.len()])
+        && path[..dir.len()].iter().zip(dir).all(|(&a, &b)| a == b || (sep(a) && sep(b)))
 }
 
 /// The content of `krate`'s source root as `krate` is made from it: what a key or an identity

@@ -897,6 +897,34 @@ fn the_oracle_catches_a_patch_that_keeps_a_changed_functions_old_references() {
     assert!(found.starts_with("build 1: "), "{found}");
 }
 
+/// A durable (`Durability::HIGH`) write resets the front end's witness table to the new view,
+/// so a kept walk made before that durable write walks whole rather than asking `changed_since`
+/// for a view the new witness table no longer covers (the `withdeps` `check -> build` failure
+/// on `serde_derive` when a later build script bumped `durable_view`).
+#[test]
+fn a_durable_write_walks_whole_even_when_the_kept_walk_has_a_view() {
+    let mut program = program();
+    let kept = Kept::new();
+    program.begin_build();
+    let first = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(first.walk.whole.is_some());
+
+    // Simulate a HIGH write advancing `durable_view` and resetting the front end's witness
+    // table so `changed_since(old_view)` would answer `Changed::Unknown`.
+    program.engine.high += 1;
+    program.engine.revision += 1;
+    program.engine.loses_its_set = true;
+    program.begin_build();
+    let second = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(second.walk.whole, Some("a durable input was written since the kept walk"));
+
+    // Once the new walk is kept at the new durable view, ordinary edits patch again.
+    program.engine.loses_its_set = false;
+    program.begin_build();
+    let third = built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(third.walk.whole, None);
+}
+
 /// The control of the patched walk's renaming: an edit of 4's body gives it a new key, which
 /// 2's place must name. A driver that leaves the places that named the old key builds 2
 /// calling a function the build no longer holds; the oracle says so.
@@ -1439,4 +1467,300 @@ fn a_front_end_that_loses_its_changed_set_is_refused_and_no_function_is_asked() 
     assert_eq!(edited.walk.whole, None, "the kept walk went back as it was");
     assert_eq!((edited.work.asked, edited.work.named, edited.work.held), (1, 1, 1));
     assert!(edited.work.patched, "the kept lists went back too");
+}
+
+/// The invariant (B10, driver layer): a closed-world walk kept with a world checkpoint
+/// 1. patches structurally when a body edit adds/removes non-dyn calls (`WorldChange::Unchanged`)
+///    without asking any dyn consumer,
+/// 2. patches selectively when one dyn fact changes (`WorldChange::Updated { consumers }`),
+///    re-describing ONLY the consumers of the changed object and never unrelated consumers,
+/// 3. falls back to a whole walk if `finish_world_patch` rejects closed/plain disagreement,
+/// and matches a fresh whole build byte-for-byte after every edit.
+#[test]
+fn a_closed_world_patch_re_verifies_only_consumers_of_changed_facts_and_matches_whole() {
+    use std::sync::atomic::AtomicBool;
+    use crate::backend::{WorldChange, WorldPatch};
+
+    struct TwoObjectFrontend<'a> {
+        program: &'a Program,
+        /// Target callee of dyn object A (consumer = fn 2) and dyn object B (consumer = fn 3).
+        target_a: u32,
+        target_b: u32,
+        reject_finish: bool,
+        resumed: AtomicBool,
+        finished: AtomicBool,
+        described_ids: Lock<Vec<u32>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Checkpoint {
+        target_a: u32,
+        target_b: u32,
+    }
+
+    struct TwoObjectBackend<'a> {
+        machine: Machine,
+        _marker: std::marker::PhantomData<&'a ()>,
+    }
+
+    impl<'a> Prepare for TwoObjectBackend<'a> {
+        type Frontend = TwoObjectFrontend<'a>;
+        type Prepared = Prepared;
+        type Export = Exported;
+
+        fn prepare(
+            &self,
+            frontend: &TwoObjectFrontend<'a>,
+            unit: &Unit,
+            spec: &Spec,
+            id: &u32,
+            refs: &crate::template::Refs,
+        ) -> Result<(Shape, Prepared), CodegenError> {
+            self.machine.prepare(frontend.program, unit, spec, id, refs)
+        }
+
+        fn summarize(
+            &self,
+            unit: &Unit,
+            spec: &Spec,
+            prepared: &mut Prepared,
+            refs: &crate::template::Refs,
+        ) -> Result<(Summary, Exported), CodegenError> {
+            self.machine.summarize(unit, spec, prepared, refs)
+        }
+
+        fn emit(
+            &self,
+            unit: &Unit,
+            spec: &Spec,
+            prepared: Prepared,
+            refs: &crate::template::Refs,
+            imports: Option<(&Imports, &[Import<'_, Exported>])>,
+        ) -> Result<Emitted, CodegenError> {
+            self.machine.emit(unit, spec, prepared, refs, imports)
+        }
+
+        fn masked(
+            &self,
+            unit: &Unit,
+            prepared: &Prepared,
+            refs: &crate::template::Refs,
+        ) -> Option<Masked> {
+            self.machine.masked(unit, prepared, refs)
+        }
+
+        fn merge(
+            &self,
+            group: &Group,
+            members: Vec<(&Unit, &Spec, Prepared, &crate::template::Refs)>,
+        ) -> Result<fold::Merged, CodegenError> {
+            self.machine.merge(group, members)
+        }
+
+        fn compile_static(
+            &self,
+            frontend: &TwoObjectFrontend<'a>,
+            spec: &Spec,
+            id: &u32,
+            refs: &crate::template::Refs,
+        ) -> Result<Static, CodegenError> {
+            self.machine.compile_static(frontend.program, spec, id, refs)
+        }
+    }
+
+    impl Frontend for TwoObjectFrontend<'_> {
+        type World = Checkpoint;
+        type Instance = u32;
+        type Static = u32;
+
+        fn describe(&self, id: &u32, requester: &Origin) -> Result<Described<u32, u32>, CodegenError> {
+            self.described_ids.lock().push(*id);
+            self.program.describe(id, requester)
+        }
+
+        fn describe_static(&self, id: &u32) -> Result<DescribedStatic<u32, u32>, CodegenError> {
+            self.program.describe_static(id)
+        }
+
+        fn reached(&self, functions: &[(u32, Origin)], statics: &[u32]) {
+            self.program.reached(functions, statics);
+        }
+
+        fn stopped(&self) -> bool {
+            self.program.stopped()
+        }
+
+        fn counted(&self, functions: &[(u32, Origin)]) -> Vec<crate::backend::Counted> {
+            self.program.counted(functions)
+        }
+
+        fn spell(&self, id: &u32) -> String {
+            self.program.spell(id)
+        }
+
+        fn past_recursion_limit(
+            &self,
+            id: &u32,
+            depth: u32,
+            limit: u32,
+            head: &u32,
+            limit_of: &u32,
+        ) -> CodegenError {
+            self.program.past_recursion_limit(id, depth, limit, head, limit_of)
+        }
+
+        fn redescribe(
+            &self,
+            id: &u32,
+            requester: &Origin,
+            was: &Described<u32, u32>,
+        ) -> Result<Option<Described<u32, u32>>, CodegenError> {
+            self.described_ids.lock().push(*id);
+            let now = self.program.describe(id, requester)?;
+            Ok((now != *was).then_some(now))
+        }
+
+        fn durable_view(&self) -> Option<u64> {
+            self.program.durable_view()
+        }
+
+        fn view(&self) -> Option<u64> {
+            self.program.view()
+        }
+
+        fn changed_since(&self, view: u64) -> Changed<u32, u32> {
+            self.program.changed_since(view)
+        }
+
+        fn each_build(&self, id: &u32, origin: &Origin) -> bool {
+            self.program.each_build(id, origin)
+        }
+
+        fn static_each_build(&self, id: &u32) -> bool {
+            self.program.static_each_build(id)
+        }
+
+        fn closes(&self) -> bool {
+            false
+        }
+
+        fn kept_world(&self) -> Option<Checkpoint> {
+            Some(Checkpoint { target_a: self.target_a, target_b: self.target_b })
+        }
+
+        fn resume_world(
+            &self,
+            kept: &Checkpoint,
+            _: u64,
+            _: &[(u32, Origin)],
+            _: &[u32],
+        ) -> Result<WorldChange<u32>, &'static str> {
+            self.resumed.store(true, Ordering::Relaxed);
+            self.program.engine.against.store(true, Ordering::Relaxed);
+            let mut consumers = Vec::new();
+            let app = Origin::Member(Package::new("app"));
+            if kept.target_a != self.target_a {
+                consumers.push((2, app));
+            }
+            if kept.target_b != self.target_b {
+                consumers.push((3, app));
+            }
+            if consumers.is_empty() {
+                Ok(WorldChange::Unchanged)
+            } else {
+                Ok(WorldChange::Updated { consumers })
+            }
+        }
+
+        fn finish_world_patch(&self, _: WorldPatch<'_, u32, u32>) -> Result<(), &'static str> {
+            if self.reject_finish {
+                return Err("closed walk disagrees with plain walk");
+            }
+            self.finished.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn abandon_resumed_world(&self) {
+            self.resumed.store(false, Ordering::Relaxed);
+            self.program.engine.against.store(false, Ordering::Relaxed);
+        }
+
+        fn closed(&self, functions: &[(u32, Origin)], statics: &[u32]) -> Result<bool, CodegenError> {
+            self.program.closed(functions, statics)
+        }
+    }
+
+    // Graph: 1 (main) -> 2 (consumer A -> target 4), 3 (consumer B -> target 5), 6 (helper1).
+    let mut p = Program::default();
+    p.function(1, 0x01, &[2, 3, 6]);
+    p.function(2, 0x02, &[]);
+    p.function(3, 0x03, &[]);
+    p.function(4, 0x04, &[]);
+    p.function(5, 0x05, &[]);
+    p.function(6, 0x06, &[]);
+    p.function(7, 0x07, &[]);
+    p.function(8, 0x08, &[]);
+    p.dyn_sites.insert(2, 4);
+    p.dyn_sites.insert(3, 5);
+
+    let kept: Kept<u32, u32, Checkpoint> = Kept::new();
+    let app = Origin::Member(Package::new("app"));
+    let run = |p: &Program, ta: u32, tb: u32, reject: bool, kept: Option<&Kept<u32, u32, Checkpoint>>| {
+        p.begin_build();
+        let fe = TwoObjectFrontend {
+            program: p,
+            target_a: ta,
+            target_b: tb,
+            reject_finish: reject,
+            resumed: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            described_ids: Lock::new("test.world.described", Vec::new()),
+        };
+        let be = TwoObjectBackend { machine: Machine::default(), _marker: std::marker::PhantomData };
+        let pol = policy(OptLevel::O0, Mode::Output);
+        let memo = Memo::new();
+        let store = Store::default();
+        let mut build = Build::new(&be, &fe, &pol, &memo);
+        if let Some(kept) = kept {
+            build = build.keeping(kept);
+        }
+        let out = build
+            .run_with_statics(&[(1, app)], &[], &[], &store)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let asked = fe.described_ids.lock().clone();
+        (out, asked, fe.finished.load(Ordering::Relaxed))
+    };
+
+    // Build 1: initial 2-round whole walk.
+    let (b1, _, _) = run(&p, 4, 5, false, Some(&kept));
+    assert!(b1.walk.whole.is_some());
+
+    // Build 2: structural edit in `main` (helper 6 -> helper 7), no dyn change -> patched!
+    p.functions.get_mut(&1).unwrap().calls = vec![2, 3, 7];
+    p.touch(1);
+    let (b2, asked2, finished2) = run(&p, 4, 5, false, Some(&kept));
+    let (fresh2, _, _) = run(&p.copy(), 4, 5, false, None);
+    assert_eq!(b2.walk.whole, None, "non-dyn structural edit must patch closed walk");
+    assert!(finished2);
+    assert!(!asked2.contains(&2) && !asked2.contains(&3), "neither dyn consumer asked: {asked2:?}");
+    assert_eq!(b2.id, fresh2.id, "patched build must equal fresh whole build");
+
+    // Build 3: dyn A changes target 4 -> 8 (fn 1 did NOT change; only world A changed!).
+    p.dyn_sites.insert(2, 8);
+    let (b3, asked3, finished3) = run(&p, 8, 5, false, Some(&kept));
+    let (fresh3, _, _) = run(&p.copy(), 8, 5, false, None);
+    assert_eq!(b3.walk.whole, None, "single-object dyn update must patch closed walk");
+    assert!(finished3);
+    assert!(asked3.contains(&2), "consumer of changed object A must be re-described: {asked3:?}");
+    assert!(!asked3.contains(&3), "consumer of unchanged object B must NOT be asked: {asked3:?}");
+    assert_eq!(b3.id, fresh3.id, "patched build after dyn update must equal fresh whole build");
+
+    // Build 4 (control): finish_world_patch refuses -> abandons resumed world and walks whole!
+    p.functions.get_mut(&7).unwrap().body = 0x77;
+    p.touch(7);
+    let (b4, _, finished4) = run(&p, 8, 5, true, Some(&kept));
+    let (fresh4, _, _) = run(&p.copy(), 8, 5, false, None);
+    assert_eq!(b4.walk.whole, Some("closed walk disagrees with plain walk"));
+    assert!(!finished4);
+    assert_eq!(b4.id, fresh4.id);
 }

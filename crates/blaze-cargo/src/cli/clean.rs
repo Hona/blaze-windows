@@ -239,7 +239,11 @@ fn list() -> Result<(), String> {
             Ok(Some(record)) => (
                 ago(now.saturating_sub(record.used_ns)),
                 match record.checkout {
-                    Some(checkout) if Path::new(&checkout).exists() => checkout,
+                    Some(checkout)
+                        if blaze_core::platform::path::host_if_daemon(Path::new(&checkout)).exists() =>
+                    {
+                        checkout
+                    }
                     Some(checkout) => format!("{checkout} (gone)"),
                     None => "-".to_owned(),
                 },

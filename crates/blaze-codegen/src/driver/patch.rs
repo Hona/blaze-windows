@@ -63,6 +63,7 @@ use crate::{
     InstanceKey, Linkage, Owner, Target,
     backend::{
         Changed, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Prepare,
+        WorldChange, WorldPatch,
     },
     plan::Origin,
 };
@@ -464,7 +465,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         if walked.closes && walked.world.is_none() && self.planted != Some(Planted::PatchesClosed) {
             return Err("the kept walk is of a front end that may close dyn facts, which its describes are against");
         }
-        if walked.view != view && walked.seen.is_none() {
+        // `Witnesses` records reads below `Durability::HIGH` alone and resets its `since` view
+        // whenever a durable input is written, so a kept walk can never be patched across a
+        // durable view change (even when `walked.seen` is `Some`).
+        if walked.view != view {
             return Err("a durable input was written since the kept walk");
         }
         if self.frontend.stopped() {
@@ -483,15 +487,29 @@ impl<'a, B: Prepare> Build<'a, B> {
         // build is refused with the front end's reason (`refused`; rule no-fallback), and
         // the kept walk goes back as it was, so the refusal stands until its cause is gone.
         let seen = walked.seen;
-        if walked.keep.takes_world {
-            self.frontend.resume_world(
+        let world_change = if walked.keep.takes_world {
+            // alloc: per closed-world patch, the roots of the plain walk
+            let mut fn_roots: Vec<(FrontInstance<B>, Origin)> = roots.to_vec();
+            let mut st_roots: Vec<FrontStatic<B>> = static_roots.to_vec();
+            for root in check {
+                match root {
+                    CheckRoot::Function(i, o) => fn_roots.push((i.clone(), *o)),
+                    CheckRoot::Static(s) => st_roots.push(s.clone()),
+                }
+            }
+            Some(self.frontend.resume_world(
                 walked.world.as_ref().ok_or("the front end kept no world checkpoint")?,
                 seen.ok_or("the world checkpoint has no database view")?,
-            )?;
-        }
+                &fn_roots,
+                &st_roots,
+            )?)
+        } else {
+            None
+        };
         let named = match seen {
             Some(seen) => match self.frontend.changed_since(seen) {
                 Changed::Unknown(why) => {
+                    self.frontend.abandon_resumed_world();
                     *refused = Some(why);
                     kept.keep_walk(program, walked);
                     return Err("the front end tells a view and named no changed set since it");
@@ -537,6 +555,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                 true
             }
         };
+        if let Some(WorldChange::Updated { consumers }) = world_change {
+            for asked in &consumers {
+                if let Some(&item) = keep.functions.get(asked) {
+                    asks.push(item);
+                }
+            }
+        }
         asks.sort_unstable();
         asks.dedup();
         static_asks.sort_unstable();
@@ -691,7 +716,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             dirty.insert(item);
             own.insert(item);
         }
+        // alloc: per build, the static items whose describe changed (for world verification)
+        let mut changed_static_items: Vec<u32> = Vec::with_capacity(changed_statics.len());
         for (item, now) in changed_statics {
+            changed_static_items.push(item);
             let Some(Some(Item::Static(it))) = keep.items.get(item as usize) else {
                 return Err("a kept walk asks of a static it does not hold");
             };
@@ -752,7 +780,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return Err("the front end gave no count of a new function");
                 };
                 let key = node.unit.instance.key();
-                if node.described.takes_world {
+                if node.described.takes_world && !keep.takes_world {
                     return Err("a new function takes the program's dyn facts");
                 }
                 if keep.askers.contains_key(&key) {
@@ -800,14 +828,60 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         self.frontend.reached(&told, &[]);
 
-        if keep.takes_world && (structural || recount) {
-            return Err("the closed walk's reachability changed");
-        }
-
         // What the roots reach now.
         let visited = keep.graph.visited;
         let settled = keep.graph.settle();
         work.graph = keep.graph.visited - visited;
+        if keep.takes_world {
+            // alloc: per closed-world patch, the delta of items in `ALL`
+            let mut changed_functions = Vec::with_capacity(remade.len());
+            for &(item, _, _) in &remade {
+                if keep.graph.is_member(ALL, item)
+                    && settled.entered[ALL].binary_search(&item).is_err()
+                    && let Some(it) = keep.function(item)
+                {
+                    changed_functions.push(it.asked.clone());
+                }
+            }
+            let mut entered_functions = Vec::new();
+            let mut entered_statics = Vec::new();
+            for &item in &settled.entered[ALL] {
+                if !keep.graph.is_member(ALL, item) {
+                    continue;
+                }
+                match keep.items.get(item as usize).and_then(Option::as_ref) {
+                    Some(Item::Function(it)) => entered_functions.push(it.asked.clone()),
+                    Some(Item::Static(it)) => entered_statics.push(it.value.clone()),
+                    None => {}
+                }
+            }
+            let mut left_functions = Vec::new();
+            let mut left_statics = Vec::new();
+            for &item in &settled.left[ALL] {
+                match keep.items.get(item as usize).and_then(Option::as_ref) {
+                    Some(Item::Function(it)) => left_functions.push(it.asked.clone()),
+                    Some(Item::Static(it)) => left_statics.push(it.value.clone()),
+                    None => {}
+                }
+            }
+            let mut changed_static_values = Vec::with_capacity(changed_static_items.len());
+            for item in changed_static_items {
+                if keep.graph.is_member(ALL, item)
+                    && settled.entered[ALL].binary_search(&item).is_err()
+                    && let Some(Some(Item::Static(it))) = keep.items.get(item as usize)
+                {
+                    changed_static_values.push(it.value.clone());
+                }
+            }
+            self.frontend.finish_world_patch(WorldPatch {
+                changed_functions: &changed_functions,
+                entered_functions: &entered_functions,
+                left_functions: &left_functions,
+                changed_statics: &changed_static_values,
+                entered_statics: &entered_statics,
+                left_statics: &left_statics,
+            })?;
+        }
         if structural || recount {
             // The recursion limit: with no body of more instances than the least limit
             // admits, no order of claims refuses one; else rustc's walk, over the whole

@@ -1,0 +1,155 @@
+# Standalone Windows real-project corpus (manual dispatch only, once on the default branch).
+# At batch time, `.github/workflows/windows-host.yaml` runs this corpus automatically against the
+# batch's single release `blaze.exe` build on pushes to `windows/batch`, so pushes to `windows/int`
+# or any other branch start nothing here.
+name: Windows project corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      projects:
+        description: JSON list of project names from harness/windows-corpus.json (empty for all)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  CARGO_UNSTABLE_CHECKSUM_FRESHNESS: 'true'
+  RUST_BACKTRACE: '0'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      projects: ${{ steps.pick.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/windows-corpus.ps1
+            harness/windows-corpus.json
+            harness/windows-corpus
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: pick
+        shell: pwsh
+        env:
+          REQUESTED: ${{ inputs.projects }}
+        run: |
+          ./.github/scripts/windows-corpus.ps1 -SelfTest
+          $all = @((Get-Content -LiteralPath 'harness/windows-corpus.json' -Raw | ConvertFrom-Json).projects | ForEach-Object { $_.name })
+          if ($env:REQUESTED.Trim()) {
+            $picked = @($env:REQUESTED | ConvertFrom-Json)
+            foreach ($p in $picked) {
+              if ($p -notin $all) { throw "Unknown corpus project '$p'; valid: $($all -join ', ')" }
+            }
+          } else {
+            $picked = $all
+          }
+          $json = ConvertTo-Json -InputObject @($picked) -Compress
+          "projects=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - id: cache
+        uses: ./.github/actions/windows-cargo-cache
+        with:
+          profile: release
+          slot: engine
+      - run: cargo build --locked --release -p blaze-engine --bin blaze
+      - uses: actions/upload-artifact@v7
+        with:
+          name: corpus-release-engine
+          path: target/release/blaze.exe
+          retention-days: 3
+          if-no-files-found: error
+      - uses: ./.github/actions/windows-cargo-cache-save
+        with:
+          profile: release
+          cache-hit: ${{ steps.cache.outputs.deps-cache-hit }}
+          cache-key: ${{ steps.cache.outputs.deps-cache-key }}
+
+  corpus:
+    name: corpus (${{ matrix.project }})
+    needs: [plan, build]
+    runs-on: windows-2025
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.plan.outputs.projects) }}
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - uses: actions/download-artifact@v8
+        with:
+          name: corpus-release-engine
+          path: target/release
+      - name: Provision the scratch volume change journal
+        run: |
+          $volume = [IO.Path]::GetPathRoot($env:RUNNER_TEMP).TrimEnd('\')
+          fsutil usn queryjournal $volume
+          if ($LASTEXITCODE) { fsutil usn createjournal m=33554432 a=4194304 $volume }
+      - name: Run corpus project with runner memory telemetry
+        id: run_corpus
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          . ./.github/scripts/windows-memory.ps1
+          $outDir = Join-Path $env:RUNNER_TEMP 'corpus'
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          $p = Start-Process pwsh -NoNewWindow -PassThru -ArgumentList @(
+            '-NoProfile', '-File', '.github/scripts/windows-corpus.ps1',
+            '-Blaze', "$PWD/target/release/blaze.exe",
+            '-Out', $outDir,
+            '-Project', $env:PROJECT,
+            '-ContinueOnFailure'
+          )
+          $metrics = Wait-WithHeadroom -Process $p -MetricsPath (Join-Path $outDir 'metrics.json') -NoThrow
+          $code = if ($p.HasExited) { $p.ExitCode } else { 137 }
+          if ($metrics.guard_tripped -and $code -eq 0) { $code = 137 }
+          $p.Dispose()
+          exit $code
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: result-corpus-${{ matrix.project }}
+          path: |
+            ${{ runner.temp }}/corpus/*.log
+            ${{ runner.temp }}/corpus/*.csv
+            ${{ runner.temp }}/corpus/*.json
+          retention-days: 7
+          if-no-files-found: warn
+      - if: steps.run_corpus.outcome == 'failure'
+        run: exit 1

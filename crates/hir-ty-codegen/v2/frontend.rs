@@ -11,7 +11,7 @@ use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
     backend::{
         Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates,
-        Limit,
+        Limit, WorldChange, WorldPatch,
     },
     driver::Kept,
     plan::{Mode, Origin, Package, PlanError, Policy},
@@ -115,6 +115,9 @@ pub struct HirFrontend<'db> {
     give_way: Option<&'db AtomicBool>,
     /// What the walk of a final binary found of its trait objects ([`super::devirt`]).
     pub(crate) devirt: super::devirt::State,
+    /// What this front end's walks read and made of sealed code's describes, and where they
+    /// entered it ([`described::reach`]).
+    pub(crate) reach: described::reach::State,
 }
 
 /// One value for each origin of the build's [`Policy`], told apart as the plan tells them.
@@ -561,6 +564,7 @@ impl<'db> HirFrontend<'db> {
             stop: None,
             give_way: None,
             devirt: Default::default(),
+            reach: Default::default(),
         }
     }
 
@@ -1166,13 +1170,32 @@ impl<'db> HirFrontend<'db> {
 impl Frontend for HirFrontend<'_> {
     type World = super::DynCheckpoint;
 
-    fn kept_world(&self) -> Option<Self::World> { self.devirt.checkpoint() }
-
-    fn resume_world(&self, world: &Self::World, since: u64) -> Result<(), &'static str> {
-        self.devirt.resume(self, world, since)
+    fn kept_world(&self) -> Option<Self::World> {
+        self.devirt.checkpoint()
     }
 
-    fn abandon_resumed_world(&self) { self.devirt.abandon(); }
+    fn resume_world(
+        &self,
+        world: &Self::World,
+        since: u64,
+        fn_roots: &[(HirInstance, Origin)],
+        static_roots: &[HirStatic],
+    ) -> Result<WorldChange<HirInstance>, &'static str> {
+        self.devirt.resume(self, world, since, fn_roots, static_roots)
+    }
+
+    fn finish_world_patch(
+        &self,
+        _patch: WorldPatch<'_, HirInstance, HirStatic>,
+    ) -> Result<(), &'static str> {
+        // `resume_world` never resumes on the session memo (no changed set), so no patch is
+        // ever begun to finish.
+        Err("no resumed world checkpoint to finish: the session memo names no changed set")
+    }
+
+    fn abandon_resumed_world(&self) {
+        self.devirt.abandon();
+    }
     type Instance = HirInstance;
     type Static = HirStatic;
 
@@ -1234,6 +1257,10 @@ impl Frontend for HirFrontend<'_> {
         puts: &mut Vec<blaze_codegen::driver::Put>,
     ) -> Result<(Described<HirInstance, HirStatic>, bool), CodegenError> {
         self.with(|db| self.describe_recorded_in(db, instance, requester, records, puts))
+    }
+
+    fn walk_records(&self, shared: &mut Vec<blaze_codegen::driver::Put>) {
+        self.with(|db| self.reach_records_in(db, shared));
     }
 
     fn describe_static(

@@ -728,6 +728,7 @@ impl Files {
             // Not of a file system: watches, clocks, processes, sockets, the standard streams.
             Effect::Watch { .. }
             | Effect::Journal { .. }
+            | Effect::AlsoJournal { .. }
             | Effect::Unwatch { .. }
             | Effect::Flush { .. }
             | Effect::Timer { .. }

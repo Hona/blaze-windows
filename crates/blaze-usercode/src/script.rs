@@ -169,11 +169,15 @@ pub fn prepare(
     let view = roots.view();
     let mut given = Given::new(RunKind::BuildScript);
     if let Mode::Declared { host, .. } = place.mode {
-        given.part("Windows declared inputs v2", &host.0);
+        given.part("Windows declared inputs v3", &host.0);
         // Include even previously absent/pass-through and run-only names. Never expose values
-        // in explanations. `env_keyed` sorts stably and keeps the last value like CreateProcess.
+        // in explanations. `env_keyed` sorts stably and keeps the last value like CreateProcess;
+        // each value written against the run's roots, so another checkout's is the same key.
         let names: Vec<_> = env.vars.iter().map(|(n, _)| blaze_core::platform::env::os_name(n)).collect(); // alloc: once per prepared run
-        given.env_keyed(names.iter().zip(&env.vars).map(|(n, (_, v))| (n.as_encoded_bytes(), v.as_encoded_bytes())));
+        given.env_keyed_ported(
+            names.iter().zip(&env.vars).map(|(n, (_, v))| (n.as_encoded_bytes(), v.as_encoded_bytes())),
+            view,
+        );
     }
     // The roots a given string still holds once ported (`-L/ws/p/lib`, a root after a path
     // byte): its key is then this checkout's string, and the run is kept here alone.
@@ -185,19 +189,21 @@ pub fn prepare(
         names.push(name.to_owned()); // alloc: setup, as above
     }
     given.roots(&view);
-    // Its binary is `place.code`, by content; its path is what it sees as `argv[0]`. On Windows
-    // `os_bytes` is UTF-16 units and a run has no roots, so these stay absolute there.
-    let program = crate::trace::os_bytes(unit.script.as_os_str());
-    let dir = crate::trace::os_bytes(unit.package.manifest_dir.as_os_str());
+    // Its binary is `place.code`, by content; its path is what it sees as `argv[0]`, written
+    // against its roots ([`path_part`]).
+    let program = path_part(unit.script.as_os_str());
+    let dir = path_part(unit.package.manifest_dir.as_os_str());
     given.ported("program", &program, &view);
     given.ported("dir", &dir, &view);
     #[cfg(windows)]
     {
         // Giving a previously refused read can change the program's answer even if none of
-        // its files changed. Windows roots carry independent AppContainer capabilities.
-        let mut roots = blaze_ids::Hasher::new("blaze Windows script read roots 1");
+        // its files changed. Windows roots carry independent AppContainer capabilities. Each
+        // written against the run's roots: another checkout's grants of the same places are
+        // the same part.
+        let mut roots = blaze_ids::Hasher::new("blaze Windows script read roots 2");
         for path in &place.read {
-            roots.part(path.as_os_str().as_encoded_bytes());
+            roots.part(&view.ported(&path_part(path.as_os_str())));
         }
         given.part("sandbox read roots", &roots.finish().0);
     }
@@ -271,6 +277,29 @@ pub fn prepare(
     let spec =
         run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode, roots };
     Ok(Prepared { spec, env: checked, given: names, made: given })
+}
+
+/// The bytes of a path a run's key is given, as [`crate::roots::Roots::port`] reads them: a
+/// root's text is matched in UTF-8, so a path that is UTF-8 is given as its text (`\x01`
+/// before it, a byte no path has, so a root still starts it), and on Windows one that is not
+/// (lone surrogates) as its UTF-16 units (`\x02` before it), which no root's port touches. The
+/// tags keep the two forms apart. Elsewhere a path's bytes are its text already.
+pub(crate) fn path_part(path: &OsStr) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(windows)]
+    {
+        match path.to_str() {
+            // alloc: setup, a path a key is given
+            Some(text) => std::borrow::Cow::Owned([b"\x01".as_slice(), text.as_bytes()].concat()),
+            None => {
+                let wide = crate::trace::os_bytes(path);
+                std::borrow::Cow::Owned([b"\x02".as_slice(), &wide].concat()) // alloc: as above
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        crate::trace::os_bytes(path)
+    }
 }
 
 /// Whether the variable `it` is `name`: Windows' names are one whatever their case.
@@ -566,6 +595,70 @@ mod tests {
 
     fn inherited(path: &str) -> Vec<(OsString, OsString)> {
         vec![("PATH".into(), path.into()), ("HOME".into(), "/home/u".into())]
+    }
+
+    /// `unit()` in a Windows checkout at `home` (`C:\Users\a`), with its read grants and roots
+    /// there, as `serve::unit::script` prepares one.
+    #[cfg(windows)]
+    fn moved_windows(home: &str) -> (Unit, Place) {
+        let mut unit = unit();
+        let at = |path: &str| PathBuf::from(format!(r"{home}{}", path.replace('/', "\\")));
+        unit.package.manifest_dir = at("/ws/p");
+        unit.package.manifest_path = at("/ws/p/Cargo.toml");
+        unit.tools.cargo = at("/bin/cargo.exe");
+        unit.tools.rustc = at("/bin/rustc.exe");
+        unit.tools.rustdoc = at("/bin/rustdoc.exe");
+        unit.script = at("/t/build/p/script.exe");
+        unit.out_dir = at("/t/build/p/0123456789abcdef/out");
+        let mut place = place();
+        place.read = vec![at("/ws/p"), at("/bin")];
+        place.roots = RootMap::default()
+            .with(Role::Target, &at("/t"), &Looks::none())
+            .with(Role::Workspace, &at("/ws"), &Looks::none())
+            .with(Role::Tools, &at("/bin"), &Looks::none());
+        (unit, place)
+    }
+
+    /// The Windows form of [`two_checkouts_at_different_paths_give_one_key`]: a build
+    /// script's key ports its paths' text (`path_part`) before they are UTF-16 units, its read
+    /// grants and a declared run's environment too, so two checkouts share it.
+    #[cfg(windows)]
+    #[test]
+    fn two_windows_checkouts_at_different_paths_give_one_key() {
+        let (a, a_place) = moved_windows(r"C:\Users\a");
+        let (b, b_place) = moved_windows(r"D:\ci\b");
+        let one = prepare(&a, &inherited(r"C:\Windows\System32"), &a_place, &Looks::none()).unwrap();
+        let two = prepare(&b, &inherited(r"C:\Windows\System32"), &b_place, &Looks::none()).unwrap();
+        assert_eq!(one.spec.key, two.spec.key);
+        assert_ne!(one.spec.command.env, two.spec.command.env, "what it is given is its checkout's");
+        // Declared runs (Cargo's rules, the Windows default) share it as well.
+        let declared = |(unit, mut place): (Unit, Place)| {
+            place.mode = Mode::Declared { host: ContentId::default(), verify: false };
+            prepare(&unit, &inherited(r"C:\Windows\System32"), &place, &Looks::none()).unwrap().spec.key
+        };
+        assert_eq!(declared(moved_windows(r"C:\Users\a")), declared(moved_windows(r"D:\ci\b")));
+        // Without roots, another checkout is another key.
+        let (c, mut c_place) = moved_windows(r"D:\ci\c");
+        c_place.roots = RootMap::default();
+        assert_ne!(one.spec.key, prepare(&c, &inherited(r"C:\Windows\System32"), &c_place, &Looks::none()).unwrap().spec.key);
+        // A path under no root stays absolute.
+        let (mut d, d_place) = moved_windows(r"D:\ci\d");
+        d.tools.rustc = r"E:\opt\rustc.exe".into();
+        assert_ne!(one.spec.key, prepare(&d, &inherited(r"C:\Windows\System32"), &d_place, &Looks::none()).unwrap().spec.key);
+    }
+
+    /// A path's key bytes keep its text and its UTF-16 form apart, and a root still starts the
+    /// text (the tag before it is no path byte).
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_path_part_is_its_text_with_a_root_at_its_start() {
+        let map = RootMap::default().with(Role::Workspace, Path::new(r"C:\Users\a\ws"), &Looks::none());
+        let part = path_part(OsStr::new(r"C:\Users\a\ws\p"));
+        assert_eq!(&*part, b"\x01C:\\Users\\a\\ws\\p");
+        assert_eq!(&*map.view().ported(&part), b"\x01\0w\\p");
+        use std::os::windows::ffi::OsStringExt as _;
+        let lone = OsString::from_wide(&[0x43, 0xd800]);
+        assert_eq!(path_part(&lone).first(), Some(&2));
     }
 
     #[cfg(windows)]

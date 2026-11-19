@@ -65,6 +65,13 @@ pub(crate) struct WorkspaceOptOut {
     /// `build-script-link-dirs`: absolute (a relative one is under the workspace's root),
     /// normal, sorted; or `${NAME}/rest` as written, `NAME` one `build-script-env` lists.
     pub link_dirs: Vec<String>,
+    /// `build-script-tools`: programs by name, sorted, which every build script may run as the
+    /// command's `PATH` finds them ([`crate::query::Units::script_tools`]).
+    pub tools: Vec<String>,
+    /// `build-script-caches`: variables by name, sorted, each naming a directory of blaze's
+    /// that every build script may read and write, kept across runs
+    /// ([`crate::query::Units::script_caches`]).
+    pub caches: Vec<String>,
     /// [`EXPERIMENTAL`] lists [`SANDBOXED_TESTS`]: every member's tests run sandboxed on a host
     /// that does not by default ([`tests_sandboxed_by_default`]).
     pub sandboxed_tests: bool,
@@ -156,6 +163,30 @@ pub(crate) fn workspace(
             }
             // Every build script is given the command's whole environment, these variables too.
             "build-script-env" => env = names()?,
+            "build-script-tools" => {
+                for tool in names()? {
+                    // A name the command's `PATH` is searched for, never a place: a path would
+                    // let a checkout grant its scripts any file of the machine.
+                    let named = !tool.is_empty()
+                        && !matches!(tool, "." | "..")
+                        && !tool.contains(['/', '\\', ':', '\0']);
+                    if !named {
+                        return Err(wrong(&format!(
+                            "`{tool}` of `build-script-tools` is no program's name: name one the \
+                             command's PATH has (`nasm`), with no directory"
+                        )));
+                    }
+                    out.tools.push(tool.to_owned());
+                }
+            }
+            "build-script-caches" => {
+                for name in names()? {
+                    let name = super::native::variable(name).map_err(|why| {
+                        wrong(&format!("`{name}` of `build-script-caches` {why}"))
+                    })?;
+                    out.caches.push(name);
+                }
+            }
             "unsandboxed-proc-macros" => {
                 return Err(wrong(&format!(
                     "`unsandboxed-proc-macros` lists {:?}, but no proc macro can run outside: blaze runs \
@@ -174,22 +205,29 @@ pub(crate) fn workspace(
             other => {
                 return Err(wrong(&format!(
                     "`{other}` is not known (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`, \
-                     `build-script-env`, `build-script-link-dirs` and `wasi-build-scripts` are)"
+                     `build-script-env`, `build-script-link-dirs`, `build-script-tools`, \
+                     `build-script-caches` and `wasi-build-scripts` are)"
                 )));
             }
         }
     }
     // A dir under a variable the workspace does not declare its scripts read would hang on
-    // whatever the shell happens to set.
-    if let Some((dir, name)) = under_vars.iter().find(|(_, name)| !env.contains(name)) {
+    // whatever the shell happens to set; a declared cache's variable is blaze's to set.
+    let declared = |name: &&str| env.contains(name) || out.caches.iter().any(|it| it == name);
+    if let Some((dir, name)) = under_vars.iter().find(|(_, name)| !declared(name)) {
         return Err(wrong(&format!(
-            "`{dir}` of `build-script-link-dirs` is under `{name}`, which `build-script-env` does not list"
+            "`{dir}` of `build-script-link-dirs` is under `{name}`, which neither \
+             `build-script-env` nor `build-script-caches` lists"
         )));
     }
     out.build_scripts.sort_unstable();
     out.build_scripts.dedup();
     out.link_dirs.sort_unstable();
     out.link_dirs.dedup();
+    out.tools.sort_unstable();
+    out.tools.dedup();
+    out.caches.sort_unstable();
+    out.caches.dedup();
     Ok(out)
 }
 
@@ -399,7 +437,8 @@ mod tests {
         let error = workspace(Some(&undeclared), manifest, LINUX).unwrap_err();
         assert!(
             error.what.ends_with(
-                "is under `LLVM_SYS_231_PREFIX`, which `build-script-env` does not list"
+                "is under `LLVM_SYS_231_PREFIX`, which neither `build-script-env` nor \
+                 `build-script-caches` lists"
             ),
             "{}",
             error.what
@@ -407,6 +446,34 @@ mod tests {
         let unclosed = metadata("[blaze.sandbox]\nbuild-script-link-dirs = [\"${LLVM/lib\"]\n");
         let error = workspace(Some(&unclosed), manifest, LINUX).unwrap_err();
         assert!(error.what.contains("with no `NAME}` after it"), "{}", error.what);
+    }
+
+    /// What a fresh clone's scripts need besides the checkout is the project's to say: tools by
+    /// name and caches by variable, never a place of the machine. The controls: a tool given as
+    /// a path, and a cache under a variable cargo or the loader reads, are refused.
+    #[test]
+    fn the_workspace_names_its_scripts_tools_and_caches() {
+        let manifest = Path::new("/w/Cargo.toml");
+        let value = metadata(
+            "[blaze.sandbox]\nbuild-script-tools = [\"nasm\", \"cmake\", \"nasm\"]\n\
+             build-script-caches = [\"GHOSTTY_VT_CACHE_DIR\"]\n\
+             build-script-link-dirs = [\"${GHOSTTY_VT_CACHE_DIR}/lib\"]\n",
+        );
+        let out = workspace(Some(&value), manifest, LINUX).unwrap();
+        assert_eq!(out.tools, ["cmake", "nasm"]);
+        assert_eq!(out.caches, ["GHOSTTY_VT_CACHE_DIR"]);
+        assert_eq!(out.link_dirs, ["${GHOSTTY_VT_CACHE_DIR}/lib"], "a cache's variable is declared");
+
+        for tool in ["/usr/bin/nasm", r"C:\nasm\nasm.exe", "bin/nasm", "..", ""] {
+            let text = format!("[blaze.sandbox]\nbuild-script-tools = [{tool:?}]\n");
+            let error = workspace(Some(&metadata(&text)), manifest, LINUX).unwrap_err();
+            assert!(error.what.contains("is no program's name"), "{tool}: {}", error.what);
+        }
+        for name in ["PATH", "CARGO_HOME", "lower", "RUSTFLAGS"] {
+            let text = format!("[blaze.sandbox]\nbuild-script-caches = [{name:?}]\n");
+            let error = workspace(Some(&metadata(&text)), manifest, LINUX).unwrap_err();
+            assert!(error.what.contains("of `build-script-caches`"), "{name}: {}", error.what);
+        }
     }
 
     #[test]

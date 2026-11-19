@@ -605,6 +605,11 @@ pub struct Options {
     pub unheld: Option<Duration>,
     /// How edited outputs are placed on an NTFS volume ([`super::ntfs_edit::VAR`]).
     pub(crate) ntfs_edit: super::ntfs_edit::NtfsEdit,
+    /// Whether the directories outside views are heard through one reader of each volume's
+    /// journal ([`blaze_vfs::outside::Outside::journaled`]) rather than a watch each: the
+    /// caller's to say (the daemon on Windows), never the host's, so a simulation runs alike on
+    /// every system.
+    pub outside_journaled: bool,
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
@@ -2474,6 +2479,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         plane.unsettled(|it| {
             if matches!(it.state, blaze_protocol::events::NodeState::Running)
                 && !plane.loop_runs(it.id)
+                && !plane.is_held(it.id)
             {
                 found.push((it.request, it.id));
             }
@@ -3213,23 +3219,37 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// and the plane node of each lost thread failed with its line ([`Plane::abandon`]), so its
     /// build ends with that error and the daemon serves the next. Never waits.
     fn take_stuck(&mut self, now: Duration) {
-        let (plane, stuck) = (&mut self.plane, &mut self.stuck);
-        self.pulse.take_stuck(|said| {
-            if said.lost
-                && let Some(node) = said.node.and_then(|it| u32::try_from(it).ok())
-            {
-                // alloc: a stuck task, once
-                let why = format!(
-                    "blaze: {}; nothing can unwind its thread, so its task fails and the thread is lost to the daemon",
-                    said.said
-                );
-                plane.abandon(now, blaze_graph::machine::NodeId(node), why);
+        let mut abandoned = Vec::new(); // alloc: none unless a thread task was abandoned
+        {
+            let (plane, stuck) = (&mut self.plane, &mut self.stuck);
+            self.pulse.take_stuck(|said| {
+                if said.lost
+                    && let Some(node) = said.node.and_then(|it| u32::try_from(it).ok())
+                {
+                    let node = blaze_graph::machine::NodeId(node);
+                    // alloc: a stuck task, once
+                    let why = format!(
+                        "blaze: {}; nothing can unwind its thread, so its task fails and the thread is lost to the daemon",
+                        said.said
+                    );
+                    let reads = plane.batch_reads(node);
+                    if plane.abandon(now, node, why.clone()) {
+                        abandoned.push((node, reads, why));
+                    }
+                }
+                if stuck.len() >= STUCK_SHOWN {
+                    stuck.remove(0);
+                }
+                stuck.push(said); // alloc: grows to STUCK_SHOWN once
+            });
+        }
+        if !abandoned.is_empty() {
+            let mut said = self.spare.said.pop().unwrap_or_default();
+            for (node, reads, why) in abandoned {
+                self.jobs.abandoned(&mut world!(self, said), node, reads, &why);
             }
-            if stuck.len() >= STUCK_SHOWN {
-                stuck.remove(0);
-            }
-            stuck.push(said); // alloc: grows to STUCK_SHOWN once
-        });
+            self.said(said);
+        }
     }
 
     /// What each build is doing, looked at once each [`doing::EVERY`] of the driver's clock
@@ -3239,12 +3259,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// (the plane's folds) what it found; blocks on nothing.
     fn doing(&mut self) {
         let now = self.driver.now();
+        // Take the watchdog's lock-free queue every turn so a lost thread is abandoned at once
+        // without waiting up to `doing::EVERY` (or forever in a simulation with no driver timer).
+        self.take_stuck(now);
         if now.saturating_sub(self.looked) < doing::EVERY {
             return;
         }
         self.looked = now;
         self.builds.clear();
-        self.take_stuck(now);
         // What `blaze debug inspect` says of each job's waiting write, once a look.
         self.pulse.set_writes(self.jobs.write_waits(now));
         if self.jobs.under_way() == 0 {
@@ -3259,6 +3281,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         plane.unsettled(|it| {
             if matches!(it.state, blaze_protocol::events::NodeState::Running)
                 && !plane.loop_runs(it.id)
+                && !plane.is_held(it.id)
             {
                 running.push((it.request, it.id));
             }
@@ -3372,6 +3395,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if let Some((seq, rung)) = super::relief::CHANNEL.pending() {
             let _span = tracing::info_span!(target: "blaze", "memory relief", rung = rung.name()).entered();
             let given = self.jobs.relieve(&self.steps, rung);
+            super::relief::CHANNEL.asked_running(given.builds);
             tracing::warn!(target: "blaze", rung = rung.name(), ?given, "past the memory ceiling: gave back");
             super::relief::CHANNEL.answer(seq, rung, given);
         }
@@ -3408,6 +3432,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             || self.launch.undurable()
             || self.jobs.slots_writing();
         if self.stopping.is_none()
+            && self.unheld.is_none()
             && super::idle::exit_due(
                 idle_for,
                 self.jobs.exit_wait(self.worked),

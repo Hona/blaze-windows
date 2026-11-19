@@ -257,19 +257,21 @@ fn sweep(cx: &Cx<'_, '_>, owners: &[DefWithBodyId], gate: Gate) -> Vec<DefWithBo
         "body lints sweep",
         function = phase,
         linted_bodies = owners.len(),
+        asked = tracing::field::Empty,
+        named = tracing::field::Empty,
+        whole = tracing::field::Empty,
     )
     .entered();
     let db = cx.db;
-    db.run_all(Tag::Diagnostics, owners.len(), |db, at| {
-        body_lints_clean(db, owners[at], gate);
+    let swept = crate::kept::sweep(db, (cx.krate.base(), gate), owners, |db, owner| {
+        body_lints_clean(db, owner, gate)
     });
-    // alloc: the bodies a lint is found in, empty for a crate with none
-    let mut found_in = Vec::new();
-    for &owner in owners {
-        if !body_lints_clean(db, owner, gate) {
-            found_in.push(owner);
-        }
-    }
+    sweeping.record("asked", swept.asked);
+    sweeping.record("named", swept.named);
+    sweeping.record("whole", swept.whole);
+    #[cfg(test)]
+    tests::SWEPT.lock().push((db.nonce(), gate.late, swept.asked, swept.whole));
+    let found_in = swept.unclean;
     drop(sweeping);
     tracing::info_span!(
         target: "blaze",

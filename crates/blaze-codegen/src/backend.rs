@@ -238,6 +238,30 @@ pub enum Changed<I, S> {
     Unknown(String),
 }
 
+/// What a resumed closed-world check found of the program's whole-program facts since the
+/// kept walk's view ([`Frontend::resume_world`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WorldChange<I> {
+    /// The closed world is unchanged; no unchanged consumer needs re-verification.
+    Unchanged,
+    /// One or more whole-program facts changed and the updated world is now installed on the
+    /// front end. Only the listed consumers depend on a changed fact and must be re-described
+    /// against the new world (in addition to items named by [`Frontend::changed_since`]).
+    Updated { consumers: Vec<(I, Origin)> },
+}
+
+/// What a patched walk changed in its closed-walk item set, passed to
+/// [`Frontend::finish_world_patch`] to update the world checkpoint and prove that the patched
+/// closed walk still agrees with the resumed world.
+pub struct WorldPatch<'a, I, S> {
+    pub changed_functions: &'a [(I, Origin)],
+    pub entered_functions: &'a [(I, Origin)],
+    pub left_functions: &'a [(I, Origin)],
+    pub changed_statics: &'a [S],
+    pub entered_statics: &'a [S],
+    pub left_statics: &'a [S],
+}
+
 /// The front end of a build: which instances there are and what they refer to.
 pub trait Frontend: Sync {
     /// Proof of the inputs to both rounds of this program's closed-world walk, held
@@ -406,6 +430,17 @@ pub trait Frontend: Sync {
         }
     }
 
+    /// The records this front end made for the walk that belong to the machine's sealed layer,
+    /// pushed to `shared`: the describes of sealed code ([`Self::describe_recorded`] keeps
+    /// them here rather than among its `puts`) and what each place the walk entered sealed code
+    /// reaches. Each is made once and handed over once: a second call gives only what was
+    /// made since. Asked by a build that reads records ([`crate::driver::Build::recording`])
+    /// once its walk has reached everything. Keyed by content alone, so every home of the
+    /// machine, and every machine the layer is installed on, reads them. The default has none.
+    fn walk_records(&self, shared: &mut Vec<crate::driver::Put>) {
+        let _ = shared;
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.
@@ -464,9 +499,28 @@ pub trait Frontend: Sync {
         None
     }
 
-    /// Install the world only if both the plain walk and the closed walk still yield it.
-    fn resume_world(&self, _: &Self::World, _: u64) -> Result<(), &'static str> {
+    /// Update the plain-walk world checkpoint since `since` from `fn_roots` and `static_roots`
+    /// and install the resulting world on the front end. Returns [`WorldChange::Unchanged`]
+    /// when the closed world is unchanged, or [`WorldChange::Updated`] naming only the
+    /// consumer functions that depend on a changed trait-object fact.
+    fn resume_world(
+        &self,
+        _world: &Self::World,
+        _since: u64,
+        _fn_roots: &[(Self::Instance, Origin)],
+        _static_roots: &[Self::Static],
+    ) -> Result<WorldChange<Self::Instance>, &'static str> {
         Err("the front end does not resume a closed world")
+    }
+
+    /// After patching a closed-world walk, update the closed-walk checkpoint with the items
+    /// that changed, entered or left `ALL`, and prove that the patched closed walk still
+    /// agrees with the resumed world. Returning `Err` abandons the patch and runs whole.
+    fn finish_world_patch(
+        &self,
+        _patch: WorldPatch<'_, Self::Instance, Self::Static>,
+    ) -> Result<(), &'static str> {
+        Ok(())
     }
 
     /// A structural walk starts without a world, including after an attempted patch.

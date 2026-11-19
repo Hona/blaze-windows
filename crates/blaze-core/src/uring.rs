@@ -2877,6 +2877,9 @@ impl Driver for Uring {
                     let first = crate::journal::first_on_linux(&dir, &since);
                     self.watch(tag, dir, Some(first)).map(|()| None)
                 }
+                Effect::AlsoJournal { .. } => {
+                    Err(io::Error::new(io::ErrorKind::Unsupported, crate::JOURNAL_PER_DIRECTORY))
+                }
                 // No name to stamp: answered here, with no stamper woken for it.
                 Effect::Stamp { files, .. } if files.is_empty() => {
                     Ok(Some(Done::Stamped(Vec::new())))

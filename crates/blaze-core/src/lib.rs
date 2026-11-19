@@ -291,6 +291,11 @@ impl fmt::Display for Under<'_> {
 /// for up to this from its start, so no prewarm reads a large image from the disk whole.
 pub const PREWARM_MOST: u64 = 256 << 20;
 
+/// What an [`Effect::AlsoJournal`] fails with on a driver whose journal is read per directory
+/// (FSEvents, Linux's fanotify, a thread's watch): one [`Effect::Journal`] a directory there.
+pub const JOURNAL_PER_DIRECTORY: &str =
+    "this system's journal of changes is read per directory: watch each with an Effect::Journal of its own";
+
 /// What an [`Effect::Clone`] whose source is a symbolic link fails with, after the source's
 /// name: a clone is made of a file, never through a link. Every driver says it the same, so an
 /// asker can tell this refusal (the name is something other than the file it made) from a file
@@ -398,7 +403,9 @@ pub enum Effect {
         tag: Tag,
     },
     /// The target of the symbolic link `file`, never followed: completes with [`Done::Read`]
-    /// of the target's bytes as the link holds them (on Windows UTF-8, `\` written `/`). A
+    /// of the target's bytes as the link holds them (on Windows UTF-8 as
+    /// [`platform::path::link_target`] writes it: `/`-separated, an absolute one its daemon
+    /// name). A
     /// `file` that is not a symbolic link, or is not there, fails naming it.
     ReadLink {
         file: FileName,
@@ -706,6 +713,18 @@ pub enum Effect {
         since: Cursor,
         tag: Tag,
     },
+    /// `dir` added to the journal watch `watch` ([`Effect::Journal`], from now: no history),
+    /// so one reader of a volume's journal serves every directory watched on it. Completes
+    /// with [`Done::Flushed`] once every change under `dir` made after the completion is told
+    /// by `watch`'s [`Done::Journaled`] batches, named as that watch names its own directory's.
+    /// Fails for a watch that is no journal or not in flight, a `dir` on another volume, and
+    /// where the system's journal is read per directory (naming why); a watch that ends first
+    /// fails it.
+    AlsoJournal {
+        watch: Tag,
+        dir: FileName,
+        tag: Tag,
+    },
     Unwatch {
         tag: Tag,
     },
@@ -1002,6 +1021,7 @@ impl Effect {
             | Effect::Unlock { tag, .. }
             | Effect::Watch { tag, .. }
             | Effect::Journal { tag, .. }
+            | Effect::AlsoJournal { tag, .. }
             | Effect::Unwatch { tag }
             | Effect::Stamp { tag, .. }
             | Effect::Entries { tag, .. }

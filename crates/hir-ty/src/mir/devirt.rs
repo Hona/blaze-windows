@@ -48,7 +48,7 @@ impl fmt::Debug for DevirtWorld {
 
 /// An object type, as the code generator keys its vtables: the principal trait and its
 /// arguments after Self, regions erased ([`object_key`]).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_query::Value)]
 pub struct ObjectKey {
     pub trait_: TraitId,
     pub args: StoredGenericArgs,

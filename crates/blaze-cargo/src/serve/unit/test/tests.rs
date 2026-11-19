@@ -530,3 +530,118 @@ fn a_failed_sandbox_says_first_how_to_run_outside_then_why() {
     assert!(said.starts_with("to run these tests anyway, set `BLAZE_SANDBOX=off`"), "{said}");
     assert!(said.ends_with("so the run stopped before its other tests: /t/lib could not be started in its sandbox: no user namespaces"), "{said}");
 }
+
+/// Whole-binary Windows (`TestMode::Threads`) runs parse per-test libtest outcomes cleanly
+/// (CRLF included), keep `not_kept` honest, and fail loudly on failed tests, missing result
+/// lines (crash/timeout) or a non-zero exit after all tests printed `ok`.
+#[test]
+fn whole_binary_test_results_parse_pass_fail_ignored_and_crash() {
+    use std::time::Duration;
+    use blaze_api::TestOutcome;
+    use blaze_usercode::test::{Failure, Finished, Outcome, Reported};
+
+    let make = |outcome: Outcome, output: &[u8]| {
+        let done = Finished {
+            binary: 0,
+            test: None,
+            outcome,
+            attempts: 1,
+            output: output.to_vec(),
+            took: Duration::from_millis(42),
+            trace: Trace::Unknown("run whole".to_owned()),
+            executed: Executed::Not("run whole as libtest's threads".to_owned()),
+        };
+        let report = blaze_usercode::test::report("/w/target/debug/deps/hello.exe", &done).unwrap();
+        (done, report)
+    };
+
+    // Single passing test with Windows CRLF.
+    let (done, report) = make(
+        Outcome::Passed,
+        b"\r\nrunning 1 test\r\ntest it_greets ... ok\r\n\r\ntest result: ok. 1 passed; 0 failed; 0 ignored\r\n",
+    );
+    let (results, failed) = super::whole_results(&["it_greets".to_owned()], &done, &report, 0, false);
+    assert!(!failed);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "it_greets");
+    assert_eq!(results[0].outcome, TestOutcome::Passed);
+    assert_eq!(results[0].millis, 42);
+    assert_eq!(
+        results[0].not_kept.as_ref().map(|it| (it.no.as_str(), it.why.as_str())),
+        Some(("whole", "run whole as libtest's threads"))
+    );
+
+    // Mixed pass, fail (with per-test stdout block) and ignored.
+    let mixed = concat!(
+        "\r\nrunning 3 tests\r\n",
+        "test a::ok ... ok\r\n",
+        "test b::skip ... ignored\r\n",
+        "test c::boom ... FAILED\r\n",
+        "\r\nfailures:\r\n\r\n",
+        "---- c::boom stdout ----\r\n",
+        "thread 'c::boom' panicked at src/lib.rs:9: assert failed\r\n",
+        "\r\nfailures:\r\n    c::boom\r\n",
+    );
+    let (done, report) = make(Outcome::Failed(Failure::Code(101)), mixed.as_bytes());
+    let names = vec!["a::ok".to_owned(), "b::skip".to_owned(), "c::boom".to_owned()];
+    let (results, failed) = super::whole_results(&names, &done, &report, 0, false);
+    assert!(failed);
+    assert_eq!(
+        results.iter().map(|it| (it.name.as_str(), it.outcome)).collect::<Vec<_>>(),
+        vec![
+            ("a::ok", TestOutcome::Passed),
+            ("b::skip", TestOutcome::Ignored),
+            ("c::boom", TestOutcome::Failed),
+        ]
+    );
+    assert!(
+        String::from_utf8_lossy(&results[2].output).contains("panicked at src/lib.rs:9"),
+        "{:?}",
+        results[2].output
+    );
+    // Total millis sums to the single binary wall time (42), not 3 * 42.
+    assert_eq!(results.iter().map(|it| it.millis).sum::<u64>(), 42);
+
+    // A requested test missing from output (e.g. process crashed mid-run or name mismatch) fails.
+    let (done, report) = make(Outcome::Passed, b"running 0 tests\r\n");
+    let (results, failed) = super::whole_results(&["missing_test".to_owned()], &done, &report, 0, false);
+    assert!(failed);
+    assert_eq!(results[0].outcome, TestOutcome::Failed);
+
+    // Non-zero exit after all tests printed `ok` (teardown crash) still reports failure.
+    let (done, report) = make(
+        Outcome::Failed(Failure::Code(-1073741819)),
+        b"running 1 test\r\ntest it_greets ... ok\r\n",
+    );
+    let (results, failed) = super::whole_results(&["it_greets".to_owned()], &done, &report, 0, false);
+    assert!(failed);
+    assert!(results.iter().any(|it| it.outcome == TestOutcome::Failed));
+    assert_eq!(report.outcome, Reported::Failed);
+}
+
+/// Test selection arguments (`--exact`, `--skip`, `--ignored`, `--include-ignored`, free names)
+/// parse cleanly and reject unknown flags loudly.
+#[test]
+fn test_filter_handles_selection_arguments_and_refuses_unknown_flags() {
+    use blaze_usercode::test::Ignored;
+    fn sel<'a>(filter: &'a [String], args: &'a [String]) -> crate::serve::work::Selection<'a> {
+        crate::serve::work::Selection { filter, args, all: false, ub: None }
+    }
+    let f = vec!["hello".to_owned()];
+    let a = vec![
+        "--exact".to_owned(),
+        "--skip".to_owned(),
+        "slow".to_owned(),
+        "--skip=flaky".to_owned(),
+        "--ignored".to_owned(),
+        "extra".to_owned(),
+    ];
+    let parsed = super::filter(&sel(&f, &a)).unwrap();
+    assert_eq!(parsed.names, vec!["hello", "extra"]);
+    assert!(parsed.exact);
+    assert_eq!(parsed.skip, vec!["slow", "flaky"]);
+    assert_eq!(parsed.ignored, Ignored::Only);
+
+    let bad = vec!["--nocapture".to_owned()];
+    assert!(super::filter(&sel(&[], &bad)).is_err());
+}

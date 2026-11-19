@@ -1,0 +1,188 @@
+{
+  "about": "Windows real-project corpus exercised by .github/scripts/windows-corpus.ps1 at batch time (backlog B13; modeled on harness/blaze_cli.py --small). GitHub projects use the exact commits pinned in harness/blaze_cli.py. Each project runs lock, check, build, run --version (where applicable), test, noop build, and a one-line edit rebuild under the batch's release blaze.exe.",
+  "schema": 1,
+  "projects": [
+    {
+      "name": "ripgrep",
+      "archetype": "workspace + build script + regex CLI",
+      "source": {
+        "kind": "git",
+        "repo": "BurntSushi/ripgrep",
+        "tag": "15.1.0",
+        "rev": "af60c2de9d85e7f3d81c78601669468cf02dabab"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 25,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "ripgrep 15.1.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "crates/core/main.rs",
+        "find": "fn main() -> ExitCode {",
+        "replace": "fn main() -> ExitCode {\n    eprintln!(\"edited main\");"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "fd",
+      "archetype": "clap CLI + parallel walker + build script",
+      "source": {
+        "kind": "git",
+        "repo": "sharkdp/fd",
+        "tag": "v10.3.0",
+        "rev": "d38148f0aabdd073b4080cde770f679f3197b920"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 25,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "fd 10.3.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/main.rs",
+        "find": "fn main() {",
+        "replace": "fn main() {\n    eprintln!(\"edited main\");"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "bat",
+      "archetype": "CLI + cc C libraries (onig_sys, libgit2-sys)",
+      "source": {
+        "kind": "git",
+        "repo": "sharkdp/bat",
+        "tag": "v0.26.0",
+        "rev": "c734087e1d15fb730d7653389c841fd9e3016556"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 30,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "bat 0.26.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/bin/bat/main.rs",
+        "find": "fn main() {",
+        "replace": "fn main() {\n    eprintln!(\"edited main\");"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "hyperfine",
+      "archetype": "clap CLI + process spawning",
+      "source": {
+        "kind": "git",
+        "repo": "sharkdp/hyperfine",
+        "tag": "v1.19.0",
+        "rev": "12fec42098642a19855ead34c8cb1e0be28c8ead"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 25,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "hyperfine 1.19.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/main.rs",
+        "find": "fn main() {",
+        "replace": "fn main() {\n    eprintln!(\"edited main\");"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "just",
+      "archetype": "clap derive CLI",
+      "source": {
+        "kind": "git",
+        "repo": "casey/just",
+        "tag": "1.43.0",
+        "rev": "b7e7c46495b34e9407982ffbbb25eb2808ec40b7"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 25,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "just 1.43.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/main.rs",
+        "find": "fn main() {",
+        "replace": "fn main() {\n  eprintln!(\"edited main\");"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "axum",
+      "archetype": "tokio + hyper HTTP service workspace",
+      "source": {
+        "kind": "git",
+        "repo": "tokio-rs/axum",
+        "tag": "axum-v0.8.6",
+        "rev": "c1bb9c3e90625fb8de4f9c9750f669cb4edac3df"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 30,
+      "check_args": ["-p", "example-hello-world"],
+      "build_args": ["-p", "example-hello-world"],
+      "run_args": null,
+      "run_expect": "",
+      "test_args": ["-p", "example-testing", "--no-fail-fast"],
+      "edit": {
+        "file": "examples/hello-world/src/main.rs",
+        "find": "<h1>Hello, World!</h1>",
+        "replace": "<h1>Hello, edited world!</h1>"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "tokio-service",
+      "archetype": "tokio IOCP loopback service (inline)",
+      "source": {
+        "kind": "local",
+        "path": "harness/windows-corpus/tokio-service"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 20,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "tokio-service 0.1.0",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/main.rs",
+        "find": "\"tokio-service 0.1.0\"",
+        "replace": "\"tokio-service 0.1.0-edited\"",
+        "run_expect": "tokio-service 0.1.0-edited"
+      },
+      "check_zero_script_reruns": true
+    },
+    {
+      "name": "cc-native",
+      "archetype": "cc build.rs + MSVC static C lib (inline)",
+      "source": {
+        "kind": "local",
+        "path": "harness/windows-corpus/cc-native"
+      },
+      "cores": "1",
+      "step_timeout_minutes": 20,
+      "check_args": [],
+      "build_args": [],
+      "run_args": ["--", "--version"],
+      "run_expect": "cc-native 0.1.0 (sum=42)",
+      "test_args": ["--no-fail-fast"],
+      "edit": {
+        "file": "src/main.rs",
+        "find": "\"cc-native 0.1.0\"",
+        "replace": "\"cc-native 0.1.0-edited\"",
+        "run_expect": "cc-native 0.1.0-edited (sum=42)"
+      },
+      "check_zero_script_reruns": true
+    }
+  ]
+}

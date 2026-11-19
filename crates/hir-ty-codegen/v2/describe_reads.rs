@@ -37,6 +37,9 @@ use hir_ty::body_store::{BodyFacts, Classified, Step};
 use super::*;
 use crate::v2::{ItemHashes, tests::policy};
 
+#[path = "sealed_reach.rs"]
+mod sealed_reach;
+
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Census {
     // One count per visited read, not one count per executed query. Sorted for --nocapture.

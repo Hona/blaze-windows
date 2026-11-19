@@ -263,6 +263,8 @@ fn units() -> Units {
         build_dir: "/w/target".to_owned(),
         finished: "`dev` profile [unoptimized + debuginfo]".to_owned(),
         link_dirs: Vec::new(),
+        script_tools: Vec::new(),
+        script_caches: Vec::new(),
         native: Vec::new(),
     }
 }

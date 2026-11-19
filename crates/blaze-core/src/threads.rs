@@ -1420,6 +1420,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::Timer { .. }
         | Effect::Watch { .. }
         | Effect::Journal { .. }
+        | Effect::AlsoJournal { .. }
         | Effect::Unwatch { .. }
         | Effect::Flush { .. }
         | Effect::Spawn { .. }
@@ -1493,7 +1494,7 @@ fn link_bytes(_: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec
 #[cfg(windows)]
 fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec<u8>> {
     match target.into_os_string().into_string() {
-        Ok(target) => Ok(target.replace('\\', "/").into_bytes()),
+        Ok(target) => Ok(crate::platform::path::link_target(&target).into_bytes()),
         // alloc: an error path.
         Err(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2222,6 +2223,8 @@ impl Driver for Threads {
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
                 }
+                // alloc: an error path.
+                Effect::AlsoJournal { tag, .. } => self.tell(tag, Done::Failed(IoError(crate::JOURNAL_PER_DIRECTORY.to_owned()))),
                 Effect::Unwatch { tag } => {
                     if !self.unwatch(tag) {
                         // alloc: an error path.

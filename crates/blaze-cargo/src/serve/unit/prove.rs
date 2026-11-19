@@ -122,7 +122,9 @@ pub struct Proving {
 pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Proving, Failed> {
     let refuse = |what: String| Failed::Error(ApiError::new(what, Some("prove".to_owned())));
     let units = job.units();
-    let out = Path::new(units.build_dir.as_str()).join("lean");
+    // Lean runs on the host and is given host paths; the driver names files from them
+    // ([`file_name`]).
+    let out = blaze_core::platform::path::host(&units.build_dir).join("lean");
     let members = members_of(job, db)?;
     let functions = functions_of(db, &members, subset);
 
@@ -237,8 +239,11 @@ fn members_of(job: &Job, db: &Db) -> Result<Vec<Member>, Failed> {
         // job built and applied the view's proc macros before posting this; checked again here.
         answer_macros_built(db, krate, &unit.target.name, "prove")?;
         let package = job.package(unit)?;
-        let manifest = Path::new(package.manifest_path.as_str());
-        let Some(dir) = manifest.parent() else {
+        // The manifest's daemon name (`/C:/w/p/Cargo.toml`): its directory and `lean/` in it
+        // are named `/`-separated ([`DaemonPath`]), never through `Path::join`, which writes a
+        // `\` on Windows.
+        use blaze_core::platform::path::DaemonPath;
+        let Some(dir) = DaemonPath::parse(&package.manifest_path).and_then(DaemonPath::parent) else {
             return Err(Failed::Error(ApiError::new(
                 format!(
                     "the manifest `{}` of package `{}` is in no directory, where its proof files' \
@@ -248,17 +253,13 @@ fn members_of(job: &Job, db: &Db) -> Result<Vec<Member>, Failed> {
                 Some("prove".to_owned()),
             )));
         };
-        let proofs = dir.join("lean");
+        let named = dir.join("lean");
+        let proofs = named.to_host().into_path_buf();
         // The view holds the checkout: a package outside it (a path dependency made a member)
         // has no proof files the view can give.
-        let in_view = proofs.to_str().and_then(|path| {
-            let rest = path.strip_prefix(root)?;
-            match rest.strip_prefix('/') {
-                Some(rest) => Some(rest.to_owned()),
-                None if rest.is_empty() => Some(String::new()),
-                None => None,
-            }
-        });
+        let in_view = DaemonPath::parse(root)
+            .and_then(|root| named.as_daemon().strip_prefix(root))
+            .map(str::to_owned);
         // clone: the member owns its name, once per crate
         members.push(Member { krate, name: package.name.clone(), proofs, in_view });
     }
@@ -786,10 +787,11 @@ impl Checking {
     }
 }
 
-/// `path`, absolute, as the driver names a file: under its root, which is the machine's.
+/// `path`, absolute, as the driver names a file: under its root, which is the machine's
+/// ([`crate::serve::file_name`]: a host path or a daemon name).
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
-        format!("{} is no path the daemon's driver can name (it is not UTF-8, or has `..`)", path.display())
+    crate::serve::file_name(path).map_err(|why| {
+        format!("{} is no path the daemon's driver can name: {why:#}", path.display())
     })
 }
 

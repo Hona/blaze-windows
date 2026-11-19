@@ -498,6 +498,192 @@ fn result(report: test::Report, executable: u32, outside: bool, verdict: Option<
 /// A test's verdict as a result says it: the machine's verdict, why it ran ([`ran_why`]), and
 /// what it read that moved after it began ([`blaze_usercode::inputs::Began::moved`]).
 type Judged = (Verdict, Option<blaze_api::RanWhy>, Option<blaze_usercode::inputs::Moved>);
+/// Per-test [`TestResult`]s parsed from a whole-binary `TestMode::Threads` run (Windows, where
+/// there is no fork server): each requested test in `names` gets its own outcome from libtest's
+/// `test <name> ... ok|FAILED|ignored` lines, never claiming a pass was kept/cached, and any
+/// test missing a result line (crash, timeout, launch failure, name mismatch) or any non-zero
+/// process exit fails loudly (`any_failed = true`).
+fn whole_results(
+    names: &[String],
+    done: &Finished,
+    report: &test::Report,
+    executable: u32,
+    outside: bool,
+) -> (Vec<TestResult>, bool) {
+    let text = String::from_utf8_lossy(&report.output);
+    let mut verdicts: blaze_hash::HashMap<&str, TestOutcome, Global> =
+        blaze_hash::HashMap::new_in(Global);
+    let mut failure_out: blaze_hash::HashMap<&str, String, Global> =
+        blaze_hash::HashMap::new_in(Global);
+    let mut current_failure: Option<&str> = None;
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(name) = line.strip_prefix("---- ").and_then(|it| it.strip_suffix(" stdout ----"))
+        {
+            current_failure = Some(name);
+            failure_out.entry(name).or_default();
+            continue;
+        }
+        if line == "failures:" {
+            current_failure = None;
+            continue;
+        }
+        if let Some(name) = current_failure {
+            if let Some(buf) = failure_out.get_mut(name) {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("test ")
+            && let Some((name, tail)) = rest.split_once(" ... ")
+        {
+            let stripped = strip_ansi(tail);
+            let verdict = stripped.trim();
+            let outcome = if verdict == "ok" || verdict.starts_with("ok ") {
+                Some(TestOutcome::Passed)
+            } else if verdict == "FAILED" || verdict.starts_with("FAILED ") {
+                Some(TestOutcome::Failed)
+            } else if verdict == "ignored" || verdict.starts_with("ignored,") {
+                Some(TestOutcome::Ignored)
+            } else {
+                None
+            };
+            if let Some(outcome) = outcome {
+                verdicts.insert(name, outcome);
+            }
+        }
+    }
+    if names.is_empty() {
+        let failed = done.outcome != Outcome::Passed;
+        let it = TestResult {
+            ran: None,
+            binary: report.binary.clone(),
+            executable,
+            outside,
+            name: report.name.clone(),
+            cached: None,
+            not_kept: None,
+            outcome: if failed { TestOutcome::Failed } else { TestOutcome::Passed },
+            output: report.output.clone(),
+            millis: report.millis,
+        };
+        return (vec![it], failed);
+    }
+    let not_kept_reason = || {
+        if outside {
+            blaze_api::NotKept { no: "outside".to_owned(), why: "not sandboxed".to_owned() }
+        } else {
+            blaze_api::NotKept {
+                no: "whole".to_owned(),
+                why: "run whole as libtest's threads".to_owned(),
+            }
+        }
+    };
+    let mut results = Vec::with_capacity(names.len());
+    let mut any_failed = done.outcome != Outcome::Passed;
+    for (idx, name) in names.iter().enumerate() {
+        let millis = if idx == 0 { report.millis } else { 0 };
+        match verdicts.get(name.as_str()).copied() {
+            Some(TestOutcome::Passed) => results.push(TestResult {
+                ran: None,
+                binary: report.binary.clone(),
+                executable,
+                outside,
+                name: name.clone(),
+                cached: None,
+                not_kept: Some(not_kept_reason()),
+                outcome: TestOutcome::Passed,
+                output: Vec::new(),
+                millis,
+            }),
+            Some(TestOutcome::Ignored) => results.push(TestResult {
+                ran: None,
+                binary: report.binary.clone(),
+                executable,
+                outside,
+                name: name.clone(),
+                cached: None,
+                not_kept: None,
+                outcome: TestOutcome::Ignored,
+                output: Vec::new(),
+                millis,
+            }),
+            Some(TestOutcome::Failed) => {
+                any_failed = true;
+                let output = failure_out
+                    .get(name.as_str())
+                    .filter(|it| !it.is_empty())
+                    .map(|it| it.as_bytes().to_vec())
+                    .unwrap_or_else(|| report.output.clone());
+                results.push(TestResult {
+                    ran: None,
+                    binary: report.binary.clone(),
+                    executable,
+                    outside,
+                    name: name.clone(),
+                    cached: None,
+                    not_kept: None,
+                    outcome: TestOutcome::Failed,
+                    output,
+                    millis,
+                });
+            }
+            None => {
+                any_failed = true;
+                results.push(TestResult {
+                    ran: None,
+                    binary: report.binary.clone(),
+                    executable,
+                    outside,
+                    name: name.clone(),
+                    cached: None,
+                    not_kept: None,
+                    outcome: TestOutcome::Failed,
+                    output: report.output.clone(),
+                    millis,
+                });
+            }
+        }
+    }
+    // If the binary exited non-zero after every test line said ok (for example a crash or
+    // timeout during teardown), still emit a failed result carrying the binary's output.
+    if done.outcome != Outcome::Passed && !results.iter().any(|it| it.outcome == TestOutcome::Failed)
+    {
+        results.push(TestResult {
+            ran: None,
+            binary: report.binary.clone(),
+            executable,
+            outside,
+            name: report.binary.clone(),
+            cached: None,
+            not_kept: None,
+            outcome: TestOutcome::Failed,
+            output: report.output.clone(),
+            millis: 0,
+        });
+    }
+    (results, any_failed)
+}
+
+/// Strips ANSI CSI escape sequences (`\x1b[...m`) from a single libtest verdict token.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
 
 /// Why a run that passed is not kept, as a result says it: `None` for a run kept, and for a
 /// failure (a failure runs every time; its outcome says so). A pass not kept for a read that
@@ -959,6 +1145,10 @@ pub(crate) struct TestRun {
     /// By the queue's index of a binary: the suite it is of. A suite gives the queue one
     /// binary, or two when some of its tests run outside the sandbox.
     suite_of: Vec<u32>,
+    /// By the queue's index of a binary: the exact test names passed to it when it was
+    /// scheduled as a whole-binary `TestMode::Threads` run (Windows), or `None` for per-test
+    /// `TestMode::Process` runs.
+    whole_jobs: Vec<Option<Vec<String>>>,
     queue: Option<Queue>,
     ok: bool,
     /// What keeping how its tests ran put ([`Runs::take_puts`]).
@@ -992,6 +1182,7 @@ pub(crate) fn start(
         all,
         suites,
         suite_of: Vec::new(),
+        whole_jobs: Vec::new(),
         queue: None,
         ok: true,
         puts: RunPuts::default(),
@@ -1270,6 +1461,18 @@ impl TestRun {
             };
             let Some(report) = test::report(&suite.name, &done) else { continue };
             let Some(name) = done.test.as_deref() else {
+                if let Some(names) = self.whole_jobs.get(done.binary).and_then(|it| it.as_deref()) {
+                    let (results, any_failed) =
+                        whole_results(names, &done, &report, executable, outside);
+                    if any_failed {
+                        self.ok = false;
+                    }
+                    for it in results {
+                        out.push(Response::TestResult(it));
+                    }
+                    suite.give_back(&job.shared.selectors);
+                    continue;
+                }
                 self.ok = false;
                 out.push(Response::TestResult(result(report, executable, outside, None)));
                 // alloc: error path
@@ -1325,6 +1528,7 @@ impl Runs<Real> for TestRun {
     ) -> Option<bool> {
         let mut binaries = Vec::with_capacity(self.suites.len());
         self.suite_of.clear();
+        self.whole_jobs.clear();
         for refused in std::mem::take(&mut self.refused) {
             self.ok = false;
             let what = match refused.at {
@@ -1392,7 +1596,7 @@ impl Runs<Real> for TestRun {
                         binary.jobs.push(TestJob {
                             // clone: the queue owns its jobs' names, once per test run
                             name: tests[n].name.clone(),
-                            ignore: false,
+                            ignore: tests[n].ignore,
                             expected: Duration::from_micros(last.unwrap_or(0)),
                             timeout: TIMEOUT,
                             retries: 0,
@@ -1433,8 +1637,11 @@ impl Runs<Real> for TestRun {
                 match runs {
                     Ok(runs) => {
                         for run in runs {
+                            let whole = matches!(run.mode, TestMode::Threads { .. })
+                                .then(|| run.jobs.iter().map(|it| it.name.clone()).collect());
                             binaries.push(run);
                             self.suite_of.push(at);
+                            self.whole_jobs.push(whole);
                         }
                     }
                     Err(what) => {

@@ -797,11 +797,32 @@ registry can be named in:
 unsandboxed-build-scripts = ["libghostty-vt-sys", "flecs_ecs_sys"]   # by package name
 build-script-link-dirs = ["/opt/vendor/lib", "${OPENSSL_DIR}/lib"]   # rustc-link-search may name
 build-script-env = ["OPENSSL_DIR"]                                   # a ${NAME} above must be listed here
+build-script-tools = ["nasm"]                                        # programs scripts run, by name
+build-script-caches = ["GHOSTTY_VT_CACHE_DIR"]                       # directories scripts keep, by variable
 ```
 
 An entry that starts `${NAME}` is under the variable's value in the environment the script runs
-in, for a library whose place differs by machine; `build-script-env` must list `NAME`, and a
-script run where it is unset, or is no absolute path, fails naming it.
+in, for a library whose place differs by machine; `build-script-env` or `build-script-caches`
+must list `NAME`, and a script run where it is unset, or is no absolute path, fails naming it.
+
+What a fresh clone's scripts need of the machine is the project's to say in these two keys, so
+no one sets `BLAZE_SCRIPT_READ` or `BLAZE_SCRIPT_CACHES` to build it ([below](#a-build-scripts-own-writable-state)).
+Each names a thing, never a place, so a checkout can't grant its scripts a file it chose:
+
+- `build-script-tools`: programs by name (no directory). Each is the file the command's own
+  `PATH` finds first (on Windows `.com`, `.exe`, `.bat`, then `.cmd`; a Scoop shim's program
+  too), which every build script may read and run and whose bytes are in its run's key. Only
+  that file: a tool that needs files beside it is given them with `BLAZE_SCRIPT_READ`. A name
+  `PATH` lacks fails the run, naming it.
+- `build-script-caches`: variables by name, as a pinned input's `env` may be named. Every build
+  script is given each, naming `<BLAZE_HOME>/script-caches/<checkout>/<VARIABLE>`, a directory
+  of this checkout alone (`<checkout>` a hash of its root) that it may read and write and that
+  is kept across runs; where the caller's `BLAZE_SCRIPT_CACHES` names the variable, its
+  directory is the one. A cache's contents are in no key, as the caller's are.
+
+A cache fills only from what a script can reach in its sandbox, which has no network: a script
+that downloads on a cold machine (rune-desktop's terminal fetches Zig to build Ghostty) needs
+what it downloads as a [pinned native input](#pinned-native-inputs) instead.
 
 The table may also have `unsandboxed-proc-macros`, `build-script-env` and `wasi-build-scripts`,
 each a list of names, which v1 read: v2 checks that each is a list of strings and does nothing
@@ -1559,7 +1580,10 @@ arrived and holds the request until the watch has told every record before it
 heard as it is first written and as it is closed, not at each write. A checkout on a network
 share, on a volume with no USN journal (FAT, exFAT) or on one whose journal was never made
 can't be watched: each request on it fails, naming the checkout and why (the last says how an
-administrator makes the journal).
+administrator makes the journal). Directories outside the checkout that a build reads (the
+Windows SDK, the toolchain) are watched through the same journals, one reader per volume
+(`crates/blaze-vfs/src/outside.rs`), so a file there is vouched for and not stamped again at
+each request; a lost or reset journal confirms every directory on its volume again.
 
 `blaze clean` is normally not needed: the daemon collects what is unused on its own, and works
 harder the fuller the disk gets, so free space stays above its floor without anyone asking
@@ -1676,6 +1700,7 @@ so), and 1 otherwise. The same tree gives the same output, byte for byte.
 | `state` | the daemon image and the profile history read; the state's size against the disk's free bytes; directories of layouts this blaze no longer reads (`v2.store-format-*`, `runner-*`), with their sizes |
 | `toolchain` | the pinned Rust and its library sources; the machine's shared directory |
 | `project` | directories of 1 GiB or more with no `CACHEDIR.TAG` (not `target/`, `.git/`); a file system whose timestamps have no sub-second part |
+| `machine` | Windows only (`doctor/machine.rs`): a commit limit under 32 GiB; whether blaze's root and the workspace are on a trusted Dev Drive (else each output is written whole and scanned); each directory blaze writes that Defender scans, with the `Add-MpPreference` line that excludes it |
 | `tools` | the sandbox build scripts and proc macros run in |
 
 Each check is `ok`, `absent` or `unused` (a part a daemon starts empty), `warn` (blaze works,
@@ -1802,6 +1827,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
 | `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
 | `BLAZE_DAEMON_EXIT_UNHELD` | the daemon stops itself once no client or launcher connection has been open at its socket for a grace: `on` for 20 s, or a whole number of seconds above 0. It never stops while one is open, a connection inside the grace ends the countdown, and it stops as `blaze stop` does (writing its image), logging why and ending with exit status 78 (`UNHELD`). For test runs and scripts whose clients may be killed before they could stop it. A daemon setting: a command that sets another value than the running daemon's is refused ([The daemon](#the-daemon)) | unset: it exits only as below |
+| `BLAZE_NTFS_EDIT` | Windows: how an edited output on NTFS is placed. `auto`: a PE image of 16 MiB or less is a new sparse file renamed over the old (no exclusive open, so no wait for Defender's scan), a larger image and any other file (a PDB) is patched in place; `rename` renames every PE image, whatever its size; `rename-all` renames every output; `patch` patches every output in place; a size (`8mib`, `512kib`, bytes; `0` is `patch`) is `auto` with that limit. A daemon setting, as `BLAZE_CORES` | `auto` |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code
@@ -2103,14 +2129,21 @@ A read grant remains read-only;
 a link-search permission is not a filesystem grant. Neither the script nor a child gets
 the invoking user's unrestricted filesystem access. The sandbox-off path is not cached.
 
+Each path in that key, and in what the run printed, is written against the checkout's roots
+(`blaze_usercode::roots`), so another checkout of the project at another path or drive finds
+the same result and gets its output with its own paths in it
+([platforms.md](platforms.md#v2-build-scripts-on-windows)).
+
 ### A build script's own writable state
 
 A script writes its `OUT_DIR`, whose files are its run's and kept under its key, and a
 temporary directory of its run alone. Nothing else it writes outlives the run: on Windows its
 `LOCALAPPDATA` is the run's own AppContainer profile, made fresh and removed after it.
 
-A download cache, which a script fills once and reads in later runs, is declared by whoever
-runs blaze, never by the project: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
+A cache, which a script fills once and reads in later runs, is declared by the project
+(`build-script-caches`, a directory of blaze's home of that checkout alone,
+[above](#build-scripts-and-proc-macros-run-in-a-sandbox)) or by whoever runs blaze, who also
+says where: `BLAZE_SCRIPT_CACHES` is a list of the system's paths whose
 entries are each `VARIABLE=DIRECTORY`, such as
 `GHOSTTY_VT_CACHE_DIR=C:\Users\me\AppData\Local\seer\ghostty-vt` for rune-desktop's terminal.
 Every build script is told each variable, naming its directory, which blaze makes if missing

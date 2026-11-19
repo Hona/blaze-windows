@@ -47,6 +47,8 @@ static PAGE: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 #[cfg(windows)]
 pub struct AddressCapacity {
     pub physical: u64,
+    /// The system's commit limit: physical memory and every page file at its present size.
+    pub commit_limit: u64,
     pub available_commit: u64,
     pub available_address: u64,
 }
@@ -61,6 +63,7 @@ pub fn address_capacity() -> io::Result<AddressCapacity> {
     }
     Ok(AddressCapacity {
         physical: status.ullTotalPhys,
+        commit_limit: status.ullTotalPageFile,
         available_commit: status.ullAvailPageFile,
         available_address: status.ullAvailVirtual,
     })

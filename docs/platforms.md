@@ -1,7 +1,7 @@
 ---
 status: record
-summary: The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
-date: 2026-10-30
+summary: The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all; and v2 on Windows x86-64 MSVC, from the Windows port's runs.
+date: 2026-11-19
 ---
 # Platforms
 
@@ -9,8 +9,8 @@ This is the state of each platform blaze v1 was run on, as of its integration in
 2026-10-30. v1's link (rustc's link line with blaze's object first), its splice
 (`crates/blaze-splice`), `blaze-engine weaken`, `blaze-live` as described here and
 `BLAZE_STD_FROM` are gone; v2 links with its own linker (`crates/blaze-link`,
-[v2/plan/lanes/link.md](v2/plan.md)), and no v2 build has been run on any platform
-in CI yet. The
+[v2/plan/lanes/link.md](v2/plan.md)). v2 on Windows has its own sections below, ending with
+[its state on `windows/int`](#v2-on-windows-state-on-windowsint-2026-11-19). The
 numbers are from GitHub Actions run 39057174862 on commit 888e87df74, the last recorded run
 that covered all four native platforms under both backends, unless a line says otherwise.
 The report behind it is reports/PLAT-ABI2.md. The table of what is
@@ -235,11 +235,21 @@ capability does not gain access. Granting a directory includes its contents. The
 can write its `OUT_DIR` and temporary directory, not the inputs.
 
 Windows redirects `LOCALAPPDATA` to the AppContainer profile. Each run gets a new profile
-that is deleted when it ends, not a persistent folder shared by packages. To consume an
-existing machine cache, point the script's own override at the cached input and grant it
-read access. For example, `GHOSTTY_VT_LIB` can name the prebuilt Ghostty archive. Its
-parent must also be allowed as a `build-script-link-dirs` entry. This does not grant
-write access to the user's cache or let the script download a missing archive.
+that is deleted when it ends, not a persistent folder shared by packages. A download cache
+a script fills once and reads later is declared with `BLAZE_SCRIPT_CACHES`
+([cargo.md](cargo.md#a-build-scripts-own-writable-state)); for example
+`GHOSTTY_VT_CACHE_DIR=C:\Users\me\AppData\Local\seer\ghostty-vt`. The script reads and
+writes that directory through a capability of its own. To use a prebuilt archive instead,
+point the script's own override at it (`GHOSTTY_VT_LIB`), grant it read access, and allow
+its parent as a `build-script-link-dirs` entry.
+
+A run's key holds its paths against the checkout's roots (the package, `OUT_DIR`, the
+target directory, the workspace), as on Linux and macOS: two checkouts of one project at
+different paths, on different drives too, share build-script results. The roots are host
+paths (`C:\Users\me\w`); a drive's or share's own root is never one. A result whose output
+names a root is restored with the other checkout's path. A read outside the roots ties the
+result to its checkout, except a read under `C:\Windows` or `Program Files` (the C
+compiler's headers and the SDK).
 
 Windows has two ways to reuse a script. Blaze can prove that it prints constants or
 depends only on known Cargo variables. Otherwise a successful AppContainer run is keyed
@@ -260,6 +270,27 @@ repository's `.git` directory (including its `worktrees` subdirectory). Blaze do
 treat paths supplied by a checkout's `.git` file or Cargo `[env]` as permission. All
 build scripts of that invocation can read the inputs you list; do not list a profile,
 a credentials directory or a repository whose history you cannot share with them.
+
+### v2 on Windows: state on `windows/int` (2026-11-19)
+
+The port builds on Windows 11 with MSVC and the Windows SDK, `x86_64-pc-windows-msvc` only.
+"Run" below names a recorded run; "coded" means it compiles and has its unit tests but no
+recorded run on Windows yet.
+
+| Area | State |
+|---|---|
+| A hello and a crate with serde derive, serde_json, anyhow and windows-sys | Run: `check`, `build`, `run`, `test`, a no-op, a one-line edit and the edited run pass three times at `890978b38` on the fork's Windows runners; the dependency crate runs its 7 build scripts on `check` and `test` and none on the other steps. |
+| blaze's unit suites (cargo, CAS, core, link, mem, usercode, VFS) | Run at `890978b38`: all pass except one link test that fails the same way on the upstream base on Linux and macOS. |
+| `blaze test` | A test binary run whole has its per-test results read from libtest's output, and `--ignored` reaches it. A pass is not kept: what a test reads is not traced on Windows. |
+| Paths | The daemon names a path `/C:/a` or `/UNC/server/share/a`; it converts to the system's `C:\a` at one boundary (`blaze_core::platform::path`), whatever the crate. |
+| Watching | The checkout through the volume's USN journal (above). Coded: directories outside the checkout (the SDK, the toolchain) through one shared journal reader per volume, so an unchanged SDK file is not stamped again at each request. |
+| Placing an edited executable | Coded: an image of 16 MiB or less is written as a new sparse file and renamed over the old one, which avoids the wait for Defender's scan that an exclusive open costs (median 0.9 to 1.6 s measured); larger images and other files (PDBs) are patched in place. `BLAZE_NTFS_EDIT` chooses ([cargo.md](cargo.md)). |
+| `cdylib` members | Coded: a DLL and a same-named binary share no output path, and the DLL's import library (`foo.dll.lib`) is a recorded output placed beside it. |
+| Build scripts | AppContainer, reused under Cargo's rerun rules, shared across checkouts (above). |
+| `blaze doctor` | Coded: a machine section names the commit limit, whether blaze's home and the workspace are on a trusted Dev Drive, and what Defender scans, each with its fix; it changes nothing. |
+| Install | Coded: `install.ps1` and a Windows release archive ([install.md](install.md)); the release job has not run. |
+| Real projects | A pinned corpus (ripgrep, fd, bat, hyperfine, just, axum, a tokio service, a `cc` crate) is wired into the Windows batch gate and has not run. rune's workspace: `check` passes; a full build and a renderer snapshot are not recorded. |
+| Not done | Tracing a build script's reads (Windows reuses runs by Cargo's rules instead), CFG tables, debug types and locals, Windows on ARM64 and the GNU targets. |
 
 ## macOS arm64
 

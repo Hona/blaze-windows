@@ -283,6 +283,7 @@ mod native {
     /// before anything was written and before anything was asked of the daemon that the
     /// engine would not ask again.
     fn run(decided: Decided, words: &[OsString], started: Instant, main_ns: i64) -> Result<ExitCode, String> {
+        let run_ns = kernel::mono_ns();
         let Decided { asked, home, cwd, found } = decided;
         let Some(asked) = asked else {
             let this = std::env::current_exe()
@@ -316,6 +317,7 @@ mod native {
             width,
         };
         let request = request::request(&asked, sent);
+        let made_ns = kernel::mono_ns();
 
         // What an answer shows is the screen's (docs/terminal.md), as the engine shows it: what
         // stderr is, found before the daemon is talked to.
@@ -343,9 +345,11 @@ mod native {
             terminal: detected,
             size: blaze_thin::answer::on_disk,
         };
+        let shown_ns = kernel::mono_ns();
 
         let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
         let engine = Engine::beside()?;
+        let engine_ns = kernel::mono_ns();
         let spoken = talk::Spoken {
             asked: &asked,
             request: &request,
@@ -357,6 +361,10 @@ mod native {
         let mut timings = Timings::default();
         let started_ns = kernel::started_ns()?;
         timings.span(talk::EXEC_TO_MAIN, started_ns, main_ns);
+        timings.span(talk::ROUTE_AND_PIN, main_ns, run_ns);
+        timings.span(talk::REQUEST_MADE, run_ns, made_ns);
+        timings.span(talk::SCREEN_FOUND, made_ns, shown_ns);
+        timings.span(talk::ENGINE_FOUND, shown_ns, engine_ns);
         // Nothing changed since the daemon's last answer to this request: its slot says so,
         // and the client answers with no daemon asked (`solo`); anything else is the daemon's.
         #[cfg(unix)]
@@ -533,10 +541,34 @@ mod native {
         }
         rows.send(exec_ns);
         let mut command = std::process::Command::new(&exec.program);
-        command
-            .args(&exec.args)
-            .envs(exec.env.iter().map(|(name, value)| (name, value)))
-            .current_dir(&exec.cwd);
+        command.args(&exec.args).current_dir(&exec.cwd);
+        let dylib = match std::env::consts::OS {
+            "windows" => "PATH",
+            "macos" | "ios" | "tvos" | "watchos" | "visionos" => "DYLD_FALLBACK_LIBRARY_PATH",
+            "aix" => "LIBPATH",
+            _ => "LD_LIBRARY_PATH",
+        };
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        for (name, value) in &exec.env {
+            let is_dylib = if cfg!(windows) {
+                name.eq_ignore_ascii_case(dylib)
+            } else {
+                name == dylib
+            };
+            if is_dylib
+                && let Some(existing) = std::env::var_os(name)
+                && !existing.is_empty()
+                && !existing.as_encoded_bytes().starts_with(value.as_bytes())
+            {
+                let mut joined = OsString::with_capacity(value.len() + sep.len() + existing.len());
+                joined.push(value);
+                joined.push(sep);
+                joined.push(existing);
+                command.env(name, joined);
+            } else {
+                command.env(name, value);
+            }
+        }
         // This process becomes the program, which ends the command as it ends.
         #[cfg(windows)]
         return Ok(sys::run(&mut command).unwrap_or_else(|why| error(&why.to_string())));

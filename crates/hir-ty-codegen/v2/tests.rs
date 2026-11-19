@@ -4218,7 +4218,7 @@ fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
 /// closure closes to a different world.
 #[test]
 fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
-    use blaze_codegen::backend::Frontend as _;
+    use blaze_codegen::backend::{Frontend as _, WorldChange};
     let source = "pub struct K;\npub fn roots(x: u32) -> u32 { dep::resize::<K>(x, &|y| y * 3) }\n";
     let mut fixture = fixture::db(DYN_FN_BUILT_IN);
     let file = fixture.file_at("/main.rs").file_id(fixture.db());
@@ -4258,7 +4258,7 @@ fn a_dyn_checkpoint_distinguishes_a_literal_from_a_new_vtable() {
         let f = HirFrontend::new(Databases::new(db), HashSource::ById(ById), BuildTime::default())
             .with_policy(&policy);
         f.with(|db| f.devirt.makes(db, super::RootKind::Executable, krate)).unwrap();
-        assert!(f.resume_world(&kept, 0).is_err());
+        assert!(f.resume_world(&kept, 0, &[], &[]).is_err());
         assert!(f.devirt.world().is_none());
     }
     let (_, after_literal) = walk(fixture.db());

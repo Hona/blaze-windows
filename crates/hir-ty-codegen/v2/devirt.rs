@@ -28,8 +28,13 @@ use std::{
 
 use base_db::{Crate, Db};
 use blaze_codegen::{
-    CodegenError, InstanceKey, Owner, backend::FrontRef, plan::Origin, slot::Slot,
+    CodegenError, InstanceKey, Owner,
+    backend::{FrontRef, WorldChange, WorldPatch},
+    driver::support::{self, ALL},
+    plan::Origin,
+    slot::Slot,
 };
+use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey};
 use hir_def::{CallableDefId, HasModule, ItemContainerId, TraitId, signatures::TraitSignature};
@@ -69,6 +74,10 @@ pub(crate) struct Facts {
 }
 
 impl Facts {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.vtables.is_empty() && self.upcasts.is_empty() && self.foreign.is_empty()
+    }
+
     /// A vtable request of the IR ([`crate::fragment::DataRequest::Vtable`]), whose trait
     /// reference holds Self first.
     pub(crate) fn vtable(&mut self, ty: &StoredTy, trait_: TraitId, args: &StoredGenericArgs) {
@@ -211,43 +220,486 @@ pub(crate) fn code(code: blaze_items::CodeHash, read: &[[u8; 32]]) -> blaze_item
     blaze_items::CodeHash(hasher.finish())
 }
 
-/// What a build's front end knows of the program it walks, for its world: two records, each
-/// written once ([`Slot`]) and read with no lock, as every describe of the walk reads the
-/// world on every core at once. What the walk reached is the walk's own, handed to
-/// [`State::closed`] whole and in the walk's order when it ends: nothing here grows.
-#[derive(Default)]
+/// What a build's front end knows of the program it walks, for its world: written once
+/// ([`Slot`]) and read with no lock, as every describe of the walk reads the world on every
+/// core at once. What the walk reached is the walk's own, handed to [`State::closed`] whole
+/// and in the walk's order when it ends.
 pub(crate) struct State {
     /// What the unit makes, from its roots ([`HirFrontend::roots`]): unset before.
     makes: Slot<(RootKind, Crate)>,
     /// The world the program's bodies are built against, held from the end of its first walk
     /// ([`State::closed`]): unset before, and for a program that has none.
     held: Slot<Held>,
-    plain: Slot<Arc<Members>>,
-    closed_members: Slot<Arc<Members>>,
-    resumed: Slot<Checkpoint>,
+    plain: Slot<Arc<WorldSet>>,
+    closed_members: Slot<Arc<WorldSet>>,
+    closed_consumers: Slot<Arc<ConsumerIndex>>,
+    /// Lock-free world handle installed by [`Self::resume`] for worker threads reading
+    /// [`Self::world`].
+    resumed_world: Slot<Held>,
+    /// Mutable working checkpoint held only between [`Self::resume`], [`Self::finish_patch`]
+    /// and [`Self::checkpoint`] on the single build patching a kept walk.
+    resumed_state: Lock<Option<ResumedState>>,
     using_resumed: AtomicBool,
 }
 
-/// The exact inputs of the two successful closures, scoped to the kept walk's database.
+impl Default for State {
+    fn default() -> Self {
+        State {
+            makes: Slot::default(),
+            held: Slot::default(),
+            plain: Slot::default(),
+            closed_members: Slot::default(),
+            closed_consumers: Slot::default(),
+            resumed_world: Slot::default(),
+            resumed_state: Lock::new("codegen.devirt.resumed", None),
+            using_resumed: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The exact inputs of the two successful closures, plus the per-object consumer index and
+/// incremental plain-walk reachability graph, scoped to the kept walk's database.
 #[derive(Clone)]
 pub struct Checkpoint {
     makes: (RootKind, Crate),
     program: Box<str>,
     held: Held,
-    plain: Arc<Members>,
-    closed: Arc<Members>,
+    plain: Arc<WorldSet>,
+    plain_graph: Option<Arc<PlainGraph>>,
+    closed: Arc<WorldSet>,
+    consumers: Arc<ConsumerIndex>,
 }
 
-#[derive(PartialEq, Eq, Debug)]
-struct Members {
+#[cfg(test)]
+impl Checkpoint {
+    pub(super) fn closed_functions_for_test(&self) -> Vec<(HirInstance, Origin)> {
+        self.closed.functions.keys().cloned().collect()
+    }
+}
+
+struct ResumedState {
+    checkpoint: Checkpoint,
+    world_changed: bool,
+    /// Functions in `kept.closed` whose `contribution` query changed since the kept view.
+    changed_closed_fns: Vec<(HirInstance, Origin)>,
+    /// Statics in `kept.closed` whose `static_contribution` query changed since the kept view.
+    changed_closed_statics: Vec<HirStatic>,
+    /// Consumers asked to re-verify because an object they read changed.
+    reverified_consumers: Vec<(HirInstance, Origin)>,
+}
+
+/// One round's reached items and an index of only those that contribute trait-object facts or
+/// consume the world: updating a few items and recomputing the world costs the contributors,
+/// not the whole program.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct WorldSet {
     functions: HashMap<(HirInstance, Origin), Arc<Contribution>>,
     statics: HashMap<HirStatic, Arc<StaticContribution>>,
+    fn_contributors: HashMap<(HirInstance, Origin), Arc<Contribution>>,
+    static_contributors: HashMap<HirStatic, Arc<StaticContribution>>,
+    site_count: usize,
+}
+
+impl WorldSet {
+    fn from_maps(
+        functions: HashMap<(HirInstance, Origin), Arc<Contribution>>,
+        statics: HashMap<HirStatic, Arc<StaticContribution>>,
+    ) -> WorldSet {
+        let mut fn_contributors = HashMap::new();
+        let mut site_count = 0;
+        for (asked, c) in &functions {
+            if c.sites {
+                site_count += 1;
+            }
+            if c.contributes() {
+                fn_contributors.insert(asked.clone(), c.clone());
+            }
+        }
+        let mut static_contributors = HashMap::new();
+        for (s, c) in &statics {
+            if c.contributes() {
+                static_contributors.insert(*s, c.clone());
+            }
+        }
+        WorldSet { functions, statics, fn_contributors, static_contributors, site_count }
+    }
+
+    /// Inserts or replaces a function's contribution. Returns `true` if any world-relevant
+    /// input (`sites`, `facts`, `loader`, `foreign`, `objects`) changed.
+    fn insert_fn(&mut self, asked: (HirInstance, Origin), now: Arc<Contribution>) -> bool {
+        let was = self.functions.insert(asked.clone(), now.clone());
+        let had_sites = was.as_ref().is_some_and(|it| it.sites);
+        if had_sites && !now.sites {
+            self.site_count = self.site_count.saturating_sub(1);
+        } else if !had_sites && now.sites {
+            self.site_count += 1;
+        }
+        let dirty = match &was {
+            Some(old) => !old.same_world_inputs(&now),
+            None => now.sites || now.contributes(),
+        };
+        if now.contributes() {
+            self.fn_contributors.insert(asked, now);
+        } else {
+            self.fn_contributors.remove(&asked);
+        }
+        dirty
+    }
+
+    fn remove_fn(&mut self, asked: &(HirInstance, Origin)) -> bool {
+        let Some(old) = self.functions.remove(asked) else {
+            return false;
+        };
+        if old.sites {
+            self.site_count = self.site_count.saturating_sub(1);
+        }
+        self.fn_contributors.remove(asked);
+        old.sites || old.contributes()
+    }
+
+    fn insert_static(&mut self, s: HirStatic, now: Arc<StaticContribution>) -> bool {
+        let was = self.statics.insert(s, now.clone());
+        let dirty = match &was {
+            Some(old) => !old.same_world_inputs(&now),
+            None => now.contributes(),
+        };
+        if now.contributes() {
+            self.static_contributors.insert(s, now);
+        } else {
+            self.static_contributors.remove(&s);
+        }
+        dirty
+    }
+
+    fn remove_static(&mut self, s: &HirStatic) -> bool {
+        let Some(old) = self.statics.remove(s) else {
+            return false;
+        };
+        self.static_contributors.remove(s);
+        old.contributes()
+    }
+}
+
+/// Which closed-walk consumer functions read each [`ObjectKey`] (including `ABSENT` lookups),
+/// so a change to one trait object re-verifies only the consumers that read it.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ConsumerIndex {
+    by_fn: HashMap<(HirInstance, Origin), Vec<ObjectKey>>,
+    by_object: HashMap<ObjectKey, Vec<(HirInstance, Origin)>>,
+}
+
+impl ConsumerIndex {
+    fn set(&mut self, asked: (HirInstance, Origin), keys: Vec<ObjectKey>) {
+        if let Some(old) = self.by_fn.get(&asked)
+            && *old == keys
+        {
+            return;
+        }
+        self.remove(&asked);
+        if keys.is_empty() {
+            return;
+        }
+        for &key in &keys {
+            self.by_object.entry(key).or_default().push(asked.clone());
+        }
+        self.by_fn.insert(asked, keys);
+    }
+
+    fn remove(&mut self, asked: &(HirInstance, Origin)) {
+        let Some(old) = self.by_fn.remove(asked) else {
+            return;
+        };
+        for key in old {
+            if let Some(list) = self.by_object.get_mut(&key) {
+                list.retain(|it| it != asked);
+                if list.is_empty() {
+                    self.by_object.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn consumers_of(
+        &self,
+        changed: &blaze_hash::HashSet<ObjectKey, Global>,
+    ) -> Vec<(HirInstance, Origin)> {
+        let mut out = Vec::new();
+        let mut seen = blaze_hash::HashSet::new_in(Global);
+        for key in changed {
+            if let Some(list) = self.by_object.get(key) {
+                for asked in list {
+                    if seen.insert(asked.clone()) {
+                        out.push(asked.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone)]
+enum PlainNode {
+    Function((HirInstance, Origin)),
+    Static(HirStatic),
+}
+
+/// Incremental DRed reachability graph for the plain walk (Round 1, `world = None`), built
+/// lazily on the first edit that changes plain edges and reused across subsequent edits.
+#[derive(Clone)]
+struct PlainGraph {
+    graph: support::Graph,
+    nodes: Vec<Option<PlainNode>>,
+    functions: HashMap<(HirInstance, Origin), u32>,
+    statics: HashMap<HirStatic, u32>,
+}
+
+/// Cap on newly reached plain-walk items discovered inside one incremental `resume_world`
+/// update (rule 18): a runaway monomorphization edit falls back to the whole walk and its
+/// full recursion-limit check.
+const PLAIN_GROWTH_CAP: usize = 4096;
+
+impl PlainGraph {
+    fn place(&mut self) -> u32 {
+        let item = self.graph.add();
+        if self.nodes.len() <= item as usize {
+            self.nodes.resize_with(item as usize + 1, || None);
+        }
+        item
+    }
+
+    fn build(
+        plain: &WorldSet,
+        fn_roots: &[(HirInstance, Origin)],
+        static_roots: &[HirStatic],
+    ) -> Result<PlainGraph, &'static str> {
+        let total = plain.functions.len() + plain.statics.len();
+        let mut pg = PlainGraph {
+            graph: support::Graph::default(),
+            nodes: Vec::with_capacity(total),
+            functions: HashMap::with_capacity(plain.functions.len()),
+            statics: HashMap::with_capacity(plain.statics.len()),
+        };
+        for asked in plain.functions.keys() {
+            let item = pg.place();
+            pg.functions.insert(asked.clone(), item);
+            pg.nodes[item as usize] = Some(PlainNode::Function(asked.clone()));
+        }
+        for &s in plain.statics.keys() {
+            let item = pg.place();
+            pg.statics.insert(s, item);
+            pg.nodes[item as usize] = Some(PlainNode::Static(s));
+        }
+        for (asked, c) in &plain.functions {
+            let item = pg.functions[asked];
+            let mut outs = Vec::with_capacity(c.edges.len());
+            for r in &c.edges {
+                match r {
+                    FrontRef::Function(callee) => {
+                        let target = pg
+                            .functions
+                            .get(&(callee.clone(), c.origin))
+                            .copied()
+                            .ok_or("a kept plain edge target is absent from the plain checkpoint")?;
+                        outs.push(target);
+                    }
+                    FrontRef::Static(s) => {
+                        let target = pg
+                            .statics
+                            .get(s)
+                            .copied()
+                            .ok_or("a kept plain static edge is absent from the plain checkpoint")?;
+                        outs.push(target);
+                    }
+                    FrontRef::Extern(_) | FrontRef::Weak(_) => {}
+                }
+            }
+            pg.graph.set_outs(item, outs);
+        }
+        for (s, c) in &plain.statics {
+            let item = pg.statics[s];
+            let mut outs = Vec::with_capacity(c.edges.len());
+            for r in &c.edges {
+                match r {
+                    FrontRef::Function(callee) => {
+                        let target = pg
+                            .functions
+                            .get(&(callee.clone(), c.origin))
+                            .copied()
+                            .ok_or("a kept static edge target is absent from the plain checkpoint")?;
+                        outs.push(target);
+                    }
+                    FrontRef::Static(target_s) => {
+                        let target = pg
+                            .statics
+                            .get(target_s)
+                            .copied()
+                            .ok_or("a kept static-to-static edge is absent from the plain checkpoint")?;
+                        outs.push(target);
+                    }
+                    FrontRef::Extern(_) | FrontRef::Weak(_) => {}
+                }
+            }
+            pg.graph.set_outs(item, outs);
+        }
+        for root in fn_roots {
+            let item = pg
+                .functions
+                .get(root)
+                .copied()
+                .ok_or("a plain root function is absent from the plain checkpoint")?;
+            pg.graph.root(ALL, item);
+        }
+        for root in static_roots {
+            let item = pg
+                .statics
+                .get(root)
+                .copied()
+                .ok_or("a plain root static is absent from the plain checkpoint")?;
+            pg.graph.root(ALL, item);
+        }
+        pg.graph.settle();
+        for item in 0..pg.nodes.len() as u32 {
+            if pg.nodes[item as usize].is_some() && !pg.graph.is_member(ALL, item) {
+                return Err("the plain checkpoint holds an item unreachable from its roots");
+            }
+        }
+        Ok(pg)
+    }
+
+    fn outs_for(
+        &mut self,
+        edges: &[super::places::Ref],
+        origin: Origin,
+        fresh_fns: &mut Vec<(u32, (HirInstance, Origin))>,
+        fresh_statics: &mut Vec<(u32, HirStatic)>,
+    ) -> Vec<u32> {
+        let mut outs = Vec::with_capacity(edges.len());
+        for r in edges {
+            match r {
+                FrontRef::Function(callee) => {
+                    let asked = (callee.clone(), origin);
+                    let item = match self.functions.get(&asked).copied() {
+                        Some(item) => item,
+                        None => {
+                            let item = self.place();
+                            self.functions.insert(asked.clone(), item);
+                            self.nodes[item as usize] = Some(PlainNode::Function(asked.clone()));
+                            fresh_fns.push((item, asked));
+                            item
+                        }
+                    };
+                    outs.push(item);
+                }
+                FrontRef::Static(s) => {
+                    let item = match self.statics.get(s).copied() {
+                        Some(item) => item,
+                        None => {
+                            let item = self.place();
+                            self.statics.insert(*s, item);
+                            self.nodes[item as usize] = Some(PlainNode::Static(*s));
+                            fresh_statics.push((item, *s));
+                            item
+                        }
+                    };
+                    outs.push(item);
+                }
+                FrontRef::Extern(_) | FrontRef::Weak(_) => {}
+            }
+        }
+        outs
+    }
+
+    fn apply_edits(
+        &mut self,
+        plain: &mut WorldSet,
+        db: &Db,
+        facing: super::frontend::Facing,
+        changed_fns: &[((HirInstance, Origin), Arc<Contribution>)],
+        changed_statics: &[(HirStatic, Arc<StaticContribution>)],
+    ) -> Result<bool, &'static str> {
+        let mut world_dirty = false;
+        let mut fresh_fns = Vec::new();
+        let mut fresh_statics = Vec::new();
+        for (asked, now) in changed_fns {
+            let Some(&item) = self.functions.get(asked) else { continue };
+            let edges_changed = plain
+                .functions
+                .get(asked)
+                .is_none_or(|was| was.edges != now.edges || was.origin != now.origin);
+            if edges_changed {
+                let outs =
+                    self.outs_for(&now.edges, now.origin, &mut fresh_fns, &mut fresh_statics);
+                self.graph.set_outs(item, outs);
+            }
+            world_dirty |= plain.insert_fn(asked.clone(), now.clone());
+        }
+        for (s, now) in changed_statics {
+            let Some(&item) = self.statics.get(s) else { continue };
+            let edges_changed = plain
+                .statics
+                .get(s)
+                .is_none_or(|was| was.edges != now.edges || was.origin != now.origin);
+            if edges_changed {
+                let outs =
+                    self.outs_for(&now.edges, now.origin, &mut fresh_fns, &mut fresh_statics);
+                self.graph.set_outs(item, outs);
+            }
+            world_dirty |= plain.insert_static(*s, now.clone());
+        }
+        let mut added = 0usize;
+        while !fresh_fns.is_empty() || !fresh_statics.is_empty() {
+            for (item, asked) in std::mem::take(&mut fresh_fns) {
+                added += 1;
+                if added > PLAIN_GROWTH_CAP {
+                    return Err("the plain walk grew past the incremental update cap");
+                }
+                let now = contribution(db, asked.0.clone(), asked.1, facing)
+                    .as_ref()
+                    .map_err(|_| "a newly reached function's world contribution failed")?
+                    .clone();
+                let outs =
+                    self.outs_for(&now.edges, now.origin, &mut fresh_fns, &mut fresh_statics);
+                self.graph.set_outs(item, outs);
+                world_dirty |= plain.insert_fn(asked, now);
+            }
+            for (item, s) in std::mem::take(&mut fresh_statics) {
+                added += 1;
+                if added > PLAIN_GROWTH_CAP {
+                    return Err("the plain walk grew past the incremental update cap");
+                }
+                let now = static_contribution(db, s, facing)
+                    .as_ref()
+                    .map_err(|_| "a newly reached static's world contribution failed")?
+                    .clone();
+                let outs =
+                    self.outs_for(&now.edges, now.origin, &mut fresh_fns, &mut fresh_statics);
+                self.graph.set_outs(item, outs);
+                world_dirty |= plain.insert_static(s, now);
+            }
+        }
+        let settled = self.graph.settle();
+        for item in settled.left[ALL].iter().copied() {
+            match self.nodes[item as usize].take() {
+                Some(PlainNode::Function(asked)) => {
+                    self.functions.remove(&asked);
+                    world_dirty |= plain.remove_fn(&asked);
+                }
+                Some(PlainNode::Static(s)) => {
+                    self.statics.remove(&s);
+                    world_dirty |= plain.remove_static(&s);
+                }
+                None => {}
+            }
+        }
+        Ok(world_dirty)
+    }
 }
 
 impl State {
     pub(super) fn checkpoint(&self) -> Option<Checkpoint> {
         if self.using_resumed.load(Ordering::Acquire) {
-            return self.resumed.get().cloned();
+            return self.resumed_state.lock().as_ref().map(|it| it.checkpoint.clone());
         }
         let held = self.held.get()?;
         Some(Checkpoint {
@@ -255,12 +707,15 @@ impl State {
             program: held.world().program.clone(), // clone: the program's name, once a build
             held: held.clone(),                    // clone: one reference, kept with its walk
             plain: self.plain.get()?.clone(),
+            plain_graph: None,
             closed: self.closed_members.get()?.clone(),
+            consumers: self.closed_consumers.get()?.clone(),
         })
     }
 
     pub(super) fn abandon(&self) {
         self.using_resumed.store(false, Ordering::Release);
+        *self.resumed_state.lock() = None;
     }
 
     pub(super) fn resume(
@@ -268,9 +723,11 @@ impl State {
         _front: &HirFrontend<'_>,
         _kept: &Checkpoint,
         _view: u64,
-    ) -> Result<(), &'static str> {
+        _fn_roots: &[(HirInstance, Origin)],
+        _static_roots: &[HirStatic],
+    ) -> Result<WorldChange<HirInstance>, &'static str> {
         // Under blaze-memo, `HirFrontend::view` is `None` and the session memo names no
-        // changed set (`frontend.rs:1270`), so closed worlds are recomputed rather than resumed.
+        // changed set (`frontend.rs`), so a closed world is walked again rather than patched.
         Err("the session memo names no changed set for world contributions")
     }
 }
@@ -302,7 +759,7 @@ impl State {
     /// for a program that has none. One acquire load.
     pub(crate) fn world(&self) -> Option<DevirtWorld> {
         if self.using_resumed.load(Ordering::Acquire) {
-            return self.resumed.get().map(|it| it.held.world().id);
+            return self.resumed_world.get().map(|it| it.world().id);
         }
         self.held.get().map(|it| it.world().id)
     }
@@ -334,36 +791,41 @@ impl State {
         if made.is_some() && made.as_ref().is_some_and(|it| held.is_none_or(|id| it.id == id)) {
             let slot = if held.is_none() { &self.plain } else { &self.closed_members };
             if slot.get().is_none() {
-                // alloc: one membership index for this round; changes are probed by item.
-                let members = frontend.with(|db| {
+                // alloc: one membership + contributor index for this round; changes are probed by item.
+                let (members, consumers) = frontend.with(|db| {
                     let facing = frontend.facing(None);
                     let fail = |s: &String| refused_of(db, krate, kind, s);
-                    Ok::<_, CodegenError>(Arc::new(Members {
-                        functions: functions
-                            .iter()
-                            .map(|(i, o)| {
-                                Ok((
-                                    (i.clone(), *o),
-                                    contribution(db, i.clone(), *o, facing)
-                                        .as_ref()
-                                        .map_err(fail)?
-                                        .clone(),
-                                ))
-                            })
-                            .collect::<Result<_, CodegenError>>()?,
-                        statics: statics
-                            .iter()
-                            .map(|s| {
-                                Ok((
-                                    *s,
-                                    static_contribution(db, *s, facing)
-                                        .as_ref()
-                                        .map_err(fail)?
-                                        .clone(),
-                                ))
-                            })
-                            .collect::<Result<_, CodegenError>>()?,
-                    }))
+                    let mut fn_map = HashMap::with_capacity(functions.len());
+                    let mut consumers = ConsumerIndex::default();
+                    for (i, o) in functions {
+                        let c = contribution(db, i.clone(), *o, facing)
+                            .as_ref()
+                            .map_err(fail)?
+                            .clone();
+                        if held.is_some() && c.sites {
+                            let inlined = frontend.inlines_for(db, i, o).map_err(|s| fail(&s))?;
+                            let keys = refs::read_objects(
+                                db,
+                                i,
+                                refs::Walking { inlined, world: held },
+                            )
+                            .map_err(|s| fail(&s))?;
+                            consumers.set((i.clone(), *o), keys.to_vec());
+                        }
+                        fn_map.insert((i.clone(), *o), c);
+                    }
+                    let mut st_map = HashMap::with_capacity(statics.len());
+                    for s in statics {
+                        let c = static_contribution(db, *s, facing)
+                            .as_ref()
+                            .map_err(fail)?
+                            .clone();
+                        st_map.insert(*s, c);
+                    }
+                    Ok::<_, CodegenError>((
+                        Arc::new(WorldSet::from_maps(fn_map, st_map)),
+                        Arc::new(consumers),
+                    ))
                 })?;
                 if slot.put(members).is_err() {
                     return Err(frontend.with(|db| {
@@ -374,6 +836,9 @@ impl State {
                             "two walks gave different members for the same closure",
                         )
                     }));
+                }
+                if held.is_some() && self.closed_consumers.get().is_none() {
+                    let _ = self.closed_consumers.put(consumers);
                 }
             }
         }
@@ -458,6 +923,20 @@ struct Contribution {
     objects: Vec<ContentId>,
 }
 
+impl Contribution {
+    fn contributes(&self) -> bool {
+        !self.facts.is_empty() || self.loader.is_some()
+    }
+
+    fn same_world_inputs(&self, other: &Contribution) -> bool {
+        self.sites == other.sites
+            && self.facts == other.facts
+            && self.loader == other.loader
+            && self.foreign == other.foreign
+            && self.objects == other.objects
+    }
+}
+
 /// DB handles alone don't prove that an object's content identity has not changed. Read
 /// the same type, principal and argument digests the world writer uses for each key.
 fn object_inputs(
@@ -528,6 +1007,16 @@ struct StaticContribution {
     objects: Vec<ContentId>,
 }
 
+impl StaticContribution {
+    fn contributes(&self) -> bool {
+        !self.facts.is_empty()
+    }
+
+    fn same_world_inputs(&self, other: &StaticContribution) -> bool {
+        self.facts == other.facts && self.objects == other.objects
+    }
+}
+
 fn static_contribution(
     db: &Db,
     value: HirStatic,
@@ -535,14 +1024,7 @@ fn static_contribution(
 ) -> Result<Arc<StaticContribution>, String> {
     let front = facing.front(db)?;
     let mut facts = Facts::default();
-    let mut edges = super::places::Placer::open();
     if let super::statics::Source::Compiled(compiled) = super::statics::source(db, value.0)? {
-        for request in &compiled.requests.funcs {
-            let r = super::places::func_ref(db, &request.target)?;
-            if matches!(r, FrontRef::Function(_)) {
-                edges.place(r)?;
-            }
-        }
         for request in &compiled.requests.datas {
             if let crate::fragment::DataRequest::Vtable {
                 ty,
@@ -552,19 +1034,146 @@ fn static_contribution(
             {
                 facts.vtable(ty, *trait_, args);
             }
-            if let crate::fragment::DataRequest::Static(id) = request {
-                let r = super::places::static_ref(db, *id)?;
-                if matches!(r, FrontRef::Static(_)) {
-                    edges.place(r)?;
+        }
+    }
+    let mut edges = super::statics::value(db, &front.hashes, value.0)?.refs;
+    super::frontend::asked_by(front.static_owner(db, &value), &mut edges);
+    edges.retain(|r| matches!(r, FrontRef::Function(_) | FrontRef::Static(_)));
+    let objects = object_inputs(&front, db, &facts)?;
+    let origin = front.origin(db, value.0.krate(db));
+    Ok(Arc::new(StaticContribution { facts, edges, origin, objects }))
+}
+
+/// Builds the program's [`World`] from only the contributing items in `set` (a small fraction
+/// of the program). Refuses to guess when two distinct loader or foreign open-reason strings
+/// could depend on BFS walk order (rule 25), letting the caller fall back to a whole walk.
+fn world_from_set(
+    frontend: &HirFrontend<'_>,
+    db: &Db,
+    (kind, program): (RootKind, Box<str>),
+    set: &WorldSet,
+) -> Result<Option<World>, &'static str> {
+    if set.site_count == 0 {
+        return Ok(None);
+    }
+    let mut objects: blaze_hash::HashMap<ObjectKey, Found, Global> =
+        blaze_hash::HashMap::new_in(Global);
+    let mut upcasts: Vec<(ObjectKey, ObjectKey)> = Vec::new();
+    let mut loads: Option<String> = None;
+    let mut by_instance: blaze_hash::HashMap<&HirInstance, &Contribution, Global> =
+        blaze_hash::HashMap::new_in(Global);
+    for ((instance, _), c) in &set.fn_contributors {
+        if let Some(prev) = by_instance.insert(instance, c.as_ref()) {
+            if !prev.same_world_inputs(c) {
+                return Err("two origins of one instance contribute different dyn facts");
+            }
+            continue;
+        }
+        let facts = &c.facts;
+        for (ty, key) in &facts.vtables {
+            objects.entry(*key).or_default().tys.push(ty.clone());
+        }
+        for &upcast in &facts.upcasts {
+            if !upcasts.contains(&upcast) {
+                upcasts.push(upcast);
+            }
+        }
+        for key in &facts.foreign {
+            let found = objects.entry(*key).or_default();
+            if let Some(reason) = &c.foreign {
+                match &found.open {
+                    None => found.open = Some(reason.clone()),
+                    Some(existing) if existing == reason => {}
+                    Some(_) => {
+                        return Err("multiple foreign signatures open one trait object");
+                    }
+                }
+            }
+        }
+        if let Some(reason) = &c.loader {
+            match &loads {
+                None => loads = Some(reason.clone()),
+                Some(existing) if existing == reason => {}
+                Some(_) => {
+                    return Err("multiple dynamic loaders open the program's dyn facts");
                 }
             }
         }
     }
-    let objects = object_inputs(&front, db, &facts)?;
-    let origin = front.origin(db, value.0.krate(db));
-    let mut edges = edges.into_refs();
-    super::frontend::asked_by(front.static_owner(db, &value), &mut edges);
-    Ok(Arc::new(StaticContribution { facts, edges, origin, objects }))
+    for c in set.static_contributors.values() {
+        for (ty, key) in &c.facts.vtables {
+            objects.entry(*key).or_default().tys.push(ty.clone());
+        }
+    }
+    let bound = objects.values().map(|it| it.tys.len() + 1).sum::<usize>() + upcasts.len() + 1;
+    let mut rounds = 0;
+    loop {
+        let mut changed = false;
+        for &(from, to) in &upcasts {
+            let (tys, open) = match objects.get(&from) {
+                Some(found) => (found.tys.clone(), found.open.clone()),
+                None => continue,
+            };
+            let into = objects.entry(to).or_default();
+            for ty in tys {
+                if !into.tys.contains(&ty) {
+                    into.tys.push(ty);
+                    changed = true;
+                }
+            }
+            if let Some(open) = open {
+                match &into.open {
+                    None => {
+                        into.open = Some(open);
+                        changed = true;
+                    }
+                    Some(existing) if *existing == open => {}
+                    Some(_) => {
+                        return Err("upcasts merge multiple open reasons for one trait object");
+                    }
+                }
+            }
+        }
+        rounds += 1;
+        if !changed {
+            break;
+        }
+        if rounds > bound {
+            return Err("the upcasts of the program did not settle");
+        }
+    }
+    let everything = match kind {
+        RootKind::Shared => Some(
+            "the program is a cdylib: a program that loads it may make objects of its traits"
+                .to_owned(),
+        ),
+        _ => loads,
+    };
+    let mut made = Vec::with_capacity(objects.len());
+    for (key, found) in objects {
+        made.push(
+            object(frontend, db, key, found, everything.as_deref())
+                .map_err(|_| "building an object's dyn facts failed")?,
+        );
+    }
+    made.sort_unstable_by(|a, b| a.digest.cmp(&b.digest));
+    World::new(program, made).map(Some).map_err(|_| "building the updated dyn world failed")
+}
+
+/// The object keys added, removed, or given another digest between `old` and `new`.
+fn diff_objects(old: &World, new: &World) -> blaze_hash::HashSet<ObjectKey, Global> {
+    let mut changed = blaze_hash::HashSet::new_in(Global);
+    for obj in old.objects() {
+        if new.object(&obj.key).is_none_or(|now| now.digest != obj.digest) {
+            changed.insert(obj.key);
+        }
+    }
+    for obj in new.objects() {
+        if old.object(&obj.key).is_none() {
+            changed.insert(obj.key);
+        }
+    }
+    changed
 }
 
 /// The program's world from what its walk reached; `None` where no reached body calls through

@@ -930,3 +930,40 @@ fn ntfs_edit_policy_routes_small_images_to_rename_and_large_or_pdb_to_custody() 
         Trace { looked_base: false, try_patched: false, renamed: true, vouched: true, contents: want }
     );
 }
+
+/// B5, the barrier behind kept units: a unit that stands waits for no standing unit below it,
+/// only for the frontier its crate's identity is made from (a build script's run), so std's
+/// chain is posted at once; a unit that does not stand still waits for every standing unit of
+/// its closure, as the chain of one-task-a-level gave it. Control: with each standing unit
+/// waiting on its direct dependencies, `std` would wait on `alloc` and `alloc` on `core`.
+#[test]
+fn a_standing_chain_waits_only_for_its_runs_and_its_dependents_for_all_of_it() {
+    use blaze_units::schema::Mode;
+    let unit = crate::serve::tests::unit;
+    let all = vec![
+        unit("core", "lib", Mode::Build, &[]),
+        unit("alloc", "lib", Mode::Build, &[0]),
+        unit("std", "lib", Mode::Build, &[1]),
+        unit("sys", "custom-build", Mode::Build, &[]),
+        unit("sys", "custom-build", Mode::RunCustomBuild, &[3]),
+        unit("sys", "lib", Mode::Build, &[4, 2]),
+        unit("app", "bin", Mode::Build, &[5, 2]),
+    ];
+    let hops = [true, true, true, true, true, true, false];
+    let tasks: Vec<bool> = (0..all.len()).map(|at| one_task(&all, &hops, at)).collect();
+    assert_eq!(tasks, [true, true, true, true, false, true, false]);
+    let mut memo = vec![None; all.len()];
+    let frontier = |memo: &mut Vec<Option<Box<[u32]>>>, at: usize| -> Vec<u32> {
+        stood_closure(&all, &hops, at, memo)
+            .iter()
+            .copied()
+            .filter(|&d| !one_task(&all, &hops, d as usize))
+            .collect()
+    };
+    for at in [0, 1, 2, 3] {
+        assert_eq!(frontier(&mut memo, at), Vec::<u32>::new(), "unit {at} is posted at once");
+    }
+    assert_eq!(frontier(&mut memo, 5), [4], "sys's library waits for its script's run alone");
+    assert_eq!(&*stood_closure(&all, &hops, 5, &mut memo), [0, 1, 2, 3, 4]);
+    assert_eq!(&*stood_closure(&all, &hops, 2, &mut memo), [0, 1]);
+}
