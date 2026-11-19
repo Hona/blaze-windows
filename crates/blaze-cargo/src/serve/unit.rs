@@ -1375,6 +1375,9 @@ struct BuildEnd {
     compiled: Vec<bool>,
     /// Whether the build compiles code: none for a check.
     compiles: bool,
+    /// The dependency crates whose inference a write of this build let go already, mid-build
+    /// ([`BuildEnd::newly_finished`]), sorted.
+    released: Vec<base_db::Crate>,
 }
 
 impl BuildEnd {
@@ -1384,7 +1387,20 @@ impl BuildEnd {
             kept: vec![false; units],     // alloc: a flag a unit, once per build
             compiled: vec![false; units], // alloc: a flag a unit, once per build
             compiles,
+            released: Vec::new(), // alloc: none until a crate finishes
         }
+    }
+
+    /// The dependency crates (no workspace member's) every unit of which compiled since the
+    /// last call, now counted as released: what a write mid-build lets go the inference of
+    /// ([`release_finished`]), so a cold build holds the inference of the crates it is still
+    /// compiling, not of every crate it compiled. None for a check, which keeps inference for
+    /// the next check.
+    fn newly_finished(&mut self, db: &base_db::Db) -> Vec<base_db::Crate> {
+        if !self.compiles {
+            return Vec::new(); // alloc: none
+        }
+        newly(self.finished(), |krate| krate.data(db).origin.is_local(), &mut self.released)
     }
 
     /// How many crates the build made: those of a compiled unit not found kept.
@@ -1468,6 +1484,47 @@ impl BuildEnd {
         span.record("unread", unread.values);
         span.record("query_storage", db.storage().held_bytes());
     }
+}
+
+/// Of `finished`, the crates that are not `local` and not in `released` (sorted), each added to
+/// it: each dependency crate is let go once, a workspace member's never mid-build.
+fn newly<C: Ord + Copy>(mut finished: Vec<C>, local: impl Fn(&C) -> bool, released: &mut Vec<C>) -> Vec<C> {
+    finished.retain(|krate| !local(krate) && released.binary_search(krate).is_err());
+    finished.sort_unstable();
+    finished.dedup();
+    for krate in &finished {
+        if let Err(at) = released.binary_search(krate) {
+            released.insert(at, *krate);
+        }
+    }
+    finished
+}
+
+/// With the front end exclusive for a write that was asked anyway (a build script's run, a
+/// proc macro's load), lets go of the inference and solver caches of every dependency crate
+/// that finished compiling since the last such write ([`BuildEnd::newly_finished`]). Never a
+/// write of its own: a write stops every reader, so this only rides on one. A value read again
+/// is made again from its memo and backdated, so nothing read can differ; what a later crate's
+/// codegen still reads of a finished one (a generic's body) is made again on demand.
+fn release_finished(lowered: &mut Lowered, end: &mut BuildEnd) {
+    let crates = {
+        let db: &base_db::Db = &*lowered.served_db();
+        end.newly_finished(db)
+    };
+    if crates.is_empty() {
+        return;
+    }
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end release of finished dependency crates, on a write",
+        crates = crates.len(),
+        inference = tracing::field::Empty,
+        solver_caches = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let dropped = hir::evict::drop_crates_after_store(lowered.served_db(), &crates, false);
+    span.record("inference", dropped.inference);
+    span.record("solver_caches", dropped.solver_caches);
 }
 
 /// `broke`, a failure or a panic of a step of an apply for each of the units `ready`, kept
@@ -1673,6 +1730,7 @@ impl Writer<Real> for UnitWriter {
             self.broken = true;
             return Err(error);
         }
+        release_finished(lowered, &mut self.end);
         Ok(true)
     }
 

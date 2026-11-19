@@ -1522,6 +1522,23 @@ fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
     assert_eq!(compile::module_at(path, module.clone()), Ok(module));
 }
 
+/// Mid-build, a write lets go of each finished dependency crate once and never of a workspace
+/// member's: the member's inference is the next edit's. Control: a selection that ignores
+/// `released` lets one crate go twice.
+#[test]
+fn a_finished_dependency_is_released_once_and_a_member_never_mid_build() {
+    let local = |krate: &u32| *krate >= 100;
+    let mut released = Vec::new();
+    assert_eq!(super::newly(vec![3, 1, 100], local, &mut released), [1, 3]);
+    assert_eq!(super::newly(vec![3, 1, 2, 100, 101], local, &mut released), [2], "1 and 3 went already");
+    assert_eq!(released, [1, 2, 3]);
+    assert!(super::newly(vec![1, 2, 3], local, &mut released).is_empty());
+    let mut ignoring = Vec::new();
+    let twice = |finished: Vec<u32>, _: &mut Vec<u32>| finished.into_iter().filter(|it| !local(it)).collect::<Vec<_>>();
+    let first = twice(vec![1], &mut ignoring);
+    assert_eq!(first, twice(vec![1], &mut ignoring), "the control lets go of crate 1 at every write");
+}
+
 /// A front end held on the loop whose drop panics (a storage with a table it can't walk) lets
 /// go of nothing past the catch: dropped, its holder goes on; let go of by a refusal, the job
 /// is given the panic.
