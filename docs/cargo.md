@@ -973,6 +973,13 @@ cargo or blaze sets, or a loader, shell, make, compiler driver or reproducible b
 `cc` crate's per-target `CC_`, `CXX_`, `AR_`, `CFLAGS_`, `CXXFLAGS_`, `LDFLAGS_`, `TARGET_`,
 `HOST_`. Two inputs may not give one script the same variable.
 
+A target may also say `"file"`: a file of its archive, relative and `/`-separated
+(`"lib/ghostty-vt.lib"`), which the variable then names in place of the directory, for a
+script that reads a library's file from a variable (rune-desktop's terminal reads
+`GHOSTTY_VT_LIB`, its one way to build with no download). Each target says its own, as each
+archive lays out its own files; one with an empty part, `.`, `..`, `\` or `:` fails the load,
+and one the layout has no file at fails the script's run before it starts, naming both.
+
 Before any of the build's units is lowered (or a trace's or verify's view is read), the
 daemon lays out each input the build needs, on an IO thread
 (`crates/blaze-cargo/src/serve/native.rs`): one layout task a digest, shared by every job
@@ -1009,7 +1016,8 @@ the build naming the input, the target, the URL, and the pinned and received dig
 no other place a script is pointed at. Old layouts are not yet collected (a follow-up for
 docs/gc.md): remove one with the command above.
 
-Each script run of a named package is then started with `env` set to that directory. The
+Each script run of a named package is then started with `env` set to that directory (or its
+`file`). The
 variable is set over the command's own (blaze's choice, 2026-11-04): a shell that sets it (`nix
 develop` sets `LLVM_SYS_231_PREFIX` to the flake's LLVM) keeps working with no change, and the
 script still links exactly the bytes the pin names, never the machine's, so two machines build

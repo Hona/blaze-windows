@@ -80,6 +80,17 @@ pub struct NativeDir {
     pub dir: PathBuf,
 }
 
+impl NativeDir {
+    /// What the input's variable names: the layout, or its file ([`NativeInput::file`]),
+    /// joined part by part so it is spelt as the system spells paths.
+    pub fn given(&self) -> PathBuf {
+        let Some(file) = &self.input.file else { return self.dir.clone() }; // clone: the caller's own
+        let mut path = self.dir.clone(); // clone: as above
+        path.extend(file.split('/'));
+        path
+    }
+}
+
 /// The digests whose layouts this daemon has walked and held to their marks (or laid out
 /// itself): each is walked once a daemon.
 pub(crate) struct Verified(Lock<BTreeSet<String>>);
@@ -461,6 +472,7 @@ mod tests {
             name: "llvm".to_owned(),
             target: "x".to_owned(),
             env: "LLVM_PREFIX".to_owned(),
+            file: None,
             packages: vec!["llvm-sys".to_owned()],
             url: "https://example.com/a.tar.xz".to_owned(),
             sha256: "0".repeat(64),

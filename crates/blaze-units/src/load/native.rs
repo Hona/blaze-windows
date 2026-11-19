@@ -116,6 +116,19 @@ struct Declared {
 struct PinTarget {
     name: String,
     sha256: String,
+    /// The file of the archive the variable names in place of its directory
+    /// ([`NativeInput::file`]).
+    #[serde(default)]
+    file: Option<String>,
+}
+
+/// Whether `file` names a file inside a layout: relative, `/` between its parts, none of them
+/// empty, `.` or `..`, and no `\`, `:` or NUL, so on no system does it leave the layout or name
+/// a drive.
+fn inside(file: &str) -> bool {
+    !file.is_empty()
+        && !file.contains(['\\', ':', '\0'])
+        && file.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 fn wrong(manifest: &Path, what: &str) -> LoadError {
@@ -274,6 +287,7 @@ pub(crate) fn needed<F: Files>(
                 name: input.name.clone(),
                 target: target.to_owned(),
                 env: input.env.clone(),
+                file: archive.file.clone(),
                 packages: input.packages.clone(),
                 url: format!("{release}/{}", archive.name),
                 sha256: archive.sha256.clone(),
@@ -339,6 +353,11 @@ fn read_pin<F: Files>(
         if !is_sha256(&archive.sha256) {
             return Err(bad(format!("target `{target}`'s `sha256` is `{}`, not 64 lowercase hex digits", archive.sha256)));
         }
+        if let Some(file) = archive.file.as_deref().filter(|it| !inside(it)) {
+            return Err(bad(format!(
+                "target `{target}`'s `file` is `{file}`, not a file inside the archive (relative, `/` between parts, no `.` or `..`)"
+            )));
+        }
     }
     Ok((release.to_owned(), archives)) // alloc: a URL, once per pin read
 }
@@ -363,4 +382,81 @@ pub(crate) fn locked_pins<F: Files>(
         out.push(crate::lock::NativePin { name: input.name.clone(), pin, targets });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Cow, path::PathBuf};
+
+    use blaze_manifest::files::{FileKind, Files};
+
+    use super::*;
+
+    /// A view holding one file, the pin.
+    struct Pin(&'static str);
+
+    impl Files for Pin {
+        fn read(&self, _: &Path) -> std::io::Result<Cow<'_, [u8]>> {
+            Ok(Cow::Borrowed(self.0.as_bytes()))
+        }
+        fn kind(&self, _: &Path) -> Option<FileKind> {
+            Some(FileKind::File)
+        }
+        fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>> {
+            Err(std::io::Error::other(format!("{} is no directory", path.display())))
+        }
+        fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+            Ok(path.to_owned())
+        }
+    }
+
+    fn metadata() -> toml::Value {
+        toml::from_str(
+            "[blaze.native.ghostty]\npin = \"ghostty.json\"\nenv = \"GHOSTTY_VT_LIB\"\npackages = [\"terminal\"]\n",
+        )
+        .unwrap()
+    }
+
+    const MSVC: &str = "x86_64-pc-windows-msvc";
+
+    fn needed_with(pin: &'static str, target: &str) -> Result<Vec<NativeInput>, LoadError> {
+        let runs = [ScriptRun { package: "terminal", platform: Some(target), features: &[] }];
+        needed(&Pin(pin), Some(&metadata()), Path::new("/w/Cargo.toml"), MSVC, &runs)
+    }
+
+    /// The invariant: a target's `file` is handed on with its input, each target its own, and
+    /// one that could leave the layout or name a drive is refused naming it. The control: a pin
+    /// with no `file` hands on none, as every pin before it.
+    #[test]
+    fn a_pins_target_may_name_a_file_of_its_archive_inside_it() {
+        let sha = "a".repeat(64);
+        let pin: &'static str = format!(
+            r#"{{"release": "https://example.com/r", "targets": {{
+                "{MSVC}": {{"name": "w.tar.xz", "sha256": "{sha}", "file": "lib/ghostty-vt.lib"}},
+                "aarch64-apple-darwin": {{"name": "m.tar.xz", "sha256": "{sha}", "file": "lib/libghostty-vt.a"}}
+            }}}}"#
+        )
+        .leak();
+        let inputs = needed_with(pin, MSVC).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].file.as_deref(), Some("lib/ghostty-vt.lib"));
+        assert_eq!(inputs[0].env, "GHOSTTY_VT_LIB");
+        let mac = needed_with(pin, "aarch64-apple-darwin").unwrap();
+        assert_eq!(mac[0].file.as_deref(), Some("lib/libghostty-vt.a"));
+
+        let plain: &'static str = format!(
+            r#"{{"release": "https://example.com/r", "targets": {{"{MSVC}": {{"name": "w.tar.xz", "sha256": "{sha}"}}}}}}"#
+        )
+        .leak();
+        assert_eq!(needed_with(plain, MSVC).unwrap()[0].file, None);
+
+        for file in ["../x.lib", "/x.lib", "lib//x.lib", r"lib\x.lib", "C:x.lib", "lib/./x.lib", ""] {
+            let pin: &'static str = format!(
+                r#"{{"release": "https://example.com/r", "targets": {{"{MSVC}": {{"name": "w.tar.xz", "sha256": "{sha}", "file": {file:?}}}}}}}"#
+            )
+            .leak();
+            let error = needed_with(pin, MSVC).unwrap_err();
+            assert!(error.what.contains("not a file inside the archive"), "{file}: {}", error.what);
+        }
+    }
 }

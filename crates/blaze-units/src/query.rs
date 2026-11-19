@@ -565,7 +565,10 @@ impl Versioned for Units {
     // 16: a git package's tree digest ([`PackagePlan::tree`]).
     // 17: `sandboxed_tests` left and `TestSandbox::opted_in` became `outside_by_host`: tests
     // are sandboxed by default where the host can keep them apart.
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 17");
+    // 18: the workspace's `build-script-tools` and `build-script-caches`
+    // ([`Units::script_tools`], [`Units::script_caches`]), and a native input's file
+    // ([`NativeInput::file`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 18");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -577,8 +580,13 @@ pub struct NativeInput {
     pub name: String,
     /// The target triple whose archive this is: the platform of the script runs that get it.
     pub target: String,
-    /// The variable the scripts read the unpacked directory from.
+    /// The variable the scripts read the unpacked directory from, or [`NativeInput::file`] in it.
     pub env: String,
+    /// A file of the archive, `/` between its parts and relative to the unpacked directory,
+    /// that [`NativeInput::env`] names in place of the directory: for a script that reads a
+    /// library's file from a variable (rune-desktop's `GHOSTTY_VT_LIB`). The pin file's
+    /// target says it (`"file"`), as each target's archive lays its files out its own way.
+    pub file: Option<String>,
     /// The packages whose build scripts are given it, sorted: each a name, or `name/feature`
     /// for that package's script only when the run has the feature on.
     pub packages: Vec<String>,

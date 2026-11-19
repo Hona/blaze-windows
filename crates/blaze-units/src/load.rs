@@ -389,7 +389,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 12");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 13");
     type Key = ();
     type Value = Cbor<Planned>;
 
