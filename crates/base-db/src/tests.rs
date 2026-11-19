@@ -2163,3 +2163,20 @@ fn an_included_file_is_read_by_the_daemons_name_of_it() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(read.as_deref().ok(), Some(&b"\x28\xb5\x2f\xfd"[..]), "{named}");
 }
+
+/// The invariant: a source root's paths and the directories they are compared with are one
+/// spelling apart at most: a view file under a daemon name is `/`-separated (`paths`'s join),
+/// and a file is below an `OUT_DIR` by whole parts whichever separator either was written
+/// with. The control: a sibling whose name only starts with the directory's is not below it.
+#[test]
+fn a_view_files_path_is_slash_separated_and_below_its_out_dir_by_whole_parts() {
+    let base = AbsPathBuf::try_from("/C:/w").unwrap();
+    let path = VfsPath::from(base.join("target/debug/build/a-0123/out/gen.rs"));
+    assert_eq!(path.to_string(), "/C:/w/target/debug/build/a-0123/out/gen.rs");
+    let out = ["/C:/w/target/debug/build/a-0123/out".to_owned()];
+    assert!(crate::below_any(&path.to_string(), &out));
+    assert!(crate::below(r"/C:/w\target\debug\build\a-0123\out\gen.rs", &out[0]));
+    assert!(crate::below("/C:/w/target/debug/build/a-0123/out/gen.rs", r"/C:/w\target\debug\build\a-0123\out\"));
+    assert!(!crate::below("/C:/w/target/debug/build/a-0123/outer/gen.rs", &out[0]), "a sibling");
+    assert!(!crate::below(&out[0], &out[0]), "the directory itself is not below it");
+}

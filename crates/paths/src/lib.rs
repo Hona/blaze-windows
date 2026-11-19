@@ -139,12 +139,42 @@ impl AbsPathBuf {
     ///   and `path` is not empty, the new path is normalized: all references
     ///   to `.` and `..` are removed.
     pub fn push<P: AsRef<Utf8Path>>(&mut self, suffix: P) {
-        self.0.push(suffix)
+        self.0 = joined(&self.0, suffix.as_ref());
     }
 
     pub fn join(&self, path: impl AsRef<Utf8Path>) -> Self {
-        Self(self.0.join(path))
+        Self(joined(&self.0, path.as_ref()))
     }
+}
+
+/// `base` joined with `path`, as [`Utf8Path::join`], but a daemon name stays one: on Windows
+/// a path from the root with no prefix (`/C:/w`, how the daemon names `C:\w`) is joined with
+/// `/`, and `\` in a relative `path` written `/`, so `/C:/w` and `src\lib.rs` is
+/// `/C:/w/src/lib.rs` where std's join gives `/C:/w\src\lib.rs`, a text every `/`-separated
+/// reader of a source root's paths (keys, frozen images, `below_any`) splits wrongly. A
+/// system path (`C:\w`) and an absolute `path` join as std joins them; elsewhere std's join is
+/// already `/`.
+fn joined(base: &Utf8Path, path: &Utf8Path) -> Utf8PathBuf {
+    joined_as(base, path, cfg!(windows))
+}
+
+/// [`joined`] as on Windows (`windows`) or elsewhere, so both are tested on every host.
+fn joined_as(base: &Utf8Path, path: &Utf8Path, windows: bool) -> Utf8PathBuf {
+    let daemon = |it: &Utf8Path| {
+        it.has_root() && !matches!(it.components().next(), Some(Utf8Component::Prefix(..)))
+    };
+    let relative =
+        !path.has_root() && !matches!(path.components().next(), Some(Utf8Component::Prefix(..)));
+    if windows && daemon(base) && relative && !path.as_str().is_empty() {
+        let head = base.as_str().trim_end_matches(['/', '\\']);
+        // alloc: the joined path, which the caller owns
+        let mut out = String::with_capacity(head.len() + 1 + path.as_str().len());
+        out.push_str(head);
+        out.push('/');
+        out.extend(path.as_str().chars().map(|c| if c == '\\' { '/' } else { c }));
+        return Utf8PathBuf::from(out);
+    }
+    base.join(path)
 }
 
 impl fmt::Display for AbsPathBuf {
@@ -224,9 +254,9 @@ impl AbsPath {
         self.join(path).normalize()
     }
 
-    /// Equivalent of [`Utf8Path::join`] for `AbsPath`.
+    /// Equivalent of [`Utf8Path::join`] for `AbsPath` ([`joined`]: a daemon name stays `/`).
     pub fn join(&self, path: impl AsRef<Utf8Path>) -> AbsPathBuf {
-        Utf8Path::join(self.as_ref(), path).try_into().unwrap()
+        joined(self.as_ref(), path.as_ref()).try_into().unwrap()
     }
 
     /// Normalize the given path:
@@ -467,5 +497,30 @@ fn is_absolute(path: &Utf8Path) -> bool {
         path.has_root()
     } else {
         path.is_absolute()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Utf8Path, joined_as};
+
+    /// The invariant: joining under a daemon name gives a daemon name, `/`-separated whatever
+    /// separator the relative part was written with, on Windows; elsewhere std's join. The
+    /// control is std's own Windows join, which puts `\` after the name.
+    #[test]
+    fn a_daemon_name_joined_stays_slash_separated() {
+        let join = |base: &str, path: &str| {
+            joined_as(Utf8Path::new(base), Utf8Path::new(path), true).into_string()
+        };
+        assert_eq!(join("/C:/w", "src/lib.rs"), "/C:/w/src/lib.rs");
+        assert_eq!(join("/C:/w/", r"src\a\b.rs"), "/C:/w/src/a/b.rs");
+        assert_eq!(join("/UNC/srv/share", "x.rs"), "/UNC/srv/share/x.rs");
+        assert_eq!(join("/", "x"), "/x");
+        assert_eq!(join("/C:/w", "../x.rs"), "/C:/w/../x.rs", "normalize takes `..` out");
+        assert_eq!(join("/home/a", "b/c"), "/home/a/b/c");
+        let elsewhere = joined_as(Utf8Path::new("/home/a"), Utf8Path::new("b/c"), false);
+        assert_eq!(elsewhere.as_str(), Utf8Path::new("/home/a").join("b/c").as_str());
+        #[cfg(windows)]
+        assert_eq!(Utf8Path::new("/C:/w").join("src/lib.rs").as_str(), r"/C:/w\src/lib.rs");
     }
 }

@@ -1091,11 +1091,20 @@ pub fn other_out_dirs(db: &Db, krate: Crate) -> Box<[String]> {
     dirs.into_boxed_slice()
 }
 
-/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]).
+/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]), by whole parts and with
+/// `/` and `\` the same separator, so a directory given in the system's spelling and a path
+/// in the daemon's (or a Windows path joined with `\`) compare as the one directory they are.
 pub fn below_any(path: &str, dirs: &[String]) -> bool {
-    dirs.iter().any(|dir| {
-        path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with(['/', '\\']))
-    })
+    dirs.iter().any(|dir| below(path, dir))
+}
+
+/// Whether `path` is strictly below the directory `dir`, part by part, `/` and `\` alike.
+pub fn below(path: &str, dir: &str) -> bool {
+    let sep = |b: u8| b == b'/' || b == b'\\';
+    let (path, dir) = (path.as_bytes(), dir.trim_end_matches(['/', '\\']).as_bytes());
+    path.len() > dir.len()
+        && sep(path[dir.len()])
+        && path[..dir.len()].iter().zip(dir).all(|(&a, &b)| a == b || (sep(a) && sep(b)))
 }
 
 /// The content of `krate`'s source root as `krate` is made from it: what a key or an identity

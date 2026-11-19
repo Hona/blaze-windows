@@ -195,12 +195,38 @@ pub(crate) fn parent(path: &str) -> &str {
     }
 }
 
-/// Where the symlink at `link` pointing to `target` leads, `.` and `..` taken out.
+/// Where the symlink at `link` pointing to `target` leads, `.` and `..` taken out. A target is
+/// absolute where it starts with `/`, on every system: a tree keeps a Windows link's target
+/// as `blaze_core::platform::path::link_target` writes it (an absolute one its daemon name,
+/// `/C:/x`), and on Unix `C:x` and `a\b` are relative names.
 fn follow(link: &str, target: &str) -> String {
-    let target = target.replace('\\', "/");
-    let absolute = target.starts_with('/') || target.as_bytes().get(1) == Some(&b':');
-    let joined = if absolute { target } else { format!("{}/{target}", parent(link)) };
+    let joined = match target.starts_with('/') {
+        true => target.to_owned(),
+        false => format!("{}/{target}", parent(link)),
+    };
     normalize(&joined)
 }
 
 pub(crate) use blaze_units::load::normal_text as normalize;
+
+#[cfg(test)]
+mod tests {
+    use super::{follow, parent, rest};
+
+    /// The invariant: a link is followed by the daemon's names alone, the same on every
+    /// system: a target starting with `/` (a Windows absolute target as its daemon name,
+    /// `/C:/x`) replaces the link's path, any other is joined to the link's directory; a mount
+    /// covers a Windows daemon name by whole parts. The control: a drive-like `C:x` is a
+    /// relative name, joined, never taken for a path off the tree.
+    #[test]
+    fn a_link_is_followed_and_a_mount_matched_by_daemon_names_on_every_system() {
+        assert_eq!(follow("/C:/w/p/src/lib.rs", "../outside.rs"), "/C:/w/p/outside.rs");
+        assert_eq!(follow("/C:/w/p/link.rs", "/D:/vendor/x.rs"), "/D:/vendor/x.rs");
+        assert_eq!(follow("/UNC/srv/share/p/a.rs", "./b.rs"), "/UNC/srv/share/p/b.rs");
+        assert_eq!(follow("/w/p/link", "C:x"), "/w/p/C:x", "a relative name, not a drive");
+        assert_eq!(parent("/C:/w/p/lib.rs"), "/C:/w/p");
+        assert_eq!(rest("/C:/w/p/src/lib.rs", "/C:/w/p"), Some("src/lib.rs"));
+        assert_eq!(rest("/C:/w/p", "/C:/w/p/"), Some(""));
+        assert_eq!(rest("/C:/w/pp/lib.rs", "/C:/w/p"), None, "a mount covers whole parts");
+    }
+}

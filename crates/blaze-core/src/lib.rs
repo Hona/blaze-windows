@@ -398,7 +398,9 @@ pub enum Effect {
         tag: Tag,
     },
     /// The target of the symbolic link `file`, never followed: completes with [`Done::Read`]
-    /// of the target's bytes as the link holds them (on Windows UTF-8, `\` written `/`). A
+    /// of the target's bytes as the link holds them (on Windows UTF-8 as
+    /// [`platform::path::link_target`] writes it: `/`-separated, an absolute one its daemon
+    /// name). A
     /// `file` that is not a symbolic link, or is not there, fails naming it.
     ReadLink {
         file: FileName,

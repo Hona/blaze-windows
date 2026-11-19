@@ -426,7 +426,10 @@ impl ProbeFiles {
         };
         let (mode, bytes) = if meta.file_type().is_symlink() {
             match std::fs::read_link(&at) {
-                Ok(to) => (Mode::Symlink, to.to_string_lossy().into_owned().into_bytes()),
+                Ok(to) => {
+                    let to = blaze_core::platform::path::link_target(&to.to_string_lossy());
+                    (Mode::Symlink, to.into_bytes())
+                }
                 Err(error) => {
                     self.fail(&at, &error);
                     return None;

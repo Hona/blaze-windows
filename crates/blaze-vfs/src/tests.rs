@@ -1115,6 +1115,10 @@ fn a_symlink_reads_as_its_target_and_follows_to_its_file() {
                 write_as("dir", "src", Mode::Symlink),
                 write_as("out", "../x", Mode::Symlink),
                 write_as("abs", "/etc/passwd", Mode::Symlink),
+                // A Windows absolute target as the read boundary keeps it, its daemon name
+                // (`blaze_core::platform::path::link_target`): out of the tree like any other.
+                write_as("abs-win", "/C:/Windows/win.ini", Mode::Symlink),
+                write_as("abs-unc", "/UNC/server/share/x", Mode::Symlink),
                 write_as("loop", "loop", Mode::Symlink),
                 write_as("dangling", "nope", Mode::Symlink),
             ],
@@ -1131,7 +1135,7 @@ fn a_symlink_reads_as_its_target_and_follows_to_its_file() {
     }
     assert_eq!(vfs.follow(view, "dir"), Ok(None), "a directory");
     assert_eq!(vfs.follow(view, "dangling"), Ok(None));
-    for path in ["out", "abs", "loop"] {
+    for path in ["out", "abs", "abs-win", "abs-unc", "loop"] {
         assert!(matches!(vfs.follow(view, path), Err(OpError::BadLink { .. })), "{path}");
     }
 }

@@ -1405,7 +1405,7 @@ fn link_bytes(_: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec
 #[cfg(windows)]
 fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec<u8>> {
     match target.into_os_string().into_string() {
-        Ok(target) => Ok(target.replace('\\', "/").into_bytes()),
+        Ok(target) => Ok(crate::platform::path::link_target(&target).into_bytes()),
         // alloc: an error path.
         Err(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,

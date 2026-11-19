@@ -494,5 +494,29 @@ pub fn canonical_matches(path: &Path, canonical: &Path) -> bool {
     }
 }
 
+/// A symbolic link's target as the daemon's trees keep it, from the target's text as the
+/// system read it (`std::fs::read_link`): `/`-separated, and absolute only where it starts
+/// with `/`, the one test every reader of a tree's links makes on every system. On Windows
+/// `..\x` is `../x` and an absolute target (`C:\x`, `\\?\C:\x`, `\\server\share\x`) is its
+/// daemon name ([`daemon`]: `/C:/x`, `/UNC/server/share/x`), so a link out of the tree is
+/// refused, or resolved against the mounts, as on Unix; `\x` (the current drive's root) is
+/// `/x`, out of the tree and so refused; a drive-relative `C:x` stays relative text. On Unix
+/// the bytes are the link's own: `C:x` and `a\b` are names there.
+pub fn link_target(target: &str) -> String {
+    link_target_of(target)
+}
+
+#[cfg(windows)]
+fn link_target_of(target: &str) -> String {
+    // alloc: the target, which the caller owns
+    daemon_of(target).unwrap_or_else(|| target.replace('\\', "/"))
+}
+
+#[cfg(not(windows))]
+fn link_target_of(target: &str) -> String {
+    // alloc: the target, which the caller owns
+    target.to_owned()
+}
+
 #[cfg(test)]
 mod tests;
