@@ -244,30 +244,33 @@ impl<E: Write> Drop for Show<E> {
 /// terminal's progress report, and exits as an interrupted command does. Only for a screen
 /// that redraws; a pipe's has nothing to put back, and its command dies of the signal as
 /// before.
-#[cfg(unix)]
+/// On Windows the interrupt is the console's Ctrl-C or Ctrl-Break (or its close), which the
+/// handler holds so this thread puts the terminal back first.
+#[cfg(any(unix, windows))]
 pub fn watch_interrupts(terminal: Terminal) -> io::Result<()> {
-    use std::io::Read as _;
     crate::serve::signals::catch();
-    let mut pipe = crate::serve::signals::stop_pipe()?;
+    let mut stop = crate::serve::signals::stop_wait()?;
     std::thread::Builder::new().name("blaze screen interrupt".into()).spawn(move || {
-        let mut byte = [0u8; 1];
-        let got = {
-            let _waiting = tracing::info_span!(
-                target: "blaze",
-                "screen: wait for an interrupt (SIGINT or SIGTERM) to put the terminal back"
-            )
-            .entered();
-            pipe.read(&mut byte)
-        };
-        if got.is_err() {
-            return;
+        let _waiting = tracing::info_span!(
+            target: "blaze",
+            "screen: wait for an interrupt (SIGINT or SIGTERM) to put the terminal back"
+        )
+        .entered();
+        // Each wait bounded; the command's own end ends the thread with the process.
+        loop {
+            match stop.wait(std::time::Duration::from_secs(60)) {
+                Ok(false) => {}
+                Ok(true) => break,
+                Err(_) => return,
+            }
         }
+        drop(_waiting);
         interrupted(&terminal);
     })?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn watch_interrupts(_terminal: Terminal) -> io::Result<()> {
     Ok(())
 }

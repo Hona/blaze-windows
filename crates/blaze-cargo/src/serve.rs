@@ -1520,7 +1520,6 @@ fn listen(
     // Armed before the CLI is told it listens: from then on a SIGTERM ends the daemon within
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
-    #[cfg(unix)]
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
     // The task watchdog: a task that makes no progress for its bound is named, with what it
     // waits on and who holds it, and its job fails (`stuck`).
@@ -1569,7 +1568,9 @@ fn listen(
         }
     }
     #[cfg(unix)]
-    { tasks_watch.disarm(); guard.disarm(); }
+    tasks_watch.disarm();
+    guard.disarm();
+    signals::stop_ended();
     match daemon.failed() {
         Some(why) => bail!("{why}"),
         None if daemon.ended_unheld() => {

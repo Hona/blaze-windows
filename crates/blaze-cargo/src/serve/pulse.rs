@@ -10,11 +10,11 @@
 //! all run between turns. The guard watches the turns from a thread of its own.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 use std::time::Duration;
 
 use crossbeam_queue::SegQueue;
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 use blaze_core::lock::stall::Stall;
 
 /// The loop's progress, written by the loop at the end of each turn and read by the stop's
@@ -133,19 +133,19 @@ impl Pulse {
         self.turns.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(all(unix, feature = "native"))]
+    #[cfg(feature = "native")]
     pub fn moved(&self) -> u64 {
         self.moved.load(Ordering::Relaxed)
     }
 
-    #[cfg(all(unix, feature = "native"))]
+    #[cfg(feature = "native")]
     pub fn turns(&self) -> u64 {
         self.turns.load(Ordering::Relaxed)
     }
 }
 
 /// What one look at the loop's turns found.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
     /// A turn ended since the last look: the loop turns.
@@ -160,7 +160,7 @@ pub enum Look {
 
 /// Judges the loop's turns, told the time and the count at each look: a turn that lasts past
 /// `report` is reported once, and again only after the loop turned in between.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 #[derive(Debug)]
 pub struct LoopWatch {
     report_ns: u64,
@@ -169,7 +169,7 @@ pub struct LoopWatch {
     said: bool,
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 impl LoopWatch {
     pub fn new(report: Duration) -> LoopWatch {
         LoopWatch {
@@ -269,14 +269,14 @@ impl CeilingWatch {
 
 /// One stall as the dedupe tells two apart: a deadlock by its cycle's threads, sorted, and a
 /// convoy by its head, whatever it waits on and however many queue behind it.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StallKey {
     Deadlock(Vec<u64>),
     Convoy(u64),
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 impl StallKey {
     pub fn of(stall: &Stall) -> StallKey {
         match stall {
@@ -295,14 +295,14 @@ impl StallKey {
 /// ([`blaze_core::lock::graph::stalls`], or none when no wait is past the threshold), it hands
 /// back the ones the last look did not have, by [`StallKey`], and forgets the ones gone, so a
 /// stall that ends and comes back is said again. Reads no clock and does no IO.
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 #[derive(Debug, Default)]
 pub struct StallWatch {
     /// The stalls the last look had, said already.
     said: Vec<StallKey>,
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(feature = "native")]
 impl StallWatch {
     /// One look at `stalls`: the indices into it of those new since the last look, in its
     /// order (deadlocks first, then convoys, most behind first).
@@ -324,7 +324,7 @@ impl StallWatch {
     }
 }
 
-#[cfg(all(test, unix, feature = "native"))]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
 
