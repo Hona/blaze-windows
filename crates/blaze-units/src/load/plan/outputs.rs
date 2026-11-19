@@ -384,7 +384,15 @@ pub(super) fn compile_outputs(it: &CompileFiles<'_>) -> Result<Vec<String>, Load
         outputs.push(path.display().to_string());
         if let Some(link) = hardlink {
             if it.is_root && !matches!(file.flavor, Flavor::DebugInfo | Flavor::Auxiliary) {
-                depinfo.push(link.with_extension("d").display().to_string());
+                // Keep `.dll` in a Windows DLL's uplifted dep-info (`foo.dll.d`, matching
+                // `foo.dll.pdb`) so a package's `cdylib` and same-named `bin` (`foo.d`) do
+                // not collide in `one_unit_per_path`.
+                let dep = if file.prefix.is_empty() && file.suffix == ".dll" {
+                    format!("{}.d", link.display())
+                } else {
+                    link.with_extension("d").display().to_string()
+                };
+                depinfo.push(dep);
             }
             outputs.push(link.display().to_string());
         }

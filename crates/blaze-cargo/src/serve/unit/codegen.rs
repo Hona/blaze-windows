@@ -1808,6 +1808,10 @@ pub(crate) struct LinkMade {
     /// ([`debug_side`], [`SideFile`]): for the loop to place from these bytes, after the
     /// build's answer. Empty for an image with none, and for a link that changed nothing.
     pub(crate) side: Vec<SideFile>,
+    /// The import library written beside an MSVC DLL (`foo.dll.lib`, [`import_library`]), at
+    /// the DLL's output path: stored in CAS and recorded in the unit's record so both its
+    /// output path and its uplifted copy are placed on cold and replayed builds alike.
+    pub(crate) import: Option<(String, Vec<u8>)>,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
@@ -2183,7 +2187,8 @@ fn link_at(
         // A proc macro built for wasm is a WASI reactor ([`blaze_link::target::reactor`]).
         Makes::Shared { proc_macro: true } if wasm => None,
         Makes::Shared { .. } => {
-            let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+            let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+            let name = shared_name(path, plan);
             let exports = built.symbols.iter().map(|it| it.1.clone()).collect();
             Some((name, exports))
         }
@@ -2388,10 +2393,11 @@ fn link_at(
         Ok(_) => debug_side(job, unit, path, &mut linked),
         Err(_) => Ok(Vec::new()), // alloc: none, empty
     };
-    // A DLL's import library, beside it: written from its exports as committed.
+    // A DLL's import library, beside it: written from its exports as committed, and stored
+    // as a regular recorded output (not a side file) so record replay places it too.
     let import = match &made {
-        Ok(_) => import_side(job, unit, path, &linked),
-        Err(_) => Ok(Vec::new()), // alloc: none, empty
+        Ok(_) => import_library(job, unit, path, &linked),
+        Err(_) => Ok(None),
     };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
@@ -2469,8 +2475,8 @@ fn link_at(
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let mut side = debug?;
-    side.extend(import?);
+    let side = debug?;
+    let import = import?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -2486,6 +2492,7 @@ fn link_at(
         written,
         made: runs,
         side,
+        import,
         read,
         table,
         how,
@@ -2549,6 +2556,7 @@ fn launched(
             false => Written::Kept(linked.key),
         },
         side,
+        import: None,
         read: Vec::new(), // alloc: none, empty
         table: None,
         how,
@@ -3488,20 +3496,35 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
 }
 
 
+/// The file name embedded in a shared library's export directory / soname and its MSVC
+/// import library: the uplifted copy's name (`foo.dll`) when the plan uplifts the DLL, so
+/// downstream importers load `foo.dll` rather than `foo-<hash>.dll`, else the link's own
+/// file name.
+fn shared_name(path: &str, plan: &blaze_units::query::UnitPlan) -> String {
+    // Only a PE DLL names itself in its export directory and import library; other formats
+    // keep the link's own file name as before.
+    let named = match path.ends_with(".dll") {
+        true => super::artifact::uplifted(path, plan).unwrap_or(path),
+        false => path,
+    };
+    named.rsplit('/').next().unwrap_or(named).to_owned()
+}
+
 /// The import library planned beside the DLL `path` (`foo.dll.lib`, cargo's output of a
 /// `cdylib` on MSVC, [`super::artifact::import_library`]), written from the DLL's exports as
-/// this link committed them (`Image::import_library`, link.exe's `/IMPLIB`), at that path and
-/// at its uplifted copy: none for any other image. A DLL planned with one whose link makes
-/// none is an error naming both: nothing is placed in its stead.
-fn import_side(
+/// this link committed them (`Image::import_library`, link.exe's `/IMPLIB`). Returned as a
+/// normal output `(deps_path, bytes)` so `compile::store` hashes it into CAS, records both
+/// it and its uplifted copy in the unit's record, and replays both on a warm record hit.
+/// A DLL planned with one whose link makes none is an error naming both.
+fn import_library(
     job: &Job,
     unit: usize,
     path: &str,
     linked: &Linked,
-) -> Result<Vec<SideFile>, LinkCause> {
+) -> Result<Option<(String, Vec<u8>)>, LinkCause> {
     let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
     let Some(lib) = super::artifact::import_library(path, plan) else {
-        return Ok(Vec::new()); // alloc: none, empty
+        return Ok(None);
     };
     let _span = tracing::info_span!(target: "blaze", "link import library", unit = %path).entered();
     let bytes = linked
@@ -3513,12 +3536,5 @@ fn import_side(
                 "{lib} is planned beside {path}, and its link makes no import library: it is no DLL"
             ))
         })?;
-    let key = blaze_cas::Key(ContentId::of("blaze v2 serve import library", &bytes));
-    let file = blaze_cas::Sparse { len: bytes.len() as u64, runs: vec![(0, bytes)] };
-    let file = Arc::new(Made::Whole(file)); // alloc: once per import library, shared by its paths
-    Ok(std::iter::once(lib)
-        .chain(super::artifact::uplifted(lib, plan))
-        // clone: a refcount; alloc: once per import library, a path or two
-        .map(|at| SideFile { path: at.to_owned(), key, file: Arc::clone(&file) })
-        .collect())
+    Ok(Some((lib.to_owned(), bytes)))
 }

@@ -6,9 +6,65 @@ fn debug_outputs_use_daemon_names_for_native_and_foreign_targets() {
     let (file, plist) = super::side_paths(Format::Pe, "/C:/out/app.exe", "app.pdb");
     assert_eq!(file, "/C:/out/app.pdb");
     assert_eq!(plist, None);
+    let (file, plist) = super::side_paths(Format::Pe, "/C:/out/luau_panel.dll", "luau_panel.dll.pdb");
+    assert_eq!(file, "/C:/out/luau_panel.dll.pdb");
+    assert_eq!(plist, None);
     let (file, plist) = super::side_paths(Format::MachO, "/root/app", "ignored");
     assert_eq!(file, "/root/app.dSYM/Contents/Resources/DWARF/app");
     assert_eq!(plist.as_deref(), Some("/root/app.dSYM/Contents/Info.plist"));
+}
+
+#[test]
+fn shared_library_name_uses_uplifted_dll_name_when_present() {
+    let plan = |extra: &str, outputs: &[&str]| blaze_units::query::UnitPlan {
+        checked_as_test: false,
+        metadata: extra.trim_start_matches('-').to_owned(),
+        extra_filename: extra.to_owned(),
+        unit_id: format!("{:0>16}", extra.trim_start_matches('-')),
+        cfgs: Vec::new(),
+        check_cfg: Vec::new(),
+        rustflags: Vec::new(),
+        lints: Vec::new(),
+        env: Vec::new(),
+        outputs: outputs.iter().map(|it| (*it).to_owned()).collect(),
+        out_dir: None,
+        links: None,
+        unsandboxed: false,
+        runner: Vec::new(),
+        harness: true,
+        clippy: None,
+        macro_wasm: false,
+        gpu_msl: None,
+    };
+    let hashed = plan(
+        "-89ab",
+        &[
+            "/w/target/debug/deps/rune_www-89ab.dll",
+            "/w/target/debug/rune_www.dll",
+            "/w/target/debug/deps/rune_www-89ab.dll.lib",
+            "/w/target/debug/rune_www.dll.lib",
+        ],
+    );
+    assert_eq!(
+        super::shared_name("/w/target/debug/deps/rune_www-89ab.dll", &hashed),
+        "rune_www.dll"
+    );
+    let unhashed = plan(
+        "",
+        &[
+            "/w/build/debug/build/rune_www/0123/out/rune_www.dll",
+            "/w/target/debug/rune_www.dll",
+        ],
+    );
+    assert_eq!(
+        super::shared_name("/w/build/debug/build/rune_www/0123/out/rune_www.dll", &unhashed),
+        "rune_www.dll"
+    );
+    let dep = plan("-89ab", &["/w/target/debug/deps/dep-89ab.dll"]);
+    assert_eq!(
+        super::shared_name("/w/target/debug/deps/dep-89ab.dll", &dep),
+        "dep-89ab.dll"
+    );
 }
 
 use std::collections::HashMap;

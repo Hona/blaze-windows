@@ -595,6 +595,42 @@ fn an_msvc_cdylib_is_one_image_and_its_import_library_is_beside_it() {
         .filter(|it| artifact::listed(it) && it.starts_with(deps) && !it.ends_with(".pdb"))
         .collect();
     assert_eq!(control.len(), 2, "the control: the DLL and its import library both images");
+
+    // New unhashed layout (build/<pkg>/<hash>/out -> target/debug): cdylib+rlib plans one
+    // DLL image plus the rlib, its import library is uplifted alongside it, and `.dll.pdb`
+    // and `.dll.exp` stay out of `made` and `filenames`.
+    let out = "/w/build/debug/build/luau-panel/0123/out";
+    let new_outputs = [
+        format!("{out}/luau_panel.dll"),
+        "/w/target/debug/luau_panel.dll".to_owned(),
+        format!("{out}/luau_panel.dll.lib"),
+        "/w/target/debug/luau_panel.dll.lib".to_owned(),
+        format!("{out}/luau_panel.dll.exp"),
+        "/w/target/debug/luau_panel.dll.exp".to_owned(),
+        format!("{out}/luau_panel.dll.pdb"),
+        "/w/target/debug/luau_panel.dll.pdb".to_owned(),
+        format!("{out}/libluau_panel.rlib"),
+        format!("{out}/luau_panel.d"),
+        "/w/target/debug/luau_panel.dll.d".to_owned(),
+    ];
+    let new_plan = plan("", &new_outputs.iter().map(String::as_str).collect::<Vec<_>>());
+    let new_dll = format!("{out}/luau_panel.dll");
+    let new_rlib = format!("{out}/libluau_panel.rlib");
+    assert_eq!(artifact::made(&new_plan), [new_dll.as_str(), new_rlib.as_str()]);
+    assert_eq!(artifact::import_library(&new_dll, &new_plan), Some(format!("{new_dll}.lib").as_str()));
+    assert_eq!(
+        artifact::uplifted(&format!("{new_dll}.lib"), &new_plan),
+        Some("/w/target/debug/luau_panel.dll.lib")
+    );
+    let panel = unit(P, target("luau_panel", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    assert_eq!(
+        artifact::filenames(&panel, &new_plan),
+        [
+            "/w/target/debug/luau_panel.dll",
+            "/w/target/debug/luau_panel.dll.lib",
+            new_rlib.as_str(),
+        ]
+    );
 }
 
 #[test]

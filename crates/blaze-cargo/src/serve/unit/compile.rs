@@ -4646,6 +4646,9 @@ fn assemble(
                             // alloc: once per image linked, shared by the paths it is placed at
                             made_files.push((path.to_owned(), Arc::new(made)));
                         }
+                        if let Some((lib_path, bytes)) = linked.import {
+                            files.push((lib_path, Written::Bytes(bytes), false));
+                        }
                         side_files.extend(linked.side);
                     }
                     Err(failed) => {
