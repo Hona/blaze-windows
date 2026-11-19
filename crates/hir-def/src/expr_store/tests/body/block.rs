@@ -731,3 +731,53 @@ mod user {
         "#]],
     )
 }
+
+#[test]
+fn macro2_body_macro_path_is_private_to_the_def_site() {
+    // A path a `macro` writes reaches what is private to where the macro is defined, wherever
+    // it is called: std's `unicode_str!` calls `crate::sys::pal::windows::api::wide_str!`
+    // through `pal`'s private `windows` from every module of std (rustc's
+    // `resolve_ident_in_module_ext` checks a segment from the macro's `expn_def_scope`).
+    check_at(
+        r#"
+#![feature(decl_macro)]
+mod pal {
+    mod windows {
+        pub mod api {
+            pub macro wide() { fn from_def_site() {} }
+            pub macro outer() { crate::pal::windows::api::wide!(); }
+        }
+    }
+    pub use self::windows::*;
+}
+mod user {
+    fn f() {
+        crate::pal::api::outer!();
+        $0
+    }
+}
+"#,
+        &expect![[r#"
+            (block scope)
+            - from_def_site : value
+
+            crate
+            - pal : type
+            - user : type
+
+            crate::pal
+            - api : type (glob)
+            - windows : type
+
+            crate::pal::windows
+            - api : type
+
+            crate::pal::windows::api
+            - outer : macro!
+            - wide : macro!
+
+            crate::user
+            - f : value
+        "#]],
+    )
+}

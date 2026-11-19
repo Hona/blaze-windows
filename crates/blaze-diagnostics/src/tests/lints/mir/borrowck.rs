@@ -186,6 +186,20 @@ fn main() {}
 }
 
 #[test]
+fn const_initializers_promote_const_calls_alongside_closure_function_pointers() {
+    let source = r#"struct Trigger { run: fn(u8) }
+const fn replay(run: fn(u8)) -> Trigger { Trigger { run } }
+const fn session(keys: &'static [Trigger]) -> &'static [Trigger] { keys }
+fn open(_: u8) {}
+static MIXED: &[Trigger] = session(&[replay(open), Trigger { run: |x| open(x) }]);
+const REVERSED: &[Trigger] = session(&[Trigger { run: |_| {} }, replay(open)]);
+static ARG: &[Trigger] = session(&[replay(|x| open(x))]);
+fn main() {}
+"#;
+    assert_eq!(errors(Some("sized, copy, fn, unsize, coerce_unsized"), source), [] as [&str; 0]);
+}
+
+#[test]
 fn an_immutable_pattern_binding_assigned_again() {
     // tests/ui/borrowck/borrowck-match-binding-is-assignment.rs
     let source = r#"// Test that immutable pattern bindings cannot be reassigned.

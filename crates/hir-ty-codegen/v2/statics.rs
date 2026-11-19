@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     ConstBlob, compiled_static,
-    fragment::{CompiledStatic, Requests},
+    fragment::{CompiledStatic, DataRequest, Requests},
     is_thread_local,
 };
 
@@ -92,6 +92,21 @@ pub(crate) fn value(db: &Db, hashes: &HashSource, id: StaticId) -> Result<Value,
             (blob, requests, *writable)
         }
     };
+    // A DLL's static has its address in its import address table cell once the image is
+    // loaded, which no value written into the image can hold.
+    for request in &requests.datas {
+        if let DataRequest::Static(named) = request
+            && crate::dll_imported(db, *named)
+        {
+            // alloc: the error's message
+            return Err(format!(
+                "the value of `{}` holds the address of `{}`, a DLL's static: a PE image has it \
+                 only in its import address table, at run time",
+                StaticSignature::of(db, id).name.as_str(),
+                StaticSignature::of(db, *named).name.as_str()
+            ));
+        }
+    }
     let places = place_requests(db, hashes, Some(id.krate(db)), &mut placer, &mut requests)?;
     let imports = wasm_imports(db, target, id, &requests)?;
     let mut bytes = super::shape::value(&blob, &requests, &places)?;

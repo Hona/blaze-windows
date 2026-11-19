@@ -1,0 +1,5 @@
+use windows_sys::Win32::Foundation::CloseHandle;
+fn helper() {
+    std::process::Command::new("git");
+    libc::getpid();
+}

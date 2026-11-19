@@ -123,8 +123,9 @@ bun crates/blaze-napi/test/smoke.ts
 the options `blaze-fast --help` lists (packages, features, profile, target, the target
 selection flags, `--color`, `-v`, `-q`, `--json`) and refuses any other word by name, saying
 to use `blaze`; it never runs `blaze` in its place. It prints each diagnostic as the daemon
-rendered it, blaze's reports through blaze-report's renderer, and cargo's `Compiling`,
-`Checking` and `Finished` lines; with `--json`, each response as one line of the API's JSON.
+rendered it, blaze's reports through blaze-report's renderer, and of the build the lines
+[terminal.md](terminal.md) gives a pipe (`blaze: progress`, then `blaze: ok` or `blaze: failed`);
+with `--json`, each response as one line of the API's JSON.
 `why` and `status` print the answer as JSON. It exits 0 when the request ended ok, 101 when it
 did not, 2 for a command line it does not handle.
 
@@ -136,27 +137,34 @@ engine links the compiler, so it takes milliseconds to start; the thin `blaze` l
 it and answers what would otherwise cost only that start:
 
 - `blaze --version`, from what it was built with and the launcher's kept pin lookup;
-- a `build` or a `run` with nothing to do: one request on the daemon's socket, the CLI's own
-  (the same bytes; `the_thin_blaze_sends_this_clis_request_byte_for_byte` in blaze-cargo holds
-  a table of command lines to it), its answer printed as the CLI prints it, and for `run` the
-  program, which it becomes.
+- a `build`, `check` or `run` that goes well with nothing to say but cargo's status lines (nothing
+  to do, or units compiled with no diagnostic: an edit's build): one request on the daemon's
+  socket, the CLI's own (the same bytes; `the_thin_blaze_sends_this_clis_request_byte_for_byte`
+  in blaze-cargo holds a table of command lines to it), its answer printed as the CLI prints
+  it (`Compiling`, `link:`, `Finished`, `Running`), and for `run` the program, which it
+  becomes on Unix or starts and waits for on Windows. One connection a command, with one `Status` asked on it first and the `run`'s
+  launch after: `a_run_after_an_edit_is_one_connection_and_one_status` holds that count.
 
 Everything else is the engine's, never done a second way:
 
 | When | What the thin `blaze` does |
 |---|---|
-| A word it does not read exactly as the CLI's parser does (anything but `build`/`b`/`run`/`r` with `-q`, `--quiet`, `-r`, `--release`, and `run`'s program arguments), or `--version` with more words | runs the engine with the command line as typed |
-| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME`, or `IX_PROF` | the same |
+| A word it does not read exactly as the CLI's parser does, or `--version` with more words | runs the engine with the command line as typed. The thin parser handles build/check/run and their aliases, quiet/release flags, simple package selectors, and `run`'s program arguments. |
+| The environment sets a `BLAZE_*` variable other than `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD`, or `IX_PROF` | the same |
 | No current pin lookup is kept for the directory, the workspace pins another blaze, or `default` in blaze's home names another release | the same: the engine's launcher decides and keeps the lookup |
-| No daemon listens, or the daemon is not the engine beside it | the same: the engine starts or replaces the daemon, saying so |
-| The request is sent and the answer is more than a build with nothing to do (a unit compiled, a diagnostic, a report, an error, anything recomputed), or has not ended 25 ms after it was sent | becomes the engine, handing it the connection and the answer read so far (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks its own request against the one sent, byte for byte, and prints the whole answer; the daemon is asked once |
+| No daemon listens, or the daemon is not the engine beside it, or was started with another `BLAZE_DAEMON_EXIT_UNHELD` than the command sets (its `Status` says, blaze-thin's `route::drifted`) | the same: the engine starts or replaces the daemon, saying so, or refuses the difference naming both values; a daemon the engine starts inherits the command's `BLAZE_DAEMON_EXIT_UNHELD` |
+| The request is sent and the answer is more than cargo's status lines (a diagnostic, a report, an error, a failure; for a `build` that is not quiet, which says why it recomputed what it did, a unit compiled), or has not ended 150 ms after it was sent | becomes the engine, handing it the connection and the answer read so far (`blaze __answered`, `crates/blaze-cargo/src/cli/resume.rs`): the engine checks its own request against the one sent, byte for byte, and prints the whole answer; the daemon is asked once |
 
 `blaze-thin --thin-route WORDS...` says which of the first three rows a command line falls
 under (`thin`, or `engine:` and why) and runs nothing.
 
+On Windows the partial-answer deadline is 60 seconds. A response the client cannot print triggers immediate handover. The client authenticates the socket peer before sending the request. Only the connection, answer file and standard streams are inherited; the parent waits for the engine. With `[serve] host = "process"`, the engine serves the command without contacting a resident daemon.
+
+`blaze-thin --thin-timing WORDS...` reports the engine fallback reason. On Windows the main-entry and exit QPC ticks can be compared
+with a parent process's QPC samples to separate launch and teardown from daemon latency.
+
 The thin `blaze` says none of the lines about blaze's updates: the engine says them, before
-every command that reaches it. It sends no client rows to the profile history (it records
-none); a build it answered has the daemon's rows alone.
+every command that reaches it. On a daemon answer it sends the client timing rows on the same connection; on handover it includes the rows so far in the answer file.
 
 Installed, `blaze` is `blaze-thin` and `blaze-engine` is beside it. In a build directory the
 thin `blaze` keeps the name `blaze-thin`, since `blaze` there is blaze-engine's second

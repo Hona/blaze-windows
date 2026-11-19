@@ -3,7 +3,9 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 // Unsafe code is in `llvm` (LLVM's C API) and `lent` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 
@@ -998,12 +1000,18 @@ const CHAINED: usize = 256;
 
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
+///
+/// It is an identity (equal prints are taken as equal code, with no compare after), so it is
+/// BLAKE3 under a domain, 128 bits kept (docs/v2/plan/design/caches.md, "Hash functions"):
+/// until 2026-11-12 it was SipHash-128 under a fixed public key, which is no identity.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
-    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    code.hash(&mut hasher);
-    let type_id::Fingerprint(low, high) = hasher.finish();
-    u128::from(low) | u128::from(high) << 64
+    let mut hasher = blaze_ids::Hasher::new(PRINT_DOMAIN);
+    code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+    hasher.finish().fingerprint().0
 }
+
+/// The domain of [`print_of`].
+const PRINT_DOMAIN: &str = "blaze v2 compiled code print 1";
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
@@ -1029,16 +1037,19 @@ type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
     compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
 #[blaze_query::tracked(returns(ref))]
+#[blaze::renders_positions]
 fn instance_rows(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> Vec<Row> {
     compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
+#[blaze::renders_positions]
 fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
     // alloc: empty, allocates nothing
     let Some(source) = &compiled.source else { return Vec::new() };
@@ -1767,16 +1778,26 @@ fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
 fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
     let level = mir_opt_level_of(db, krate)?;
+    let lang = krate.data(db).origin.is_lang();
+    // The library's bodies as shipped (rustc's pipeline, no pass on facts); another crate's
+    // optimizing where its level is 2, else tier 0. v1 keeps the library inlined at every
+    // level, as it was; v2's `Build::options` decides per unit.
+    let tier = match (level, lang) {
+        (_, true) => hir_ty::facts::Tier::Shipped,
+        (MirOptLevel::Release, false) => hir_ty::facts::Tier::Optimizing,
+        (_, false) => hir_ty::facts::Tier::Zero,
+    };
     Ok(MirOptions {
         level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
-        inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
+        inline: rustc_inlines(level, lang, backend::optimizing()),
         // v1 knows nothing of the program its crates are linked into, so not what allocator
         // it has: no allocation moves to the stack.
         heap_to_stack: false,
         // Nor what trait objects it makes.
         world: None,
+        tier,
     })
 }
 
@@ -1840,6 +1861,12 @@ fn instance_body<'db>(
 /// coroutine's by the body it is written in), and the lowering error in words, which for a call
 /// with no function is the callee as written, where the call is and why it resolved to nothing,
 /// in the body it was met in (rule 19).
+#[expect(
+    blaze::reads_positions,
+    reason = "the codegen query words a lowering error, where the call is included, inside itself: the \
+              `CodegenError` must carry the `MirLowerError` and be worded by `blaze_items::lowering::write` at \
+              the edge"
+)]
 fn mir_failed(
     db: &Db,
     owner: MirOwner<'_>,
@@ -2055,6 +2082,11 @@ fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
 /// it; or its value points to memory allocated while evaluating it; or it calls a function whose
 /// body blaze could not lower, which is named with where it was called. `None` for any other
 /// error.
+#[expect(
+    blaze::reads_positions,
+    reason = "the static's compile words a refused evaluation, where the refused call is included, inside the \
+              query: the `CodegenError` must carry the error and its span, worded at the edge"
+)]
 fn refused_const_eval(
     db: &Db,
     of: GeneralConstId<'_>,
@@ -2163,6 +2195,7 @@ fn refused_const_eval(
 /// macro is called only if the macro is another crate's or the compiler's, and of where the
 /// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
 /// the body when there is none, where that is itself what the macro writes.
+#[blaze::renders_positions]
 fn row_location_in_file(
     db: &Db,
     owner: DefWithBodyId,
@@ -2213,6 +2246,7 @@ fn written_place(
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
 #[blaze_query::tracked]
+#[blaze::renders_positions]
 fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u32, u32)> {
     let source = written_node(db, func.lookup(db));
     location_of(db, source.file_id, written_range(source.value))
@@ -2220,6 +2254,7 @@ fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u
 
 /// The node `loc` is written as, viewed in the tree the database keeps for its file: what
 /// `source(db)` is, with no handle made.
+#[blaze::renders_positions]
 fn written_node<'db>(db: &'db Db, loc: &impl HasSource) -> InFile<syntax::view::Node<'db>> {
     let InFile { file_id, value } = loc.ast_ptr(db);
     InFile::new(file_id, syntax::view::to_node(value.syntax_node_ptr(), file_id.root(db)))
@@ -2249,9 +2284,11 @@ pub fn exported_symbol(db: &Db, func: FunctionId) -> Option<String> {
 }
 
 /// Whether a function is `#[rustc_comptime]`: one the const evaluator alone runs, such as
-/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code.
+/// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code. Nothing that
+/// runs calls one in a crate the check passed
+/// (`hir_ty_mir::mir::const_check::comptime::comptime_calls`).
 pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
-    AttrFlags::has_word(db, func.into(), "rustc_comptime")
+    hir_ty_mir::mir::const_check::comptime::is_comptime(db, func)
 }
 
 /// The refusal of `method` of the impl a builtin derive makes for `self_ty`, as `lookup_impl_method`
@@ -2528,6 +2565,22 @@ fn static_link_name(db: &Db, id: StaticId) -> Result<Option<String>> {
     Ok(static_link_name_for(db, target_of_crate(db, id.krate(db))?, id))
 }
 
+/// Whether a static of an `extern` block is a DLL's, which a PE image reaches only through its
+/// import address table cell (`__imp_X`): one of a block whose first `#[link]` is a `dylib`
+/// (or of no kind) or a `raw-dylib`, on a COFF target, as rustc's `is_dllimport` has it. A
+/// static of a `static` library, or of a block that names none, is the image's own.
+pub(crate) fn dll_imported(db: &Db, id: StaticId) -> bool {
+    let ItemContainerId::ExternBlockId(block) = id.lookup(db).container else { return false };
+    let coff = target_of_crate(db, id.krate(db))
+        .is_ok_and(|target| target.object_format == ObjectFormat::Coff);
+    let cfg = id.krate(db).cfg_options(db);
+    let first = AttrFlags::native_libs(db, block).iter().find(|lib| lib.linked_under(cfg));
+    coff && first.is_some_and(|lib| {
+        use hir_def::attrs::NativeLibKind as Kind;
+        matches!(lib.kind, Kind::Unspecified | Kind::Dylib | Kind::RawDylib)
+    })
+}
+
 /// [`static_link_name`] on `target`, the target of the code that names the static.
 fn static_link_name_for(db: &Db, target: &Target, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -2580,9 +2633,9 @@ fn compile_as<'db>(
     // What the builder made is checked before the passes change it, and what they made of it
     // after: a bad instruction of either is this function's error, never code made from it.
     let built = built.and_then(|mut ctx| {
-        verified(&ctx.func, isa, "built")?;
+        verified(&ctx.func, target, "built")?;
         tally.step(Step::Translate, || settle(&mut ctx, &cg))?;
-        verified(&ctx.func, isa, "settled")?;
+        verified(&ctx.func, target, "settled")?;
         Result::Ok(ctx)
     });
     // Back to the caller before anything can return: nothing after the build reads it.
@@ -2666,9 +2719,26 @@ fn compile_as<'db>(
 /// Every build runs it, release too: on a cold debug build of regex, serde and serde_json with
 /// std (2026-11-03), its two walks of each function were 0.76 to 0.79 s of 144 to 148 s of CPU.
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private
-fn verified(func: &ir::Function, isa: &dyn isa::TargetIsa, stage: &'static str) -> Result<()> {
-    let errors = backend::Tally::global()
-        .step(Step::Verify, || cranelift_codegen::verify_function(func, isa.flags()));
+fn verified(func: &ir::Function, target: &'static Target, stage: &'static str) -> Result<()> {
+    // `get_frame_pointer` and `get_return_address` verify only against a code generator that
+    // keeps frame pointers, which the compile of a function reading them switches to
+    // (`compiled`, as an SEH landing pad and `...` do); the rest against the flags alone.
+    let reads_frame = func.layout.blocks().any(|block| {
+        func.layout.block_insts(block).any(|inst| {
+            matches!(
+                func.dfg.insts[inst].opcode(),
+                ir::Opcode::GetFramePointer | ir::Opcode::GetReturnAddress
+            )
+        })
+    });
+    let isa = match reads_frame {
+        true => &**target_of(target, Features::BASELINE, Isa::FramePointer, false)?,
+        false => &**isa_for(target)?,
+    };
+    let errors = backend::Tally::global().step(Step::Verify, || match reads_frame {
+        true => cranelift_codegen::verify_function(func, isa),
+        false => cranelift_codegen::verify_function(func, isa.flags()),
+    });
     let Err(errors) = errors else { return Ok(()) };
     // alloc: the error's message
     let refused: Vec<&cranelift_codegen::verifier::VerifierError> =
@@ -2936,6 +3006,8 @@ fn build<'db>(
             unwind_to: None,
             pads: Vec::new_in(frame),
             poison: None,
+            terminate: None,
+            boundary: false,
             exception: None,
             argument_slots: Vec::new_in(frame),
             free_argument_slots: Vec::new_in(frame),
@@ -3434,6 +3506,10 @@ fn root_body<'db>(
     Ok((body, env))
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread relocation buffers reused from one function to the next, uncapped: they keep the most relocations one function had"
+)]
 thread_local! {
     /// The relocations of the function [`ObjectCodegen::define_code`] puts in the object, and
     /// those of them Cranelift is given: kept by the thread from one function to the next. A
@@ -3797,6 +3873,9 @@ struct FunctionCx<'cx, 'db> {
     /// In an `async` body: the landing pad of what unwinds with nothing to clean up, which
     /// marks the body as panicked.
     poison: Option<ir::Block>,
+    /// The pad that terminates an unwind escaping this function's ABI.
+    terminate: Option<ir::Block>,
+    boundary: bool,
     /// Where the exception is kept while the cleanup blocks run.
     exception: Option<ir::StackSlot>,
     /// The slots the arguments of the calls so far were copied to since the last were
@@ -3905,6 +3984,15 @@ struct SuspendedState {
     held: hir_ty_mir::mir::HeldLocals,
 }
 
+/// The bugs a test plants in the process caches of interned rows.
+#[cfg(test)]
+pub(crate) mod plant {
+    /// [`super::erase_regions`]' map is kept across a release of the interner's tables, as
+    /// before it kept the release it was filled under.
+    pub(crate) static KEEPS_ERASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+}
+
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
 /// code, and the ones a caller passes on are its own parameters, which mean nothing in the
 /// callee. The fold is compile identity's ([`hir_ty_identity::instance::erased`]), which folds
@@ -3921,25 +4009,41 @@ pub(crate) fn erase_regions<'db>(
     use rustc_type_ir::TypeVisitableExt;
     /// How many are kept before they are let go, as each keeps its types interned.
     const KEPT: usize = 1 << 16;
+    /// The release of the interner's tables ([`hir_ty::evict::tables_released`]) the map was
+    /// filled under, and the map: a release frees the rows it names, and the next row interned
+    /// takes a freed one's number, so the map starts over when the count moved. A release runs
+    /// only while no task does, so this thread's first use after it sees the move.
+    type Erased = (u64, HashMap<StoredGenericArgs, StoredGenericArgs, Global>);
     thread_local! {
-        static ERASED: std::cell::RefCell<HashMap<StoredGenericArgs, StoredGenericArgs, Global>> =
-            std::cell::RefCell::default();
+        static ERASED: std::cell::RefCell<Erased> = std::cell::RefCell::default();
     }
     // Binders are anonymized too (`erased`), so a type with bound variables but no free region
     // is erased as well: `for<'a> fn(&'a u8)` and `for<'b> fn(&'b u8)` are one instance.
     if !args.has_type_flags(hir_ty_identity::instance::ERASES) {
         return args;
     }
+    let released = hir_ty::evict::tables_released();
     let key = args.store();
-    if let Some(known) = ERASED.with_borrow(|it| it.get(&key).map(|it| it.as_ref())) {
+    let known = ERASED.with_borrow_mut(|(under, map)| {
+        #[cfg(test)]
+        if plant::KEEPS_ERASED.load(std::sync::atomic::Ordering::Relaxed) {
+            *under = released;
+        }
+        if *under != released {
+            map.clear();
+            *under = released;
+        }
+        map.get(&key).map(|it| it.as_ref())
+    });
+    if let Some(known) = known {
         return known;
     }
     let erased = hir_ty_identity::instance::erased(interner, args);
-    ERASED.with_borrow_mut(|it| {
-        if it.len() >= KEPT {
-            it.clear();
+    ERASED.with_borrow_mut(|(_, map)| {
+        if map.len() >= KEPT {
+            map.clear();
         }
-        it.insert(key, erased.store());
+        map.insert(key, erased.store());
     });
     erased
 }
@@ -5749,6 +5853,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn codegen(&mut self) -> Result<()> {
         let body = self.body.expect("MIR body");
+        self.boundary = !self.aborts && !hir_ty_mir::mir::abi_can_unwind(self.abi);
         self.check_bfloat_blocks(body)?;
         let FnAbi { ret, args: mut param_modes } = self.body_abi(body, self.abi)?;
         self.ret_mode = ret;
@@ -9179,12 +9284,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a libm function taking and returning `ty`.
     fn float_libcall(&mut self, name: &str, ty: Type, args: &[Value]) -> Result<Value> {
-        let mut sig = self.cg.make_signature();
-        sig.params.extend(args.iter().map(|_| AbiParam::new(ty)));
-        sig.returns.push(AbiParam::new(ty));
-        let callee = self.cg.import(name, &sig)?;
-        let callee = self.cg.declare_func_in_func(callee, self.builder.func);
-        Ok(self.invoke(callee, args)[0])
+        let params: smallvec::SmallVec<[Type; 3]> = args.iter().map(|_| ty).collect();
+        self.builtin(name, &params, ty, args)
     }
 
     /// `as` between a float and an integer or another float.
@@ -11930,11 +12031,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         self.cg.declare_func_in_func(callee, self.builder.func)
                     }
                 };
-                self.invoke(callee, values)
+                if let InstanceDef::Fn(func) = def && !hir_ty_mir::mir::fn_can_unwind(self.cg.db, func) {
+                    let call = self.builder.ins().call(callee, values);
+                    self.builder.inst_results(call).to_vec() // alloc: the received results
+                } else {
+                    self.invoke(callee, values)
+                }
             }
-            Callee::Pointer(pointer, ..) => {
+            Callee::Pointer(pointer, abi, _) => {
                 let sig = self.builder.import_signature(sig);
-                self.invoke_indirect(sig, pointer, values)
+                if hir_ty_mir::mir::abi_can_unwind(abi) {
+                    self.invoke_indirect(sig, pointer, values)
+                } else {
+                    let call = self.builder.ins().call_indirect(sig, pointer, values);
+                    self.builder.inst_results(call).to_vec() // alloc: the received results
+                }
             }
         };
         self.receive(ret_mode, &mut results.into_iter(), dst, ret_layout);
@@ -13565,7 +13676,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         ));
                     self.builder.ins().try_call_indirect(try_fn, &[data], table);
                 } else {
-                    self.guarded_call(caught, |builder| {
+                    self.guarded_call(caught, true, |builder| {
                         builder.ins().call_indirect(try_sig, try_fn, &[data])
                     });
                     self.builder.ins().jump(returned, &[]);
@@ -15135,10 +15246,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Calls a function of compiler-builtins, which are C's by convention.
     fn builtin(&mut self, name: &str, params: &[Type], ret: Type, args: &[Value]) -> Result<Value> {
-        // 64-bit Windows takes an integer of 128 bits by reference and returns it as a
-        // vector.
+        // 64-bit Windows takes an integer or a float of 128 bits by reference and returns it
+        // as a vector (`win64_pass_mode`, as LLVM's Win64 convention has `i128` and `fp128`).
         let windows = self.cg.target.call_conv == isa::CallConv::WindowsFastcall;
-        let wide = |ty: Type| windows && ty == types::I128;
+        let wide = |ty: Type| windows && (ty == types::I128 || ty == types::F128);
         let mut sig = self.cg.make_signature();
         sig.params.extend(
             params
@@ -15164,7 +15275,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let slot = self.scratch_wide();
         self.builder.ins().store(MEM, value, slot, 0);
-        Ok(self.builder.ins().load(types::I128, MEM, slot, 0))
+        Ok(self.builder.ins().load(ret, MEM, slot, 0))
     }
 
     /// Whether an atomic access of `ty` is made of compare-and-swaps of compiler_builtins:
@@ -15364,7 +15475,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self.guarded_call(pad, |builder| builder.ins().call(callee, args));
+            return self.guarded_call(pad, self.boundary, |builder| builder.ins().call(callee, args));
         }
         let sig = self.builder.func.dfg.ext_funcs[callee].signature;
         let (table, after) = self.exception_table(sig, pad);
@@ -15380,8 +15491,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.builder.inst_results(call).to_vec();
         };
         if !self.cg.target.exception_in_register() {
-            return self
-                .guarded_call(pad, |builder| builder.ins().call_indirect(sig, pointer, args));
+            return self.guarded_call(pad, self.boundary, |builder| {
+                builder.ins().call_indirect(sig, pointer, args)
+            });
         }
         let (table, after) = self.exception_table(sig, pad);
         self.builder.ins().try_call_indirect(pointer, args, table);
@@ -15409,6 +15521,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.inner_pad;
         }
         let Some(target) = self.unwind_to else {
+            if self.boundary {
+                return Some(*self.terminate.get_or_insert_with(|| {
+                    let pad = self.builder.create_block();
+                    self.builder.append_block_param(pad, self.cg.target.pointer());
+                    self.builder.set_cold_block(pad);
+                    pad
+                }));
+            }
             // rustc's coroutine transform has every call that unwinds out of an `async` body
             // unwind to a block that poisons it, so that polling it again panics.
             self.suspended.as_ref()?;
@@ -15445,7 +15565,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let normal = self.builder.func.dfg.block_call(after, &results);
         let unwound = self.builder.func.dfg.block_call(cleanup, &[ir::BlockArg::TryCallExn(0)]);
-        let tag = ir::ExceptionTag::with_number(unwind::CLEANUP).expect("a small tag");
+        let tag = ir::ExceptionTag::with_number(if self.boundary { unwind::CATCH } else { unwind::CLEANUP }).expect("a small tag");
         let table = self.builder.func.dfg.exception_tables.push(ir::ExceptionTableData::new(
             sig,
             normal,
@@ -15456,15 +15576,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     /// Makes a call that goes to `pad` when it unwinds, where a call cannot name its pad:
     /// the unwinder has the call return with the exception in a slot of the frame that is
-    /// empty otherwise, and the call is followed by a look at it.
+    /// empty otherwise, and the call is followed by a look at it. `catches`: the pad stops
+    /// the unwind (`catch_unwind`'s), so the personality claims the exception there while it
+    /// looks for a handler; any other pad cleans up, and runs while frames are unwound.
     fn guarded_call(
         &mut self,
         pad: ir::Block,
+        catches: bool,
         call: impl FnOnce(&mut FunctionBuilder<'_>) -> ir::Inst,
     ) -> Vec<Value> {
         self.guarded = true;
         let loc = self.cg.source_loc(self.span);
-        self.builder.set_srcloc(unwind::seh::guarded(loc));
+        let marked = if catches { unwind::seh::catching(loc) } else { unwind::seh::guarded(loc) };
+        self.builder.set_srcloc(marked);
         let call = call(&mut self.builder);
         self.at(self.span);
         let results = self.builder.inst_results(call).to_vec(); // alloc: returned as a `Vec`
@@ -15485,6 +15609,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Fills in the landing pads of a body in `MirPhase::Runtime`: each keeps the exception
     /// and goes on to its cleanup block, which ends in `UnwindResume`.
     fn emit_pads(&mut self) -> Result<()> {
+        if let Some(pad) = self.terminate.take() {
+            self.builder.switch_to_block(pad);
+            self.cannot_unwind()?;
+        }
         for (target, pad) in std::mem::replace(&mut self.pads, Vec::new_in(self.frame)) {
             self.builder.switch_to_block(pad);
             let exception = self.builder.block_params(pad)[0];
@@ -15668,6 +15796,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn resume_unwinding(&mut self, exception: Value) -> Result<()> {
+        if self.boundary {
+            return self.cannot_unwind();
+        }
         let mut sig = self.cg.make_signature();
         sig.params.push(AbiParam::new(self.cg.target.pointer()));
         let resume = if self.cg.target.exception_in_register() {
@@ -15678,6 +15809,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let resume = self.cg.import(resume, &sig)?;
         let resume = self.cg.declare_func_in_func(resume, self.builder.func);
         self.builder.ins().call(resume, &[exception]);
+        self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
+        Ok(())
+    }
+
+    fn cannot_unwind(&mut self) -> Result<()> {
+        let cleaning = std::mem::replace(&mut self.in_cleanup, true);
+        self.call_panic(&["panicking", "panic_cannot_unwind"], &[])?;
+        self.in_cleanup = cleaning;
         self.builder.ins().trap(ir::TrapCode::user(1).expect("a nonzero trap code"));
         Ok(())
     }
@@ -16849,6 +16988,24 @@ mod number_ranges {
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
+
+    /// The invariant: a print is the first 128 bits of the BLAKE3 of the code's `Hash` under
+    /// `PRINT_DOMAIN`, the same in every process, and other code has another print. The
+    /// control is the hash it replaced: SipHash-128 of the same value is not the print.
+    #[test]
+    fn a_print_is_blake3_under_its_domain() {
+        use std::hash::Hash as _;
+        let code = (7u32, "body", [1u8, 2, 3]);
+        let mut hasher = blaze_ids::Hasher::new(super::PRINT_DOMAIN);
+        code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+        assert_eq!(super::print_of(&code), hasher.finish().fingerprint().0);
+        assert_eq!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 3])));
+        assert_ne!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 4])));
+        let mut sip = rustc_stable_hash::StableSipHasher128::new();
+        code.hash(&mut sip);
+        let super::type_id::Fingerprint(low, high) = sip.finish();
+        assert_ne!(super::print_of(&code), u128::from(low) | u128::from(high) << 64);
+    }
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// core's two UB checks are known by their pre-interned symbols, however the name was
@@ -17355,11 +17512,36 @@ mod tests {
         builder.call_memcpy(ill, to, from, bytes);
         builder.ins().return_(&[]);
         builder.finalize(target.frontend_config(isa));
-        let error = super::verified(&func, isa, "built").expect_err("ill-typed IR verified");
+        let error = super::verified(&func, target, "built").expect_err("ill-typed IR verified");
         let super::CodegenError::InvalidIr { stage, ref errors } = error else { panic!("{error}") };
         assert_eq!(stage, "built");
         assert!(errors.contains("call"), "{errors}");
         assert!(error.to_string().contains("Cranelift's verifier refuses (as built)"), "{error}");
+    }
+
+    /// A function that reads its frame pointer (an SEH landing pad's arrival slot) verifies:
+    /// against the code generator that keeps frame pointers its compile switches to, where the
+    /// flags alone answer that it needs an ISA.
+    #[test]
+    fn a_function_reading_its_frame_pointer_verifies() {
+        for triple in ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"] {
+            let target = super::Target::of(triple).unwrap();
+            let isa = &**super::isa_for(target).unwrap();
+            let pointer = target.pointer();
+            let mut sig = ir::Signature::new(isa.default_call_conv());
+            sig.returns.push(AbiParam::new(pointer));
+            let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), sig);
+            let mut builder_ctx = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let frame = builder.ins().get_frame_pointer(pointer);
+            builder.ins().return_(&[frame]);
+            builder.finalize(target.frontend_config(isa));
+            assert!(cranelift_codegen::verify_function(&func, isa.flags()).is_err(), "premise");
+            super::verified(&func, target, "built").unwrap_or_else(|e| panic!("{triple}: {e}"));
+        }
     }
 
     /// One of more than 128 bytes stays a call, of `memcpy` named in place.

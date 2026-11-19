@@ -50,11 +50,62 @@ pub(crate) fn convert(
             // alloc: the function's unwind info, kept with its code; `Unwind::Windows` owns it
             Ok((Unwind::Windows { info: info.to_vec(), handler: None, lsda: None }, None))
         }
-        UnwindParts::Windows { landing_pads: Some(_), .. } => Err(
-            // alloc: the error's message
-            "a Windows function with landing pads: v2 has no SEH handler data yet".to_owned(),
-        ),
+        UnwindParts::Windows { info, landing_pads: Some(pads), .. } => {
+            let arch = isa.triple().architecture;
+            if arch != target_lexicon::Architecture::X86_64 {
+                // alloc: the error's message
+                return Err(format!(
+                    "a Windows function with landing pads on {arch}: blaze names a handler in \
+                     x64's UNWIND_INFO alone"
+                ));
+            }
+            let (info, lsda) = windows_handler(info, pads)?;
+            let unwind =
+                Unwind::Windows { info, handler: Some(personality()?), lsda: Some(lsda.id) };
+            Ok((unwind, Some(lsda)))
+        }
     }
+}
+
+/// `UNWIND_INFO`'s flags of a function whose handler the dispatcher asks while it looks for
+/// one (`UNW_FLAG_EHANDLER`: a pad that catches claims the exception) and while it unwinds
+/// the frame (`UNW_FLAG_UHANDLER`: a pad that cleans up runs), in the high five bits of its
+/// first byte.
+const UNW_FLAG_EHANDLER: u8 = 1;
+const UNW_FLAG_UHANDLER: u8 = 2;
+
+/// A Windows function's `UNWIND_INFO` with its handler flag, and the data its personality
+/// reads ([`crate::unwind::seh::Pads`]): the number of its calls with a landing pad, then
+/// theirs, 12 bytes each. The linker writes the handler's RVA after the unwind codes and this
+/// data's RVA after it, which `DISPATCHER_CONTEXT::HandlerData` points at.
+fn windows_handler(info: &[u8], pads: &[u8]) -> Result<(Vec<u8>, Data), String> {
+    let Some(&first) = info.first() else {
+        // alloc: the error's message
+        return Err("a Windows function with landing pads and no UNWIND_INFO".to_owned());
+    };
+    if first >> 3 != 0 {
+        // alloc: the error's message
+        return Err(format!(
+            "an UNWIND_INFO with flags {:#x} already: a function with landing pads names its \
+             handler alone",
+            first >> 3
+        ));
+    }
+    if pads.is_empty() || !pads.len().is_multiple_of(12) {
+        // alloc: the error's message
+        return Err(format!("{} bytes of landing pads, not 12 a call", pads.len()));
+    }
+    let count = u32::try_from(pads.len() / 12)
+        // alloc: the error's message
+        .map_err(|_| format!("{} calls with landing pads", pads.len() / 12))?;
+    // alloc: the function's unwind info, kept with its code; `Unwind::Windows` owns it
+    let mut info = info.to_vec();
+    info[0] |= (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) << 3;
+    // alloc: the landing pads' data, kept with the code; `Data::new` owns its bytes
+    let mut bytes = Vec::with_capacity(4 + pads.len());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(pads);
+    Ok((info, Data::new(4, bytes, Relocs::new())))
 }
 
 /// The CIE every function of the process's ISA shares, made and read back once: Cranelift's
@@ -191,6 +242,45 @@ mod tests {
         // DW_CFA_advance_loc 1, DW_CFA_def_cfa_offset 16, DW_CFA_offset r6 2.
         assert_eq!(&entry.fde[..5], &[0x41, 0x0e, 16, 0x80 | 6, 2]);
         assert!(entry.fde[5..].iter().all(|&it| it == 0));
+    }
+
+    /// A Windows function with landing pads names the personality as its exception and its
+    /// unwind handler (`UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER`), and its handler data is its
+    /// own read-only object of the number of its guarded calls and then theirs (a pad that
+    /// catches marked), which the linker puts the RVA of after the handler's; one without pads
+    /// has neither.
+    #[test]
+    fn a_windows_function_with_landing_pads_names_its_handler_and_its_pads() {
+        let isa = crate::isa_for(crate::Target::of("x86_64-pc-windows-msvc").unwrap()).unwrap();
+        // Version 1, a 4-byte prologue, two codes (push rbp; set rbp), frame register rbp.
+        let info = vec![1, 4, 2, 5, 4, 0x03, 1, 0x50];
+        let mut pads = crate::unwind::seh::Pads::default();
+        pads.entered(9..10, 0, false);
+        pads.entered(20..21, 0, true);
+        let unwind = crate::unwind::FunctionUnwind::from_unwind_info(32, info.clone(), pads);
+        let personality = || Ok(Target::Extern("rust_eh_personality".to_owned()));
+        let (converted, lsda) = convert(&**isa, &unwind, personality).unwrap();
+        let lsda = lsda.expect("the pads' data");
+        let Unwind::Windows { info: flagged, handler, lsda: named } = converted else {
+            panic!("not Windows unwind info: {converted:?}")
+        };
+        assert_eq!(flagged[0], 1 | 3 << 3, "version 1, UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER");
+        assert_eq!(flagged[1..], info[1..]);
+        assert_eq!(handler, Some(Target::Extern("rust_eh_personality".to_owned())));
+        assert_eq!(named, Some(lsda.id));
+        let words: Vec<u32> =
+            lsda.bytes.chunks(4).map(|it| u32::from_le_bytes(it.try_into().unwrap())).collect();
+        assert_eq!(words, [2, 9, 10, 0, 20 | 1 << 31, 21, 0], "the second call's pad catches");
+
+        let plain = crate::unwind::FunctionUnwind::from_unwind_info(
+            32,
+            info.clone(),
+            crate::unwind::seh::Pads::default(),
+        );
+        let refused = || Err("no personality is asked for".to_owned());
+        let (converted, lsda) = convert(&**isa, &plain, refused).unwrap();
+        assert_eq!(converted, Unwind::Windows { info, handler: None, lsda: None });
+        assert!(lsda.is_none());
     }
 
     #[test]

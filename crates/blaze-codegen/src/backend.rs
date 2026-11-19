@@ -45,6 +45,10 @@ pub enum FrontRef<I, S> {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: copied out of the front end's memo, once per function described
 pub struct Described<I, S> {
     pub item: ItemKey,
+    /// This body may consume a fact closed over the whole program. Even when its
+    /// current describe reads no such fact, introducing the first consumer requires
+    /// closing the world before the build can use the patched walk.
+    pub takes_world: bool,
     /// Its code, with the key of the store its body is written in: what its instance key
     /// ([`crate::Instance::key`]) and so the link name it by, so two bodies written alike in
     /// two places are two functions, each reporting its own positions.
@@ -111,6 +115,18 @@ pub struct Described<I, S> {
     /// key, which instance of the item it is (a closure by its place in its owner's body, a
     /// shim by its kind) and its type arguments. An edit of its body keeps it.
     pub identity: ContentId,
+    /// What a caller's code assumes of it beyond its address: its calling convention, whether
+    /// it is variadic, and for each argument and its result the identity of the type, which
+    /// holds the layout of the type and of every type it names, behind references and
+    /// pointers too (a `&Foo` argument is read at `Foo`'s offsets), a closure by its
+    /// captures' types and a `dyn` by its trait's interface (its vtable's shape). How each
+    /// value is passed is the backend's function of the target and those layouts, so equal
+    /// ones pass alike. Two functions with one `abi` can be called by each other's callers.
+    /// An edit of its body keeps it, as it keeps `identity`; an edit of its signature, or of
+    /// the layout of a type its signature names, changes it and keeps `identity`
+    /// (docs/v2/plan/design/launcher.md, "More than one changed body, and a changed
+    /// signature": a running program's slot is `identity` and this).
+    pub abi: ContentId,
     /// Its code as it runs, test selection's `Bound`: its code hash, its item's
     /// `blaze_items::bound_hash` (which function each ref of its body binds to) and its type
     /// arguments. `Err` names why its item's could not be hashed; only a test binary's table
@@ -224,6 +240,9 @@ pub enum Changed<I, S> {
 
 /// The front end of a build: which instances there are and what they refer to.
 pub trait Frontend: Sync {
+    /// Proof of the inputs to both rounds of this program's closed-world walk, held
+    /// only beside its database. `()` for a front end that never resumes a world.
+    type World: Send + Sync;
     /// A function instance, as the front end holds it. Never hashed: its content is
     /// [`Described::code`] and [`Described::args`].
     type Instance: Clone + Eq + Hash + Send + Sync + Debug;
@@ -290,6 +309,51 @@ pub trait Frontend: Sync {
         self.describe(instance, requester).map(Some)
     }
 
+    /// The store key of the record of the describe of `instance` for `requester`
+    /// (docs/v2/plan/design/store.md, "Describe records"): made of the content of everything
+    /// that describe reads and of nothing of this front end's database or process, so
+    /// another database of the same sources, in this process or a later one, makes the same
+    /// key. `None` for a describe with no content identity the front end can make without
+    /// the describe itself (code an edit reaches, a body that names a file by the build's
+    /// name for it): the walk describes it. Asked once per function the walk has no kept
+    /// describe of, on every core at once, so it must cost far less than the describe. The
+    /// default is `None`: a front end that keeps no records.
+    fn record_key(&self, instance: &Self::Instance, requester: &Origin) -> Option<blaze_cas::Key> {
+        let _ = (instance, requester);
+        None
+    }
+
+    /// The describe of `instance` for `requester` as `bytes` hold it, which the store gave
+    /// under [`Self::record_key`] of the two: what [`Self::describe`] would give, its
+    /// instances made in this front end's database. `Err` says why the bytes do not read
+    /// here, and is the build's error naming the function and the key: the key says the
+    /// record is of this content, so a record that does not read is a key that leaves an
+    /// input out (rule 21), never a reason to describe again.
+    fn from_record(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<Self::Instance, Self::Static>, String> {
+        let _ = (instance, requester, bytes);
+        // alloc: an error, of a front end that keeps no records and is given one
+        Err("the front end keeps no describe records".to_owned())
+    }
+
+    /// `described`, the describe of `instance` for `requester` this front end just made, as
+    /// the record kept under [`Self::record_key`] of the two: every instance and static it
+    /// names written by content. `None` where some part has no such form; nothing is kept
+    /// then. Two databases of the same sources give the same bytes (rule 25).
+    fn to_record(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        described: &Described<Self::Instance, Self::Static>,
+    ) -> Option<Vec<u8>> {
+        let _ = (instance, requester, described);
+        None
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.
@@ -335,13 +399,26 @@ pub trait Frontend: Sync {
         true
     }
 
-    /// Whether a walk of this front end may close facts of the whole program
+    /// Whether a walk of this front end may close facts of the whole program even
+    /// when no described function sets `takes_world`
     /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached,
     /// so a walk patched from a kept one, which holds only what changed, is for a front end
     /// that says `false`. The default is `true`.
     fn closes(&self) -> bool {
         true
     }
+
+    fn kept_world(&self) -> Option<Self::World> {
+        None
+    }
+
+    /// Install the world only if both the plain walk and the closed walk still yield it.
+    fn resume_world(&self, _: &Self::World, _: u64) -> Result<(), &'static str> {
+        Err("the front end does not resume a closed world")
+    }
+
+    /// A structural walk starts without a world, including after an attempted patch.
+    fn abandon_resumed_world(&self) {}
 
     /// Told that the walk has reached everything, with no error: `functions` (each with whose
     /// code asked for it) and `statics` are all it reached, each once, in the walk's order,

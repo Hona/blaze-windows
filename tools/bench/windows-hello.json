@@ -1,0 +1,17 @@
+{
+  "project": "C:/bench/hello",
+  "blaze": "C:/bench/bin/blaze-thin.exe",
+  "engine": "C:/bench/bin/blaze-engine.exe",
+  "blaze_commit": "replace with the commit of those binaries",
+  "cargo": "C:/bench/rust/bin/cargo.exe",
+  "toolchains": "C:/bench/prefetched/toolchains",
+  "volumes": ["C:/bench/scratch", "D:/bench/scratch"],
+  "out": "C:/bench/results-1",
+  "runs": 5,
+  "comment": "src/main.rs",
+  "leaf": {"file":"src/main.rs", "before":"println!(\"{}\", greeting());", "after":"println!(\"{} {tick}\", greeting());"},
+  "mid": null,
+  "test": {"file":"src/main.rs", "before":"assert!(r.is_err());", "after":"assert_eq!(true, r.is_err());"},
+  "test_args": ["catch_unwind_returns"],
+  "environment": {"RUSTUP_TOOLCHAIN":"stable-x86_64-pc-windows-msvc", "CARGO_BUILD_JOBS":"16"}
+}

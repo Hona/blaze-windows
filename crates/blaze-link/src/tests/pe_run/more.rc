@@ -1,0 +1,10 @@
+// A second resource file on the same link, as two build scripts each give one: a string table
+// and data by number, in a language other than the first file's (`build.ps1`).
+#include <winres.h>
+
+LANGUAGE LANG_GERMAN, SUBLANG_GERMAN
+STRINGTABLE
+BEGIN
+  100 "zweite Datei"
+END
+7 RCDATA { "seven\0" }

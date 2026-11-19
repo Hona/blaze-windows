@@ -1,7 +1,6 @@
 //! The loop's pulse as threads outside it read it ([`Pulse`]), the judge of a loop that
-//! stopped turning ([`LoopWatch`]), the judge of a footprint against the daemon's memory
-//! ceiling ([`CeilingWatch`]) and the dedupe of the wait-for graph's stalls ([`StallWatch`]):
-//! sans-IO cores the stop's guard (`serve::stop`) drives.
+//! stopped turning ([`LoopWatch`]) and the dedupe of the wait-for graph's stalls
+//! ([`StallWatch`]): sans-IO cores the stop's guard (`serve::stop`) drives.
 //!
 //! The loop is the one thread that reaps the daemon's children and hands their completions on
 //! (blaze-core's drivers reap a child only as their `poll` sees it exit). A loop stuck inside a
@@ -35,7 +34,32 @@ pub struct Pulse {
     /// on, which nothing it runs after its wait may do (`Daemon::turn_after_wait`). A queue
     /// has no holder to wait for. At most [`STALLS_KEPT`] are kept: the guard drops the oldest.
     stalls: SegQueue<Option<String>>,
+    /// The task watchdog's word to the loop (`serve::stuck`): each task it found stuck, once,
+    /// for the loop to put in its build's live model and, for a thread nothing can unwind, to
+    /// fail its plane node ([`StuckSaid::lost`]). A queue, as `stalls` is: the loop never
+    /// parks on the watchdog. At most [`STUCK_KEPT`]: the watchdog drops the oldest.
+    stuck: SegQueue<StuckSaid>,
+    /// Each job's write that waits, as the loop last looked (`Daemon::doing`, once a second
+    /// while a build runs), for `blaze debug inspect`. The loop only tries it, so it never
+    /// parks on a reader; a look it could not take is taken at the next.
+    writes: blaze_core::lock::Lock<Vec<super::work::WriteWaiting>>,
 }
+
+/// A task the watchdog found stuck, as it tells the loop.
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: a stuck task, once
+pub struct StuckSaid {
+    /// The build its thread works for; 0 for none (it is said in every build's model).
+    pub build: u32,
+    /// The plane node of the daemon `task` span it is inside, if any.
+    pub node: Option<u64>,
+    /// A thread stuck where nothing can unwind it: its node is failed at the plane with
+    /// `said`'s line and the late end of its task, if one ever comes, is dropped.
+    pub lost: bool,
+    pub said: blaze_protocol::now::Stuck,
+}
+
+/// The most stuck tasks the queue holds for the loop: more than a 128-core pool's convoy.
+const STUCK_KEPT: usize = 512;
 
 /// The most stall lines the queue holds for the loop: a loop that builds nothing takes none,
 /// and the guard says one each look while a stall lasts.
@@ -43,11 +67,47 @@ const STALLS_KEPT: usize = 4;
 
 impl Default for Pulse {
     fn default() -> Pulse {
-        Pulse { moved: AtomicU64::new(0), turns: AtomicU64::new(0), stalls: SegQueue::new() }
+        Pulse {
+            moved: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+            stalls: SegQueue::new(),
+            stuck: SegQueue::new(),
+            writes: blaze_core::lock::Lock::new("serve.pulse.writes", Vec::new()),
+        }
     }
 }
 
 impl Pulse {
+    /// On the loop: the writes that wait now. Never waits: a reader holding the lock leaves
+    /// the last look in place.
+    pub fn set_writes(&self, writes: Vec<super::work::WriteWaiting>) {
+        if let Some(mut it) = self.writes.try_lock() {
+            *it = writes;
+        }
+    }
+
+    /// The writes that waited at the loop's last look; waits for the loop's swap at most.
+    pub fn writes(&self) -> Vec<super::work::WriteWaiting> {
+        self.writes.lock().clone() // clone: an answer, on demand
+    }
+
+    /// The task watchdog found `said` stuck. Never waits: past [`STUCK_KEPT`] untaken, the
+    /// oldest goes (it was logged and recorded as it was said).
+    pub fn say_stuck(&self, said: StuckSaid) {
+        if self.stuck.len() >= STUCK_KEPT {
+            drop(self.stuck.pop());
+        }
+        self.stuck.push(said);
+    }
+
+    /// On the loop: each stuck task said since the last take, oldest first. Never waits;
+    /// bounded by [`STUCK_KEPT`] and what the watchdog says meanwhile, a look every few seconds.
+    pub fn take_stuck(&self, mut each: impl FnMut(StuckSaid)) {
+        while let Some(said) = self.stuck.pop() {
+            each(said);
+        }
+    }
+
     /// The guard's latest stall line, `None` once none lasts. Never waits: the oldest line
     /// the loop has not taken goes when [`STALLS_KEPT`] are queued, and the last said stays.
     pub fn set_stall(&self, line: Option<String>) {
@@ -139,9 +199,64 @@ impl LoopWatch {
     }
 }
 
+/// What one look at the loop's turns found.
+#[cfg(all(unix, feature = "native"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// A turn ended since the last look: the loop turns.
+    Turning,
+    /// No turn ended since the last look, for less than the report's bound, or the stuck turn
+    /// was reported already.
+    Holds,
+    /// No turn ended for `for_ns`, from `since_ns`, past the report's bound: said once a stuck
+    /// turn, the loop having finished `turns` turns.
+    Stuck { since_ns: u64, for_ns: u64, turns: u64 },
+}
+
+/// Judges the loop's turns, told the time and the count at each look: a turn that lasts past
+/// `report` is reported once, and again only after the loop turned in between.
+#[cfg(all(unix, feature = "native"))]
+#[derive(Debug)]
+pub struct LoopWatch {
+    report_ns: u64,
+    /// The turns at the last look that saw them move, and when.
+    seen: Option<(u64, u64)>,
+    said: bool,
+}
+
+#[cfg(all(unix, feature = "native"))]
+impl LoopWatch {
+    pub fn new(report: Duration) -> LoopWatch {
+        LoopWatch {
+            report_ns: u64::try_from(report.as_nanos()).unwrap_or(u64::MAX),
+            seen: None,
+            said: false,
+        }
+    }
+
+    /// One look: `now_ns` on a monotonic clock, `turns` the loop's count ([`Pulse::turns`]).
+    pub fn look(&mut self, now_ns: u64, turns: u64) -> Look {
+        match self.seen {
+            Some((seen, since_ns)) if seen == turns => {
+                let for_ns = now_ns.saturating_sub(since_ns);
+                if self.said || for_ns < self.report_ns {
+                    return Look::Holds;
+                }
+                self.said = true;
+                Look::Stuck { since_ns, for_ns, turns }
+            }
+            _ => {
+                self.seen = Some((turns, now_ns));
+                self.said = false;
+                Look::Turning
+            }
+        }
+    }
+}
+
 /// What one look at the daemon's footprint against its memory ceiling found
 /// ([`CeilingWatch::look`]).
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(windows, feature = "native"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CeilingLook {
     /// Under the ceiling, and no nearer or further than the last look said.
@@ -164,8 +279,8 @@ pub enum CeilingLook {
 /// Judges the daemon's footprint against its ceiling, told both at each look: past it, the
 /// daemon ends; near it, or eased from near it, a line says so once. A ceiling of 0 is none,
 /// and a footprint at the ceiling is not past it. Allocates nothing, so the guard may look
-/// every 100 ms (`serve::ceiling::EVERY`).
-#[cfg(all(unix, feature = "native"))]
+/// every 100 ms (the commit guard).
+#[cfg(all(windows, feature = "native"))]
 #[derive(Debug, Default)]
 pub struct CeilingWatch {
     /// The last look that was not under said near, and none has said eased since.
@@ -174,10 +289,10 @@ pub struct CeilingWatch {
     purged: bool,
 }
 
-#[cfg(all(unix, feature = "native"))]
+#[cfg(all(windows, feature = "native"))]
 impl CeilingWatch {
     /// One look: `footprint` the daemon's bytes as the system counts them
-    /// (`raw::memory::own_footprint`), `ceiling` its ceiling's (`serve::ceiling::ceiling`).
+    /// (`raw::memory::own_footprint`), `ceiling` its ceiling's (the engine guard).
     pub fn look(&mut self, footprint: u64, ceiling: u64) -> CeilingLook {
         if ceiling == 0 {
             self.near = false;
@@ -342,6 +457,70 @@ mod tests {
         }
     }
 
+    fn convoy(head: u64, waiters: usize) -> Stall {
+        use blaze_core::lock::stall::{Blocked, WaitRow};
+        let on = Blocked::Signal("test.gate");
+        let oldest = WaitRow {
+            thread: head + 100,
+            span: 0,
+            since_ns: 0,
+            deadline_ns: None,
+            on,
+            holder: Some(head),
+            site: None,
+        };
+        Stall::Convoy { head, head_wait: None, holds: on, waiters, oldest }
+    }
+
+    fn deadlock(threads: &[u64]) -> Stall {
+        use blaze_core::lock::stall::{Blocked, WaitRow};
+        let cycle = threads
+            .iter()
+            .map(|&thread| WaitRow {
+                thread,
+                span: 0,
+                since_ns: 0,
+                deadline_ns: None,
+                on: Blocked::Signal("test.gate"),
+                holder: None,
+                site: None,
+            })
+            .collect();
+        Stall::Deadlock { cycle }
+    }
+
+    /// Each stall is said once while it lasts, however its convoy grows or its cycle is
+    /// walked from; a stall gone from a look and back is said again. Make `look` keep nothing
+    /// and every look says every stall; make it never forget and one that came back is
+    /// never said.
+    #[test]
+    fn each_stall_is_said_once_while_it_lasts_and_again_after_it_ended() {
+        let mut watch = StallWatch::default();
+        assert_eq!(watch.look(&[convoy(7, 3)]), [0]);
+        assert_eq!(watch.look(&[convoy(7, 61)]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[2, 1]), convoy(7, 61)]), [0]);
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 61)]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2])]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 2)]), [1]);
+        assert_eq!(watch.look(&[]), Vec::<usize>::new());
+        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(9, 2)]), [0, 1]);
+    }
+
+    #[test]
+    fn the_pulse_counts_turns_and_keeps_the_last_progress() {
+        let pulse = Pulse::default();
+        pulse.turned(3);
+        pulse.turned(3);
+        pulse.turned(9);
+        assert_eq!((pulse.turns(), pulse.moved()), (3, 9));
+    }
+}
+
+/// The Windows private-commit guard's decision.
+#[cfg(all(windows, test, feature = "native"))]
+mod ceiling_tests {
+    use super::*;
+
     const GIB: u64 = 1 << 30;
 
     /// The guard's decision on a daemon's footprint against a ceiling of 48 GiB: under it, or
@@ -389,55 +568,5 @@ mod tests {
         assert_eq!(small.look(8, 8), Near);
         assert_eq!(small.look(9, 8), Purge);
         assert_eq!(small.look(9, 8), Passed);
-    }
-
-    fn convoy(head: u64, waiters: usize) -> Stall {
-        use blaze_core::lock::stall::{Blocked, WaitRow};
-        let on = Blocked::Signal("test.gate");
-        let oldest =
-            WaitRow { thread: head + 100, span: 0, since_ns: 0, on, holder: Some(head), site: None };
-        Stall::Convoy { head, head_wait: None, holds: on, waiters, oldest }
-    }
-
-    fn deadlock(threads: &[u64]) -> Stall {
-        use blaze_core::lock::stall::{Blocked, WaitRow};
-        let cycle = threads
-            .iter()
-            .map(|&thread| WaitRow {
-                thread,
-                span: 0,
-                since_ns: 0,
-                on: Blocked::Signal("test.gate"),
-                holder: None,
-                site: None,
-            })
-            .collect();
-        Stall::Deadlock { cycle }
-    }
-
-    /// Each stall is said once while it lasts, however its convoy grows or its cycle is
-    /// walked from; a stall gone from a look and back is said again. Make `look` keep nothing
-    /// and every look says every stall; make it never forget and one that came back is
-    /// never said.
-    #[test]
-    fn each_stall_is_said_once_while_it_lasts_and_again_after_it_ended() {
-        let mut watch = StallWatch::default();
-        assert_eq!(watch.look(&[convoy(7, 3)]), [0]);
-        assert_eq!(watch.look(&[convoy(7, 61)]), Vec::<usize>::new());
-        assert_eq!(watch.look(&[deadlock(&[2, 1]), convoy(7, 61)]), [0]);
-        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 61)]), Vec::<usize>::new());
-        assert_eq!(watch.look(&[deadlock(&[1, 2])]), Vec::<usize>::new());
-        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(7, 2)]), [1]);
-        assert_eq!(watch.look(&[]), Vec::<usize>::new());
-        assert_eq!(watch.look(&[deadlock(&[1, 2]), convoy(9, 2)]), [0, 1]);
-    }
-
-    #[test]
-    fn the_pulse_counts_turns_and_keeps_the_last_progress() {
-        let pulse = Pulse::default();
-        pulse.turned(3);
-        pulse.turned(3);
-        pulse.turned(9);
-        assert_eq!((pulse.turns(), pulse.moved()), (3, 9));
     }
 }

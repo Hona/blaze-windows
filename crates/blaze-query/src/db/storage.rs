@@ -22,6 +22,7 @@ use super::{
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
     provenance::{self, Cause, restamp_run},
     row::{Owners, Pages, VALUE, VIEW_MASK, span},
+    seal::Seals,
 };
 
 /// What a database is to the engine: its storage. `base_db::Db` implements it; the generated
@@ -116,6 +117,18 @@ pub(crate) fn key_parts(key: u64) -> (u32, Id, u32) {
 pub(crate) type Summary = [u64; 2];
 pub(crate) const ALL: Summary = [u64::MAX; 2];
 
+/// The summary bit no input field's own bits take ([`input_bits`]): set on an input field no
+/// seal group owns, on a row whose reads no one group covers, and so, by the summaries' own
+/// rule, on every row that reads one of them at any depth ([`super::seal`]). A row without it
+/// reads, transitively, only inputs of its seal group and of the groups that one depends on.
+pub(crate) const LOOSE: Summary = [0, 1 << 63];
+
+/// Whether `summary` has [`LOOSE`].
+#[inline(always)]
+pub(crate) fn loose(summary: Summary) -> bool {
+    summary[1] & LOOSE[1] != 0
+}
+
 /// A node of the dependency graph: what a walk reads of it (its color, summary and key) in one
 /// place, so a walk checks the node's index once and finds all of it in one cache line.
 #[repr(C, align(32))]
@@ -158,12 +171,18 @@ impl NodeRow {
         [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)]
     }
 
-    /// Adds `summary`'s bits: a walk's, which racing walkers of a view agree on.
+    /// Adds `summary`'s bits: a walk's, which racing walkers of a view agree on. Whether it
+    /// held bits before and gained one.
     #[inline]
-    pub(crate) fn grow_summary(&self, summary: Summary) {
+    pub(crate) fn grow_summary(&self, summary: Summary) -> bool {
+        gained(self.add_summary(summary), summary)
+    }
+
+    /// Adds `summary`'s bits and gives the summary before.
+    #[inline]
+    pub(crate) fn add_summary(&self, summary: Summary) -> Summary {
         let [a, b] = &self.summary;
-        a.fetch_or(summary[0], Ordering::Relaxed);
-        b.fetch_or(summary[1], Ordering::Relaxed);
+        [a.fetch_or(summary[0], Ordering::Relaxed), b.fetch_or(summary[1], Ordering::Relaxed)]
     }
 
     #[inline(always)]
@@ -175,16 +194,25 @@ impl NodeRow {
 /// Views of written-field masks kept: a memo verified further back walks.
 const HISTORY: usize = 64;
 
-/// The two bits of input field node `node`: two multiplicative hashes by odd constants.
+/// The two bits of input field node `node`: two multiplicative hashes by odd constants. Never
+/// bit 127, which is [`LOOSE`]'s.
 #[inline]
 pub(crate) fn input_bits(node: u32) -> Summary {
     let node = u64::from(node);
     let mut bits = [0; 2];
     for k in [0x9e37_79b9_7f4a_7c15_u64, 0xc2b2_ae3d_27d4_eb4f] {
-        let bit = (node.wrapping_mul(k) >> 57) as u32;
+        let bit = ((node.wrapping_mul(k) >> 57) as u32).min(126);
         bits[(bit >> 6) as usize] |= 1 << (bit & 63);
     }
     bits
+}
+
+/// Whether a node whose summary was `old` and is now `old | new` or `new` gained a bit its
+/// readers may lack: it held bits before (a node never summarized has no reader yet: a reader
+/// takes its summary as it ends its run, after the node's first) and `new` has one more.
+#[inline(always)]
+pub(crate) fn gained(old: Summary, new: Summary) -> bool {
+    old != [0; 2] && (new[0] & !old[0]) | (new[1] & !old[1]) != 0
 }
 
 #[inline(always)]
@@ -200,7 +228,7 @@ const INTERN_HEAP: usize = 1 << 35;
 /// Nodes and edges a storage may have; entries and captures one view's [`super::Reads`] may
 /// hold.
 #[cfg(target_pointer_width = "64")]
-const NODES: usize = 1 << 28;
+pub(crate) const NODES: usize = 1 << 28;
 #[cfg(target_pointer_width = "64")]
 const EDGES: usize = 1 << 32;
 #[cfg(target_pointer_width = "64")]
@@ -217,7 +245,7 @@ const HEAP: usize = 512 << 20;
 #[cfg(not(target_pointer_width = "64"))]
 const INTERN_HEAP: usize = 256 << 20;
 #[cfg(not(target_pointer_width = "64"))]
-const NODES: usize = 1 << 23;
+pub(crate) const NODES: usize = 1 << 23;
 #[cfg(not(target_pointer_width = "64"))]
 const EDGES: usize = 1 << 26;
 #[cfg(not(target_pointer_width = "64"))]
@@ -249,7 +277,7 @@ pub struct Storage {
     /// views.
     written: [Summary; HISTORY],
     /// Each ingredient's row-page directory, null until first use.
-    dirs: Box<[AtomicPtr<AtomicPtr<u8>>; MAX_INGREDIENTS]>,
+    dirs: Box<[AtomicPtr<super::row::DirEntry>; MAX_INGREDIENTS]>,
     /// Each ingredient's table, null until first use.
     tables: Box<[AtomicPtr<()>; MAX_INGREDIENTS]>,
     #[expect(clippy::disallowed_types, reason = "held only while an ingredient's table or page directory is made, once each")]
@@ -302,6 +330,8 @@ pub struct Storage {
     epochs: [u32; 2],
     /// The changed set's feeds, reverse index and walks ([`super::frontier`]).
     pub(crate) frontier: Frontier,
+    /// The seal groups: which group each node is of, and each group's state ([`super::seal`]).
+    pub(crate) seals: Seals,
     /// The database type of its first function table ([`Storage::check_db`]).
     #[expect(clippy::disallowed_types, reason = "held once per function table made, to check its database type")]
     db_type: blaze_core::lock::Lock<Option<TypeId>>,
@@ -345,7 +375,10 @@ impl Storage {
             making: blaze_core::lock::Lock::new("query.storage.making", ()),
             heap: Heap::new(HEAP, Tag::Query),
             intern_heap: Heap::new(INTERN_HEAP, Tag::Intern),
+            #[cfg(not(windows))]
             owners: Owners::sparse(Tag::Query, "page owners"),
+            #[cfg(windows)]
+            owners: Owners::growing(MAX_PAGES, Tag::Query, "page owners"),
             next_page: AtomicU32::new(1),
             nodes: Dense::growing(NODES, Tag::Query, "nodes"),
             runs: Dense::growing(NODES, Tag::Query, "node runs"),
@@ -369,6 +402,7 @@ impl Storage {
             passed_at: [0; Tag::COUNT],
             epochs: [view; 2],
             frontier: Frontier::new(),
+            seals: Seals::new(),
             db_type: blaze_core::lock::Lock::new("query.storage.db_type", None),
         }
     }
@@ -431,6 +465,59 @@ impl Storage {
         (summary[0] & written[0]) | (summary[1] & written[1]) == 0
     }
 
+    /// Whether the row of node `node` (`row`), of durability `durability` and verified in
+    /// `verified`, whose last run made no untracked read, holds in this view with no look at
+    /// its edges: no input of its kind or above was written since, or none whose bits its
+    /// summary has; counted from the view it was verified in, or from the changed set's floor
+    /// where that is later and holds the row ([`super::frontier::floor`]); or the changed
+    /// set's walk of this view says it is unchanged ([`super::frontier::unreached`]).
+    ///
+    /// Each proof is counted to the row's ingredient under the branch that made it, the
+    /// first in this order (the validity census, [`counts::proved`]): a branch the census of
+    /// real builds shows unused is one to delete.
+    #[inline]
+    pub(crate) fn holds(&self, node: u32, row: &NodeRow, durability: u8, verified: u32) -> bool {
+        // A row behind a seal that holds: one check of its group stood for every row of it
+        // ([`super::seal`]).
+        if self.seals.proves(node) {
+            counts::proved(key_parts(row.key()).0, counts::PROVED_SEAL);
+            return true;
+        }
+        if self.unchanged_since(durability, verified) || self.inputs_unchanged(row, verified) {
+            // The census: which of the two proved it, asked again in their order.
+            let by = if self.unchanged_since(durability, verified) {
+                counts::PROVED_DURABILITY
+            } else {
+                counts::PROVED_SUMMARY
+            };
+            counts::proved(key_parts(row.key()).0, by);
+            return true;
+        }
+        let floor = super::frontier::floor(self);
+        if floor > verified
+            && (self.unchanged_since(durability, floor) || self.inputs_unchanged(row, floor))
+            && super::frontier::floored(self, node)
+        {
+            let by = if self.unchanged_since(durability, floor) {
+                counts::PROVED_FLOOR_DURABILITY
+            } else {
+                counts::PROVED_FLOOR_SUMMARY
+            };
+            counts::proved(key_parts(row.key()).0, by);
+            return true;
+        }
+        // A row whose edges a seal pass let go is reached by no reverse edge, so the walk's
+        // reach and end say nothing of it: past its seal, its durability and its summary
+        // (none of which reads an edge), it runs again ([`super::seal::Seals::let_go`]).
+        if self.seals.let_go(node) {
+            return false;
+        }
+        // Or the changed set's walk of this view says so: it ended, or the row is outside
+        // its reach. It counts its own proofs ([`counts::PROVED_WALK_END`],
+        // [`counts::PROVED_REACH`]).
+        super::frontier::unreached(self, node)
+    }
+
     /// Node `node`: one check of its index for all it holds.
     ///
     /// # Panics
@@ -460,14 +547,22 @@ impl Storage {
     #[inline]
     pub(crate) fn set_summary(&self, node: u32, summary: Summary) {
         let [a, b] = &self.node(node).summary;
+        let old = [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)];
         a.store(summary[0], Ordering::Relaxed);
         b.store(summary[1], Ordering::Relaxed);
+        // A node that ran again and reads an input its readers' summaries lack: they are
+        // completed at the next view boundary ([`Storage::complete_summaries`]).
+        if gained(old, summary) {
+            self.frontier.grew(node);
+        }
     }
 
     /// Adds `summary`'s bits to `node`'s: a walk's, which racing walkers of a view agree on.
     #[inline]
     pub(crate) fn grow_summary(&self, node: u32, summary: Summary) {
-        self.node(node).grow_summary(summary);
+        if self.node(node).grow_summary(summary) {
+            self.frontier.grew(node);
+        }
     }
 
     /// The OR of the summaries of `edges`' nodes.
@@ -517,6 +612,12 @@ impl Storage {
     /// `file!()` where ingredient `ingredient` is defined.
     pub fn ingredient_file(&self, ingredient: u32) -> &'static str {
         ingredient::vtable(ingredient).map_or("<unregistered>", |it| it.file)
+    }
+
+    /// Whether `ingredient` is defined in a source file whose `file!()` path ends in the
+    /// `/`-separated path components `tail`, matching whole components on every host separator.
+    pub fn ingredient_in_file(&self, ingredient: u32, tail: &str) -> bool {
+        file_ends_with(self.ingredient_file(ingredient), tail)
     }
 
     /// The IDs an interned row's fields name, pushed onto `out`; nothing for another row.
@@ -578,6 +679,21 @@ impl Storage {
         tables + self.graph_usage().iter().map(MemoryUsage::held).sum::<u64>()
     }
 
+    /// Each function in use, with the values it holds and what it holds in bytes (its row
+    /// pages and what its values hold beside them, [`MemoryUsage::held`]), pushed onto `out`:
+    /// from counters alone, a few loads a function and no row read, so a build's report can say
+    /// what each query holds every time, not only under pressure ([`Storage::memory_usage`] walks
+    /// rows to count the ones in use). Sound with queries running, as every count is an atomic
+    /// load. A task-scoped function ([`super::task_scope`]) has no table here.
+    pub fn held_by_function(&self, out: &mut Vec<(&'static str, u64, u64)>) {
+        for index in self.live() {
+            let Some(vtable) = ingredient::vtable(index) else { continue };
+            let Some(values) = vtable.values else { continue };
+            // alloc: the caller's report, one entry per function in use
+            out.push((vtable.name, values(self, index), (vtable.memory)(self, index).held()));
+        }
+    }
+
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
     fn graph_usage(&self) -> [MemoryUsage; 4] {
         let live = self
@@ -591,7 +707,8 @@ impl Storage {
                 name: "dependency nodes",
                 rows: nodes,
                 used: nodes,
-                row_bytes: (self.nodes.committed_bytes() + self.runs.committed_bytes()) as u64,
+                row_bytes: (self.nodes.committed_bytes() + self.runs.committed_bytes()) as u64
+                    + self.seals.bytes(),
                 value_bytes: 0,
             },
             MemoryUsage {
@@ -625,6 +742,9 @@ impl Storage {
     /// below is green by its summary.
     pub fn synthetic_write(&mut self, durability: Durability) {
         self.new_view(durability, ALL);
+        // No field names it: every sealed group whose rows read something no group covers
+        // (an untracked read is one) is checked before a row of it is taken as unchanged.
+        self.seal_wrote_all();
     }
 
     /// Opens the next view for a write of kind `durability` to the input fields whose
@@ -638,8 +758,13 @@ impl Storage {
         if durability.0 >= Durability::HIGH.0 {
             self.high_opened = self.opened;
         }
+        // The reaches of the view before are no view's now.
+        self.drop_reaches();
         // Before the edge array settles: the fold reads the spans runs replaced.
         self.fold_reverse();
+        // Before the write's mask is tested against any row: every reader's summary holds
+        // what its dependencies read now.
+        self.complete_summaries();
         self.settle();
         self.sweep();
         self.view
@@ -731,12 +856,15 @@ impl Storage {
     /// Passes every view stamp the storage holds through `restamp`, storing what it gives.
     fn restamp(&mut self, restamp: &mut Restamp<'_>) {
         self.view = restamp.apply(self.view);
+        let floor = self.frontier.floor.get_mut();
+        *floor = restamp.apply(*floor);
         for kind in &mut self.last_changed {
             *kind = restamp.apply(*kind);
         }
         for epoch in &mut self.epochs {
             *epoch = restamp.apply(*epoch);
         }
+        self.seals.restamp(restamp);
         for node in 1..self.nodes_made() {
             let painted = self.color_of(node);
             let (verified, changed) = ((painted >> 32) as u32, painted as u32);
@@ -819,6 +947,24 @@ impl Storage {
                 self.passed_at[at] = tag::snapshot().get(tag).live;
             }
         }
+    }
+
+    /// What the values of each tag's `lru` functions weigh now, by [`Tag::index`]: what
+    /// [`Storage::sweep_values`] weighs against its budgets, for a caller that caps them by
+    /// bytes (`blaze-cargo`'s give-back of a kept front end's values, which lowers each
+    /// tag's cap by its part of what is asked). A weighing of every weighed ingredient, as a
+    /// sweep's first half is.
+    pub fn weighed_bytes(&mut self) -> [u64; Tag::COUNT] {
+        let mut weight = [0u64; Tag::COUNT];
+        let count = self.weighed.get_mut().len();
+        for at in 0..count {
+            let index = self.weighed.get_mut()[at];
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
+            weight[weighed.tag.index()] += (weighed.weight)(self, index);
+        }
+        weight
     }
 
     /// Ends an epoch of the host's (a build), with `&mut`: lets go of every value of an
@@ -965,7 +1111,17 @@ impl Storage {
     /// The ingredient that owns `id`'s page.
     #[inline]
     pub fn owner(&self, id: Id) -> Option<u32> {
-        match self.owners.get(id.page()).load(Ordering::Acquire) {
+        let slot = {
+            #[cfg(windows)]
+            {
+                self.owners.get_checked(id.page())
+            }
+            #[cfg(not(windows))]
+            {
+                Some(self.owners.get(id.page()))
+            }
+        };
+        match slot.map_or(0, |it| it.load(Ordering::Acquire)) {
             0 => None,
             owner => Some(owner),
         }
@@ -1015,6 +1171,12 @@ impl Storage {
         let page = self.next_page.fetch_add(1, Ordering::Relaxed) as usize;
         assert!(page < MAX_PAGES, "the query database ran out of ID pages ({MAX_PAGES})");
         // Release: whoever sees an ID of the page sees its owner.
+        #[cfg(windows)]
+        {
+            self.owners.ensure(page + 1);
+            self.owners.get(page).store(ingredient, Ordering::Release);
+        }
+        #[cfg(not(windows))]
         self.owners.get_to_write(page).store(ingredient, Ordering::Release);
         page
     }
@@ -1022,6 +1184,11 @@ impl Storage {
     /// ID pages made so far: every page index is below it.
     pub(crate) fn pages_made(&self) -> usize {
         self.next_page.load(Ordering::Relaxed) as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owners_committed_bytes(&self) -> usize {
+        self.owners.committed_bytes()
     }
 
     /// `count` fresh nodes, consecutive, the first returned; their keys and colors zero.
@@ -1258,11 +1425,13 @@ impl Storage {
         self.hook.is_some()
     }
 
-    /// The row-page directory of ingredient `index`, null before its first use: once published,
-    /// a [`Pages::dir`], valid for every index below `MAX_PAGES`.
+    /// A row page of ingredient `index`, null before its table or page was published.
     #[inline(always)]
-    pub(crate) fn dir(&self, index: u32) -> *const AtomicPtr<u8> {
-        self.dirs[index as usize].load(Ordering::Acquire)
+    pub(crate) fn row_page(&self, index: u32, id: Id) -> *mut u8 {
+        let dir = self.dirs[index as usize].load(Ordering::Acquire);
+        if dir.is_null() { return ptr::null_mut(); }
+        // SAFETY: make_table published this boxed table's directory. Only &mut can remove it.
+        unsafe { Pages::lookup(dir, id) }
     }
 
     /// The table of ingredient `index` as `T`, if made. The caller names the `T` the
@@ -1349,6 +1518,14 @@ impl Drop for Storage {
             }
         }
     }
+}
+
+/// Whether a `file!()` path `file` ends in the `/`-separated path components `tail`,
+/// independently of the build host's path separator (`/` or `\`). Matches whole path
+/// components so `not-hir-def/src/nameres.rs` does not match `hir-def/src/nameres.rs`.
+pub fn file_ends_with(file: &str, tail: &str) -> bool {
+    let mut actual = file.rsplit(['/', '\\']);
+    tail.rsplit('/').all(|part| actual.next() == Some(part))
 }
 
 impl fmt::Debug for Storage {

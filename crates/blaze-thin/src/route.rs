@@ -10,7 +10,8 @@
 //!
 //! The environment routes too ([`env`]): a variable that changes what the engine's launcher
 //! or its CLI does before the request (which blaze runs, the daemon's settings, the profile,
-//! the core budget) is the engine's to read.
+//! the core budget) is the engine's to read. The one daemon setting a typed command keeps
+//! ([`CHECKED_HERE`]) is checked here against the daemon's ([`drifted`]) instead.
 
 use std::ffi::{OsStr, OsString};
 
@@ -20,6 +21,7 @@ use crate::say;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Build,
+    Check,
     Run,
 }
 
@@ -28,6 +30,7 @@ impl Command {
     pub const fn name(self) -> &'static str {
         match self {
             Command::Build => "build",
+            Command::Check => "check",
             Command::Run => "run",
         }
     }
@@ -41,6 +44,8 @@ pub struct Asked {
     pub args: Vec<String>,
     pub quiet: bool,
     pub release: bool,
+    /// Package selectors as cargo's target selection receives them, in argument order.
+    pub packages: Vec<String>,
     /// `run`'s arguments of the program.
     pub program: Vec<OsString>,
 }
@@ -95,6 +100,7 @@ pub fn words(words: &[OsString]) -> Route {
     let command = match first.to_str() {
         Some("--version" | "-V") if rest.is_empty() => return Route::Version,
         Some("build" | "b") => Command::Build,
+        Some("check" | "c") => Command::Check,
         Some("run" | "r") => Command::Run,
         _ => return Route::Engine(Why::Command(shown(first))),
     };
@@ -103,11 +109,26 @@ pub fn words(words: &[OsString]) -> Route {
         args: Vec::new(), // alloc: once a command, its words
         quiet: false,
         release: false,
+        packages: Vec::new(),
         program: Vec::new(), // alloc: once a command, the program's arguments
     };
     let mut rest = rest.iter();
+    let mut locked = false;
     while let Some(word) = rest.next() {
         let text = word.to_str();
+        if matches!(text, Some("-p" | "--package")) {
+            let Some(package) = rest.next().and_then(|it| it.to_str()) else {
+                return Route::Engine(Why::Word(shown(word)));
+            };
+            // More complex package specs and patterns remain the full parser's.
+            if package.is_empty() || !package.starts_with(|c: char| c.is_ascii_alphanumeric())
+                || !package.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
+                return Route::Engine(Why::Word(shown(word)));
+            }
+            asked.packages.push(package.to_owned());
+            asked.args.extend([shown(word), package.to_owned()]);
+            continue;
+        }
         // `run`'s program has the rest once its first argument comes (clap's
         // `trailing_var_arg`), the first `--` among them dropped; after a `--` it has all.
         let (program, drops) = match text {
@@ -119,7 +140,7 @@ pub fn words(words: &[OsString]) -> Route {
             }
         };
         if program {
-            if command == Command::Build {
+            if command != Command::Run {
                 return Route::Engine(match text {
                     Some("--") => Why::Trailing,
                     _ => Why::Word(shown(word)),
@@ -138,6 +159,7 @@ pub fn words(words: &[OsString]) -> Route {
         let flag = match text {
             Some("-q" | "--quiet") => &mut asked.quiet,
             Some("-r" | "--release") => &mut asked.release,
+            Some("--locked") => &mut locked,
             _ => return Route::Engine(Why::Word(shown(word))),
         };
         if *flag {
@@ -160,16 +182,53 @@ pub fn words(words: &[OsString]) -> Route {
 /// The one variable of blaze's own that the thin `blaze` reads itself: where blaze's home is.
 const HOME: &str = "BLAZE_HOME";
 
+/// The daemon settings (blaze-cargo's `serve::settings::STARTED_WITH`) a typed command keeps
+/// on the thin `blaze`'s path. Each only says how a daemon is started, and the thin starts
+/// none: where no daemon answers it hands the command to the engine, which inherits this
+/// process's environment and starts the daemon with the setting, as it does any. Where a
+/// daemon answers, the thin holds the setting to the daemon's own ([`drifted`], against
+/// `Status::settings`) and leaves a difference to the engine, which refuses it naming both
+/// (`DaemonError::Drifted`), so a command that sets one is never answered by a daemon started
+/// with another. `BLAZE_DAEMON_EXIT_UNHELD` (blaze-cargo's `serve::unheld`): a test of the typed
+/// path sets it on every command, so that a test killed before it could stop its daemon
+/// leaves none, and the typed path stays what it tests.
+pub const CHECKED_HERE: &[&str] = &["BLAZE_DAEMON_EXIT_UNHELD"];
+
+/// Why the daemon that answered (`theirs`, its `Status::settings`) is not the one this command
+/// asks for: the first of [`CHECKED_HERE`] that `ours` (this process's environment) sets to
+/// another value than the daemon's, or that the daemon does not say. `None` where every one
+/// `ours` sets is the daemon's too; one `ours` leaves unset is the daemon's to choose, as the
+/// engine's client has it (`serve::settings::drift`).
+pub fn drifted(ours: impl Fn(&str) -> Option<String>, theirs: &[blaze_api::Setting]) -> Option<String> {
+    CHECKED_HERE.iter().find_map(|name| {
+        let asked = ours(name)?;
+        let their = theirs.iter().find(|it| it.name == *name).and_then(|it| it.value.as_deref());
+        // alloc: the reason the engine runs the command, once
+        (their != Some(asked.as_str())).then(|| match their {
+            Some(their) => {
+                use blaze_report::say::{Code, Words};
+                blaze_report::say!(Words(name), ": the daemon has ", Code(their), ", this command ", Code(&asked))
+                    .flat()
+            }
+            None => {
+                use blaze_report::say::{Code, Words};
+                blaze_report::say!(Words(name), ": the daemon has it unset, this command ", Code(&asked)).flat()
+            }
+        })
+    })
+}
+
 /// The first of `names` (the environment's variables) that makes the command the engine's:
-/// every `BLAZE_*` but `BLAZE_HOME` (the pin a launcher ran this blaze under, the daemon's
-/// settings, the core budget, the profile and the statistics a command asks for), `IX_PROF`
+/// every `BLAZE_*` but `BLAZE_HOME` and [`CHECKED_HERE`] (the pin a launcher ran this blaze
+/// under, the daemon's other settings, the core budget, the profile and the statistics a
+/// command asks for), `IX_PROF`
 /// (the sampler) and cargo's override of the terminal's width, each read by the engine before
 /// it sends its request. blaze-cargo's tests hold every setting the daemon keeps to a name
 /// this refuses.
 pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
     for name in names {
         let refused = match name.to_str() {
-            Some(name) => refuses(name),
+            Some(name) => refuses(&blaze_core::platform::env::name(name)),
             // No variable blaze reads has a name that is not UTF-8; the request can't carry
             // one, which is the engine's to say.
             None => true,
@@ -183,7 +242,8 @@ pub fn env(names: impl Iterator<Item = OsString>) -> Option<Why> {
 
 /// Whether the variable `name` makes a command the engine's ([`env`]).
 pub fn refuses(name: &str) -> bool {
-    (name.starts_with("BLAZE_") && name != HOME)
+    (name.starts_with("BLAZE_") && name != HOME && !CHECKED_HERE.contains(&name)
+        && !matches!(name, "BLAZE_SCRIPT_READ" | "BLAZE_SCRIPT_CACHES"))
         || name == "IX_PROF"
         || name == "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"
 }
@@ -226,12 +286,15 @@ mod tests {
             other => panic!("{typed:?} is not the engine's: {other:?}"),
         };
         assert_eq!(engine(&[]), Why::NoCommand);
-        for first in ["test", "check", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
+        assert_eq!(asked(&["check"]).command, Command::Check);
+        for first in ["test", "blaze", "help", "--help", "-h", "status", "serve", "--ignore-pin", "-C", "+nightly"] {
             assert_eq!(engine(&[first, "build"]), Why::Command(first.to_owned()), "{first}");
         }
         // `--version` with anything after it is blaze's cargo's own, which says the binary.
         assert_eq!(engine(&["--version", "-v"]), Why::Command("--version".to_owned()));
-        for word in ["-v", "--verbose", "-p", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
+        assert_eq!(engine(&["build", "-p"]), Why::Word("-p".into()));
+        assert_eq!(asked(&["check", "-p", "opencode-desktop"]).packages, ["opencode-desktop"]);
+        for word in ["-v", "--verbose", "--bin", "--release=1", "-qr", "--color", "--message-format=json",
             "--manifest-path", "-Zscript", "--features", "--target", "--profile", "-j8", "--goal", "--refused", "--help", "-h"]
         {
             assert_eq!(engine(&["build", word]), Why::Word(word.to_owned()), "{word}");
@@ -256,11 +319,48 @@ mod tests {
     #[test]
     fn blazes_own_variables_are_the_engines_to_read() {
         let names = |names: &[&str]| env(os(names).into_iter());
-        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "CARGO_TERM_COLOR", "BLAZEX"]), None);
+        assert_eq!(names(&["PATH", "HOME", "BLAZE_HOME", "BLAZE_SCRIPT_READ", "CARGO_TERM_COLOR", "BLAZEX"]), None);
         for name in ["BLAZE_CORES", "BLAZE_PINNED_BY", "BLAZE_IGNORE_PIN_FOR", "BLAZE_RUN_AS_DEFAULT", "BLAZE_PROFILE",
             "BLAZE_STATS", "BLAZE_UI", "BLAZE_LAUNCHED", "IX_PROF", "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS"]
         {
             assert_eq!(names(&["PATH", name]), Some(Why::Env(name.to_owned())), "{name}");
         }
+    }
+
+    /// The exemption held: with only `BLAZE_HOME` and `BLAZE_DAEMON_EXIT_UNHELD` of blaze's own
+    /// set, a typed command stays the thin's; with any other `BLAZE_*` beside them it is the
+    /// engine's, named by that variable.
+    #[test]
+    fn a_daemon_exit_setting_keeps_a_typed_command_and_any_other_blaze_variable_does_not() {
+        let names = |names: &[&str]| env(os(names).into_iter());
+        assert_eq!(names(&["PATH", "BLAZE_HOME", "BLAZE_DAEMON_EXIT_UNHELD"]), None);
+        assert_eq!(names(&["BLAZE_DAEMON_EXIT_UNHELD"]), None);
+        for other in ["BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_LOCK", "BLAZE_VERIFY_STORE", "BLAZE_DAEMON_EXIT", "BLAZE_X"] {
+            assert_eq!(
+                names(&["BLAZE_HOME", "BLAZE_DAEMON_EXIT_UNHELD", other]),
+                Some(Why::Env(other.to_owned())),
+                "{other}"
+            );
+        }
+    }
+
+    /// A daemon setting kept on the typed path is held to the daemon's: the same value, or one
+    /// the command leaves unset, is no reason; another value, or one the daemon does not have,
+    /// is, naming the variable and both values.
+    #[test]
+    fn a_kept_setting_the_daemon_does_not_share_sends_the_command_to_the_engine() {
+        let setting = |value: Option<&str>| blaze_api::Setting {
+            name: "BLAZE_DAEMON_EXIT_UNHELD".to_owned(),
+            value: value.map(str::to_owned),
+        };
+        let ours = |value: Option<&'static str>| move |name: &str| (name == "BLAZE_DAEMON_EXIT_UNHELD").then_some(value).flatten().map(str::to_owned);
+        assert_eq!(drifted(ours(Some("on")), &[setting(Some("on"))]), None);
+        assert_eq!(drifted(ours(None), &[setting(Some("on"))]), None);
+        assert_eq!(drifted(ours(None), &[]), None);
+        let other = drifted(ours(Some("on")), &[setting(Some("5"))]).unwrap();
+        assert!(other.contains("BLAZE_DAEMON_EXIT_UNHELD") && other.contains("`5`") && other.contains("`on`"), "{other}");
+        let unset = drifted(ours(Some("on")), &[setting(None)]).unwrap();
+        assert!(unset.contains("unset"), "{unset}");
+        assert!(drifted(ours(Some("on")), &[]).is_some());
     }
 }

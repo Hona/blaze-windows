@@ -5,6 +5,8 @@
 //!
 //! - `[update]`: blaze's own updates (crates/blaze-engine/src/update.rs).
 //! - `[terminal]`: what stderr's terminal does (crates/blaze-cargo/src/cli/terminal.rs).
+//! - `[sandbox]`: the machine's library directories every build script may name
+//!   (`build-script-link-dirs`, crates/blaze-cargo/src/directives.rs).
 //!
 //! Not `home::root`: that is where the daemon keeps its state and the build directories
 //! (`$BLAZE_HOME`, else a cache directory), which a user may delete; this is where what blaze
@@ -13,19 +15,22 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home (`HOME`, `USERPROFILE` on
-/// Windows). None when no variable names one; the caller says what needed it.
-pub fn home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
-    }
-    Some(user_home()?.join(".blaze"))
+/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home ([`blaze_core::home::user`]:
+/// `HOME`, else the system's record of the user).
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home, saying
+/// what was tried; the caller says what needed it.
+pub fn home() -> Result<PathBuf, blaze_core::home::NoHome> {
+    blaze_core::platform::home::config_dir(|k| std::env::var_os(k), blaze_core::home::record)
 }
 
-/// The user's home directory (`HOME`, `USERPROFILE` on Windows), none when unset or empty.
-pub fn user_home() -> Option<PathBuf> {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(home))
+/// The installation shared by this user's homes, independent of a `BLAZE_HOME` override.
+pub fn machine_home() -> Option<PathBuf> {
+    blaze_core::platform::home::config_dir(
+        |key| (key != "BLAZE_HOME").then(|| std::env::var_os(key)).flatten(), blaze_core::home::record,
+    ).ok()
 }
 
 /// `config.toml` under `home`.

@@ -414,6 +414,39 @@ fn dynamic_libraries_on_windows() {
     );
 }
 
+/// Windows names a variable whatever its case (cmd and PowerShell have `Path`): the library
+/// path cargo sets is the inherited one with the unit's directories first, and the script gets
+/// that one variable, never `Path` and `PATH` both (which would leave which a process reads to
+/// the order of its environment block). Any other variable cargo sets replaces an inherited one
+/// of another case too; on Unix the cases are two names.
+#[test]
+fn a_windows_variable_is_one_whatever_its_case() {
+    let mut unit = bar();
+    unit.host = "x86_64-pc-windows-msvc".into();
+    unit.target = "x86_64-pc-windows-msvc".into();
+    unit.dylib_search.host_root = Some(r"C:\p\target\debug".into());
+    unit.dylib_search.host_deps = vec![r"C:\p\target\debug\deps".into()];
+    unit.dylib_search.sysroot_libdir = PathBuf::new();
+    let inherited =
+        os(&[("Path", r"C:\Windows;C:\tools"), ("Out_Dir", r"C:\elsewhere"), ("ComSpec", "cmd")]);
+    let env = env(&unit, &inherited).unwrap();
+    let named = |name: &str| -> Vec<(&str, &str)> {
+        env.vars
+            .iter()
+            .filter(|(it, _)| it.eq_ignore_ascii_case(name))
+            .map(|(it, value)| (it.to_str().unwrap(), value.to_str().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        named("PATH"),
+        [("PATH", r"C:\p\target\debug;C:\p\target\debug\deps;C:\Windows;C:\tools")]
+    );
+    assert_eq!(named("OUT_DIR"), [("OUT_DIR", "/p/foo/target/debug/build/bar-2/out")]);
+    assert_eq!(named("COMSPEC"), [("ComSpec", "cmd")], "what cargo does not set is passed through");
+    let on_linux = super::env(&bar(), &os(&[("Path", "/x")])).unwrap();
+    assert_eq!(var(&on_linux, "Path"), Some("/x"), "two names on Unix");
+}
+
 /// A path cargo cannot join fails as cargo's run does.
 #[test]
 fn a_path_with_the_separator() {
@@ -496,8 +529,7 @@ fn no_sysroot_library_directory_adds_none() {
 /// `SSL_CERT_DIR` and blaze's did not).
 #[test]
 fn certificates_libgit2_finds() {
-    let dir = std::env::temp_dir().join(format!("blaze-build-script-certs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = blaze_core::temp::TempDir::for_test("blaze-build-script-certs-");
     let (empty, pki, ssl) = (dir.join("empty"), dir.join("pki"), dir.join("ssl"));
     std::fs::create_dir_all(&empty).unwrap();
     std::fs::create_dir_all(pki.join("certs")).unwrap();
@@ -588,7 +620,7 @@ fn the_sorted_environment_is_the_one_built_before() {
         unit.profile.debuginfo = rng.index(2) == 0;
         unit.profile.release = rng.index(2) == 0;
         unit.jobs = [0, 1, 8, 10, u32::MAX][rng.index(5)];
-        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/tmp/j".to_owned());
+        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/run/j".to_owned());
         unit.workspace_member = rng.index(2) == 0;
         unit.tools.rustc_wrapper = (rng.index(2) == 0).then(|| "/wrap".into());
         unit.tools.rustc_workspace_wrapper = (rng.index(2) == 0).then(|| "/ww".into());

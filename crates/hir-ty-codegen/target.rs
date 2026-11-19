@@ -781,6 +781,7 @@ impl Target {
             probe_stack: true,
             probe_log2: 12,
             counts: false,
+            slots: false,
         })
     }
 
@@ -943,7 +944,10 @@ mod tests {
     /// LLVM's default.
     #[test]
     fn frame_pointers_are_forced_or_the_abis() {
-        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu"] {
+        // x86-64 Mach-O is no target blaze emits code for (`Target::parse`), so its rule is
+        // not asked here.
+        assert!(Target::of("x86_64-apple-darwin").is_err());
+        for apple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu"] {
             let apple = Target::of(apple).expect("a target");
             assert!(apple.requires_frame_pointers());
             assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
@@ -1144,23 +1148,28 @@ mod tests {
     }
 
     /// `f16` and `f128` are lowered on AArch64 under Apple's convention as under System V's,
-    /// and Cranelift's `apple_aarch64` passes and returns them; Windows' x64 refuses them.
+    /// and on x86-64 under Windows' as under System V's, and Cranelift passes and returns them
+    /// under each.
     #[test]
-    fn apple_aarch64_passes_f16_and_f128() {
-        use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
-        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    fn f16_and_f128_are_passed_under_each_convention_that_lowers_them() {
         let apple = Target::of("aarch64-apple-darwin").expect("a target");
         assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
         assert!(crate::f16_f128::soft_floats(&apple));
         assert!(crate::f16_f128::soft_floats(
             &Target::of("aarch64-unknown-linux-gnu").expect("a target")
         ));
-        assert!(!crate::f16_f128::soft_floats(
-            &Target::of("x86_64-pc-windows-msvc").expect("a target")
-        ));
+        let windows = Target::of("x86_64-pc-windows-msvc").expect("a target");
+        assert!(crate::f16_f128::soft_floats(&windows));
+        passes_f16_and_f128(apple);
+        passes_f16_and_f128(windows);
+    }
+
+    fn passes_f16_and_f128(target: &Target) {
+        use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
         let isa =
-            apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
-        let mut signature = ir::Signature::new(apple.call_conv);
+            target.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        let mut signature = ir::Signature::new(target.call_conv);
         signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
         signature.returns.extend([AbiParam::new(types::F128), AbiParam::new(types::F16)]);
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature);
@@ -1176,7 +1185,7 @@ mod tests {
         builder.finalize(isa.frontend_config());
         let mut compiled = cranelift_codegen::Context::for_function(func);
         if let Err(e) = compiled.compile(&*isa, &mut Default::default()) {
-            panic!("{:?}", e.inner);
+            panic!("{}: {:?}", target.triple(), e.inner);
         }
     }
 
@@ -1197,11 +1206,14 @@ mod tests {
 
     /// A target is what its triple says whichever targets the process named before: its word,
     /// its pointer type and its ISA are its own, and naming it again gives the same one.
-    #[hegel::test]
-    fn a_target_is_its_triple_whatever_was_named_before(tc: hegel::TestCase) {
-        use hegel::generators as gs;
+    #[test]
+    fn a_target_is_its_triple_whatever_was_named_before() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| a_target_is_its_triple(tape))
+    }
+
+    fn a_target_is_its_triple(tape: &blaze_sim::Tape) {
         let triples = vec![Target::host(), "wasm32-wasip1", "wasm64-blaze-wasip1"];
-        let order: Vec<&str> = tc.draw(gs::vecs(gs::sampled_from(triples)).min_size(1).max_size(8));
+        let order: Vec<&str> = tape.vec(1..=8, "order", |tape| *tape.one_of(&triples, "triple"));
         for triple in order {
             let target = Target::of(triple).expect("a target");
             assert_eq!(target.triple(), triple);

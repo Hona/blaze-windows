@@ -19,6 +19,9 @@
 
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod blocked;
 pub mod calls;
@@ -260,11 +263,12 @@ impl Given {
         hasher.update(&[self.kind.byte()]);
         hasher.update(&(self.args.len() as u64).to_le_bytes());
         for arg in &self.args {
-            hasher.part(&trace::os_bytes(arg));
+            trace::hash_os(&mut hasher, arg);
         }
         hasher.update(&(self.env.len() as u64).to_le_bytes());
         for (name, value) in &self.env {
-            hasher.part(&trace::os_bytes(name)).part(&trace::os_bytes(value));
+            trace::hash_os(&mut hasher, name);
+            trace::hash_os(&mut hasher, value);
         }
         hasher.update(&self.stdin);
         hasher.update(&(self.len as u64).to_le_bytes());

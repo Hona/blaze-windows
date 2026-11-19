@@ -145,17 +145,18 @@ pub fn resolve_view<'db, R>(
     })
 }
 
-/// `triple`'s cfg as cargo reads `[target.'cfg(..)']` for a build on `host` (with `target`
-/// the build's `--target`): its probe with the configuration's rustflags for it and
-/// `--crate-type proc-macro`.
+/// The cfg of `kind`'s platform (`None` the host's, `Some` the target's) as cargo reads
+/// `[target.'cfg(..)']` for a build on `host` (with `target` the build's `--target`): its
+/// probe with the configuration's rustflags for the kind and `--crate-type proc-macro`.
 pub fn platform_cfg<F: Files>(
     config: &Config<F>,
-    triple: &str,
     host: &str,
     target: Option<&str>,
+    kind: Option<&str>,
 ) -> Result<Vec<Cfg>, LoadError> {
     let error = |what: String| LoadError { what, at: None };
-    let rustflags = super::plan::platform_rustflags(config, triple, host, target)?;
+    let triple = kind.unwrap_or(host);
+    let rustflags = super::plan::platform_rustflags(config, host, target, kind)?;
     let args = CfgArgs::from_flags(&rustflags).map_err(error)?;
     platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)
 }

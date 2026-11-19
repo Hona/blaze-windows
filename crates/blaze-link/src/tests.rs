@@ -23,7 +23,7 @@ use object::{
 
 use crate::{
     COLUMN, Change, Debug, Format, Image, LINE, LinkError, Live, Native, NativeKind, Output,
-    OutputKind, Position, SpanTable,
+    OutputKind, Position, Span, SpanTable,
 };
 
 const TO: &str = "out/app";
@@ -176,6 +176,9 @@ fn edit(g2: &CompiledFunction) -> Change<'_> {
     }
 }
 
+/// A page of zeros: what a [`Sparse`] page it has not got reads as.
+static ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
+
 /// A file as pages, most of an incremental image being room nothing has written.
 #[derive(Clone, Default, Debug)]
 struct Sparse {
@@ -192,8 +195,9 @@ impl Sparse {
             let n = (PAGE as usize - from).min(bytes.len() - done);
             let chunk = &bytes[done..done + n];
             // A page it has not got reads as zeros: zeros written there change nothing, and a
-            // gigabyte of zeroed code costs no memory.
-            if !self.pages.contains_key(&(addr / PAGE)) && chunk.iter().all(|it| *it == 0) {
+            // gigabyte of zeroed code costs no memory. Compared as slices (a `memcmp`), not byte
+            // by byte: a link writes hundreds of MiB here, and the test is built unoptimized.
+            if !self.pages.contains_key(&(addr / PAGE)) && chunk == &ZERO_PAGE[..n] {
                 done += n;
                 continue;
             }
@@ -213,8 +217,7 @@ impl Sparse {
     }
 
     fn page(&self, page: u64) -> &[u8] {
-        static ZERO: [u8; PAGE as usize] = [0; PAGE as usize];
-        self.pages.get(&page).map_or(&ZERO[..], |it| &it[..])
+        self.pages.get(&page).map_or(&ZERO_PAGE[..], |it| &it[..])
     }
 
     /// Whether two files have the same bytes.
@@ -252,6 +255,8 @@ struct Disk {
     files: BTreeMap<FileName, Sparse>,
     modes: BTreeMap<FileName, u32>,
     fail_rename: bool,
+    /// A volume whose files share no blocks: every clone is refused, as NTFS refuses one.
+    unshared: bool,
     /// Each effect run: its kind and the bytes it wrote.
     log: Vec<(&'static str, usize)>,
 }
@@ -270,6 +275,9 @@ impl Disk {
                 self.log.push(("truncate", 0));
                 self.files.entry(file.clone()).or_default().truncate(*len);
                 Done::Truncated
+            }
+            Effect::Clone { .. } if self.unshared => {
+                Done::Failed(IoError("the volume's files share no blocks (NTFS)".into()))
             }
             Effect::Clone { from, to, .. } => {
                 self.log.push(("clone", 0));
@@ -484,6 +492,42 @@ fn an_incremental_link_puts_the_new_function_in_the_old_slot_and_writes_little()
     assert_eq!(b.at(new, 6), returns(2));
     assert_eq!(b.at(old, 6), returns(1), "a running program may still be in the old code");
     assert_eq!(image.slot(&key(2)), Some(slot));
+}
+
+/// On a volume whose files share no blocks (NTFS) an incremental link and its rollback ask for
+/// no clone (the volume refuses one) and write the whole file, which is byte for byte the file
+/// the same links make on a volume that clones.
+#[test]
+fn on_a_volume_that_shares_no_blocks_a_commit_writes_the_whole_file_and_never_clones() {
+    let (start, g) = program(Target::Function);
+    let g2 = function(3, &returns(2), Vec::new());
+    let run = |unshared: bool| {
+        let mut image = Image::new(name(TO), output(true)).unwrap();
+        if unshared {
+            image.set_sharing(blaze_core::Sharing::Unshared);
+        }
+        let mut disk = Disk { unshared, ..Disk::default() };
+        disk.link(&mut image, first(&start, &g)).unwrap();
+        disk.log.clear();
+        disk.link(&mut image, edit(&g2)).expect("the edit");
+        let edited = disk.file(TO).clone();
+        let kinds: Vec<&str> = disk.log.iter().map(|it| it.0).collect();
+        let written: usize = disk.log.iter().map(|it| it.1).sum();
+        disk.log.clear();
+        disk.roll_back(&mut image).expect("the rollback");
+        let rolled = disk.file(TO).clone();
+        let rollback: Vec<&str> = disk.log.iter().map(|it| it.0).collect();
+        (edited, rolled, kinds, rollback, written)
+    };
+    let (edited, rolled, kinds, rollback, written) = run(true);
+    let (cloned_edit, cloned_rollback, clone_kinds, _, _) = run(false);
+    assert!(clone_kinds.contains(&"clone"), "the control clones: {clone_kinds:?}");
+    assert!(!kinds.contains(&"clone") && !rollback.contains(&"clone"), "{kinds:?} {rollback:?}");
+    assert!(edited.same(&cloned_edit), "the edit's file is the cloning volume's");
+    assert!(rolled.same(&cloned_rollback), "the rollback's file is the cloning volume's");
+    // The whole file, every byte of it in the file's runs: more than an edit's few pages.
+    let in_file: usize = edited.pages.values().map(Vec::len).sum();
+    assert!(written >= in_file / 2, "{written} bytes written of {in_file} in the file");
 }
 
 /// The lineage's order, a radix sort by 8-byte prefix then a comparison within a prefix,
@@ -1598,12 +1642,15 @@ fn a_relink_that_drops_a_covered_function_drops_its_entries() {
 #[test]
 fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     let anchor = id(50);
+    // Span 1 is item-relative: on its base's line, 8 columns right of it. A reformat that
+    // moves the item is a change of the base alone.
     let table = |line| SpanTable {
         files: vec!["src/main.rs".into()],
         spans: vec![
-            Position { file: 0, line: 1, column: 1 },
-            Position { file: 0, line, column: 9 },
+            Span::At(Position { file: 0, line: 1, column: 1 }),
+            Span::From { base: 0, line: 0, column: 8 },
         ],
+        bases: vec![Position { file: 0, line, column: 1 }],
     };
     // `lea rax, [rip + location]; ret`
     let start = function(
@@ -1645,6 +1692,22 @@ fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     );
     let error = image.stage(Change { added: vec![&missing], ..Change::default() }).unwrap_err();
     assert!(error.what.contains("span table"), "{error}");
+
+    // A shorter table alone would leave the unchanged instruction with an invalid location.
+    // The same table is valid when the last user is replaced in the edit that shrinks it.
+    let mut shorter = table(9);
+    shorter.spans.pop();
+    let spans = shorter.encode();
+    let error = image.stage(Change { spans: vec![(anchor, &spans)], ..Change::default() }).unwrap_err();
+    assert!(error.what.contains("still refers to it") && error.what.contains("index: 1"), "{error}");
+    let updated = function(
+        1,
+        &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3],
+        vec![rel32(3, Target::Position(SpanRef { anchor, index: 0 }))],
+    );
+    disk.link(&mut image, Change { removed: vec![key(1)], added: vec![&updated], spans: vec![(anchor, &spans)], ..Change::default() }).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    assert_eq!(linked.u32_at(linked.rel32(linked.symbol("start") + 3) + LINE as u64), 1);
 }
 
 #[test]
@@ -1880,6 +1943,25 @@ fn a_statics_writable_data_is_its_own_and_writable() {
     assert!(within(".rodata", one_shared), "{one_shared:#x}");
 }
 
+#[test]
+fn resting_a_compact_image_releases_scratch_and_undo_history() {
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let mut disk = Disk::default();
+    let f = function(1, &[0xc3], vec![]);
+    let change = Change {
+        added: vec![&f],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    image.scratch.reserve(64 << 10);
+    assert!(image.scratch.capacity() >= 64 << 10);
+    image.rest();
+    assert_eq!(image.scratch.capacity(), 0, "rest() must release key-hashing scratch");
+    assert_eq!(image.history.capacity(), 0, "rest() must drop undo history on compact images");
+}
+
 /// An x86-64 ELF object defining `c_helper`, which calls `rust_fn`.
 fn c_object() -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
@@ -1972,7 +2054,8 @@ fn line_tables_are_written_from_the_span_tables() {
     let anchor = id(70);
     let spans = SpanTable {
         files: vec!["src/lib.rs".into()],
-        spans: vec![Position { file: 0, line: 4, column: 1 }],
+        spans: vec![Span::At(Position { file: 0, line: 4, column: 1 })],
+        bases: Vec::new(),
     }
     .encode();
     let mut start = function(1, &returns(0), Vec::new());
@@ -2001,8 +2084,11 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
         SpanTable {
             files: files.iter().map(|it| (*it).into()).collect(),
             spans: (0..spans)
-                .map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                .map(|it| {
+                    Span::At(Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                })
                 .collect(),
+            bases: Vec::new(),
         }
         .encode()
     };
@@ -2304,6 +2390,9 @@ mod beside;
 mod eh_frame_reach;
 
 mod tls_desc;
+
+#[cfg(windows)]
+mod pe_run;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

@@ -214,8 +214,92 @@ mod os {
         }
     }
 
+    /// `dir` and each missing directory above it made the user's alone, as Unix makes them
+    /// 0o700: a protected list that lets in the user, the system and the administrators, so a
+    /// directory made under one that lets others write (a drive's root lets every signed-in
+    /// user modify) does not inherit that. A directory that is there is left as it is.
     pub(super) fn make(dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)
+        use windows_sys::Win32::{
+            Security::{
+                Authorization::{
+                    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                    SDDL_REVISION_1,
+                },
+                PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+            },
+            Storage::FileSystem::CreateDirectoryW,
+        };
+        let mut missing = Vec::new(); // alloc: the directories to make, once per store open
+        for at in dir.ancestors() {
+            match std::fs::symlink_metadata(at) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(at),
+                Err(error) => return Err(error),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let gate = Gate(user()?);
+        let mut text: *mut u16 = ptr::null_mut();
+        // SAFETY: the user's identifier in the gate's buffer, alive for the call, and a pointer
+        // for the call to write its text to, freed below.
+        if unsafe { ConvertSidToStringSidW(gate.user(), &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call wrote a NUL-terminated string there, read up to its NUL.
+        let user = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, wcslen(text))) };
+        // SAFETY: allocated by the call above, freed once.
+        unsafe { LocalFree(text.cast()) };
+        // alloc: the list, once per directory made
+        let list = format!("D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+        let list: Vec<u16> = list.encode_utf16().chain([0]).collect(); // alloc: as above
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the text ends with a NUL, and `descriptor` is for the call to write.
+        let made = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                list.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        if made == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _descriptor = Descriptor(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        for at in missing.iter().rev() {
+            use std::os::windows::ffi::OsStrExt as _;
+            let wide: Vec<u16> = at.as_os_str().encode_wide().chain([0]).collect(); // alloc: once per directory made
+            // SAFETY: a NUL-terminated path and attributes whose descriptor lives past the call.
+            if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+                let error = io::Error::last_os_error();
+                // Made meanwhile by another process: it is checked as any directory is.
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The length of the NUL-terminated string at `text`.
+    ///
+    /// # Safety
+    ///
+    /// `text` points to a NUL-terminated string of `u16`s.
+    unsafe fn wcslen(text: *const u16) -> usize {
+        let mut len = 0;
+        // SAFETY: the caller's: every unit before the NUL is readable.
+        while unsafe { *text.add(len) } != 0 {
+            len += 1;
+        }
+        len
     }
 
     pub(super) fn top(dir: &Path) -> io::Result<(Access, Gate)> {

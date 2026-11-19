@@ -73,6 +73,20 @@ fn adding_an_impl_costs_one_op_and_one_slice() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+#[test]
+fn an_expansion_adding_only_an_unnamed_const_publishes_its_trait_impl() {
+    let mut loaded = Loaded::new("//- /main.rs crate:main deps:derive\npub trait T {} pub struct S; derive::make!(S);\n//- /derive.rs crate:derive\n#[macro_export] macro_rules! make { ($s:ty) => {}; }");
+    let krate = loaded.krate();
+    let source = loaded.files[1];
+    work_of(&mut loaded.db, krate, |db| db.set_file_text(source,
+        "#[macro_export] macro_rules! make { ($s:ty) => { const _: () = { impl crate::T for $s {} }; }; }"));
+    let mut failures = String::new();
+    check(&loaded.db, krate, "a dependency macro gained an impl in an anonymous const", &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+    let t = trait_named(&loaded.db, krate, "T");
+    assert_eq!(TraitImpls::for_crate_and_trait(&loaded.db, krate, t).impls().count(), 1);
+}
+
 /// Whether `query` is among the ingredient names in `executed`, which name a method of a
 /// tracked impl by its type and method (`TraitImpls::for_crate_and_trait`).
 fn ran(executed: &[String], query: &str) -> usize {

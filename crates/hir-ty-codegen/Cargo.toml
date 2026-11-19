@@ -51,6 +51,7 @@ span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
 
+blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
@@ -78,13 +79,14 @@ rsasm = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# Measure the item store's real classifier at the describe query boundary, not a copy of its rules.
+blaze-item-hash.workspace = true
 # The code identity, held to what rustc says each of the code generator's crates read
 # (`toolchain/tests.rs`).
 blaze-codegen-code.workspace = true
-blaze-cas.workspace = true
+blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 blaze-store-check.workspace = true
-hegeltest.workspace = true
 # The revision tests' cases (`v2/edits/revisions.rs`): each `test.toml`, and the report's lines.
 toml.workspace = true
 serde_json.workspace = true

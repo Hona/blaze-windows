@@ -46,6 +46,10 @@ pub(crate) type Ref = FrontRef<HirInstance, HirStatic>;
 /// The symbol of the routine the unwinder asks about a frame with landing pads.
 pub(crate) const PERSONALITY: &str = crate::unwind::PERSONALITY;
 
+/// The symbol COFF's thread-local sequence reads the image's TLS slot from: the linker's (or
+/// the CRT's `tlssup`) cell that the TLS directory names, which the loader fills.
+pub(crate) const COFF_TLS_INDEX: &str = "_tls_index";
+
 /// The reference a function request of the IR builder is.
 pub(crate) fn func_ref(db: &Db, target: &FuncTarget) -> Result<Ref, String> {
     match target {
@@ -145,6 +149,12 @@ pub(crate) fn static_ref(db: &Db, id: StaticId) -> Result<Ref, String> {
     }
     // alloc: the error's message, where the crate's target did not load
     match static_link_name(db, id).map_err(|e| e.to_string())? {
+        // A DLL's static is reached through its import address table cell, `__imp_X`, which
+        // the code loads its address from (`Recorder::declare_data_in_func`).
+        Some(symbol) if crate::dll_imported(db, id) => {
+            // alloc: the cell's symbol, which the reference owns
+            Ok(FrontRef::Extern(format!("__imp_{symbol}")))
+        }
         Some(symbol) => Ok(FrontRef::Extern(symbol)),
         None => Ok(FrontRef::Static(HirStatic(id))),
     }

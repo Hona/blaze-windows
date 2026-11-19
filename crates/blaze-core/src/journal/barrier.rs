@@ -99,7 +99,8 @@ impl Barrier {
     }
 
     /// A read was taken and what it named told: every record before `told` is told now.
-    /// `stalled`: it was asked without waiting and moved no further.
+    /// `stalled`: it was asked without waiting, after every flush waiting had its mark, and moved
+    /// no further: it reached the journal's end, which is past each mark.
     pub(crate) fn read(&mut self, told: At, stalled: bool) {
         if self.told.is_some_and(|it| it.journal != told.journal) {
             self.moves += 1;

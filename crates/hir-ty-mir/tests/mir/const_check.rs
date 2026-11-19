@@ -675,3 +675,35 @@ fn main() {
         assert_eq!(refused, [("E0015", "f(2)".to_owned())]);
     })
 }
+
+/// The methods of an inherent `const impl` (std's `const impl<T, A: [const] Allocator> Vec<T, A>`
+/// calling `RawVec::grow_one` of another) are const: a const body calls them, with or without
+/// `[const]` bounds on the impl, as rustc's `is_const_fn` takes a `const impl`'s items. Control:
+/// a method of an inherent impl that is not `const` is refused.
+#[test]
+fn a_method_of_an_inherent_const_impl_is_const_callable() {
+    let src = "\
+#![feature(const_trait_impl)]
+const trait Tr { fn m(&self) -> u8; }
+struct S;
+const impl S {
+    fn a(&self) -> u8 { self.b() }
+    fn b(&self) -> u8 { 1 }
+}
+struct W<T>(T);
+const impl<T: [const] Tr> W<T> {
+    fn c(&self) -> u8 { self.d() }
+    fn d(&self) -> u8 { self.0.m() }
+}
+struct P;
+impl P { fn e(&self) -> u8 { 2 } }
+const fn plain() -> u8 { S.a() }
+const fn bounded<T: [const] Tr>(w: &W<T>) -> u8 { w.c() }
+const fn not_const() -> u8 { P.e() }
+";
+    assert_eq!(reported(&check("sized", src, func("plain"))), NONE);
+    assert_eq!(reported(&check("sized", src, func("bounded"))), NONE);
+    let found = check("sized", src, func("not_const"));
+    assert_eq!(found.len(), 1, "{:?}", reported(&found));
+    assert_eq!(found[0].0.code, "E0015");
+}

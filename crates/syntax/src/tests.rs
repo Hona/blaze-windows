@@ -511,3 +511,18 @@ fn an_outline_parses_its_lazy_bodies_under_its_extensions() {
     assert_eq!(union_types(&reparsed), 1);
     assert_eq!(reparsed.errors_with_bodies(), Vec::<SyntaxError>::new());
 }
+
+
+/// A string literal across a CRLF line end validates as the same literal with LF, rustc's
+/// reading of the file; a bare CR is still an error, at its byte.
+#[test]
+fn a_literal_across_a_crlf_line_end_validates() {
+    let crlf = "const A: &str = \"a\r\nb\";\r\nconst B: &str = \"e\\\r\n    f\";\r\n\
+                const C: &[u8] = b\"g\r\nh\";\r\n";
+    let parse = SourceFile::parse(crlf, Edition::CURRENT);
+    assert_eq!(parse.errors(), Vec::<SyntaxError>::new());
+    let bare = "const A: &str = \"a\rb\";\n";
+    let errors = SourceFile::parse(bare, Edition::CURRENT).errors();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].range().start(), TextSize::from(18), "{errors:?}");
+}

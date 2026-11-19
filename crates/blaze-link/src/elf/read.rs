@@ -11,6 +11,7 @@ mod archive;
 mod script;
 mod shared;
 mod strings;
+mod stub;
 #[cfg(test)]
 mod tests;
 
@@ -79,6 +80,10 @@ pub(super) fn read(
         };
     }
     match kind {
+        // blaze's own stub of a shared object of the target's C library.
+        NativeKind::Shared { .. } if bytes.starts_with(stub::STUB.as_bytes()) => {
+            stub::read(name, bytes).map(NativeFile::Shared)
+        }
         NativeKind::Shared { .. } => script::read(name, bytes).map(NativeFile::Shared),
         _ => Err(format!("{name}: neither an ELF file nor an archive, given as {}", taken(kind))), // alloc: error path
     }
@@ -447,7 +452,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             object.grouped.push(member);
         }
         let sections = start..end(name, object.grouped.len(), "group members")?;
-        object.groups.push(Group { name: group_name, sections, largest: false });
+        object.groups.push(Group { name: group_name, sections, largest: false, local: false });
     }
 
     // Each section's fixups are one run of the column, so relocation sections are read in the

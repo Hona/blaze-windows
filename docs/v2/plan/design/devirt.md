@@ -173,6 +173,20 @@ never devirtualized.
 
 ## Tests and benchmark
 
+A kept walk needs two proofs before it can reuse a closed world. The roots must still
+reach the same inputs to the first closure, **without** devirtualization, and the closure
+over the second walk must still agree with the first. The checkpoint names both ordered
+sets in this database only. A tracked query projects each reached item's outgoing edges
+separately from its code bytes; equal edges backdate. The query closing the world reads
+the vtables, upcasts, foreign signatures, loader symbols, target identities and consumer
+sites. On an edit preserving both proofs, install the verified world before patching the
+walk. An edit removing the only call to a vtable producer invalidates the first proof even
+if the edited body contains no cast. No query key or interned handle goes to disk.
+
+The ordinary edit costs the changed projections and the walk's changed describes, not one
+verification per reached function. Changing the reached set still costs a walk to collect
+its new members; the floor for this case is the change in reachability and its readers.
+
 - `crates/hir-ty-mir/src/mir/optimize/devirt/fixtures.rs` covers: one type becomes direct;
   three types are compared with the `dyn` call last; an open object stays virtual with its
   reason under the span; an absent object is read as `ABSENT`; the same bytes come out twice;

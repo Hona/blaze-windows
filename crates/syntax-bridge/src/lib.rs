@@ -3,6 +3,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 use std::{
     alloc::{Allocator, Global},
@@ -588,6 +591,22 @@ pub fn desugar_doc_comment_text(text: &str, mode: DocCommentDesugarMode) -> (Sym
     }
 }
 
+/// A doc comment's text (after its `///`, `//!`, `/**` or `/*!`) as the compiler reads it:
+/// rustc reads a source file with each `\r\n` as `\n`, so a line comment of a file with CRLF
+/// line endings, which the lexer ends at the `\n`, has no `\r` at its end, and a block comment
+/// has `\n` between its lines. A bare `\r` stays, for the doc comment's error.
+pub fn doc_text_as_read(text: &str, line: bool) -> std::borrow::Cow<'_, str> {
+    let text = match line {
+        true => text.strip_suffix('\r').unwrap_or(text),
+        false => text,
+    };
+    match text.contains("\r\n") {
+        // alloc: a doc comment of a file with CRLF line endings, once per conversion
+        true => std::borrow::Cow::Owned(text.replace("\r\n", "\n")),
+        false => std::borrow::Cow::Borrowed(text),
+    }
+}
+
 /// Desugars the doc comment `text` into the attribute it stands for.
 fn convert_doc_comment(
     text: &str,
@@ -605,9 +624,9 @@ fn convert_doc_comment(
 
     let mk_doc_literal = |text: &str| {
         let from_end = if text.starts_with("/*") && text.ends_with("*/") { 2 } else { 0 };
-        let text = &text[3..text.len() - from_end];
+        let text = doc_text_as_read(&text[3..text.len() - from_end], from_end == 0);
 
-        let (text, kind) = desugar_doc_comment_text(text, mode);
+        let (text, kind) = desugar_doc_comment_text(&text, mode);
         let lit = tt::Literal { text_and_suffix: text, span, kind, suffix_len: 0 };
 
         tt::Leaf::from(lit)
@@ -1142,6 +1161,10 @@ where
 #[derive(Default)]
 struct PendingLeaves(VecDeque<tt::Leaf>);
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread shelf (blaze_mem::scratch) emptied after each conversion, kept at the most leaves pending at once, about the tree's depth"
+)]
 thread_local! {
     static PENDING_LEAVES: Cell<VecDeque<tt::Leaf>> = const { Cell::new(VecDeque::new()) }; // alloc: none, empty
 }

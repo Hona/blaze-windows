@@ -56,6 +56,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Check => &[
                 GLOBAL,
@@ -78,6 +79,7 @@ impl Clap for Command {
                 MANIFEST,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -95,14 +97,16 @@ impl Clap for Command {
                 REPORTS,
                 REFUSED,
                 GOAL,
+                PREBUILT,
             ],
             Command::Test => &[
-                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS,
-                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
+                JOBS, KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                PREBUILT,
             ],
             Command::Bench => &[
-                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING,
-                PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, NO_TESTS, FEATURES, JOBS,
+                KEEP_GOING, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
                 GLOBAL,
@@ -339,15 +343,32 @@ const MANIFEST: &[Flag] = &[
     Flag::new("manifest-path", Some('m'), Takes::Value, "PATH"),
     Flag::pointing(Some("path"), None, Points::Arg("--manifest-path")),
 ];
-/// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
-/// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
+/// `--run-all` and `--ub*` are blaze's: `blaze test` reruns only a test whose executed code or
+/// reads changed (docs/cargo.md, "Which tests run"), and `--run-all` runs every test asked,
+/// still keeping what each run learns; the `--ub` tests run in blaze's MIR evaluator, checked
+/// for undefined behavior (`hir-ty-ub`). `--reached`, the flag that once opted into selection,
+/// is refused naming both: selection is the default, and never a flag accepted and ignored.
 const TEST_ONLY: &[Flag] = &[
     Flag::switch("doc"),
-    Flag::switch("reached"),
+    Flag::switch("run-all"),
+    Flag::pointing(Some("reached"), None, Points::Says(REACHED_GONE)),
     Flag::switch("ub"),
     Flag::new("ub-seed", None, Takes::Value, "N"),
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
+
+/// What `--reached` is refused with.
+pub const REACHED_GONE: &str = "`blaze test` already reruns only the tests whose executed code or \
+     reads changed, by default; `--run-all` runs every test asked";
+
+/// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
+/// `fail` (the default) refuses it, naming the selection that matched nothing
+/// ([`super::test::refusal`]); `pass` is cargo's and libtest's behaviour, exit 0. The name and
+/// the values are cargo-nextest's.
+const NO_TESTS: &[Flag] = &[Flag {
+    possible: &["fail", "pass"],
+    ..Flag::new("no-tests", None, Takes::Value, "fail|pass")
+}];
 
 /// `--refused N|all` is blaze's: how many of the functions blaze could not compile a build's
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
@@ -360,6 +381,12 @@ const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 /// and compiles no program, so one command line serves all four.
 const GOAL: &[Flag] =
     &[Flag { possible: blaze_api::Goal::NAMES, ..Flag::new("goal", None, Takes::Value, "GOAL") }];
+
+/// `--no-prebuilt` is blaze's: this request takes no record from a pack source (packs.json's
+/// `remote`, an R2 bucket) and builds what the home's store and the machine's layer miss from
+/// source, the per-request form of packs.json's `"prebuilt": false`
+/// ([`blaze_api::Cargo::prebuilt`]).
+const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
 
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
@@ -398,10 +425,11 @@ fn blaze_only(flag: &Flag) -> bool {
     matches!(
         flag.long,
         Some(
-            "reached"
+            "run-all"
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
+                | "no-tests"
                 | "refused"
                 | "goal"
                 | "baselines"
@@ -410,6 +438,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "fix"
                 | "lint"
                 | "replace"
+                | "no-prebuilt"
         )
     )
 }
@@ -450,10 +479,19 @@ pub enum Asked {
     Why(Vec<OsString>),
     /// `blaze reach [ROOT]`, with the words after it ([`super::reach::main`]).
     Reach(Vec<OsString>),
+    /// `blaze prove`, with the words after it ([`super::prove::main`]).
+    Prove(Vec<OsString>),
     /// `blaze slow`, with the words after it ([`super::observe::slow`]).
     Slow(Vec<OsString>),
     /// `blaze doctor`, with the words after it ([`super::doctor::main`]).
     Doctor(Vec<OsString>),
+    /// `blaze audit [pin|fetch]`, with the words after it ([`super::audit::main`]).
+    Audit(Vec<OsString>),
+    /// `blaze diagnostics`, with the words after it ([`super::diagnostics::main`]).
+    Diagnostics(Vec<OsString>),
+    /// `blaze agents install|hook|status|remove`, with the words after `agents`
+    /// ([`super::agents::main`]).
+    Agents(Vec<OsString>),
     /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
     Pprof(Vec<OsString>),
     /// `blaze perf record|runs|diff ...`, with the words after it ([`super::perf::main`]).
@@ -631,7 +669,12 @@ pub struct Flags {
     /// lists what failed and what each failure left unbuilt. Passed on to the daemon.
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
-    pub reached: bool,
+    /// `--run-all`: every test asked runs, none reported cached; what each run learns is still
+    /// kept.
+    pub run_all: bool,
+    /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
+    /// Without it such a run is refused ([`super::test::refusal`]).
+    pub no_tests_pass: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
     pub ub_seed: Option<u64>,
@@ -651,6 +694,8 @@ pub struct Flags {
     pub baselines: Option<String>,
     pub bless_baselines: bool,
     pub new_baselines: Vec<String>,
+    /// `--no-prebuilt`: no record of this request comes from a pack source.
+    pub no_prebuilt: bool,
     /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
     /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
     /// (`Asked::lint_levels` of blaze-units).
@@ -696,7 +741,9 @@ impl Flags {
             "no-run" => self.no_run = true,
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
-            "reached" => self.reached = true,
+            "run-all" => self.run_all = true,
+            // `check_value` held it to `fail` and `pass` first.
+            "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),
             // `check_value` parsed them first.
@@ -716,6 +763,7 @@ impl Flags {
             "replace" => self.replace.extend(owned()),
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
+            "no-prebuilt" => self.no_prebuilt = true,
             "new-baseline" => {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));
@@ -818,12 +866,24 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
             Some("reach") => return Ok(Asked::Reach(words.collect())),
+            Some("prove") => return Ok(Asked::Prove(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("doctor") => return Ok(Asked::Doctor(words.collect())),
+            Some("audit") => return Ok(Asked::Audit(words.collect())),
+            Some("diagnostics") => return Ok(Asked::Diagnostics(words.collect())),
+            Some("agents") => return Ok(Asked::Agents(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            // `blaze store verify` is the same command's (`cli::cache`).
+            Some("store") => {
+                return Ok(Asked::Cache(std::iter::once("store".into()).chain(words).collect()));
+            }
+            // `blaze gc ...` is `blaze cache gc ...`.
+            Some("gc") => {
+                return Ok(Asked::Cache(std::iter::once("gc".into()).chain(words).collect()));
+            }
             Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
             Some("fmt") => return Ok(Asked::Fmt(words.collect())),
             Some("new") => return Ok(Asked::New { init: false, words: words.collect() }),

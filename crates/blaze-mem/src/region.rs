@@ -24,8 +24,23 @@ use std::{
 
 use crate::{MemError, Tag, huge::Pages, os, tag};
 
-/// The largest single commit: past it a region grows 64 MB per system call.
+/// What a sparse region promises before any range of it is reused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sparse {
+    /// Every byte readable from the start ([`Region::reserve_sparse`]).
+    Readable,
+    /// No byte touched before its range is reused ([`Region::reserve_sparse_ranges`]).
+    RangesOnly,
+}
+
+/// The largest single commit: past it a region grows by this much per system call.
+/// On overcommitting kernels untouched pages cost nothing, so 64 MiB keeps system calls down;
+/// on Windows every committed byte is charged immediately against the commit limit, so cap at
+/// 4 MiB to bound untouched tail commit across hundreds of arenas.
+#[cfg(not(windows))]
 const MAX_STEP: usize = 64 << 20;
+#[cfg(windows)]
+const MAX_STEP: usize = 4 << 20;
 
 /// Held while a region of the reserved pool grows: mapping hugetlb pages over a range replaces
 /// what is there, so unlike `mprotect` two growers must never map the same range. Growth of
@@ -57,6 +72,13 @@ pub struct Region {
     /// Made by [`Region::reserve_sparse`]: every byte readable and writable from the start, and
     /// `committed` the prefix its owner said it uses.
     sparse: bool,
+    /// Committed whole as it was reserved, and counted so: a readable sparse region on Windows,
+    /// which can make a range readable only by committing it.
+    whole: bool,
+    /// Of a region committed whole (`whole`), whether its owner asked for a prefix
+    /// ([`Region::ensure`]): where everything is committed already that leaves no other trace,
+    /// and a region is counted one way.
+    prefixed: std::sync::atomic::AtomicBool,
     /// Of a sparse region counted by ranges ([`Region::reuse`], [`Region::evict`]), the bytes
     /// made the process's and not given back since: what its tag holds of it besides
     /// `committed`, which such a region leaves at what its reservation counted.
@@ -119,10 +141,33 @@ impl Region {
     /// windows are slots of 1 GiB in a reservation of terabytes). Mixing them panics, naming the
     /// region.
     pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        Region::sparse(bytes, tag, Sparse::Readable)
+    }
+
+    /// Reserves a sparse column accessed only below `ensure`'s published prefix. On an
+    /// overcommitting kernel the sparse mapping needs no system call to grow. On Windows
+    /// only the prefix needs commit charge, not every possible slot of the column.
+    pub fn reserve_sparse_prefix(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        if cfg!(windows) { Region::reserve(bytes, tag) } else { Region::reserve_sparse(bytes, tag) }
+    }
+
+    /// A sparse region its owner counts by ranges alone ([`Region::reuse`], [`Region::evict`]),
+    /// touching no byte of one before reusing it: the store's buffer pool. On Linux and macOS it
+    /// is [`Region::reserve_sparse`]; on Windows, which cannot commit terabytes, only reserved,
+    /// and each range committed by its [`Region::reuse`].
+    pub fn reserve_sparse_ranges(bytes: usize, tag: Tag) -> Result<Region, MemError> {
+        Region::sparse(bytes, tag, Sparse::RangesOnly)
+    }
+
+    fn sparse(bytes: usize, tag: Tag, kind: Sparse) -> Result<Region, MemError> {
         let granule = os::page_size().max(64 << 10);
         let reserved = crate::align::checked_align_up(bytes.max(1), granule)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
-        let base = os::reserve_sparse(reserved).map_err(|os| MemError::Reserve {
+        let made = match kind {
+            Sparse::Readable => os::reserve_sparse(reserved),
+            Sparse::RangesOnly => os::reserve_sparse_ranges(reserved),
+        };
+        let base = made.map_err(|os| MemError::Reserve {
             tag,
             bytes: reserved,
             os,
@@ -137,10 +182,13 @@ impl Region {
             pages: Pages::Base,
             node: None,
             sparse: true,
+            whole: cfg!(windows) && kind == Sparse::Readable,
+            prefixed: std::sync::atomic::AtomicBool::new(false),
             held: AtomicUsize::new(0),
             tag,
         };
-        if cfg!(windows) {
+        // Windows committed a readable sparse region whole, and counts it so.
+        if region.whole {
             region.publish(reserved);
         }
         Ok(region)
@@ -151,8 +199,16 @@ impl Region {
     }
 
     fn placed(bytes: usize, pages: Pages, node: Option<u32>, tag: Tag) -> Result<Region, MemError> {
+        // On overcommitting Unix kernels committing 64 KiB only backs pages actually touched;
+        // on Windows `VirtualAlloc(MEM_COMMIT)` charges every page immediately to the commit
+        // limit, so commit at native page granularity (4 KiB) while still rounding reservations
+        // to `RESERVE_ALIGN` (64 KiB).
+        #[cfg(windows)]
+        let granule = os::page_size();
+        #[cfg(not(windows))]
         let granule = os::page_size().max(64 << 10);
-        let whole = if pages.is_huge() { huge_unit() } else { granule };
+        let reserve_unit = if cfg!(windows) { os::RESERVE_ALIGN.max(granule) } else { granule };
+        let whole = if pages.is_huge() { huge_unit() } else { reserve_unit };
         let reserved = crate::align::checked_align_up(bytes.max(1), whole)
             .ok_or(MemError::TooLarge { tag, what: "a reservation", wanted: bytes })?;
         let transparent = pages == Pages::Transparent;
@@ -173,6 +229,8 @@ impl Region {
             pages,
             node,
             sparse: false,
+            whole: false,
+            prefixed: std::sync::atomic::AtomicBool::new(false),
             held: AtomicUsize::new(0),
             tag,
         })
@@ -293,6 +351,9 @@ impl Region {
     /// kernel refuses.
     #[inline]
     pub fn ensure(&self, len: usize) -> Result<(), MemError> {
+        if self.whole {
+            self.prefix_of_whole();
+        }
         if len <= self.committed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -595,9 +656,11 @@ impl Region {
     ///   batch costs one TLB flush. The pages read zeros when next touched.
     /// - macOS: `MADV_FREE_REUSABLE` per range, out of `phys_footprint` at once; their bytes are
     ///   unspecified until [`Region::reuse`] and a write.
-    /// - Windows: `MEM_DECOMMIT` per range. A decommitted page faults when read, so there an
-    ///   optimistic read ([`crate::racy::copy_out`]) of a page being given back is not defined;
-    ///   the pool on Windows is not designed yet.
+    /// - Windows: `DiscardVirtualMemory` per range: the pages leave the working set now and their
+    ///   bytes are unspecified until written, as on macOS, and they stay committed, so an
+    ///   optimistic read ([`crate::racy::copy_out`]) of a page being given back reads some bytes
+    ///   and never faults. The commit charge of a range stays from its first [`Region::reuse`]
+    ///   to the region's end (`docs/memory-budget.md`, Windows).
     ///
     /// Never plain `MADV_FREE`, which the kernel goes on counting (rule `one-memory-measure`).
     ///
@@ -684,13 +747,23 @@ impl Region {
     }
 
     /// Panics unless this sparse region is counted by ranges: nothing committed past what its
-    /// reservation counted (all of it on Windows, none elsewhere).
+    /// reservation counted (all of it where it was committed whole, none elsewhere).
     #[track_caller]
     fn by_ranges(&self, doing: &str) {
-        let initial = if cfg!(windows) { self.reserved } else { 0 };
-        if self.committed() != initial {
+        let initial = if self.whole { self.reserved } else { 0 };
+        if self.committed() != initial || self.prefixed.load(Ordering::Acquire) {
             self.mixed(doing);
         }
+    }
+
+    /// [`Region::ensure`] of a region committed whole: marked counted by its prefix, or refused
+    /// where it is counted by ranges already.
+    #[track_caller]
+    fn prefix_of_whole(&self) {
+        if self.held.load(Ordering::Acquire) != 0 {
+            self.mixed("committing a prefix of");
+        }
+        self.prefixed.store(true, Ordering::Release);
     }
 
     #[cold]

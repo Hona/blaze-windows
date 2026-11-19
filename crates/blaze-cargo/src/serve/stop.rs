@@ -12,12 +12,10 @@
 //! one thread that reaps the daemon's children: stuck inside a turn (lane reaphang,
 //! 2026-11-03), it left them zombies and its clients waiting, and nothing said so.
 //!
-//! At each look, every [`super::ceiling::EVERY`] at least, before a stop and during one, it
-//! reads the daemon's footprint against its memory ceiling ([`super::ceiling`], judged by
-//! [`CeilingWatch`]): past it, the daemon writes what it held by tag and what each thread was
-//! inside, and ends ([`Exit::MemoryCeiling`]). A look allocates nothing and takes no lock.
+//! It watches no memory: the kernel's limit is the daemon's one ceiling (its own watch of the
+//! footprint against a ceiling was deleted with memory admission, 2026-11-13).
 //!
-//! At each look too, before a stop and during one, it names the stalls in the wait-for graph
+//! At each look, before a stop and during one, it names the stalls in the wait-for graph
 //! of named locks, signals and kernel waits ([`Stalls`], blaze-core's `lock::graph`): once a
 //! wait is older than [`STALL_THRESHOLD`], each deadlock and each convoy is said once as a
 //! `blaze::stall` event while it lasts, and the top one's line goes in each build's live model
@@ -26,24 +24,30 @@
 
 #![forbid(unsafe_code)]
 
-use std::{io::Read as _, os::fd::AsFd as _, sync::Arc, thread::JoinHandle, time::Duration};
+#[cfg(unix)]
+use std::{io::Read as _, os::fd::AsFd as _, sync::Arc, thread::JoinHandle};
+use std::time::Duration;
 
+use blaze_core::exit::Exit;
+#[cfg(unix)]
 use blaze_core::{
-    exit::Exit,
     lock::{
         graph,
         stall::{Stall, WaitRow},
     },
 };
+#[cfg(unix)]
 use blaze_profile::{Watchdog, watchdog::Progress};
+#[cfg(unix)]
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{
-    ceiling::{EASED, Gib, NEAR, STOPPED},
     flightrec,
-    pulse::{CeilingLook, CeilingWatch, Look, LoopWatch, Pulse, StallWatch},
+
     signals,
 };
+#[cfg(unix)]
+use super::pulse::{Look, LoopWatch, Pulse, StallWatch};
 
 /// How long a wait in the wait-for graph (a named lock, a signal, a kernel wait) lasts before
 /// the guard looks for the stall behind it. Far under the loop's own bounds (a stuck turn is
@@ -54,14 +58,12 @@ use super::{
 /// microseconds) and than a fair queue behind one long hold, short enough that a person
 /// watching the build view sees the stall while it is the reason. A daemon run with a stall
 /// bound under 8 s takes a quarter of it instead, to stay under its report.
+#[cfg(unix)]
 const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long the guard waits for the scheduler's lock to read its waits: a deadlock may hold it.
+#[cfg(unix)]
 const WAITS_READ: Duration = Duration::from_secs(2);
-
-/// How long a daemon past its memory ceiling waits for the scheduler's lock to name its waits:
-/// its workers go on taking memory meanwhile.
-const WAITS_READ_AT_CEILING: Duration = Duration::from_millis(250);
 
 /// What a stop that ended so says first: `blaze serve: pid 7 stop stalled: ...`.
 pub const STALLED: &str = " stop stalled: ";
@@ -70,11 +72,13 @@ pub const STALLED: &str = " stop stalled: ";
 pub const STUCK: &str = " loop stuck: ";
 
 /// The guard's thread, waiting for a stop, then watching it ([`arm`]).
+#[cfg(unix)]
 pub struct Guard {
     done: Sender<()>,
     thread: JoinHandle<()>,
 }
 
+#[cfg(unix)]
 impl Guard {
     /// The stop is over: the guard ends, unless the bound ended the process first.
     pub fn disarm(self) {
@@ -89,6 +93,7 @@ impl Guard {
 /// ([`watch_turns`]). Then it waits for SIGTERM or SIGINT, or for the daemon to begin a stop of
 /// its own ([`signals::stop_begun`]), and ends the process once neither the worker pool's jobs,
 /// the queries nor the loop's progress ([`Pulse::moved`]) moved for `bound`.
+#[cfg(unix)]
 pub fn arm(bound: Duration, pulse: Arc<Pulse>) -> anyhow::Result<Guard> {
     use anyhow::Context as _;
     let pipe = signals::stop_pipe().context("making the pipe the stop's guard waits on")?;
@@ -100,16 +105,17 @@ pub fn arm(bound: Duration, pulse: Arc<Pulse>) -> anyhow::Result<Guard> {
     Ok(Guard { done, thread })
 }
 
-/// How often the guard looks: ten looks a bound, between 10 ms and 1 s apart, and at least
-/// every [`super::ceiling::EVERY`], the footprint's watch.
+/// How often the guard looks: ten looks a bound, between 10 ms and 1 s apart.
 fn look_every(bound: Duration) -> Duration {
-    (bound / 10).clamp(Duration::from_millis(10), Duration::from_secs(1)).min(super::ceiling::EVERY)
+    (bound / 10).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
+#[cfg(unix)]
 fn now_ns() -> u64 {
     u64::try_from(blaze_profile::clock::mono_ns()).unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()>) {
     if !watch_turns(pipe, bound, pulse, over) {
         return;
@@ -117,13 +123,10 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
     let mut watchdog = Watchdog::new(bound);
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
-    let mut memory = Memory::default();
     let mut stalls = Stalls::new(bound);
     let pid = std::process::id();
     loop {
-        // A stop that writes its image takes memory too: held to the ceiling as before it.
-        memory.look(pid);
-        // And may stall on a lock: named as before it.
+        // A stop may stall on a lock: named as before it.
         stalls.look(pid, pulse);
         let progress = Progress {
             jobs: pool.ended(),
@@ -164,6 +167,7 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
 /// worker was working" of a daemon whose every worker was (2026-11-11). `working_now` is the
 /// workers inside a job's code as the stall is said (`blaze_graph::pool::Pool::working`): not
 /// counted as moving, because a job blocked on a lock is inside its code too.
+#[cfg(unix)]
 fn counted(at: &Progress, working_now: usize) -> String {
     // alloc: once, as the process ends
     format!(
@@ -177,10 +181,12 @@ fn counted(at: &Progress, working_now: usize) -> String {
 /// Watches the loop's turns until a stop: SIGTERM or SIGINT, or the daemon's own stop, as a
 /// byte on `pipe`. A turn that lasts half of `bound` is reported once ([`LoopWatch`]); a loop
 /// that has not turned while the worker pool's jobs and the queries stood still too, for the
-/// whole `bound` ([`Watchdog`]), is deadlocked, and the daemon ends ([`Exit::LoopStalled`])
+/// whole `bound` (the loop as a task of the task watchdog's core, [`loop_seen`]), is
+/// deadlocked, and the daemon ends ([`Exit::LoopStalled`])
 /// rather than leave its children unreaped and its clients waiting for ever. `true` once a stop
 /// began; `false` once the guard is disarmed ([`Guard::disarm`]) with no stop, or when the pipe
 /// can't be read, so no stop is bounded.
+#[cfg(unix)]
 fn watch_turns(
     mut pipe: std::fs::File,
     bound: Duration,
@@ -188,17 +194,18 @@ fn watch_turns(
     over: &Receiver<()>,
 ) -> bool {
     let mut turning = LoopWatch::new(bound / 2);
-    let mut watchdog = Watchdog::new(bound);
+    // The loop is one task of the task watchdog's core, on a thread of its own: the loop's
+    // driver may be the one that is stuck, and the task watchdog's reader takes the
+    // scheduler's locks, which a deadlock may hold. Its span is its progress.
+    let mut watch = blaze_profile::stuck::Watch::new();
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
     let pid = std::process::id();
-    let mut memory = Memory::default();
     let mut stalls = Stalls::new(bound);
     loop {
         if !matches!(over.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)) {
             return false;
         }
-        memory.look(pid);
         stalls.look(pid, pulse);
         let now = now_ns();
         let turns = pulse.turns();
@@ -215,12 +222,13 @@ fn watch_turns(
             steps: turns,
             working: 0,
         };
-        if let Some(quiet) = watchdog.tick(now, progress, look != Look::Turning) {
+        let seen = [loop_seen(&progress, now, bound)];
+        if let Some(quiet) = watch.look(now, &seen).first() {
             // alloc: once, as the process ends
             let why = format!(
                 "the loop has not finished a turn and nothing moved for {} s, its bound ({}): it ends with exit status {}",
-                quiet.for_ns / 1_000_000_000,
-                counted(&quiet.at, pool.working()),
+                quiet.still_ns / 1_000_000_000,
+                counted(&progress, pool.working()),
                 Exit::LoopStalled
             );
             let said = stuck_line(pid, &why);
@@ -253,12 +261,37 @@ fn watch_turns(
     }
 }
 
+/// The loop as a task of the task watchdog ([`blaze_profile::stuck`]): its span the loop's
+/// turns, the pool's jobs ended and the queries completed, so a turn, a job's end or a query
+/// moves it; no CPU of its own (a loop spinning inside a turn is as stuck as one parked); its
+/// bound the daemon's stall bound in place of its wait's.
+#[cfg(unix)]
+fn loop_seen(progress: &Progress, now_ns: u64, bound: Duration) -> blaze_profile::stuck::TaskSeen {
+    use blaze_profile::stuck::{Task, TaskSeen, WaitsOn};
+    let span = progress
+        .steps
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(21)
+        ^ progress.jobs.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(42)
+        ^ progress.queries.wrapping_mul(0x1656_67b1_9e37_79f9);
+    TaskSeen {
+        task: Task::Loop,
+        build: 0,
+        span,
+        span_since_ns: now_ns,
+        cpu_ns: None,
+        waits: WaitsOn::Nothing,
+        bound_ns: Some(u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX)),
+    }
+}
+
 /// The guard's watch of the wait-for graph: the driver of [`StallWatch`]. Each look reads the
 /// oldest wait in progress (one pass over the registry, under its lock, allocating nothing);
 /// only past the threshold does it take the graph's snapshot and analysis
 /// ([`graph::stalls`]), say each stall new since the last look ([`said`]) and put the top
 /// one's line in the pulse for the loop's live models.
 #[derive(Debug)]
+#[cfg(unix)]
 struct Stalls {
     watch: StallWatch,
     /// [`STALL_THRESHOLD`], or a quarter of a shorter stall bound.
@@ -269,6 +302,7 @@ struct Stalls {
     unprobed: bool,
 }
 
+#[cfg(unix)]
 impl Stalls {
     fn new(bound: Duration) -> Stalls {
         let threshold = STALL_THRESHOLD.min(bound / 4);
@@ -316,6 +350,7 @@ impl Stalls {
 }
 
 /// What a guard with no lock probe to time waits by says, once.
+#[cfg(unix)]
 const UNPROBED: &str = "no lock probe is installed (blaze-profile installs it), so the stop's guard \
      times no wait in the wait-for graph and names no deadlock or convoy";
 
@@ -325,6 +360,7 @@ const UNPROBED: &str = "no lock probe is installed (blaze-profile installs it), 
 /// deadlock's threads in its cycle), the `threads` by mark, comma-separated (a deadlock's
 /// cycle in its order; a convoy's head, then its oldest waiter) and `oldest_ns`, how long the
 /// oldest of its waits has waited, on the probe's clock.
+#[cfg(unix)]
 fn said(pid: u32, stall: &Stall, now_ns: u64) {
     use std::fmt::Write as _;
     let age = |row: &WaitRow| now_ns.saturating_sub(row.since_ns);
@@ -358,103 +394,8 @@ fn said(pid: u32, stall: &Stall, now_ns: u64) {
     eprintln!("blaze serve: pid {pid} stall: {line}");
 }
 
-/// What a guard that can't read the daemon's footprint says, once until it reads it again.
-const UNREAD: &str = "its footprint is unread, so its own watch holds it to no memory ceiling until \
-     a read comes back (the kernel's limit, where its ceiling's line names one, still holds it)";
-
-/// The guard's watch of the daemon's footprint against its memory ceiling: the driver of
-/// [`CeilingWatch`], which reads the ceiling ([`super::ceiling::ceiling`]) and the footprint as
-/// the system counts it ([`crate::raw::memory::own_footprint`], as `blaze_mem::tag::resident_by`
-/// reads it for admission), says a footprint near the ceiling or eased from it once, and ends
-/// the daemon past it ([`passed`]).
-#[derive(Debug, Default)]
-struct Memory {
-    watch: CeilingWatch,
-    /// The last look could not read the footprint, and said so.
-    unread: bool,
-}
-
-impl Memory {
-    /// One look. Allocates nothing and takes no lock on a look that finds the footprint under
-    /// the ceiling and no nearer or further than before (an atomic's load and one read of the
-    /// kernel's: `proc_pid_rusage` on macOS; on Linux the daemon's cgroup's `memory.current`
-    /// and `memory.stat`, or `/proc/self/statm` where it has none, into buffers of the stack);
-    /// a line is said only at a crossing.
-    fn look(&mut self, pid: u32) {
-        let ceiling = super::ceiling::ceiling();
-        if ceiling == 0 {
-            return;
-        }
-        let Some(footprint) = crate::raw::memory::own_footprint() else {
-            if !self.unread {
-                self.unread = true;
-                tracing::error!(target: "blaze", "blaze serve: pid {pid}: {UNREAD}");
-                // logged: the event above
-                eprintln!("blaze serve: pid {pid}: {UNREAD}");
-            }
-            return;
-        };
-        self.unread = false;
-        let mut look = self.watch.look(footprint, ceiling);
-        let mut footprint = footprint;
-        if look == CeilingLook::Purge {
-            // Past the ceiling: what the allocators keep freed goes back first, and only a
-            // footprint still past it after that ends the daemon. The purge reads it once every
-            // worker gave back its heaps' free pages (or its wait passed), on this thread, the
-            // guard's, never the loop's: a reading at once still held what they kept.
-            let purged = crate::raw::memory::purge();
-            footprint = purged.after.unwrap_or(footprint);
-            look = self.watch.look(footprint, ceiling);
-            tracing::warn!(
-                target: "blaze",
-                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after, {} returned, workers' give-back {:?}",
-                purged.returned(),
-                purged.settle,
-            );
-        }
-        let (at, of) = (Gib(footprint), Gib(ceiling));
-        let line = match look {
-            CeilingLook::Under => return,
-            CeilingLook::Near => NEAR,
-            CeilingLook::Eased => EASED,
-            // A purge gave back too little: the second look ends it.
-            CeilingLook::Purge | CeilingLook::Passed => passed(pid, footprint, ceiling),
-        };
-        // A crossing's line, once a crossing: written straight to stderr, which buffers nothing.
-        tracing::warn!(
-            target: "blaze",
-            "blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)"
-        );
-        // logged: the event above
-        eprintln!("blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)");
-    }
-}
-
-/// The daemon's footprint, `footprint` bytes, passed its ceiling, `ceiling`: it writes its
-/// postmortem to its log first (what it holds by tag, as its memory line says it, then the
-/// ceiling, the footprint, what each thread is inside, the scheduler's waits and the children
-/// not reaped), then ends with [`Exit::MemoryCeiling`], which the client a request hung up on
-/// reads from that line and says as a failure naming the ceiling (`cli::daemon::Died`).
-fn passed(pid: u32, footprint: u64, ceiling: u64) -> ! {
-    super::daemon::log_memory(&blaze_mem::tag::snapshot());
-    // alloc: once, as the process ends
-    let said = format!(
-        "blaze serve: pid {pid}{STOPPED}{footprint} bytes passed {ceiling} bytes ({} of {} GiB): it ends with exit status {}; {}",
-        Gib(footprint),
-        Gib(ceiling),
-        Exit::MemoryCeiling,
-        inside_within(WAITS_READ_AT_CEILING),
-    );
-    tracing::error!(target: "blaze", "{said}");
-    // logged: the event above
-    eprintln!("{said}");
-    // The recorder's last seconds only: the daemon is over its memory, and its workers go on
-    // taking more while this is written.
-    _ = flightrec::record(flightrec::Why::MemoryCeiling, &said, flightrec::WINDOW_AT_CEILING);
-    signals::exit_now(Exit::MemoryCeiling);
-}
-
 /// Without its pipe the guard hears no stop: said, and the stop runs unbounded.
+#[cfg(unix)]
 fn unread(error: &std::io::Error) -> bool {
     tracing::error!(target: "blaze", "the stop's guard can't read its pipe, so no stop of this daemon is bounded: {error}");
     // logged: the event above
@@ -465,6 +406,7 @@ fn unread(error: &std::io::Error) -> bool {
 }
 
 /// The report of a turn that has lasted `for_ns`, the loop having finished `turns` turns.
+#[cfg(unix)]
 fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
     // alloc: once a stuck turn
     let why = format!(
@@ -475,12 +417,14 @@ fn stuck(pid: u32, for_ns: u64, turns: u64) -> String {
 }
 
 /// `blaze serve: pid 7 loop stuck: why; inside`.
+#[cfg(unix)]
 fn stuck_line(pid: u32, why: &str) -> String {
     format!("blaze serve: pid {pid}{STUCK}{why}; {}", inside()) // alloc: once a stuck turn
 }
 
 /// The line a stop that did not end says as it ends the daemon: `why` (how long nothing moved
 /// and where the counts stayed, or a second signal), then [`inside`].
+#[cfg(unix)]
 fn stalled(pid: u32, why: &str) -> String {
     // alloc: once, as the process ends
     format!(
@@ -492,6 +436,7 @@ fn stalled(pid: u32, why: &str) -> String {
 
 /// What a stuck daemon is inside: what each thread is inside, what each of the scheduler's
 /// waits waits on, and each child not reaped with what waits for it ([`children`]).
+#[cfg(unix)]
 fn inside() -> String {
     inside_within(WAITS_READ)
 }
@@ -503,6 +448,13 @@ fn inside_within(within: Duration) -> String {
 
 /// Each child started and not reaped, its state and what waits for it: a zombie whose waiter is
 /// a spawn effect says the loop that polls its driver is stuck.
+#[cfg(windows)]
+fn children() -> String {
+    // The IOCP driver ends each process with its job and keeps no list of them to say here.
+    "children not reaped: not listed on Windows".to_owned() // alloc: once a report
+}
+
+#[cfg(unix)]
 fn children() -> String {
     let unreaped = blaze_core::children::unreaped();
     if unreaped.is_empty() {
@@ -536,7 +488,8 @@ fn waits(within: Duration) -> String {
     }
 }
 
-#[cfg(test)]
+// The guard's own tests start it on Unix's signal pipe, which Windows has none of yet.
+#[cfg(all(test, unix))]
 mod tests {
     use std::{
         process::{Command, Stdio},
@@ -552,6 +505,10 @@ mod tests {
     /// (in ms), the loop turning with its progress never moving, and a worker inside a span it
     /// never leaves, as the macro sessions' deadlock held 18 workers (selfbuild4 group 1); it
     /// says it is ready on stdout and waits to be signalled.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's deadlocked worker, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after its signal"
+    )]
     fn deadlocked(bound_ms: u64) -> ! {
         blaze_profile::install();
         signals::catch();
@@ -595,6 +552,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
@@ -666,6 +624,10 @@ mod tests {
     /// spawn effect tagged 0x5ca1ab1e, as a build script or sandbox launcher is) and is never
     /// polled again, as the daemon's loop parked inside a write's maintain was (lane reaphang,
     /// 2026-11-03), so the child exits and stays a zombie; the loop's turns never move.
+    #[expect(
+        blaze::unbounded_test_wait,
+        reason = "the child process's turn that never ends, which is what the test is about; its stop guard ends the process, and the parent test kills it 30 s after it is ready"
+    )]
     fn stuck(bound_ms: u64) -> ! {
         use blaze_core::Driver as _;
         blaze_profile::install();
@@ -711,6 +673,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
+            .map(stdx::JodChild)
             .unwrap();
         let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();

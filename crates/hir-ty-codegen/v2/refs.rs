@@ -55,8 +55,8 @@ use super::{
     places::{self, Ref},
 };
 use crate::{
-    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, asm, fn_trait_methods,
-    fncache,
+    Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, NarrowInt, ObjectFormat, asm,
+    fn_trait_methods, fncache,
     fragment::{Asked, DataRequest, FuncTarget, Recorder},
     is_integer, is_thread_local,
 };
@@ -98,8 +98,9 @@ impl Walking {
     /// [`Build::WALK`], and where a unit of the instance MIR-inlines, each of
     /// [`Build::WALKS_INLINED`] against the program's world. It is the same list for every kind
     /// of instance and every crate: a unit builds each under its own settings, and even where
-    /// the instance's own MIR is the same under all of them (a body of the library's, inlined
-    /// in every unit; a shim, which has none) the `#[inline(always)]` callees of other crates
+    /// the instance's own MIR is the same under all of them (a shim, which has none; a body
+    /// of the library's is MIR-inlined only where the unit inlines, `Build::options`) the
+    /// `#[inline(always)]` callees of other crates
     /// it builds in are built under them (`always_inlinable_callee`), their bodies MIR-inlined
     /// where the unit inlines: core's `<&A as PartialEq<&B>>::eq` builds in smol_str's
     /// `<SmolStr as PartialEq<str>>::eq`, whose code inlined asks for `Repr::as_str` and
@@ -313,8 +314,8 @@ fn code_refs(
     }
     // The body each pass walks, as a unit under its settings reads it: under `WALK` first, so
     // the list starts with what a unit that inlines nothing asks for. A body of the library's
-    // or a coroutine is the same MIR under each (the library's is inlined in every unit, a
-    // coroutine has nothing inlined into it), and is walked under each all the same: the
+    // is inlined only under the passes that inline (`Build::options`), and a coroutine has
+    // nothing inlined into it under any; each is walked under every pass all the same: the
     // callees it builds in are built under the pass's settings ([`Walking::builds`]).
     // alloc: inline, one body a pass
     let mut bodies: SmallVec<[(Build, _); 3]> = SmallVec::new();
@@ -546,6 +547,10 @@ impl Listed {
         self.requests += 1;
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a reference's place is a u32 in the codegen record; a function with 2^32 references needs a typed refusal from lowering"
+    )]
     fn next(&self) -> u32 {
         u32::try_from(self.refs.len()).expect("fewer than 2^32 references")
     }
@@ -596,6 +601,19 @@ impl Listed {
             None => {
                 let at = self.symbol(Cow::Owned(places::libcall_symbol(libcall)));
                 self.libcalls.push((libcall, at));
+            }
+        }
+    }
+
+    /// Lists what the code of `format` names to reach a thread-local: ELF's `__tls_get_addr`,
+    /// COFF's `_tls_index`; Mach-O's descriptor is the static's own.
+    fn thread_local(&mut self, format: ObjectFormat) {
+        match format {
+            ObjectFormat::Coff => {
+                self.symbol(Cow::Borrowed(places::COFF_TLS_INDEX));
+            }
+            ObjectFormat::Elf | ObjectFormat::MachO | ObjectFormat::Wasm => {
+                self.libcall(ir::LibCall::ElfTlsGetAddr);
             }
         }
     }
@@ -699,7 +717,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                                         );
                                     }
                                     if is_thread_local(db, *id) {
-                                        listed.libcall(ir::LibCall::ElfTlsGetAddr);
+                                        listed.thread_local(fx.cg.target.object_format);
                                     }
                                     Some(place)
                                 }
@@ -746,6 +764,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// function's own where its ABI is not Rust's, and each foreign function's it calls. Code
     /// outside the program may make or take objects of them.
     fn edge(&mut self, body: &'db MirBody<'db>, abi: ExternAbi) -> Result<(), String> {
+        if !hir_ty_mir::mir::abi_can_unwind(abi) && self.fx.interner.lang_items().PanicCannotUnwind.is_some() {
+            self.panic(&["panicking", "panic_cannot_unwind"])?;
+        }
         let db = self.fx.cg.db;
         let (infcx, env) = (&self.fx.infcx, self.fx.env.param_env);
         let facts = &mut self.found.facts;

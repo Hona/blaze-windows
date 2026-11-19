@@ -184,7 +184,12 @@ fn configure(bytes: &[u8]) -> Configured {
         Err(what) => return Configured { asked: Err(LoadError { what, at: None }), mounts: empty },
     };
     let invocation = config.invocation;
-    let whole = |name: &str| crate::query::env_var(&invocation.env, name);
+    // Each name read here is one [`crate::query::read_by_plan`] keeps: the view's
+    // configuration holds no other variable ([`BuildConfig::planned`]).
+    let whole = |name: &str| {
+        debug_assert!(crate::query::read_by_plan(name), "`{name}` is read by the plan and not kept for it");
+        crate::query::env_var(&invocation.env, name)
+    };
     let ci = crate::lock::ci_says(whole("CI"), whole("TF_BUILD"));
     let lock_env_writes = match crate::lock::env_writes(whole(crate::lock::LOCK_ENV)) {
         Ok(it) => it,
@@ -192,7 +197,7 @@ fn configure(bytes: &[u8]) -> Configured {
     };
     let ignore_pin_for = whole("BLAZE_IGNORE_PIN_FOR").filter(|it| !it.is_empty()).map(str::to_owned);
     let env: Vec<(String, String)> =
-        invocation.env.into_iter().filter(|(name, _)| read_by_cargo(name)).collect();
+        invocation.env.into_iter().filter(|(name, _)| crate::query::read_by_cargo(name)).collect();
     let mut known: Vec<String> = Vec::new();
     for dir in ancestors(&format!("{}/x", invocation.root))
         .into_iter()
@@ -204,10 +209,16 @@ fn configure(bytes: &[u8]) -> Configured {
     }
     let lookup =
         |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    // As blaze-manifest's `cargo_home` finds it (`USERPROFILE` on Windows, where `C:\a` is
+    // absolute too), so the directory the configuration is searched in is a known one.
     let home = match lookup("CARGO_HOME") {
-        Some(home) if home.starts_with('/') => Some(home.to_owned()),
+        Some(home) if home.starts_with('/') || std::path::Path::new(home).is_absolute() => {
+            Some(home.to_owned())
+        }
         Some(home) => Some(format!("{}/{home}", invocation.cwd)),
-        None => lookup("HOME").filter(|it| !it.is_empty()).map(|home| format!("{home}/.cargo")),
+        None => lookup(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|it| !it.is_empty())
+            .map(|home| format!("{home}/.cargo")),
     };
     if let Some(home) =
         home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it)))
@@ -241,24 +252,6 @@ fn configure(bytes: &[u8]) -> Configured {
     let asked = parse(invocation.command, &invocation.args, asked)
         .map_err(|what| LoadError { what, at: None });
     Configured { asked, mounts }
-}
-
-/// The variables cargo reads by name (cargo-notes section 1), and clippy's driver's
-/// `CLIPPY_CONF_DIR`: no other one is kept.
-fn read_by_cargo(name: &str) -> bool {
-    name.starts_with("CARGO_")
-        || matches!(
-            name,
-            "RUSTFLAGS"
-                | "CLIPPY_CONF_DIR"
-                | "RUSTDOCFLAGS"
-                | "RUSTC_WORKSPACE_WRAPPER"
-                | "HOME"
-                | "USERPROFILE"
-                | "__CARGO_DEFAULT_LIB_METADATA"
-                | "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
-                | "__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT"
-        )
 }
 
 /// How an argument of cargo's takes a value.

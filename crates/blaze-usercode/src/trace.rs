@@ -107,6 +107,7 @@ pub fn untraceable_name(it: Untraceable) -> &'static str {
         Untraceable::Random => "random",
         Untraceable::Network => "network",
         Untraceable::Descriptor => "descriptor",
+        Untraceable::CargoDeclared => "cargo-declared",
     }
 }
 
@@ -116,6 +117,7 @@ pub fn untraceable_of(name: &str) -> Option<Untraceable> {
         "random" => Untraceable::Random,
         "network" => Untraceable::Network,
         "descriptor" => Untraceable::Descriptor,
+        "cargo-declared" => Untraceable::CargoDeclared,
         _ => return None,
     })
 }
@@ -132,9 +134,10 @@ pub fn whole_env(what: &str) -> bool {
     what == ALL_ENV || what.starts_with("* ")
 }
 
-/// The name a [`Traced`] of a run that read the whole environment has, beside every variable,
-/// with the [`listing`] hash of the names (in hex) as its value: a variable added later is
-/// one it would have seen. No variable has this name: a name is a C string.
+/// The name a [`Traced`] of a run that walked its environment has, beside every variable the
+/// walk saw ([`Inputs::env_all`]: the whole environment, or the walk set of a run lent its
+/// environment), with the [`listing`] hash of those names (in hex) as its value: a variable
+/// added later is one it would have seen. No variable has this name: a name is a C string.
 pub const ALL_ENV_NAME: &str = "\0*";
 
 /// One line of a record: the letter, the scope and what, by tabs, ended by a line break. The
@@ -231,8 +234,10 @@ pub trait Inputs {
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
     /// The variable's value, lent: a check hashes it where it is.
     fn env(&mut self, name: &OsStr) -> Option<&OsStr>;
-    /// The whole environment, for a run that read all of it: sorted by name, each name once,
-    /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
+    /// What a walk of the environment sees, for a run that walked it: all of it, or the walk
+    /// set of a run that is lent its environment ([`crate::inputs::Env::lent`]), in which a
+    /// variable outside the set is still read by name ([`Inputs::env`]). Sorted by name, each
+    /// name once, lent rather than copied, as [`crate::inputs::Env`] keeps it.
     fn env_all(&mut self) -> &[(OsString, OsString)];
     /// The names in the directory, each with whether it is a directory, pushed to `out` (given
     /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`walk`]
@@ -255,6 +260,20 @@ pub enum Entry {
     Dir,
     File(ContentId, blaze_vfs::Mode),
     Missing,
+}
+
+/// What a look at the disk for an [`Entry`] is kept by ([`blaze_vfs::outside::LookKind::Entry`]):
+/// `None` for a path that is not there, else a hash of which it is, and for a file of its
+/// content ID and git mode. Equal entries give equal digests and unequal ones do not, so a
+/// later ask of an unchanged disk gives the digest kept.
+pub fn entry_digest(entry: &Entry) -> Option<[u8; 32]> {
+    let mut hasher = Hasher::new("blaze v2 disk entry look 1");
+    match entry {
+        Entry::Missing => return None,
+        Entry::Dir => hasher.update(&[0]),
+        Entry::File(id, mode) => hasher.update(&[1]).part(&id.0).part(&mode.git().to_le_bytes()),
+    };
+    Some(hasher.finish().0)
 }
 
 /// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it
@@ -674,14 +693,25 @@ impl Keyer {
         untraceable: impl IntoIterator<Item = &'t Untraceable>,
     ) {
         for (path, hash) in files {
-            self.file(&os_bytes(path.as_os_str()), hash.as_ref());
+            self.put(b"f");
+            os_part(path.as_os_str(), |bytes| self.put(bytes));
+            match hash {
+                Some(hash) => { self.put(&[1]); self.put(hash); }
+                None => self.put(&[0]),
+            }
         }
         for (path, hash) in dirs {
-            self.dir(&os_bytes(path.as_os_str()), hash);
+            self.put(b"d");
+            os_part(path.as_os_str(), |bytes| self.put(bytes));
+            self.put(hash);
         }
         for (name, value) in env {
-            let value = value.as_deref().map(os_bytes);
-            self.env(&os_bytes(name), value.as_deref());
+            self.put(b"e");
+            os_part(name, |bytes| self.put(bytes));
+            match value {
+                Some(value) => { self.put(&[1]); os_part(value, |bytes| self.put(bytes)); }
+                None => self.put(&[0]),
+            }
         }
         for it in untraceable {
             self.untraceable(untraceable_name(*it).as_bytes());
@@ -747,9 +777,38 @@ pub fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
     }
 }
 
+/// A length-prefixed `os_bytes` without allocating the UTF-16 representation on every hit.
+/// The two passes count code units (not Rust string bytes), then stream them little-endian.
+fn os_part(name: &OsStr, mut put: impl FnMut(&[u8])) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let bytes = (name.encode_wide().count() as u64) * 2;
+        put(&bytes.to_le_bytes());
+        let mut buf = [0u8; 256];
+        let mut len = 0;
+        for unit in name.encode_wide() {
+            buf[len..len+2].copy_from_slice(&unit.to_le_bytes());
+            len += 2;
+            if len == buf.len() { put(&buf); len = 0; }
+        }
+        if len != 0 { put(&buf[..len]); }
+    }
+    #[cfg(not(windows))]
+    {
+        let bytes = os_bytes(name);
+        put(&(bytes.len() as u64).to_le_bytes());
+        put(&bytes);
+    }
+}
+
+pub(crate) fn hash_os(hasher: &mut Hasher, name: &OsStr) {
+    os_part(name, |bytes| { hasher.update(bytes); });
+}
+
 /// The name [`os_bytes`] gave `bytes` of, or why they are not one. The bytes come from the
 /// store or another process, so they are checked, never taken on trust.
-pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
+pub fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
@@ -1376,5 +1435,21 @@ mod tests {
         }
         #[cfg(unix)]
         assert!(matches!(os_bytes(OsStr::new("a")), Cow::Borrowed(b"a")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn streamed_os_parts_are_the_persisted_utf16_even_at_buffer_boundaries() {
+        use std::os::windows::ffi::OsStringExt as _;
+        for len in [0, 1, 127, 128, 129, 1024] {
+            let mut units = vec![0x1234; len];
+            units.extend_from_slice(&[0xd800, 0x1234, 0xdc00]); // unpaired surrogates are legal OS strings
+            let name = OsString::from_wide(&units);
+            let mut old = Hasher::new("test OS argument");
+            old.part(&os_bytes(&name));
+            let mut streamed = Hasher::new("test OS argument");
+            hash_os(&mut streamed, &name);
+            assert_eq!(old.finish(), streamed.finish());
+        }
     }
 }

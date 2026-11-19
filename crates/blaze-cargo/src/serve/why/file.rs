@@ -180,19 +180,39 @@ impl File {
     /// `build`'s `record` to the file: appended, or the whole ledger written while the file is
     /// behind or due a compaction. What failed, for `blaze daemon status`.
     pub fn write(&mut self, build: u64, record: &[u8]) -> Result<(), String> {
-        if !self.writable || (record.is_empty() && self.behind.is_none()) {
+        // alloc: clone: one build's record, where a caller writes one alone (tests)
+        self.write_all(&[(build, record.to_vec())])
+    }
+
+    /// The records of the builds explained since the file was last written, in the order they
+    /// were explained: appended as one write with one sync, which is the bytes each would have
+    /// appended alone; or, while the file is behind or due a compaction, the whole ledger
+    /// written once, which holds every one of them. What failed, for `blaze daemon status`:
+    /// the first of the builds is then the one the file is behind from.
+    ///
+    /// Written together because they are written late: a build's record is appended and
+    /// synced once the builds have been quiet (`serve::observe::Held`), never as the build
+    /// ends, when its outputs are being placed on the disk the sync flushes (measured
+    /// 2026-11-11 on APFS: 7 ms of `F_FULLFSYNC` beside each edit's placement).
+    pub fn write_all(&mut self, records: &[(u64, Vec<u8>)]) -> Result<(), String> {
+        let Some(&(first, _)) = records.first() else { return Ok(()) };
+        let bytes: u64 = records.iter().map(|it| it.1.len() as u64).sum();
+        if !self.writable || (bytes == 0 && self.behind.is_none()) {
             return Ok(());
         }
-        if self.behind.is_some() || self.due(self.len + record.len() as u64) {
-            return self.whole().map_err(|error| self.fell_behind(build, error.why));
+        if self.behind.is_some() || self.due(self.len + bytes) {
+            return self.whole().map_err(|error| self.fell_behind(first, error.why));
         }
-        let _span = tracing::info_span!(target: "blaze", "append to blaze why's ledger", build, bytes = record.len()).entered();
-        match self.append(record) {
+        let build = records.last().map_or(first, |it| it.0);
+        let _span = tracing::info_span!(target: "blaze", "append to blaze why's ledger", build, bytes, builds = records.len()).entered();
+        // alloc: the records as one write, once a flush of the history
+        let joined = records.iter().flat_map(|it| it.1.iter().copied()).collect::<Vec<u8>>();
+        match self.append(&joined) {
             Ok(len) => {
                 self.len = len;
                 Ok(())
             }
-            Err(error) => Err(self.fell_behind(build, error)),
+            Err(error) => Err(self.fell_behind(first, error)),
         }
     }
 
@@ -350,7 +370,7 @@ impl File {
                 write!(it, "{build}").and_then(|()| it.sync_all())
             })
             // durable: the gap file's name survives a restart
-            .and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all()));
+            .and_then(|()| blaze_core::fs::sync_dir(&self.dir));
         match marked {
             Ok(()) => (
                 format!(
@@ -465,7 +485,7 @@ impl File {
         let wrote = wrote.and_then(|()| file.write_all(record)).and_then(|()| file.sync_data());
         let wrote = match len {
             // durable: the append made the ledger: its name survives a crash
-            0 => wrote.and_then(|()| fs::File::open(&self.dir).and_then(|it| it.sync_all())),
+            0 => wrote.and_then(|()| blaze_core::fs::sync_dir(&self.dir)),
             _ => wrote,
         };
         let Err(error) = wrote else {
@@ -473,7 +493,9 @@ impl File {
             return Ok(len + magic + record.len() as u64);
         };
         // durable: a failed append cut back: the ledger on disk ends at a whole record
-        match file.set_len(len).and_then(|()| file.sync_data()) {
+        // An append-only handle cannot resize a file on Windows. Keep atomic append on
+        // the normal path and request write access only when undoing a failed append.
+        match fs::OpenOptions::new().write(true).open(path).and_then(|it| it.set_len(len).and_then(|()| it.sync_data())) {
             Ok(()) => Err(format!("{}; cut back to its {len} bytes", fail("appending to", error))), // alloc: error path
             Err(cut) => Err(format!(
                 "{}; and cutting it back to its {len} bytes: {cut}, so its next restore cuts the torn record",
@@ -558,7 +580,7 @@ fn copy_aside(dir: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, String> {
             it.write_all(bytes).and_then(|()| it.sync_all())
         })
         // durable: the copy's name survives a crash
-        .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()));
+        .and_then(|()| blaze_core::fs::sync_dir(dir));
     if let Err(error) = copied {
         if made {
             _ = fs::remove_file(&to);
@@ -630,7 +652,7 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
         })
         .and_then(|()| fs::rename(&hidden, path).map_err(step("renaming the hidden file over it")))
         // durable: the rename that replaces the ledger survives a crash
-        .and_then(|()| fs::File::open(dir).and_then(|it| it.sync_all()).map_err(step(SYNC_DIR)));
+        .and_then(|()| blaze_core::fs::sync_dir(dir).map_err(step(SYNC_DIR)));
     written.map_err(|(doing, error)| {
         _ = fs::remove_file(&hidden);
         // alloc: error path
@@ -646,13 +668,13 @@ fn write_whole(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), Unwritten> {
 /// Makes the [`GAP`] file at `gap`, which an earlier process may have made and not synced,
 /// durable: the file synced, then `dir`. The failure names the file and the step.
 fn sync_held(dir: &Path, gap: &Path) -> Result<(), String> {
-    fs::File::open(gap)
+    fs::OpenOptions::new().write(true).open(gap)
         // durable: a gap file an earlier process made and may not have synced
         .and_then(|it| it.sync_all())
         .map_err(|error| format!("syncing the gap file {} already there: {error}", gap.display())) // alloc: error path
         .and_then(|()| {
             // durable: the gap file's name survives a restart
-            fs::File::open(dir).and_then(|it| it.sync_all()).map_err(|error| {
+            blaze_core::fs::sync_dir(dir).map_err(|error| {
                 format!(
                     "syncing {}, the directory of the gap file {} already there: {error}",
                     dir.display(),
@@ -696,6 +718,36 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// The refinement: builds' records written together ([`File::write_all`]) leave the file
+    /// byte for byte as each written alone as its build ended does, and a restore of either
+    /// explains the next build alike. So a record written late, with the ones after it, is
+    /// the same ledger.
+    #[test]
+    fn records_written_together_are_the_file_of_each_written_alone() {
+        let (alone, together) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mut one, _) = File::restore(alone.path());
+        for (build, code) in [(3, 7), (4, 8), (5, 9)] {
+            built(&mut one, build, code);
+        }
+        let (mut all, _) = File::restore(together.path());
+        let mut pending = Vec::new();
+        for (build, code) in [(3, 7), (4, 8), (5, 9)] {
+            let (_, _, record) = all.explain(build, true, vec![miss(1, code)]);
+            pending.push((build, record));
+        }
+        assert_eq!(fs::metadata(together.path().join(LEDGER)).map(|it| it.len()).unwrap_or(0), 0);
+        all.write_all(&pending).unwrap();
+        all.write_all(&[]).unwrap();
+        let bytes = |dir: &Path| fs::read(dir.join(LEDGER)).unwrap();
+        assert_eq!(bytes(alone.path()), bytes(together.path()));
+        assert_eq!(one.len, all.len);
+        let (mut again, said) = File::restore(together.path());
+        assert!(said.torn.is_none(), "{:?}", said.torn);
+        let (mut was, _) = File::restore(alone.path());
+        let explain = |file: &mut File| file.explain(6, true, vec![miss(1, 9), miss(2, 1)]).0;
+        assert_eq!(format!("{:?}", explain(&mut again)), format!("{:?}", explain(&mut was)));
     }
 
     /// The faults a ledger file can have at a start, each as it should be met: an empty file

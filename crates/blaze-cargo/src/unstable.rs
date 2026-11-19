@@ -704,8 +704,8 @@ mod tests {
 
     #[test]
     fn a_sanitizer_runtime_the_toolchain_lacks_is_named() {
-        let sysroot =
-            std::env::temp_dir().join(format!("blaze-sanitizer-runtimes-{}", std::process::id()));
+        let made = blaze_core::temp::TempDir::for_test("blaze-sanitizer-runtimes-");
+        let sysroot = made.path().to_owned();
         let lib = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("librustc-nightly_rt.asan.a"), b"").unwrap();
@@ -714,10 +714,8 @@ mod tests {
         assert_eq!(runtimes(Sanitizers::NONE, "aarch64-apple-darwin", &sysroot), Ok(()));
         let thread = runtimes(Sanitizers::THREAD, linux, &sysroot).unwrap_err();
         assert!(thread.starts_with("`-Zsanitizer=thread` needs its runtime `"), "{thread}");
-        assert!(
-            thread.contains(&lib.join("librustc-nightly_rt.tsan.a").display().to_string()),
-            "{thread}"
-        );
+        let named = thread.split('`').nth(3).expect("a quoted runtime path");
+        assert_eq!(std::path::Path::new(named), lib.join("librustc-nightly_rt.tsan.a"));
         let apple = runtimes(Sanitizers::ADDRESS, "aarch64-apple-darwin", &sysroot).unwrap_err();
         assert!(apple.contains("librustc-nightly_rt.asan.dylib"), "{apple}");
         assert!(
@@ -730,7 +728,6 @@ mod tests {
                 .unwrap_err()
                 .contains("Windows")
         );
-        std::fs::remove_dir_all(&sysroot).unwrap();
     }
 
     #[test]

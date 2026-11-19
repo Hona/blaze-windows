@@ -85,6 +85,7 @@ fn spec() -> Spec {
         proc_macro_bridge: false,
         report: false,
         fuel: false,
+        slots: false,
         heap_to_stack: false,
     }
 }
@@ -680,6 +681,22 @@ fn statics_are_listed_with_what_reaches_them() {
     }
     let tls = FrontRef::Extern(places::libcall_symbol(ir::LibCall::ElfTlsGetAddr));
     assert!(walked.contains(&tls), "{walked:?}");
+}
+
+/// What reaches a thread-local is the object format's: COFF's code reads `_tls_index` (the
+/// fixtures' crates are all Linux's, so the walk is checked at its list), listed once however
+/// many thread-locals the code reaches.
+#[test]
+fn a_thread_local_lists_what_its_object_format_reaches_it_by() {
+    let listed = |format| {
+        let mut listed = super::Listed::with_capacity(2);
+        listed.thread_local(format);
+        listed.thread_local(format);
+        listed.refs
+    };
+    let extern_ = |name: &str| vec![FrontRef::Extern(name.to_owned())];
+    assert_eq!(listed(crate::ObjectFormat::Coff), extern_(places::COFF_TLS_INDEX));
+    assert_eq!(listed(crate::ObjectFormat::Elf), extern_("__tls_get_addr"));
 }
 
 const CLOSURES: &str = r#"

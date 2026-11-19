@@ -172,14 +172,13 @@ fn the_oracle_catches_a_walk_in_the_order_its_describes_ran() {
 }
 
 /// No round stands between a describe and what it reached: `main` (1) calls 2 and 3, and 2
-/// calls 4. The describe of 3 waits until 4's describe is kept under its key, which a walk by
-/// levels never gets to (4 is of the level after 3's): here 4 is described, and visible by
-/// its key, while 3, reached a step before it, is still being described and long before the
-/// walk ends.
+/// calls 4. The describe of 3 waits until 4's describe has begun, which a walk by levels never
+/// gets to (4 is of the level after 3's): here 4 is described while 3, reached a step before
+/// it, is still being described and long before the walk ends.
 #[test]
-fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
+fn a_function_is_described_while_one_reached_before_it_still_is() {
     const LONG: Duration = Duration::from_secs(60);
-    let kept: Arc<Kept<u32, u32>> = Arc::new(Kept::new());
+    let four = Arc::new(AtomicBool::new(false));
     let waited = Arc::new(AtomicBool::new(false));
     let mut program = Program::default();
     program.function(1, 0x11, &[2, 3]);
@@ -187,11 +186,14 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     program.function(3, 0x33, &[]);
     program.function(4, 0x44, &[]);
     program.watch = Some(Box::new({
-        let (kept, waited) = (Arc::clone(&kept), Arc::clone(&waited));
+        let (four, waited) = (Arc::clone(&four), Arc::clone(&waited));
         move |id: u32| {
+            if id == 4 {
+                four.store(true, Ordering::Release);
+            }
             if id == 3 {
-                SpinWait::within("the describe of f4, kept while f3 is described", LONG, || {
-                    kept.function(0, &(4, member())).is_some()
+                SpinWait::within("the describe of f4, begun while f3 is described", LONG, || {
+                    four.load(Ordering::Acquire)
                 });
                 waited.store(true, Ordering::Release);
             }
@@ -201,7 +203,7 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     let reached = pool.install(|| {
         let policy = policy(OptLevel::O0, Mode::Output);
         let (machine, memo) = (Machine::default(), Memo::new());
-        let build = Build::new(&machine, &program, &policy, &memo).keeping(&kept);
+        let build = Build::new(&machine, &program, &policy, &memo);
         let mut errors = Vec::new();
         let (nodes, ..) = build.walk(&[(1, member())], &[], &[], None, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
@@ -209,4 +211,118 @@ fn a_function_is_described_and_kept_while_one_reached_before_it_still_is() {
     });
     assert_eq!(reached, 4);
     assert!(waited.load(Ordering::Acquire), "f3's describe saw f4's before it ended");
+}
+
+/// A subscriber that keeps the last `done` and `known` recorded on any span: what a walk's
+/// span carries, as the profile's subscriber reads it.
+#[derive(Default)]
+struct Counts {
+    done: std::sync::atomic::AtomicU64,
+    known: std::sync::atomic::AtomicU64,
+    /// How many records named either field.
+    records: std::sync::atomic::AtomicU64,
+}
+
+struct CountsOf<'a>(&'a Counts);
+
+impl tracing::field::Visit for CountsOf<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        let slot = match field.name() {
+            "done" => &self.0.done,
+            "known" => &self.0.known,
+            _ => return,
+        };
+        slot.store(value, Ordering::Release);
+        self.0.records.fetch_add(1, Ordering::Release);
+    }
+
+    // dyn: tracing's visitor takes any other value by its `Debug`
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+struct Recorder(Arc<Counts>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        attributes.record(&mut CountsOf(&self.0));
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut CountsOf(&self.0));
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// What the span over a walk of `program` on `workers` carried last: (`done`, `known`), how
+/// many records named them, and how many functions and statics the walk gave.
+fn carried(program: &Program, workers: usize, bug: Option<Planted>) -> (u64, u64, u64, usize) {
+    let counts = Arc::new(Counts::default());
+    let pool = Pool::new(&Topology::flat(workers), false).unwrap();
+    let items = pool.install(|| {
+        tracing::subscriber::with_default(Recorder(Arc::clone(&counts)), || {
+            let policy = policy(OptLevel::O0, Mode::Output);
+            let (machine, memo) = (Machine::default(), Memo::new());
+            let build = Build::new(&machine, program, &policy, &memo);
+            let build = match bug {
+                Some(bug) => build.planting(bug),
+                None => build,
+            };
+            let roots: Vec<(u32, Origin)> = ROOTS.iter().map(|it| (*it, member())).collect();
+            let mut errors = Vec::new();
+            let span = tracing::info_span!(
+                target: "blaze",
+                "codegen walk",
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
+            );
+            let (nodes, statics, ..) =
+                span.in_scope(|| build.walk(&roots, &STATIC_ROOTS, &[], None, &mut errors));
+            assert!(errors.is_empty(), "{errors:?}");
+            nodes.len() + statics.len()
+        })
+    });
+    (
+        counts.done.load(Ordering::Acquire),
+        counts.known.load(Ordering::Acquire),
+        counts.records.load(Ordering::Acquire),
+        items,
+    )
+}
+
+/// The invariant: the walk's span carries how far the walk is: as it ends, every item sent
+/// was visited (`done == known`), that count is the walk's functions and statics, and it is
+/// the same on one worker and on eight.
+#[test]
+fn the_walks_span_carries_done_and_known() {
+    let program = generated(3);
+    let (done, known, records, items) = carried(&program, 1, None);
+    assert!(records >= 2, "the span was told its counts: {records} records");
+    assert_eq!(done, known, "every item sent was visited");
+    // One key a function here (`generated` gives each its own code), so the walk's nodes
+    // are its entries.
+    assert_eq!(done as usize, items, "the count is the walk's functions and statics");
+    let (done_8, known_8, ..) = carried(&program, 8, None);
+    assert_eq!((done_8, known_8), (done, known), "the same counts on eight workers");
+}
+
+/// The planted bug: only the roots are counted as known. The oracle of
+/// [`the_walks_span_carries_done_and_known`] compares `done` with `known`, and here more
+/// visits ended than items were said to be known.
+#[test]
+fn the_oracle_catches_a_walk_that_counts_only_its_roots() {
+    let program = generated(3);
+    let (done, known, ..) = carried(&program, 1, Some(Planted::UncountedSends));
+    assert!(done > known, "done {done}, known {known}");
 }

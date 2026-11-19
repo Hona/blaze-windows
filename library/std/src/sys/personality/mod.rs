@@ -14,6 +14,11 @@ mod dwarf;
 
 #[cfg(not(any(test, doctest)))]
 cfg_select! {
+    // blaze's: its landing pads are blocks of their function, which this personality enters
+    // (blaze_seh.rs), where rustc's are funclets that `__CxxFrameHandler3` calls.
+    all(target_env = "msvc", target_arch = "x86_64") => {
+        mod blaze_seh;
+    }
     any(target_env = "msvc", target_family = "wasm") => {
         // This is required by the compiler to exist (e.g., it's a lang item),
         // but it's never actually called by the compiler because

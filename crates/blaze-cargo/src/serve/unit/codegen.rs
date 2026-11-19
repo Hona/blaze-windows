@@ -69,32 +69,33 @@ pub(crate) fn makes(unit: &Unit, asked: bool) -> Result<Makes, String> {
     if target.is_proc_macro() {
         return Ok(Makes::Shared { proc_macro: true });
     }
+    // cargo writes every crate type a library lists, a dependency's too, but a dependency's
+    // `cdylib`, `staticlib` or `dylib` is a file no step of the build reads: a library a build
+    // only depends on, which is also an `rlib` (`lib`), is built as that rlib and nothing else
+    // (`schema::builds_only_its_rlib`, which its planned files follow too); the programs that
+    // link it behave as under cargo (tree-sitter-highlight's `crate-type = ["lib",
+    // "staticlib"]`, betteroffice's `["cdylib", "rlib"]`).
+    let kinds = target.crate_types.iter().chain(&target.kind).map(String::as_str);
+    if schema::builds_only_its_rlib(kinds, asked) {
+        return Ok(Makes::Library);
+    }
     if has("cdylib") {
         return Ok(Makes::Shared { proc_macro: false });
     }
     if has("staticlib") || has("dylib") {
         let kind = if has("staticlib") { "staticlib" } else { "dylib" };
-        // cargo writes every crate type a library lists, a dependency's too, but a dependency's
-        // `staticlib` or `dylib` is a file no step of the build reads: what depends on the
-        // library links its `rlib`, and an archive or dylib in `deps/` is no output a program
-        // links (only an artifact dependency would name one). So a library a
-        // build only depends on, which is also an `rlib` (`lib`), is built as that rlib and
-        // nothing else; the programs that link it behave as under cargo (tree-sitter-highlight's
-        // `crate-type = ["lib", "staticlib"]`). Where the build is asked for the library itself,
-        // or it has no rlib to link, the file is what is asked for, and this linker does not
-        // write it: an error naming it, never a build that quietly leaves it out.
-        let rlib = has("lib") || has("rlib");
-        if asked || !rlib {
-            let why = match asked {
-                true => "the build is asked for this library",
-                false => "it has no `lib` or `rlib` its dependents could link instead",
-            };
-            return Err(format!(
-                "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
-                 types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
-                target.name
-            ));
-        }
+        // The build is asked for the library itself, or it has no rlib to link: the file is
+        // what is asked for, and this linker does not write it: an error naming it, never a
+        // build that quietly leaves it out.
+        let why = match asked {
+            true => "the build is asked for this library",
+            false => "it has no `lib` or `rlib` its dependents could link instead",
+        };
+        return Err(format!(
+            "`{}` asks for a `{kind}`, which blaze's linker does not write ({why}): crate \
+             types `lib`, `rlib`, `cdylib`, `proc-macro` and `bin` are what it builds",
+            target.name
+        ));
     }
     Ok(Makes::Library)
 }
@@ -113,19 +114,19 @@ pub(crate) fn wasm_macro(job: &Job, unit: usize) -> bool {
 /// whose roots are its glue's exports, kept by name as a `cdylib`'s are; a proc macro built for
 /// the host is no build's (every build plans wasm macros, and [`super::compile`]'s `macros`
 /// refuses one), so asking for its roots is an error naming it.
-fn root_kind(unit: &Unit, makes: &Makes, wasm: bool) -> Result<RootKind, String> {
+fn root_kind(mode: Mode, name: &str, makes: &Makes, wasm: bool, harness: bool) -> Result<RootKind, String> {
     Ok(match makes {
         // A doctest's programs as tests: a `test_harness` example's crate has `cfg(test)` and
         // its harness, as rustdoc's `--test` builds it; any other program's roots are its
         // `main`, as a test crate's without `cfg(test)` are.
-        Makes::Executable if matches!(unit.mode, Mode::Test | Mode::Doctest) => RootKind::Test,
+        Makes::Executable if mode == Mode::Doctest || (mode == Mode::Test && harness) => RootKind::Test,
         Makes::Executable => RootKind::Executable,
         Makes::Shared { proc_macro: true } if wasm => RootKind::Shared,
         Makes::Shared { proc_macro: true } => {
             return Err(format!(
                 "proc macro `{}` is built for the host, not as a wasm module, yet its codegen was asked for: \
                  a build runs proc macros only as wasm32-wasip1 modules",
-                unit.target.name
+                name
             ));
         }
         Makes::Shared { proc_macro: false } => RootKind::Shared,
@@ -868,7 +869,11 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     };
     // A dev executable runs on the daemon's code memory and takes edits while it runs: its
     // members' functions are reached through slots ([`super::run::inproc::runs_in_process`]).
-    if super::run::inproc::runs_in_process(job, unit, &policy)? {
+    // A launcher's program is not linked at all: every function is reached through its
+    // slot word, in the launcher's process ([`super::run::launch::launched`]).
+    if super::run::launch::launched(job, unit, &policy)? {
+        policy.mode = BuildMode::Launched;
+    } else if super::run::inproc::runs_in_process(job, unit, &policy)? {
         policy.mode = BuildMode::Live;
     }
     Ok(policy)
@@ -887,7 +892,10 @@ pub(crate) struct Parts {
     pub(crate) build_time: BuildTime,
     /// What the walks over the front end keep, which made `built`: where `built` goes back
     /// once the link is done with it ([`Drop`]).
-    kept: Arc<blaze_codegen::driver::Kept<HirInstance, hir_ty_codegen::v2::HirStatic>>,
+    kept: Arc<hir_ty_codegen::v2::KeptProgram>,
+    /// A launched build's start, made for its link ([`super::run::launch::prepare`]): taken
+    /// by the link, once. `None` for every other build, whose code is in `built`.
+    launch: Option<blaze_core::lock::Lock<Option<super::run::launch::Prepared>>>,
 }
 
 /// The `Built` goes back to the driver that made it, whatever became of its link
@@ -919,6 +927,7 @@ impl Parts {
             frontend,
             policy: &self.policy,
             image: self.image,
+            launch: self.launch.as_ref(),
             side: Default::default(),
             spans: Default::default(),
         }
@@ -933,6 +942,8 @@ pub(crate) struct Generated<'a> {
     pub(crate) policy: &'a Policy,
     /// Whether the link maps the dependency image ([`Parts::image`]).
     pub(crate) image: bool,
+    /// A launched build's start, for its link to take ([`Parts::launch`]).
+    pub(crate) launch: Option<&'a blaze_core::lock::Lock<Option<super::run::launch::Prepared>>>,
     /// The span tables the build's code names, as a change of those its last link was given
     /// ([`HirFrontend::link_inputs`]): read once, by the first link that needs them, and none
     /// for a library.
@@ -959,12 +970,22 @@ impl Generated<'_> {
     /// that does not read, is an error naming the function.
     pub(crate) fn report(
         &self,
-        store: &blaze_cas::Reader,
+        store: &crate::serve::direct::Stores,
     ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
         if !self.policy.report {
             return Ok(Vec::new());
         }
-        let guard = blaze_cas::enter();
+        // Each side table the store holds is one direct read into the task's frame, read for
+        // its rows in the scope.
+        blaze_mem::frame::current(|frame| self.report_in(store, frame))
+    }
+
+    fn report_in(
+        &self,
+        store: &crate::serve::direct::Stores,
+        frame: &blaze_mem::frame::Frame,
+    ) -> Result<Vec<hir_ty_codegen::v2::report::Reported>, String> {
+        use crate::serve::direct::{self, Which};
         let workspace = &self.built.editable;
         // alloc: once per unit reported, a function each
         let mut reports = Vec::new();
@@ -976,8 +997,8 @@ impl Generated<'_> {
             let named = || format!("{:?}", function.key); // alloc: an error's name
             let bytes = match self.built.puts.iter().find(|it| it.key == key) {
                 Some(put) => &put.bytes[..],
-                None => match store.get(&guard, &key) {
-                    Ok(Some(entry)) => entry.bytes,
+                None => match direct::read(store, Which::Home, &key, frame) {
+                    Ok(Some(bytes)) => bytes,
                     // alloc: an error
                     Ok(None) => {
                         return Err(format!("the side table of {} is not in the store", named()));
@@ -1022,13 +1043,16 @@ impl Generated<'_> {
 
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
 /// thread of the build reads the one database of the task's reader by reference: the query
-/// engine's reads take `&self`, so none waits on another and none is cloned.
+/// engine's reads take `&self`, so none waits on another and none is cloned. What its walks
+/// keep for the next build of the database is the reader's ([`UnitReader::walks`]), held by
+/// the kept front end and let go with it.
 fn frontend<'db>(
     reader: &'db UnitReader,
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
     frontend_over(reader.db(), reader.paths(), reader.spellings(), mounted, build_time)
+        .with_walks(reader.walks())
 }
 
 /// [`frontend`] over the database `db`, whose files are `paths` and whose crates' roots cargo
@@ -1041,6 +1065,17 @@ pub(crate) fn frontend_over<'db>(
     mounted: &Arc<Mounted>,
     build_time: BuildTime,
 ) -> HirFrontend<'db> {
+    HirFrontend::new(Databases::new(db), hash_source(db, paths, spellings, mounted), build_time)
+}
+
+/// How [`frontend_over`] names the files of `db` in what it hashes: what a launched run's
+/// span tables are read with too ([`super::run::launch`]).
+pub(crate) fn hash_source(
+    db: &base_db::Db,
+    paths: &Arc<std::collections::HashMap<base_db::FileId, String>>,
+    spellings: &Arc<blaze_lower::Spellings>,
+    mounted: &Arc<Mounted>,
+) -> HashSource {
     // A file of the view by the job's paths, as rustc names it: from the directory of the crate
     // root it is under as cargo passed the root, `..`s kept (`Spellings::name`); one with two
     // such names has none, and the code generator refuses what names it. One `include!` parses
@@ -1060,11 +1095,8 @@ pub(crate) fn frontend_over<'db>(
             }
         }
     };
-    HirFrontend::new(
-        Databases::new(db),
-        HashSource::Items(ItemHashes::new(Box::new(names))),
-        build_time,
-    )
+    // alloc: once a front end, its namer
+    HashSource::Items(ItemHashes::new(Box::new(names)))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
@@ -1104,6 +1136,12 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
 /// [`runs_in_process`]: super::run::inproc::runs_in_process
 fn links_image(makes: &Makes, policy: &Policy) -> bool {
     policy.mode == BuildMode::Live && *makes == Makes::Executable
+}
+
+/// A published dependency's build script is an input at a fixed version, not a program
+/// edited in this workspace. Keep its requested debug info, but no space for future patches.
+fn keeps_patch_room(build_script: bool, member: bool, source: Option<&str>) -> bool {
+    !build_script || member || blaze_lower::local(source)
 }
 
 /// `krate`'s functions, built as `unit`, compiled from its roots (the unit's own crate, or one
@@ -1152,7 +1190,9 @@ pub(crate) fn generate<'db>(
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
     };
-    let roots = match frontend.roots(krate, root_kind(u, makes, wasm_macro(job, unit))?) {
+    let harness = job.plan(unit).map_err(|it| it.what)?.harness;
+    let kind = root_kind(u.mode, &u.target.name, makes, wasm_macro(job, unit), harness)?;
+    let roots = match frontend.roots(krate, kind) {
         Ok(it) => it,
         Err(error) => return Ok(Err(refused(reader, mounted.root(), vec![error]))),
     };
@@ -1176,6 +1216,46 @@ pub(crate) fn generate<'db>(
     // configuration (docs/v2/plan/design/incremental-walk.md): the walk takes each one the
     // database's memo still holds and describes only what an edit changed or newly reaches.
     let kept = frontend.kept();
+    // A launched run (`blaze run` of a host binary): only its start is made here, and each
+    // later first call is answered from its bind record or made by the front end
+    // (docs/v2/plan/design/launcher.md). Nothing is walked whole.
+    if policy.mode == BuildMode::Launched {
+        // The view the start reads: what the next build asks what changed since.
+        let view = blaze_codegen::backend::Frontend::view(&frontend);
+        let guard = blaze_cas::enter();
+        let store = Reading { store: &job.input.store, guard: &guard };
+        let build = Build::new(&backends, &frontend, &policy, &job.memo)
+            .owned_by(&u.target.name)
+            .keeping(&kept)
+            .recording(&job.input.store);
+        let start = match build.start(&asked, &roots.statics, "main", &store) {
+            Ok(start) => start,
+            Err(errors) => {
+                if let Some(put) = profile {
+                    unput_profile(job, put);
+                }
+                return Ok(Err(refused(reader, mounted.root(), errors)));
+            }
+        };
+        let (prepared, puts) = super::run::launch::prepare(
+            job,
+            unit,
+            reader,
+            mounted,
+            build_time,
+            (&frontend, &build, &policy),
+            view,
+            start,
+            &store,
+        )?;
+        // The start's records join the unit's puts as a walked build's do (`compile` moves
+        // `built.puts` into them).
+        let mut built = Built::default();
+        built.puts = puts;
+        built.puts.extend(profile);
+        let launch = Some(blaze_core::lock::Lock::new("serve.unit.codegen.launch", Some(prepared)));
+        return Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch }));
+    }
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
@@ -1184,6 +1264,10 @@ pub(crate) fn generate<'db>(
             .verify_store(verify)
             .explain_misses(true)
             .keeping(&kept)
+            // Describes as store records (docs/v2/plan/design/store.md, "Describe records"):
+            // a function no kept walk holds is read from its record where it has one, and
+            // each describe made is among the build's puts.
+            .recording(&job.input.store)
             .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
     };
     match built {
@@ -1202,6 +1286,7 @@ pub(crate) fn generate<'db>(
                 each_build = work.each_build as u64,
                 described = walk.described as u64,
                 verified = walk.verified as u64,
+                found = walk.found as u64,
                 reached = walk.reached as u64,
                 visited = walk.visited as u64,
                 replaced = work.replaced as u64,
@@ -1214,7 +1299,7 @@ pub(crate) fn generate<'db>(
                 let _ = slot
                     .set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
             }
-            Ok(Ok(Parts { built, roots, policy, image, build_time, kept }))
+            Ok(Ok(Parts { built, roots, policy, image, build_time, kept, launch: None }))
         }
         Err(errors) => {
             if let Some(put) = profile {
@@ -1389,6 +1474,12 @@ pub struct Linked {
 }
 
 impl Linked {
+    /// A file-only link with the same inputs can keep the last generation. Whether the
+    /// image has room to *patch* changed inputs is immaterial when none changed.
+    fn keeps_file(&self, given: ContentId) -> bool {
+        self.given == Some(given) && self.output.dev_run.is_none() && self.output.live.is_none()
+    }
+
     /// The image's tables as the linker counts them, each with its elements and bytes
     /// ([`blaze_api::Response::Tables`]): `relocation` and the rest.
     pub(crate) fn tables(&self) -> Vec<(&'static str, u64, u64)> {
@@ -1416,6 +1507,11 @@ impl Linked {
     /// still attached to its code memory.
     pub(crate) fn live(&self) -> bool {
         self.loaded.as_ref().is_some_and(|it| it.running())
+    }
+
+    /// Whether this image keeps patch room for incremental links.
+    pub(crate) fn incremental(&self) -> bool {
+        self.output.incremental
     }
 
     /// Kept idle until its next link: the image's stage scratch given back ([`Image::rest`]).
@@ -1556,14 +1652,15 @@ fn natives(
             true => Some(krate),
             false => job.crates.krate(at as usize),
         };
-        if let Some(krate) = crate_of {
-            libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
-            assembled.extend(frontend.global_asm(krate, triple).map_err(|it| it.what)?);
+        // Each crate's `#[link(.., cfg(..))]`s as the linked program's crate decides them.
+        if let Some(of) = crate_of {
+            libs.extend(frontend.linked(of, krate).map_err(|it| it.what)?);
+            assembled.extend(frontend.global_asm(of, triple).map_err(|it| it.what)?);
         }
         if !libs.is_empty() {
             let mut search = search_dirs(&flags.search);
             search.extend(search_dirs(&compile.search));
-            crates.push(CrateNatives { libs, search });
+            crates.push(CrateNatives { unit: at, libs, search });
         }
     }
     let mut search = search_dirs(&own.search);
@@ -1683,6 +1780,7 @@ const FIRST_LIBRARY: u32 = 1 << 20;
 /// One crate's native libraries and the `-L`s its rustc is given ([`natives`]), owned for
 /// [`blaze_link::target::CrateLibs`].
 struct CrateNatives {
+    unit: u32,
     libs: Vec<NativeLib>,
     search: Vec<PathBuf>,
 }
@@ -1723,7 +1821,8 @@ pub(crate) struct LinkMade {
 /// `split-debuginfo`: beside the image unless the profile says `off`, which puts it inside as
 /// before. `packed` and `unpacked` are both the one side file blaze writes (it has no
 /// per-crate objects to leave debug info in). An image with no debug info has none either
-/// way, and a format blaze writes no side file for (PE, wasm) keeps what it had.
+/// way. A PE image's is its PDB, beside it whatever the profile says; wasm, for which blaze
+/// writes no side file, keeps what it had.
 pub(crate) fn debug_place(
     debug: blaze_link::Debug,
     format: blaze_link::Format,
@@ -1732,6 +1831,9 @@ pub(crate) fn debug_place(
     use blaze_link::{Debug, Format};
     match (debug, split) {
         (Debug::None, _) => Ok(Debug::None),
+        // A PE image's debug info is its PDB, beside it, whatever the profile says: Windows'
+        // debuggers read none inside it.
+        (_, None | Some("off" | "packed" | "unpacked")) if format == Format::Pe => Ok(Debug::Beside),
         (_, Some("off")) => Ok(Debug::Lines),
         (_, None | Some("packed" | "unpacked")) => Ok(match format {
             Format::Elf | Format::MachO => Debug::Beside,
@@ -1748,15 +1850,16 @@ pub(crate) fn debug_place(
 /// file name) goes for the executable at `exe`. ELF: beside it under the name its
 /// `.gnu_debuglink` holds, whatever the copy is called. Mach-O: the bundle a debugger looks
 /// for beside the executable, `<its file name>.dSYM`.
-fn side_path(format: blaze_link::Format, exe: &str, name: &str) -> std::path::PathBuf {
-    let exe = std::path::Path::new(exe);
-    let dir = exe.parent().unwrap_or(std::path::Path::new(""));
-    match (format, exe.file_name().and_then(|it| it.to_str())) {
-        (blaze_link::Format::MachO, Some(own)) => {
-            // alloc: once per side file written, its path
-            dir.join(format!("{own}.dSYM")).join("Contents/Resources/DWARF").join(own)
+fn side_paths(format: blaze_link::Format, exe: &str, name: &str) -> (String, Option<String>) {
+    // `exe` is a daemon name, including for a foreign target: never join it as a host path.
+    let at = exe.rfind('/').map_or(0, |i| i + 1);
+    let (dir, own) = exe.split_at(at);
+    match format {
+        blaze_link::Format::MachO => {
+            // alloc: the two bundle outputs' daemon names
+            (format!("{dir}{own}.dSYM/Contents/Resources/DWARF/{own}"), Some(format!("{dir}{own}.dSYM/Contents/Info.plist")))
         }
-        _ => dir.join(name),
+        _ => (format!("{dir}{name}"), None), // alloc: the side output's daemon name
     }
 }
 
@@ -1915,31 +2018,20 @@ fn debug_side(
     let exes = std::iter::once(path).chain(super::artifact::uplifted(path, plan));
     let mut files = Vec::new(); // alloc: once per side file made, a path or two
     for exe in exes {
-        let side = side_path(format, exe, &name);
+        let (side, plist_path) = side_paths(format, exe, &name);
         // A `.dSYM` bundle's `Info.plist` (`NAME.dSYM/Contents/Resources/DWARF/NAME`); none
         // for a side file that is no bundle.
-        if let (Some((key, file)), Some(contents)) = (&plist, side.ancestors().nth(3)) {
+        if let (Some((key, file)), Some(path)) = (&plist, plist_path) {
             files.push(SideFile {
-                path: named(contents.join("Info.plist"))?,
+                path,
                 key: *key,
                 file: Arc::clone(file), // clone: a refcount
             });
         }
         // clone: a refcount
-        files.push(SideFile { path: named(side)?, key, file: Arc::clone(&file) });
+        files.push(SideFile { path: side, key, file: Arc::clone(&file) });
     }
     Ok(files)
-}
-
-/// `path` as the text the loop names an output's path by.
-fn named(path: std::path::PathBuf) -> Result<String, LinkCause> {
-    path.into_os_string().into_string().map_err(|it| {
-        // alloc: error path
-        LinkCause::Given(format!(
-            "{}: a debug side file's path is not UTF-8, and the loop names an output by text",
-            std::path::Path::new(&it).display()
-        ))
-    })
 }
 
 /// What the build says when a splice was refused for a thunk it could not place and the
@@ -2027,6 +2119,8 @@ pub(crate) enum LinkStep {
     Bytes,
     /// Making the image's debug side file.
     Debug,
+    /// Making a DLL's import library.
+    Import,
 }
 
 impl LinkStep {
@@ -2038,6 +2132,7 @@ impl LinkStep {
             LinkStep::Stage => "staging the change",
             LinkStep::Bytes => "writing the image",
             LinkStep::Debug => "making the debug side file",
+            LinkStep::Import => "making the import library",
         }
     }
 }
@@ -2076,6 +2171,9 @@ fn link_at(
 ) -> Result<LinkMade, LinkCause> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = generated.built;
+    if generated.policy.mode == BuildMode::Launched {
+        return launched(job, unit, path, generated).map_err(LinkCause::Given);
+    }
     let debug = match generated.policy.profile.debuginfo {
         DebugInfo::None => blaze_link::Debug::None,
         _ => blaze_link::Debug::Lines,
@@ -2098,7 +2196,17 @@ fn link_at(
         // A wasm module is linked whole and never slid or patched in place, and its debug info
         // is its name section: each expansion instantiates the module afresh.
         true => blaze_link::target::reactor(blaze_link::Debug::None, false),
-        false => blaze_link::target::output(triple(job, u), shared, debug, true),
+        false => {
+            // A unit with no platform of its own is built for this machine, to run here; one
+            // built for `--target` runs wherever that is ([`blaze_link::target::RunsOn`]).
+            let runs = match u.platform {
+                None => blaze_link::target::RunsOn::Here,
+                Some(_) => blaze_link::target::RunsOn::Elsewhere,
+            };
+            let package = job.package(u).map_err(|it| LinkCause::Given(it.what))?;
+            let incremental = keeps_patch_room(u.target.is_custom_build(), package.is_member, package.source.as_deref());
+            blaze_link::target::output(triple(job, u), shared, debug, incremental, runs)
+        }
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
     // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
@@ -2114,6 +2222,14 @@ fn link_at(
     }
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
+    // `#![windows_subsystem = "windows"]` of the crate linked: rustc's `/SUBSYSTEM:WINDOWS`,
+    // entered at `mainCRTStartup` as before (the output's entry). Link arguments after it
+    // (`/SUBSYSTEM:CONSOLE`) win, as on rustc's link line.
+    if output.format == blaze_link::Format::Pe
+        && matches!(output.kind, blaze_link::OutputKind::Executable { .. })
+    {
+        output.windows_subsystem = generated.frontend.windows_subsystem(krate);
+    }
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
         // Each crate's libraries and assembly, asked of the front end; then where each
@@ -2131,9 +2247,11 @@ fn link_at(
             .map_err(linker(LinkStep::Output))?;
         search.extend(applied.search);
         // alloc: once per link, each crate's libraries as the linker takes them
-        let mut libs: Vec<CrateLibs<'_>> =
-            crates.iter().map(|it| CrateLibs { libs: &it.libs, search: &it.search }).collect();
-        libs.push(CrateLibs { libs: &applied.libs, search: &[] });
+        let name = |unit: usize| job.units().graph.units[unit].target.name.as_str();
+        let mut libs: Vec<CrateLibs<'_>> = crates.iter().map(|it| CrateLibs {
+            name: name(it.unit as usize), libs: &it.libs, search: &it.search,
+        }).collect();
+        libs.push(CrateLibs { name: name(unit), libs: &applied.libs, search: &[] });
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
         let located = {
             let _span = tracing::info_span!(target: "blaze", "link natives: locate").entered();
@@ -2270,6 +2388,11 @@ fn link_at(
         Ok(_) => debug_side(job, unit, path, &mut linked),
         Err(_) => Ok(Vec::new()), // alloc: none, empty
     };
+    // A DLL's import library, beside it: written from its exports as committed.
+    let import = match &made {
+        Ok(_) => import_side(job, unit, path, &linked),
+        Err(_) => Ok(Vec::new()), // alloc: none, empty
+    };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
         Ok(_) => linked
@@ -2338,11 +2461,16 @@ fn link_at(
         };
         Ok((written, runs, read, table, laid, told))
     });
-    images.push(KeptImage { path: path.to_owned(), kept: linked });
+    // A wasm proc macro is linked whole with no patch room and `runs` is `None`: keeping its
+    // 448-region `blaze_link::Image` after a successful link serves no incremental relink.
+    if !wasm || made.is_err() {
+        images.push(KeptImage { path: path.to_owned(), kept: linked });
+    }
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    let side = debug?;
+    let mut side = debug?;
+    side.extend(import?);
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -2364,6 +2492,69 @@ fn link_at(
         tiers,
         restart,
         whole: whole.map(|it| it.1),
+    })
+}
+
+/// A launcher program's link ([`super::run::launch::link`]): the file at `path` is blaze's
+/// launcher, a sidecar beside it (and beside the copy a run starts it from) names the program,
+/// and the launchers running the program were told of this build. Nothing is laid out, so
+/// there is no image to keep, no patch room and no debug side file.
+fn launched(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    generated: &Generated<'_>,
+) -> Result<LinkMade, String> {
+    use blaze_launch_host::Told;
+    let linked = super::run::launch::link(job, unit, path, generated)?;
+    let whole = |bytes: &[u8]| blaze_cas::Sparse {
+        len: bytes.len() as u64,
+        runs: vec![(0, bytes.to_vec())], // alloc: the file's one run, once a link
+    };
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    let sidecar = Arc::new(Made::Whole(whole(&linked.sidecar)));
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve launch sidecar", &linked.sidecar));
+    // The file and its sidecar are the same bytes at every build of the program: placed by
+    // its first, and left as they are by every later one, so a running launcher's file is
+    // never replaced under it and a build that changed a body writes no file at all.
+    // alloc: the sidecar's paths, once a program
+    let side = match linked.first {
+        true => std::iter::once(path)
+            .chain(super::artifact::uplifted(path, plan))
+            .map(|it| SideFile {
+                path: super::run::launch::sidecar_of(it),
+                key,
+                file: Arc::clone(&sidecar),
+            })
+            .collect(),
+        false => Vec::new(), // alloc: none, empty
+    };
+    let restart = linked.told.iter().find_map(|it| match it {
+        Told::Restart { why } => Some(why.clone()), // clone: the reason, into the build's answer
+        Told::Nothing | Told::Edit { .. } => None,
+    });
+    let edited = linked.told.iter().any(|it| matches!(it, Told::Edit { .. }));
+    let how = match (linked.first, edited || restart.is_some()) {
+        (true, _) => Linking::First,
+        (false, true) => Linking::Spliced,
+        (false, false) => Linking::Unchanged,
+    };
+    let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)?;
+    Ok(LinkMade {
+        made: linked.first.then(|| Made::Whole(whole(&linked.file))),
+        // The store is given the launcher's bytes by a program's first build; every later
+        // one names what it keeps, and hashes and writes nothing.
+        written: match linked.first {
+            true => Written::Bytes(linked.file.to_vec()), // alloc: the file, once a program
+            false => Written::Kept(linked.key),
+        },
+        side,
+        read: Vec::new(), // alloc: none, empty
+        table: None,
+        how,
+        tiers,
+        restart,
+        whole: None,
     })
 }
 
@@ -2615,7 +2806,8 @@ fn relink(
     .entered();
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
-    let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
+    // A look at one is the build's own ([`crate::serve::work::JobInput::looks`]).
+    let mut files = blaze_usercode::inputs::Disk::new(Vec::new(), &job.input.looks);
     let mut read = Vec::with_capacity(located.len());
     // The `global_asm!` objects first, which are not read off the machine, then `located`.
     let mut native_ids = Vec::with_capacity(assembled.len() + located.len());
@@ -2629,6 +2821,11 @@ fn relink(
         )));
     }
     for it in located {
+        // One the link made (a `raw-dylib`'s import library) is no file: its id is its own.
+        if let Some((id, _)) = &it.made {
+            native_ids.push(*id);
+            continue;
+        }
         let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
             .map_err(LinkCause::Native)?
             // alloc: error path
@@ -2652,15 +2849,17 @@ fn relink(
     for (order, it) in located.iter().enumerate() {
         let order = assembled.len() + order;
         if added_natives.binary_search(&native_ids[order]).is_ok() {
-            let bytes = std::fs::read(&it.path).map_err(|error| {
-                // alloc: error path
-                LinkCause::Native(blaze_usercode::inputs::Unreadable {
-                    path: it.path.clone(),
-                    error: error.to_string(),
-                })
-            })?;
-            // alloc: once per native input new to the image, which keeps it shared from here.
-            bytes_of.push((order, Arc::<[u8]>::from(bytes)));
+            if let Some((_, made)) = &it.made {
+                // clone: an `Arc`, the made library shared with the image
+                bytes_of.push((order, made.clone()));
+                continue;
+            }
+            let shared = job
+                .shared
+                .native_bytes
+                .get_or_read(native_ids[order], &it.path)
+                .map_err(LinkCause::Native)?;
+            bytes_of.push((order, shared));
         }
     }
 
@@ -2748,14 +2947,10 @@ fn relink(
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
     let given = linked.rows.given(built.id, &native_ids);
-    // Nothing to link: every row kept, the same names, natives and span tables, and a file
-    // patched in place (no code memory, no slots). Staging it would make a new generation
-    // whose file differs only in its build id, so an image whose inputs did not change (a
-    // doctest example beside an edited one) keeps the file it has, byte for byte.
-    let unchanged = linked.given == Some(given)
-        && linked.output.incremental
-        && linked.output.dev_run.is_none()
-        && linked.output.live.is_none()
+    // No patch room is needed to keep the file we already have. This matters for a
+    // fetched build script: even if its compile record missed, staging identical link
+    // inputs would change the PE build id and make its run miss on the executable.
+    let unchanged = linked.keeps_file(given)
         && removed.is_empty()
         && added_keys.is_empty()
         && gone_statics.is_empty()
@@ -3078,13 +3273,22 @@ fn tests_table(
     if !test {
         return Ok(None);
     }
+    let image = &linked.image;
+    // The jump table as the binary's runtime will name it (its descriptor's lineage and
+    // generation, its header's slot count: the capacity), and the slots given out of it.
+    let jump = blaze_codegen::JumpTable {
+        lineage: image.lineage(),
+        generation: image.generation(),
+        capacity: image.capacity(),
+        given: image.slots(),
+    };
     let table = super::test::image::table(
         path,
         generated.built,
         // Every span table, made whole: a test binary's table reads them all.
         generated.spans()?,
-        linked.image.slots(),
-        |key| linked.image.slot(key).map(|it| it.0),
+        jump,
+        |key| image.slot(key).map(|it| it.0),
         ContentId::default(),
         &generated.roots.tests,
     )?;
@@ -3280,6 +3484,41 @@ pub(crate) fn link_lib(value: &str) -> Result<NativeLib, String> {
     if name.is_empty() {
         return Err(format!("`-l {value}` names no library"));
     }
-    Ok(NativeLib { name: name.to_owned(), kind, verbatim })
+    Ok(NativeLib { name: name.to_owned(), kind, verbatim, imports: Vec::new() })
 }
 
+
+/// The import library planned beside the DLL `path` (`foo.dll.lib`, cargo's output of a
+/// `cdylib` on MSVC, [`super::artifact::import_library`]), written from the DLL's exports as
+/// this link committed them (`Image::import_library`, link.exe's `/IMPLIB`), at that path and
+/// at its uplifted copy: none for any other image. A DLL planned with one whose link makes
+/// none is an error naming both: nothing is placed in its stead.
+fn import_side(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    linked: &Linked,
+) -> Result<Vec<SideFile>, LinkCause> {
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    let Some(lib) = super::artifact::import_library(path, plan) else {
+        return Ok(Vec::new()); // alloc: none, empty
+    };
+    let _span = tracing::info_span!(target: "blaze", "link import library", unit = %path).entered();
+    let bytes = linked
+        .image
+        .import_library()
+        .map_err(|error| LinkCause::Linker { step: LinkStep::Import, error })?
+        .ok_or_else(|| {
+            LinkCause::Given(format!(
+                "{lib} is planned beside {path}, and its link makes no import library: it is no DLL"
+            ))
+        })?;
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve import library", &bytes));
+    let file = blaze_cas::Sparse { len: bytes.len() as u64, runs: vec![(0, bytes)] };
+    let file = Arc::new(Made::Whole(file)); // alloc: once per import library, shared by its paths
+    Ok(std::iter::once(lib)
+        .chain(super::artifact::uplifted(lib, plan))
+        // clone: a refcount; alloc: once per import library, a path or two
+        .map(|at| SideFile { path: at.to_owned(), key, file: Arc::clone(&file) })
+        .collect())
+}

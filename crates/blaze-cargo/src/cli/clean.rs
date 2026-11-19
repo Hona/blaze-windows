@@ -43,7 +43,12 @@
 //!    locked a lease inside it meanwhile loses its files: what is left stays until that build
 //!    ends. What a clean killed mid-removal left beside a directory is removed by the next clean
 //!    of it, once its pid no longer runs and every lease in it is taken exclusively
-//!    ([`sweep_leftovers`], review N6).
+//!    ([`sweep_leftovers`], review N6). On Windows, which refuses to rename or remove a
+//!    directory while a file under it is open (its own leases' too), the locks are let go just
+//!    before the rename, and the refusal is the lock: a build that took a lease meanwhile holds
+//!    its file open, so the rename fails and the clean says which build dir is in use
+//!    ([`blaze_gc::fs::let_go_before_moving`], [`blaze_gc::fs::held_open`]); the renamed tree's
+//!    leases are taken again, then let go before the unlink.
 
 use std::{
     ffi::OsString,
@@ -57,7 +62,7 @@ use blaze_manifest::{Config, Context, Workspace, metadata::root_manifest};
 
 use super::say;
 
-const USAGE_TEXT: &str = "blaze clean [--dry-run] [--force] [--manifest-path PATH] [--target-dir DIR] | blaze clean --list | blaze clean --all [--dry-run]";
+const USAGE_TEXT: &str = "blaze clean [--dry-run] [--force] [--manifest-path PATH] [--target-dir DIR] | blaze clean --list | blaze clean --all [--dry-run] | blaze clean --unkept [--dry-run]";
 
 /// What `blaze clean` is asked.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -118,8 +123,14 @@ fn parse(words: Vec<OsString>) -> Result<Asked, String> {
 
 /// `blaze clean`, with the words after it.
 pub fn main(words: Vec<OsString>, color: bool) -> i32 {
+    // `blaze clean --unkept`: the daemon's store forgets every record no pin and no root
+    // keeps, whatever its budget (docs/gc.md); the daemon does it, asked as `blaze gc` asks.
+    if words.first().is_some_and(|it| it == "--unkept") {
+        let asked: Vec<OsString> = std::iter::once("gc".into()).chain(words).collect();
+        return super::cache::main(&asked, color);
+    }
     let refused = |what: &str, code: i32| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         code
     };
     let asked = match parse(words) {
@@ -183,7 +194,7 @@ fn workspace(asked: &Asked, color: bool) -> Result<(), String> {
     for dir in &dirs {
         removed.add(remove(dir, &at)?);
     }
-    eprint!("{}", removed.said(asked.dry_run, color));
+    blaze_report::err!("{}", removed.said(asked.dry_run, color));
     Ok(())
 }
 
@@ -203,7 +214,7 @@ fn all(dry_run: bool, color: bool) -> Result<(), String> {
             Err(why) => _ = writeln!(refused, "  {why}"),
         }
     }
-    eprint!("{}", removed.said(dry_run, color));
+    blaze_report::err!("{}", removed.said(dry_run, color));
     match refused.is_empty() {
         true => Ok(()),
         false => Err(format!("blaze clean --all left some directories:\n{refused}")),
@@ -243,7 +254,7 @@ fn list() -> Result<(), String> {
             dir.display()
         );
     }
-    print!("{out}");
+    blaze_report::out!("{out}");
     Ok(())
 }
 
@@ -506,9 +517,17 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
                 u64::from(std::process::id()),
                 &dir.to_string_lossy(),
             ));
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             match blaze_gc::fs::rename_into_trash(&dir, &to) {
                 blaze_gc::plan::Swept::Moved => {}
                 blaze_gc::plan::Swept::Failed(why) => return Err(why),
+                blaze_gc::plan::Swept::Leased => return Err(in_use(&dir)),
+                blaze_gc::plan::Swept::NestedLeased { dir: inner } => {
+                    return Err(refused(blaze_gc::fs::Nested::Held {
+                        tree: dir.clone(),
+                        dir: PathBuf::from(inner),
+                    }));
+                }
                 _ => return Err(changed(&dir)),
             }
             // A lease a build took inside between the walk and the lock: the tree goes back,
@@ -521,13 +540,24 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
         None => {
             // What an earlier clean of it left, killed mid-removal (review N6).
             for why in sweep_leftovers(parent, &name) {
-                eprintln!("blaze clean: {why}");
+                blaze_report::errln!("blaze clean: {why}");
             }
             // Beside it, on its own file system: the rename is atomic, and nothing else is named so.
             let to = parent.join(format!(".{name}{REMOVING}{}-{now:020}", std::process::id()));
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             match blaze_gc::fs::rename_no_replace(&dir, &to) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(changed(&dir)),
+                Err(error) if blaze_gc::fs::refused_for_an_open_file(&error) => {
+                    return Err(match blaze_gc::fs::held_open(&dir, &error) {
+                        blaze_gc::plan::Swept::Leased => in_use(&dir),
+                        blaze_gc::plan::Swept::NestedLeased { dir: inner } => {
+                            refused(blaze_gc::fs::Nested::Held { tree: dir.clone(), dir: PathBuf::from(inner) })
+                        }
+                        blaze_gc::plan::Swept::Failed(why) => why,
+                        other => format!("renaming {} to {}: {error} ({other:?})", dir.display(), to.display()),
+                    });
+                }
                 Err(error) => {
                     return Err(format!("renaming {} to {}: {error}", dir.display(), to.display()));
                 }
@@ -536,6 +566,7 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
             // named (review round 7, C1); one it could not move back is left, and the next clean
             // of it sweeps it once that build ends.
             blaze_gc::fs::recheck_renamed(&dir, &to, &mut locks).map_err(refused)?;
+            blaze_gc::fs::let_go_before_moving(&mut locks);
             blaze_gc::fs::remove_tree(&to).map_err(|why| {
                 format!(
                     "removing {} (renamed from {}): {why}; what is left can be removed by hand",
@@ -641,6 +672,7 @@ fn sweep_leftovers(parent: &Path, name: &str) -> Vec<String> {
                 continue;
             }
         }
+        blaze_gc::fs::let_go_before_moving(&mut locks);
         if let Err(why) = blaze_gc::fs::remove_tree(&left) {
             problems.push(format!(
                 "removing {}, left by a clean that ended (pid {pid}): {why}",
@@ -706,20 +738,17 @@ mod tests {
         assert_eq!(size(3 << 20), "3.0MiB");
     }
 
-    /// A fresh directory of this test's own under the system's temporary directory.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "blaze-clean-{name}-{}-{}",
-            std::process::id(),
-            blaze_gc::record::now_ns()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(&dir).unwrap()
+    /// A fresh directory of this test's own, removed when the guard drops, and its canonical
+    /// path.
+    fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+        let made = blaze_core::temp::TempDir::for_test(&format!("blaze-clean-{name}-"));
+        let dir = std::fs::canonicalize(made.path()).unwrap();
+        (made, dir)
     }
 
     #[test]
     fn clean_refuses_dotdot_and_a_symlinked_checkout() {
-        let top = scratch("guard");
+        let (_made, top) = scratch("guard");
         let repo = top.join("repo");
         std::fs::create_dir_all(repo.join("target")).unwrap();
         let kept = protected(Some(&repo), &top.join("elsewhere"), &top.join("build"))
@@ -747,7 +776,7 @@ mod tests {
     /// nothing in it goes (review N13).
     #[test]
     fn clean_never_removes_a_tagged_dir_inside_cargo_home_or_the_daemons_state() {
-        let top = scratch("protected");
+        let (_made, top) = scratch("protected");
         let builds = top.join("build");
         let cargo_git = top.join("cargo").join("git");
         let state = top.join("v2").join("store");
@@ -780,7 +809,7 @@ mod tests {
     /// the error names the dir inside (review round 5, B1).
     #[test]
     fn clean_refuses_a_tree_holding_another_builds_lease() {
-        let top = scratch("nested");
+        let (_made, top) = scratch("nested");
         let builds = top.join("build");
         let workspace = builds.join("ws-1");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -826,7 +855,7 @@ mod tests {
 
     #[test]
     fn clean_refuses_an_unmarked_dir() {
-        let top = scratch("marks");
+        let (_made, top) = scratch("marks");
         let builds = top.join("build");
         let plain = top.join("photos");
         std::fs::create_dir_all(&plain).unwrap();
@@ -856,7 +885,7 @@ mod tests {
 
     #[test]
     fn clean_refuses_an_unleased_target_inside_the_checkout_unless_forced() {
-        let top = scratch("inside");
+        let (_made, top) = scratch("inside");
         let repo = top.join("repo");
         let target = repo.join("target");
         std::fs::create_dir_all(&target).unwrap();

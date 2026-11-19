@@ -16,6 +16,8 @@
 //! `&str`s.
 
 #![feature(allocator_api, allocator_ext, variant_count)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 pub mod args;
@@ -80,11 +82,12 @@ pub use lazy::{LazyPlacer, Slots};
 pub use patch::Patch;
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
-    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
-    Undefined,
+    Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, NoDefaultLibs, Output, OutputKind,
+    PeArgs, PeFlag, Platform, Undefined,
 };
 pub use position::{
-    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
+    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, Span, SpanTable, file_name, location,
+    position_in,
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;
@@ -380,6 +383,8 @@ pub struct Image {
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
+    /// Whether the image's volume can clone it ([`Image::set_sharing`]).
+    sharing: blaze_core::Sharing,
 }
 
 impl Image {
@@ -437,7 +442,7 @@ impl Image {
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
         }
-        if output.debug == Debug::Beside && !matches!(output.format, Format::Elf | Format::MachO)
+        if output.debug == Debug::Beside && output.format == Format::Wasm
         {
             // alloc: error path
             return Err(fail(format!(
@@ -497,7 +502,51 @@ impl Image {
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
             beside: beside::Kept::new(),
+            sharing: blaze_core::Sharing::Blocks,
         })
+    }
+
+    /// The import library of a Windows DLL as its last commit left it: what rustc writes beside a
+    /// `cdylib` as `<name>.dll.lib` (link.exe's `/IMPLIB`), for programs that link against the
+    /// DLL. One short import member per export, by name, a data export (`DATA`) reached only
+    /// through `__imp_`. `None` for any other image; an error before the first commit.
+    pub fn import_library(&self) -> Result<Option<Vec<u8>>, LinkError> {
+        let OutputKind::Shared { name, .. } = &self.output.kind else { return Ok(None) };
+        if self.output.format != Format::Pe {
+            return Ok(None);
+        }
+        if !self.state.laid_out {
+            return Err(LinkError {
+                function: None,
+                // alloc: error path
+                what: format!("{}: an import library before the DLL's first commit", self.to),
+                refusal: None,
+            });
+        }
+        let mut exports: Vec<&model::Export> = self.state.exports.iter().collect();
+        exports.sort_by(|a, b| a.name.cmp(&b.name));
+        // alloc: once per import library, an import per export
+        let imports: Vec<blaze_codegen::RawImport> = exports
+            .iter()
+            .map(|it| blaze_codegen::RawImport {
+                // clone: the import library's own names
+                symbol: it.name.clone(),
+                ordinal: None,
+                data: !matches!(it.kind, model::SymbolKind::Function),
+            })
+            .collect();
+        pe::raw_dylib::import_library(name, &imports)
+            .map(Some)
+            .map_err(|what| LinkError { function: None, what, refusal: None })
+    }
+
+    /// Whether the volume the image is written on can clone it ([`blaze_core::platform::volume`]
+    /// of its directory): with [`blaze_core::Sharing::Blocks`] (the default) a commit of a stage
+    /// that placed into the room the image kept clones the image and writes what changed; with
+    /// [`blaze_core::Sharing::Unshared`] (NTFS) no clone exists, and every commit and rollback
+    /// writes the whole file. A commit never asks for a clone the volume refuses.
+    pub fn set_sharing(&mut self, sharing: blaze_core::Sharing) {
+        self.sharing = sharing;
     }
 
     /// Places and relocates what `change` says, in parallel, into address space not yet
@@ -671,6 +720,9 @@ impl Image {
             island: None,
             text: None,
         };
+        // A stage's steps, each its own span (rule 16): what of a link's time is the change
+        // applied, the pieces placed, the fixups applied, and the lists, tables and file made.
+        let step = tracing::info_span!(target: "blaze", "link stage: apply the change").entered();
         stage.inputs(&change)?;
         stage.apply(&change)?;
         stage.sanitize(&change)?;
@@ -686,6 +738,8 @@ impl Image {
         stage.cells_of_removed();
         stage.asan_globals(&change)?;
         stage.dangling()?;
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: place").entered();
         // Each round places what the last made; GOT cells and PLT stubs need nothing past the
         // next, and thunks (`thunk`) only what islands' bytes moved out of reach, so a stage
         // that still makes pieces after `ROUNDS` would write them unplaced.
@@ -712,6 +766,8 @@ impl Image {
                 ),
             ));
         }
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: relocate").entered();
         stage.coverage_moved();
         if let Some(place) = self.place {
             stage.fix_tls(&place)?;
@@ -725,6 +781,7 @@ impl Image {
         stage.check_reach(&layout)?;
         stage.fill_descriptor()?;
         stage.relocate_all().map_err(|error| shape::explained(error, &layout, stage.plan.base))?;
+        drop(step);
         let base = self.state.generation;
         let image_base = stage.plan.base;
         let finished =
@@ -774,6 +831,12 @@ impl Image {
     ) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
+        // On a volume whose files share no blocks there is no clone of the image to patch: the
+        // file is written whole, and the history undoes it whole ([`Image::set_sharing`]).
+        if !staged.writes.full && self.sharing == blaze_core::Sharing::Unshared {
+            staged.writes.writes = file::whole(&staged.state);
+            staged.writes.full = true;
+        }
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
         let revert = self.take(staged.state, full, staged.undo);
@@ -1033,18 +1096,36 @@ impl Image {
     }
 
     /// Gives back what the image keeps only for its next stage to start warm: its stage
-    /// scratch's blocks, to the kernel. Nothing a stage made outlives it in the scratch (each
-    /// stage resets it as it begins, and what a stage returns borrows none of it), so this
-    /// changes nothing the next link reads; that link commits its scratch again as it goes.
-    /// For an image kept idle between builds, where many kept images' warm scratch adds up.
+    /// scratch's blocks, to the kernel, plus its key-hashing scratch and (for non-incremental
+    /// images that never roll back) its undo history. Nothing a stage made outlives it in the
+    /// scratch (each stage resets it as it begins, and what a stage returns borrows none of it),
+    /// so this changes nothing the next link reads; that link commits its scratch again as it
+    /// goes. For an image kept idle between builds, where many kept images' warm scratch adds up.
     pub fn rest(&mut self) {
         self.arena.reset();
         self.arena.trim(0);
+        self.scratch.clear();
+        self.scratch.shrink_to_fit();
+        if self.placed_pairs.is_empty() {
+            self.placed_pairs.shrink_to_fit();
+        }
+        if !self.output.incremental {
+            self.history.clear();
+            self.history.shrink_to_fit();
+        }
     }
 
     /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.
     pub fn slots(&self) -> u32 {
         self.state.slots
+    }
+
+    /// How many slots the jump table has room for: the count its header and its live
+    /// descriptor hold, fixed at the image's first link (an incremental link that would pass
+    /// it is refused), which the program's runtime arms a byte of the execution log for each
+    /// of; [`Image::slots`] of them are given out.
+    pub fn capacity(&self) -> u32 {
+        self.state.capacity
     }
 
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
@@ -1153,6 +1234,10 @@ impl Image {
                 }
             }
             views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+            // A PDB's publics: given again only when the native code may have changed.
+            let version = state.resolved.natives_version;
+            let publics = (format == Format::Pe && self.beside.pdb_natives() != Some(version))
+                .then(|| (version, state.resolved.native_functions(state)));
             let input = beside::Input {
                 format,
                 name: &self.name,
@@ -1161,6 +1246,7 @@ impl Image {
                 functions: &views.functions,
                 lines: &views.lines,
                 given: beside::Given::Changed { gone: &gone, count },
+                publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
             };
             // alloc: error path
             let updated = self.beside.update(&input, &exe, None);
@@ -1173,6 +1259,9 @@ impl Image {
             views.push(piece)?;
         }
         views.functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        // A PDB names native code by its objects' names; DWARF's side file does not.
+        let version = state.resolved.natives_version;
+        let publics = (format == Format::Pe).then(|| (version, state.resolved.native_functions(state)));
         let input = beside::Input {
             format,
             name: &self.name,
@@ -1181,6 +1270,7 @@ impl Image {
             functions: &views.functions,
             lines: &views.lines,
             given: beside::Given::All,
+            publics: publics.as_ref().map(|it| (it.0, &it.1[..])),
         };
         // alloc: error path
         let updated = self.beside.update(&input, &exe, all);

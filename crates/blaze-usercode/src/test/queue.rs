@@ -64,6 +64,7 @@ use blaze_inproc::host::{Program, Started};
 use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
     confine,
+    provider::Provider,
     trace::{self, BadRecord, Inputs, Seen},
 };
 
@@ -115,9 +116,8 @@ pub struct Binary {
     /// `program`, once per binary, and that file is what is spawned.
     pub loaded: Option<Loaded>,
     /// Whether it runs in a sandbox that traces what each test reads (docs/cargo.md, "Sandboxed
-    /// tests"): only where the workspace opts into `sandboxed-tests` or the package says
-    /// `tests = true` under `[package.metadata.blaze.sandbox]`, and neither the package says
-    /// `tests = false` nor the command `BLAZE_SANDBOX=off`. Outside, it runs as cargo runs it,
+    /// tests"): the default, unless the package says `tests = false` under
+    /// `[package.metadata.blaze.sandbox]` or the command `BLAZE_SANDBOX=off`. Outside, it runs as cargo runs it,
     /// with [`Sandbox::Off`]: no record, no [`confine::LIVE`], each test still a process of its
     /// own from the fork server, and every result's trace [`Trace::Unknown`] ([`OUTSIDE`]), so
     /// no pass is kept. `read`, `write` and `network` are the sandbox's, unused outside.
@@ -128,10 +128,89 @@ pub struct Binary {
     /// executable into two runs. Each binary has files and a socket of its own, by its place
     /// in the queue, and the outside one starts once the sandboxed tests have their results.
     /// No binary goes outside but by this field: one sandboxed whose sandbox can't be made
-    /// loses its tests, saying why.
+    /// loses its tests, saying why, and stops the run ([`Queue::take_unsandboxable`]).
     pub sandboxed: bool,
+    /// What its processes' randomness comes from when it is sandboxed: its suite's
+    /// ([`Provider::of_suite`]), named to them by [`crate::provider::VAR`] in their
+    /// environment (not in `env`, which a test's base key is made of: the provider is a
+    /// function of that key's inputs and adds none). std reads its hash maps' keys and its
+    /// `fill_bytes` from it with no system call, and the sandbox answers from it what a
+    /// process asks the kernel, each test from a stream of its own name. A sandboxed binary
+    /// with none is refused as it starts, naming it: without one, std's start reads the
+    /// kernel's randomness, which no test can be kept on. Unused outside the sandbox.
+    pub provider: Option<Provider>,
 }
 
+impl Binary {
+    /// The binary, run whole ([`Mode::Threads`]), as runs whose command lines are each at most
+    /// `longest` UTF-16 units (Windows' 32767, [`blaze_core::platform::command::LONGEST_LINE`]):
+    /// its jobs in their order, cut where the next name would pass it, each run a `Binary` of
+    /// the same program, as the split of one executable inside and outside the sandbox is
+    /// (libtest's `--exact` of the names each is given). One whose names all fit is itself; one
+    /// name that fits in no line is an error naming it, never a run that leaves it out. The
+    /// line is what the queue starts it with ([`Queue`]'s `start_whole`): the program, each
+    /// name, and room for the flags it adds and the user's own.
+    pub fn whole_runs(self, longest: usize) -> Result<Vec<Binary>, String> {
+        let Mode::Threads { args, .. } = &self.mode else { return Ok(vec![self]) };
+        // `"program" --exact --test-threads=N --include-ignored`, the user's flags, a space each.
+        use blaze_core::create_process::argument_units;
+        let arg = |it: &std::ffi::OsStr| {
+            #[cfg(windows)]
+            { use std::os::windows::ffi::OsStrExt as _; argument_units(it.encode_wide()) + 1 }
+            #[cfg(not(windows))]
+            { argument_units(it.to_string_lossy().encode_utf16()) + 1 }
+        };
+        let fixed = self.program.as_os_str().to_string_lossy().encode_utf16().count() + 2
+            + " --exact --test-threads=".len() + self.jobs.len().max(1).to_string().len()
+            + usize::from(self.jobs.iter().any(|it| it.ignore)) * " --include-ignored".len()
+            + args.iter().map(|it| arg(it)).sum::<usize>();
+        let room = longest.checked_sub(fixed).ok_or_else(|| format!(
+            "the fixed arguments for `{}` need {fixed} UTF-16 units, past the limit {longest}", self.name
+        ))?;
+        let name = |it: &str| argument_units(it.encode_utf16()) + 1;
+        if self.jobs.iter().map(|it| name(&it.name)).sum::<usize>() <= room {
+            return Ok(vec![self]);
+        }
+        let mut runs: Vec<Vec<Job>> = vec![Vec::new()];
+        let mut used = 0;
+        for job in self.jobs.iter() {
+            let len = name(&job.name);
+            if len > room {
+                return Err(format!(
+                    "test `{}` of {}: its name is longer than a command line of {} has room for",
+                    job.name, self.name, self.program.display()
+                ));
+            }
+            if used + len > room {
+                runs.push(Vec::new());
+                used = 0;
+            }
+            used += len;
+            // clone: once per test of a binary split, the run's own job.
+            runs.last_mut().expect("one run at least").push(job.clone());
+        }
+        Ok(runs
+            .into_iter()
+            .map(|jobs| Binary {
+                id: self.id,
+                // clone: once per run of a split binary, each owns its parts.
+                name: self.name.clone(),
+                program: self.program.clone(),
+                env: self.env.clone(),
+                dir: self.dir.clone(),
+                read: self.read.clone(),
+                write: self.write.clone(),
+                network: self.network,
+                memory: self.memory,
+                mode: self.mode.clone(),
+                jobs,
+                loaded: self.loaded.clone(),
+                sandboxed: self.sandboxed,
+                provider: self.provider.clone(),
+            })
+            .collect())
+    }
+}
 /// A binary blaze holds in memory. Two are the same when they are one program.
 #[derive(Clone)]
 pub struct Loaded(pub Arc<Program>);
@@ -203,7 +282,7 @@ pub enum Trace {
 pub const OUTSIDE: &str = "it ran outside the sandbox, which alone records what a test reads";
 
 impl Trace {
-    /// What was read, hashed as `inputs` has it now: what [`super::select::record`] keeps a
+    /// What was read, hashed as `inputs` has it now: what blaze-testsel's machine keeps a
     /// pass by. To be asked as the result comes, before anything else changes the files.
     pub fn traced<I: Inputs>(&self, inputs: &mut I) -> Result<Option<Traced>, I::Error> {
         match self {
@@ -649,6 +728,10 @@ pub struct Queue {
     busy: usize,
     stopping: bool,
     cancelled: bool,
+    /// Why the first sandboxed fork server could not be started in its sandbox, until the
+    /// driver takes it ([`Queue::take_unsandboxable`]): the run stops there, nothing else
+    /// starts, and the driver says once how to run outside and why.
+    unsandboxable: Option<String>,
     now: Duration,
     results: Vec<Finished>,
 }
@@ -660,6 +743,18 @@ impl Queue {
         binaries: Vec<Binary>,
         now: Duration,
         effects: &mut Vec<Effect>,
+    ) -> Queue {
+        Self::on_driver(config, binaries, now, effects, cfg!(unix))
+    }
+
+    /// The driver supplies fork servers on Unix. A simulated driver can supply them on
+    /// any host: run the protocol and timeout oracles there, not a different queue.
+    fn on_driver(
+        config: Config,
+        binaries: Vec<Binary>,
+        now: Duration,
+        effects: &mut Vec<Effect>,
+        has_fork: bool,
     ) -> Queue {
         // Every column at the size the run needs, made once: a unit per test (per binary run
         // whole), and per core an attempt, its two timers and its tags.
@@ -700,6 +795,7 @@ impl Queue {
             busy: 0,
             stopping: false,
             cancelled: false,
+            unsandboxable: None,
             now,
             results: Vec::with_capacity(cores),
         };
@@ -753,7 +849,7 @@ impl Queue {
                 continue;
             }
             match queue.bins[b].plan.mode {
-                Mode::Process if !cfg!(unix) => {
+                Mode::Process if !has_fork => {
                     let why = format!(
                         // alloc: error path
                         "{}: this platform has no fork, so no fork server: its package must run its tests as libtest's threads",
@@ -822,6 +918,14 @@ impl Queue {
         self.flush(effects);
     }
 
+    /// Why a sandboxed fork server could not be started in its sandbox, the first time one
+    /// could not, once: the queue stopped there (what had not started is not run), and the
+    /// driver says it to the person once, with the way to run outside, rather than only in
+    /// each lost test's output. `None` ever after, and when every sandbox was made.
+    pub fn take_unsandboxable(&mut self) -> Option<String> {
+        self.unsandboxable.take()
+    }
+
     /// Takes a completion of one of its tags.
     pub fn complete(&mut self, completion: Completion, now: Duration, effects: &mut Vec<Effect>) {
         self.completed(completion, now, effects);
@@ -851,10 +955,10 @@ impl Queue {
                     loaded.0.exited(started);
                 }
                 let server = self.server(b);
-                let (why, output) = match completion.done {
+                let (why, output, failed) = match completion.done {
                     Done::Exited(exit) => {
                         let why = server.lost.take().unwrap_or_else(|| ended(&exit));
-                        (why, [exit.stdout, exit.stderr].concat())
+                        (why, [exit.stdout, exit.stderr].concat(), false)
                     }
                     Done::Failed(error) => (
                         format!(
@@ -863,10 +967,21 @@ impl Queue {
                             started_in(&self.bins[b].plan)
                         ), // alloc: error path
                         Vec::new(), // alloc: error path
+                        true,
                     ),
-                    other => (format!("its spawn completed as {other:?}"), Vec::new()), // alloc: error path
+                    other => (format!("its spawn completed as {other:?}"), Vec::new(), false), // alloc: error path
                 };
+                // A fork server whose spawn failed in its sandbox (the sandbox could not be
+                // made, or kept no record: `Done::Failed`, not an exit of the program) says so
+                // of the machine and its sandbox, not of its tests: every other sandboxed
+                // server would fail the same way. The run stops there, and the driver says once
+                // how to run outside and why.
+                let unsandboxable = failed && self.bins[b].plan.sandboxed && !self.stopping;
                 self.server_ended(b, &why, &output, effects);
+                if unsandboxable {
+                    self.unsandboxable = Some(why);
+                    self.stop();
+                }
             }
             For::Recv(b, r) => self.received(b as usize, r, completion.done, effects),
             For::Send(b, r) => match completion.done {
@@ -897,6 +1012,10 @@ impl Queue {
         self.schedule(effects);
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a tag's slot is u32 and freed slots are reused, so the table holds only the tags in flight, at most a few per running test, far below 2^32"
+    )]
     fn tag(&mut self, purpose: For) -> Tag {
         let at = match self.free_tags.pop() {
             Some(at) => {
@@ -944,6 +1063,10 @@ impl Queue {
     }
 
     /// A new attempt of `unit`, by its id.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "an attempt's slot is the low u32 of its id and freed slots are reused, so the table holds only the attempts live at once, at most one per test running"
+    )]
     fn new_attempt(&mut self, unit: u32, number: u32) -> u64 {
         let at = match self.free_attempts.pop() {
             Some(at) => at,
@@ -1145,6 +1268,9 @@ impl Queue {
         let sandbox = match plan.sandboxed {
             true => {
                 env.push((confine::LIVE.into(), record_path.into()));
+                if let Some(provider) = &plan.provider {
+                    env.push(provider.entry());
+                }
                 let mut read = plan.read.clone(); // clone: setup, once per server: the driver's command owns its parts
                 read.push(PathBuf::from(socket_path));
                 Sandbox::On {
@@ -1167,20 +1293,13 @@ impl Queue {
             memory: plan.memory,
         };
         let at = Address::Unix(server.socket.clone()); // clone: setup, once per server: the driver's command owns its parts
-        let (command, loaded) = match &plan.loaded {
-            None => (command, None),
-            Some(loaded) => match loaded.0.command(command, true) {
-                Ok((command, started)) => (command, Some(started)),
-                Err(error) => {
-                    let why = format!(
-                        "{} could not be made ready to start: {error}",
-                        plan.program.display()
-                    ); // alloc: error path
-                    self.server(b).phase = Phase::Ended;
-                    self.server_ended(b, &why, &[], effects);
-                    return;
-                }
-            },
+        let (command, loaded) = match launch(plan, command, true) {
+            Ok(it) => it,
+            Err(why) => {
+                self.server(b).phase = Phase::Ended;
+                self.server_ended(b, &why, &[], effects);
+                return;
+            }
         };
         let listen = self.tag(For::Listen(b as u32));
         let spawn = self.tag(For::Spawn(b as u32));
@@ -1956,6 +2075,10 @@ impl Queue {
             args.push("--include-ignored".into());
         }
         args.extend(given.iter().cloned());
+        let mut env = plan.env.clone(); // clone: setup, once per binary run whole: the driver's command owns its parts
+        if let (true, Some(provider)) = (plan.sandboxed, &plan.provider) {
+            env.push(provider.entry());
+        }
         let sandbox = match plan.sandboxed {
             true => Sandbox::On {
                 read: plan.read.clone(),
@@ -1969,37 +2092,30 @@ impl Queue {
         let command = Command {
             program: plan.program.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             args,
-            env: plan.env.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
+            env,
             dir: plan.dir.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             stdin: Vec::new(),     // alloc: empty, allocates nothing
             sandbox,
             memory: plan.memory,
         };
         let timeout = *timeout;
-        let (command, loaded) = match &plan.loaded {
-            None => (command, None),
-            Some(loaded) => match loaded.0.command(command, false) {
-                Ok((command, started)) => (command, Some(started)),
-                Err(error) => {
-                    let why = format!(
-                        "{} could not be made ready to start: {error}",
-                        plan.program.display()
-                    ); // alloc: once per binary run whole
-                    let unit = self.bins[b].first;
-                    self.finish(
-                        unit,
-                        Went {
-                            outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
-                            attempts: 1,
-                            output: Vec::new(), // alloc: empty, allocates nothing
-                            took: Duration::ZERO,
-                            trace: Trace::Unknown(why),
-                            executed: Executed::Not(WHOLE_UNRECORDED.to_owned()), // alloc: once per binary run whole
-                        },
-                    );
-                    return;
-                }
-            },
+        let (command, loaded) = match launch(plan, command, false) {
+            Ok(it) => it,
+            Err(why) => {
+                let unit = self.bins[b].first;
+                self.finish(
+                    unit,
+                    Went {
+                        outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
+                        attempts: 1,
+                        output: Vec::new(), // alloc: empty, allocates nothing
+                        took: Duration::ZERO,
+                        trace: Trace::Unknown(why),
+                        executed: Executed::Not(WHOLE_UNRECORDED.to_owned()), // alloc: once per binary run whole
+                    },
+                );
+                return;
+            }
         };
         let spawn = self.tag(For::Whole(b as u32));
         // What the profile's `processes` row of the binary run whole names it by.
@@ -2239,6 +2355,60 @@ fn started_in(plan: &Binary) -> &'static str {
     match plan.sandboxed {
         true => " in its sandbox",
         false => "",
+    }
+}
+
+/// `command`, `plan`'s, as it is spawned: for a binary blaze holds in memory, the command its
+/// [`Program::command`] makes of it (its executable written, the start hook's variable set, and
+/// attached forking as `forks` says), which may add to its sandbox what it reads and the Mach
+/// names it looks up but nothing to write ([`adds_no_write`]); otherwise `command` as it is.
+/// `Err` says why it can't start, naming the program.
+fn launch(
+    plan: &Binary,
+    command: Command,
+    forks: bool,
+) -> Result<(Command, Option<Started>), String> {
+    if plan.sandboxed && plan.provider.is_none() {
+        return Err(format!(
+            "{} is to run sandboxed and was given no provider (`Binary::provider`): its \
+             start would read the kernel's randomness, on which none of its tests can be kept",
+            plan.program.display()
+        ));
+    }
+    let Some(loaded) = &plan.loaded else { return Ok((command, None)) };
+    let (command, started) = loaded.0.command(command, forks).map_err(|error| {
+        format!("{} could not be made ready to start: {error}", plan.program.display())
+    })?;
+    if let Err(entry) = adds_no_write(&plan.write, &command.sandbox) {
+        loaded.0.exited(started);
+        return Err(format!(
+            "{} was made ready to start with {} writable in its sandbox, which its plan does not \
+             give: a sandboxed test writes only what its own sandbox gives it, never a path of \
+             the daemon's",
+            plan.program.display(),
+            entry.display()
+        ));
+    }
+    Ok((command, Some(started)))
+}
+
+/// Whether `sandbox`, as a dev executable's launch made it of a test binary's, gives it nothing
+/// to write beyond `planned`, its plan's `write`: `Err` names the first entry that is more.
+///
+/// The daemon's side of a dev run (its code memory's host) hands a run a channel to the
+/// daemon: a Unix socket under the daemon's home (`BLAZE_HOME/v2/inproc`). That socket is for
+/// the run to connect to, which a sandbox gives as a readable entry, that exact path alone
+/// (`Recorder::may_connect`; a `SOCKET` parameter of the macOS profile); listed as writable it
+/// asked the sandbox for a path of the daemon's home to write, which Linux's refuses and which
+/// would be one if it did not. So no launch may add a writable entry: what a test writes is its
+/// plan's alone.
+fn adds_no_write<'a>(planned: &[PathBuf], sandbox: &'a Sandbox) -> Result<(), &'a PathBuf> {
+    match sandbox {
+        Sandbox::Off => Ok(()),
+        Sandbox::On { write, .. } => match write.iter().find(|it| !planned.contains(it)) {
+            Some(entry) => Err(entry),
+            None => Ok(()),
+        },
     }
 }
 

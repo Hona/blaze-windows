@@ -735,6 +735,7 @@ pub(crate) fn compile(
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
         }
+        super::coff_own_section(&module, wants.target)?;
         let counted = profiled.map(|name| pgo::counted(&module, name)).transpose()?;
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))

@@ -11,6 +11,33 @@ use std::ops::Range;
 use rustc_lexer::{Base, LiteralKind, RawStrError, validate_raw_str};
 use rustc_literal_escaper::{EscapeError, Mode, check_for_errors};
 
+/// A literal's text as rustc reads it: rustc reads a source file with each `\r\n` as `\n`
+/// (`SourceFile::normalize_newlines`), so a string written across a line of a file with CRLF
+/// line endings holds `\n`, a `\` before the line's end continues it, and only a `\r` of no
+/// `\r\n` is a bare CR. The text is the file's as it is ([`raw_offset`] maps an offset back).
+pub fn as_read(text: &str) -> Cow<'_, str> {
+    match text.contains("\r\n") {
+        // alloc: a literal across lines of a CRLF file, once per check of it
+        true => Cow::Owned(text.replace("\r\n", "\n")),
+        false => Cow::Borrowed(text),
+    }
+}
+
+/// The offset in `text` of the byte at `offset` of [`as_read`]`(text)`: each `\r` of a `\r\n`
+/// before it counted back in.
+pub fn raw_offset(text: &str, offset: usize) -> usize {
+    let bytes = text.as_bytes();
+    let (mut at, mut read) = (0, 0);
+    while at < bytes.len() && read < offset {
+        if bytes[at] == b'\r' && bytes.get(at + 1) == Some(&b'\n') {
+            at += 1;
+        }
+        at += 1;
+        read += 1;
+    }
+    at
+}
+
 /// `rustc_ast::token::LitKind` as rustc's lexer makes it: never `Bool`, and `Err` without the
 /// `ErrorGuaranteed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,11 +184,13 @@ fn cook_quoted<'s>(
     report: &mut impl FnMut(CookError),
 ) -> (LitKind, &'s str) {
     let content = &rest[prefix_len as usize..(end - postfix_len) as usize];
-    check_for_errors(content, mode, |range, err| {
+    let read = as_read(content);
+    check_for_errors(&read, mode, |range, err| {
         // clone: a range, two words
-        if let Some(message) = escape_message(content, mode, range.clone(), &err) {
+        if let Some(message) = escape_message(&read, mode, range.clone(), &err) {
             debug_assert!(err.is_fatal());
-            let range = prefix_len + range.start as u32..prefix_len + range.end as u32;
+            let (start, end) = (raw_offset(content, range.start), raw_offset(content, range.end));
+            let range = prefix_len + start as u32..prefix_len + end as u32;
             report(CookError::new(range, message));
             kind = LitKind::Err;
         }

@@ -37,6 +37,10 @@ pub(super) fn soft_floats(target: &Target) -> bool {
     match (target.arch, target.call_conv) {
         (Arch::Aarch64, isa::CallConv::SystemV | isa::CallConv::AppleAarch64) => true,
         (Arch::X86_64, isa::CallConv::SystemV) => true,
+        // Windows x64 works on both as System V's x86-64 does, through compiler-builtins (which
+        // MSVC's C runtime has none of); the C convention takes an `f128` by reference and
+        // returns it in `xmm0` (`win64_pass_mode`, `builtin`), as LLVM's Win64 does `fp128`.
+        (Arch::X86_64, isa::CallConv::WindowsFastcall) => true,
         // wasm32's LLVM passes an `f16` as the bits of an `i32` and an `f128` as an `i128`
         // (`wasm::Class`), and works on both through compiler-builtins, as on x86-64 without
         // F16C; its C `long double` is the `f128`, so C's functions of it are the `l` ones.

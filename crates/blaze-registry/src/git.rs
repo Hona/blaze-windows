@@ -676,10 +676,11 @@ fn absolute_submodule_url(base: &str, submodule: &str) -> anyhow::Result<String>
     })
 }
 
-#[expect(clippy::disallowed_methods, reason = "every `git` is run in the repository it is about")]
+/// `git` in `dir`: every `git` is run in the repository it is about, with no window and
+/// never asking at a terminal or in a dialog (credentials come from the user's helpers alone).
 fn command(dir: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.current_dir(dir);
+    let mut command = blaze_core::platform::command::command("git", dir);
+    command.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
     command
 }
 

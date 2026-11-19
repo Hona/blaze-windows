@@ -780,6 +780,11 @@ pub(crate) struct Group {
     /// Of this name the group whose first section is largest is kept, not the first one
     /// (`IMAGE_COMDAT_SELECT_LARGEST`: MSVC's vftables with or without their RTTI locator).
     pub largest: bool,
+    /// The object's own, never one of a name shared with another object's: a COFF COMDAT
+    /// whose leader symbol is static (MSVC's `static` functions and the templates only one
+    /// object instantiates, under `/Gy`), which link.exe keeps per object. Its name is for
+    /// errors only.
+    pub local: bool,
 }
 
 /// Section `section` tied to section `to` of the same object ([`Object::ties`]): ELF
@@ -1064,6 +1069,10 @@ pub(crate) struct Delta<'a> {
     /// No region moved or changed size, but for the writer's own synthetic regions, whose
     /// size it makes.
     pub same_regions: bool,
+    /// No region moved or changed its room; any may hold more or less than it did. What a
+    /// table needs whose entries are of addresses alone (`.rela.dyn`): an edit that puts new
+    /// code and data in the patch regions changes their sizes and no address.
+    pub same_places: bool,
     /// Address ranges of the regions the core wrote since the last link, by address, none
     /// overlapping. In the [`Placed`] that [`Writer::file`] sees, they include the blocks of
     /// the synthetic regions that differ from the last link's.
@@ -1391,6 +1400,24 @@ pub(crate) trait Writer: Send + Sync {
 
     fn prot(&self, class: &Class) -> Prot;
 
+    /// Whether `class` has pages of its own: it starts a page, and the class after it starts
+    /// another, whatever their protections. A PE image's sections are its loader's and its
+    /// programs' units of protection: the static CRT makes `.fptable`'s pages read-only once
+    /// it has filled them (`VirtualProtect` of the section), so nothing else may share them.
+    /// None by default.
+    fn own_pages(&self, class: &Class) -> bool {
+        let _ = class;
+        false
+    }
+
+    /// Names the link searches the archives for and keeps when one defines them, without
+    /// anything referring to them, and without an error when none does: PE's
+    /// `_load_config_used`, which link.exe always looks for (the CRT's load configuration:
+    /// the security cookie the loader initializes, the guard's fields). None by default.
+    fn searched_roots(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// How far from the base the image's regions may reach, their room included (a dev run's
     /// reservations, which hold no bytes, aside): checked on the laid-out addresses before
     /// anything is written (`Stage::check_reach`). `None` where the format sets no such limit
@@ -1534,6 +1561,15 @@ impl Writer for Formats {
     #[inline]
     fn prot(&self, class: &Class) -> Prot {
         each!(self, it => it.prot(class))
+    }
+
+    #[inline]
+    fn own_pages(&self, class: &Class) -> bool {
+        each!(self, it => it.own_pages(class))
+    }
+
+    fn searched_roots(&self) -> &'static [&'static str] {
+        each!(self, it => it.searched_roots())
     }
 
     fn window(&self) -> Option<Window> {

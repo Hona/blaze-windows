@@ -1,7 +1,11 @@
 use blaze_codegen::{Arch, InstanceKey, RelocKind, Target};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
-use cranelift_codegen::{binemit, ir::Signature, isa::CallConv};
+use cranelift_codegen::{
+    binemit,
+    ir::{KnownSymbol, Signature},
+    isa::CallConv,
+};
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
 
 use super::{DataTarget, Resolve, function, value};
@@ -218,6 +222,31 @@ fn line_rows_take_their_spans() {
 fn what_v2_has_no_target_for_is_an_error() {
     let inlined = reloc(1, binemit::Reloc::X86CallPCRel4, crate::fragment::INLINED, 0);
     assert!(convert(code(&[inlined], Vec::new()), &requests()).is_err());
+    let got = ModuleReloc {
+        offset: 1,
+        kind: binemit::Reloc::X86PCRel4,
+        name: ModuleRelocTarget::KnownSymbol(KnownSymbol::ElfGlobalOffsetTable),
+        addend: -4,
+    };
+    let refused = convert(code(&[got], Vec::new()), &requests()).expect_err("refused");
+    assert!(refused.contains("ElfGlobalOffsetTable"), "{refused}");
+}
+
+/// COFF's thread-local sequence (`mov eax, [rip + _tls_index]`) reads the TLS slot the
+/// loader wrote into the linker's `_tls_index`: the relocation is at that symbol, with its
+/// addend, and the thread-local's own `SECREL` is at the static.
+#[test]
+fn coff_thread_locals_reach_the_tls_index() {
+    let index = ModuleReloc {
+        offset: 2,
+        kind: binemit::Reloc::X86PCRel4,
+        name: ModuleRelocTarget::KnownSymbol(KnownSymbol::CoffTlsIndex),
+        addend: -4,
+    };
+    let compiled = convert(code(&[index], Vec::new()), &requests()).expect("converted");
+    let targets: Vec<_> =
+        compiled.relocs.iter().map(|it| (it.target.clone(), it.kind, it.addend)).collect();
+    assert_eq!(targets, vec![(Target::Extern("_tls_index".to_owned()), RelocKind::PcRel32, -4)]);
 }
 
 /// A function's writable object (a promoted temporary its code writes each call, as a

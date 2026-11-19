@@ -10,7 +10,7 @@ use astlog_core::Analysis;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Every rules file with a test below.
-const TESTED: &[&str] = &["rust-locks"];
+const TESTED: &[&str] = &["host-tools", "rust-locks"];
 
 fn rules_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules")
@@ -23,7 +23,8 @@ fn analyze(
     fixture: &Path,
 ) -> Result<(tempfile::TempDir, Analysis), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let source = dir.path().join("fixture.rs");
+    let name = fixture.parent().and_then(Path::file_name).unwrap().to_string_lossy();
+    let source = dir.path().join(format!("{name}-fixture.rs"));
     std::fs::copy(fixture, &source)?;
     let analysis = astlog_core::analyze(rules, &[source])?;
     Ok((dir, analysis))
@@ -71,6 +72,23 @@ fn check(name: &str) -> TestResult {
         goods += 1;
     }
     assert!(goods >= 1, "{name}: no good fixture");
+    Ok(())
+}
+
+#[test]
+fn host_tools() -> TestResult {
+    check("host-tools")?;
+    let rules = std::fs::read_to_string(rules_dir().join("host-tools.astlog"))?;
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates");
+    for module in [
+        "blaze-cargo/src/cli/doc", "blaze-cargo/src/cli/edits", "blaze-cargo/src/cli/observe",
+        "blaze-cargo/src/cli/perf", "blaze-cargo/src/cli/pprof", "blaze-cargo/src/serve/unit/artifact",
+        "blaze-cargo/src/serve/unit/script", "blaze-cargo/src/serve/unit/test", "blaze-registry/src/git",
+        "blaze-registry/src/auth/process",
+    ] {
+        let analysis = astlog_core::analyze(&rules, &[crates.join(module).with_extension("rs")])?;
+        assert!(analysis.findings()?.is_empty(), "{module}: {:?}", findings(&analysis)?);
+    }
     Ok(())
 }
 

@@ -1228,6 +1228,7 @@ fn object(bytes: &[u8], memory64: bool) -> Result<Object, String> {
             name: names.push(name)?,
             sections: start..grouped.len() as u32,
             largest: false,
+            local: false,
         });
     }
 

@@ -193,9 +193,11 @@ fn validate_literal(literal: ast::Literal<'_>, acc: &mut Vec<SyntaxError>) {
             if !s.is_raw()
                 && let Some(without_quotes) = unquote(text, 1, '"')
             {
-                unescape_str(without_quotes, |range, char| {
+                // As rustc reads the file: a CRLF within the literal is an LF.
+                let read = parser::cook::as_read(without_quotes);
+                unescape_str(&read, |range, char| {
                     if let Err(err) = char {
-                        push_err(1, range.start, err);
+                        push_err(1, parser::cook::raw_offset(without_quotes, range.start), err);
                     }
                 });
             }
@@ -204,9 +206,11 @@ fn validate_literal(literal: ast::Literal<'_>, acc: &mut Vec<SyntaxError>) {
             if !s.is_raw()
                 && let Some(without_quotes) = unquote(text, 2, '"')
             {
-                unescape_byte_str(without_quotes, |range, char| {
+                // As rustc reads the file: a CRLF within the literal is an LF.
+                let read = parser::cook::as_read(without_quotes);
+                unescape_byte_str(&read, |range, char| {
                     if let Err(err) = char {
-                        push_err(1, range.start, err);
+                        push_err(2, parser::cook::raw_offset(without_quotes, range.start), err);
                     }
                 });
             }
@@ -215,9 +219,11 @@ fn validate_literal(literal: ast::Literal<'_>, acc: &mut Vec<SyntaxError>) {
             if !s.is_raw()
                 && let Some(without_quotes) = unquote(text, 2, '"')
             {
-                unescape_c_str(without_quotes, |range, char| {
+                // As rustc reads the file: a CRLF within the literal is an LF.
+                let read = parser::cook::as_read(without_quotes);
+                unescape_c_str(&read, |range, char| {
                     if let Err(err) = char {
-                        push_err(1, range.start, err);
+                        push_err(2, parser::cook::raw_offset(without_quotes, range.start), err);
                     }
                 });
             }

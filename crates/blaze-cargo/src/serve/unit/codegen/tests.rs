@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 
+#[test]
+fn debug_outputs_use_daemon_names_for_native_and_foreign_targets() {
+    use blaze_link::Format;
+    let (file, plist) = super::side_paths(Format::Pe, "/C:/out/app.exe", "app.pdb");
+    assert_eq!(file, "/C:/out/app.pdb");
+    assert_eq!(plist, None);
+    let (file, plist) = super::side_paths(Format::MachO, "/root/app", "ignored");
+    assert_eq!(file, "/root/app.dSYM/Contents/Resources/DWARF/app");
+    assert_eq!(plist.as_deref(), Some("/root/app.dSYM/Contents/Info.plist"));
+}
+
 use std::collections::HashMap;
 
 use blaze_codegen::{plan::OptLevel, settings::Sanitize};
@@ -17,6 +28,39 @@ use super::{
 use blaze_codegen::InstanceKey;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
+
+#[test]
+fn only_immutable_build_scripts_need_no_edit_space() {
+    use super::keeps_patch_room;
+    assert!(!keeps_patch_room(true, false, None)); // crates.io
+    assert!(!keeps_patch_room(true, false, Some("(https://example.org/dep#abc)")));
+    assert!(keeps_patch_room(true, true, None));
+    assert!(keeps_patch_room(true, false, Some("(/C:/dev/path-dep)")));
+    assert!(keeps_patch_room(false, false, None));
+}
+
+#[test]
+fn an_unchanged_compact_script_image_keeps_its_build_id() {
+    let mut output = blaze_link::target::output("x86_64-pc-windows-msvc", None, blaze_link::Debug::Lines, false, blaze_link::target::RunsOn::Here).unwrap();
+    assert!(!output.incremental);
+    let mut linked = kept("/w/build_script.exe", &output).kept;
+    let inputs = ContentId([3; 32]);
+    assert!(!linked.keeps_file(inputs), "nothing linked yet");
+    linked.given = Some(inputs);
+    assert!(linked.keeps_file(inputs));
+    assert!(!linked.keeps_file(ContentId([4; 32])), "changed inputs must stage a generation");
+    output.live = Some(blaze_link::Live);
+    linked.output = output;
+    assert!(!linked.keeps_file(inputs), "a live image still handles its slots");
+}
+
+#[test]
+fn test_mode_keeps_the_users_entry_without_a_harness() {
+    use super::{Makes, Mode, RootKind, root_kind};
+    let kind = |harness| root_kind(Mode::Test, "printed", &Makes::Executable, false, harness).unwrap();
+    assert_eq!(kind(false), RootKind::Executable);
+    assert_eq!(kind(true), RootKind::Test);
+}
 
 #[test]
 fn a_crate_layout_override_is_refused_before_codegen_can_reuse_another_layouts_key() {
@@ -61,7 +105,8 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
 
 /// Debug info goes beside an ELF or Mach-O image by default and under either split setting;
 /// `off` puts it inside as before; no debug info is none wherever; a format with no side file
-/// keeps what it had; a setting rustc does not take is refused by name.
+/// keeps what it had; a PE image's is its PDB under every setting; a setting rustc does not
+/// take is refused by name.
 #[test]
 fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
     use blaze_link::{Debug, Format};
@@ -73,7 +118,12 @@ fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
         assert_eq!(super::debug_place(Debug::None, format, None), Ok(Debug::None));
         assert_eq!(super::debug_place(Debug::None, format, Some("off")), Ok(Debug::None));
     }
-    assert_eq!(super::debug_place(Debug::Lines, Format::Pe, None), Ok(Debug::Lines));
+    // A PE image's debug info is its PDB, beside it under every setting.
+    for split in [None, Some("off"), Some("packed"), Some("unpacked")] {
+        assert_eq!(super::debug_place(Debug::Lines, Format::Pe, split), Ok(Debug::Beside));
+        assert_eq!(super::debug_place(Debug::None, Format::Pe, split), Ok(Debug::None));
+    }
+    assert_eq!(super::debug_place(Debug::Lines, Format::Wasm, None), Ok(Debug::Lines));
     let refused = super::debug_place(Debug::Lines, Format::Elf, Some("split")).unwrap_err();
     assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
 }
@@ -191,16 +241,16 @@ fn a_profile_to_make_stops_with_the_flag_and_why() {
 fn a_profile_to_use_is_its_path_in_every_form_of_the_flag() {
     let words = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
     for flags in [
-        &["-Cprofile-use=/tmp/merged.profdata"][..],
-        &["-C", "profile-use=/tmp/merged.profdata"][..],
-        &["--codegen=profile-use=/tmp/merged.profdata"][..],
-        &["--codegen", "profile-use=/tmp/merged.profdata"][..],
-        &["-C", "opt-level=3", "-Cprofile_use=/tmp/merged.profdata", "-Ctarget-cpu=native"][..],
+        &["-Cprofile-use=/p/merged.profdata"][..],
+        &["-C", "profile-use=/p/merged.profdata"][..],
+        &["--codegen=profile-use=/p/merged.profdata"][..],
+        &["--codegen", "profile-use=/p/merged.profdata"][..],
+        &["-C", "opt-level=3", "-Cprofile_use=/p/merged.profdata", "-Ctarget-cpu=native"][..],
         // The last one given is the one, as rustc takes a codegen option.
-        &["-Cprofile-use=/tmp/old.profdata", "-C", "profile-use=/tmp/merged.profdata"][..],
+        &["-Cprofile-use=/tmp/old.profdata", "-C", "profile-use=/p/merged.profdata"][..],
     ] {
         let flags = words(flags);
-        assert_eq!(pgo(&flags), Ok(PgoFlag::Use("/tmp/merged.profdata")), "{flags:?}");
+        assert_eq!(pgo(&flags), Ok(PgoFlag::Use("/p/merged.profdata")), "{flags:?}");
     }
     for flags in [&["-Cprofile-use"][..], &["-C", "profile-use="][..]] {
         let refused = pgo(&words(flags)).unwrap_err();
@@ -216,8 +266,9 @@ fn a_profile_that_is_not_there_is_an_error_naming_its_path() {
     assert!(missing.contains("`-C profile-use=pgo/merged.profdata`"), "{missing}");
     let at = dir.path().join("pgo/merged.profdata");
     assert!(missing.contains(&format!("`{}` can't be read", at.display())), "{missing}");
-    let absolute = read_profile(root, "/nonexistent/blaze/merged.profdata").err().unwrap();
-    assert!(absolute.contains("`/nonexistent/blaze/merged.profdata` can't be read"), "{absolute}");
+    let path = dir.path().join("never-created.profdata");
+    let absolute = read_profile(root, path.to_str().unwrap()).err().unwrap();
+    assert!(absolute.contains(&format!("`{}` can't be read", path.display())), "{absolute}");
 }
 
 #[cfg(feature = "native")]
@@ -535,4 +586,23 @@ fn a_link_out_of_room_names_the_image_and_whose_limit_it_is() {
     assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
     assert!(no_room.contains("the limit is the output's"), "{no_room}");
     assert!(!failed(None).contains("the limit is the output's"));
+}
+
+#[test]
+fn native_bytes_shares_one_allocation_across_links_and_releases_when_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("libcmt.lib");
+    let payload = vec![0xABu8; 64 * 1024];
+    std::fs::write(&file, &payload).unwrap();
+    let mut hasher = blaze_ids::b3::Hasher::new();
+    hasher.update(&payload);
+    let id = ContentId(hasher.finalize());
+    let pool = crate::serve::unit::NativeBytes::default();
+    let first = pool.get_or_read(id, &file).unwrap();
+    let second = pool.get_or_read(id, &file).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "same content must share one Arc<[u8]>");
+    let weak = std::sync::Arc::downgrade(&first);
+    drop(first);
+    drop(second);
+    assert!(weak.upgrade().is_none(), "weak pool must not pin bytes after last image drops");
 }

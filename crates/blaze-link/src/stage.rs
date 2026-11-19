@@ -1552,7 +1552,7 @@ impl<'a> Stage<'a> {
         if change.spans.is_empty() {
             return Ok(());
         }
-        let mut changed: FrameVec<'a, (IdNo, u32)> = Vec::new_in(self.arena);
+        let mut changed: FrameVec<'a, (IdNo, u32, u32)> = Vec::new_in(self.arena);
         for (anchor, bytes) in &change.spans {
             let id = self.symbols.id(anchor);
             let before = match self.new.span_table(id) {
@@ -1563,13 +1563,13 @@ impl<'a> Stage<'a> {
             // alloc: error path
             let spans = Spans::new(bytes)
                 .map_err(|it| error(None, format!("the span table of {anchor:?}: {it}")))?;
-            let len = before.max(spans.len());
+            let len = spans.len();
             self.new.set_span_table(id, spans);
             self.spans_changed = true;
-            changed.push((id, len));
+            changed.push((id, before, len));
         }
-        for (anchor, len) in changed {
-            for index in 0..len {
+        for (anchor, before, len) in changed {
+            for index in 0..before {
                 let Some(sym) = self.symbols.find(SymKey::Position(anchor, index)) else {
                     continue;
                 };
@@ -1578,6 +1578,13 @@ impl<'a> Stage<'a> {
                 else {
                     continue;
                 };
+                // The edit may remove the last users of a trailing position along with it.
+                // Retire its definition now; `dangling` checks any surviving user after the
+                // edit, and `positions` checks new users against the new table.
+                if index >= len {
+                    self.unmake(id);
+                    continue;
+                }
                 let (bytes, file) = self.location(anchor, index)?;
                 let fixups = [Fixup {
                     at: 0,
@@ -2125,6 +2132,12 @@ impl<'a> Stage<'a> {
     /// Rewrites every piece referring to a symbol whose definition changed, and every cell
     /// running a body that moved. Costs the changed symbols' referrers.
     pub fn referrers(&mut self) {
+        // On the first link every piece was made by this stage (`make` puts it in
+        // `write`) and full relocation writes every cell. No earlier reference exists
+        // to revisit, even if a later placement round just added a thunk.
+        if !self.old.laid_out {
+            return;
+        }
         for sym in self.changed.iter() {
             for id in self.new.refs(sym) {
                 self.write.insert(id);

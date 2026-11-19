@@ -33,7 +33,8 @@
 //!   build's `panic_unwind` and `panic_abort` are.
 //!
 //! The fixture's own metadata, at its top in this order: `//- toolchain: nightly|stable`,
-//! `//- target_data_layout: <layout>`, `//- target_arch: <arch>`,
+//! `//- target_data_layout: <layout>`, `//- target_arch: <arch>`, `//- target: <tuple>` (the
+//! crates' tuple, when not the one the arch implies: x86-64's is Linux's),
 //! `//- proc_macros: <name>,<name>` (the test proc macros below, as crate `proc_macros`, a
 //! dependency of every crate) and `//- minicore: <flag>, <flag>` (a `core` of the parts of
 //! `test-utils`' minicore named, a dependency of every crate).
@@ -42,8 +43,8 @@
 //! `\$0` is a literal `$0`.
 //!
 //! The test proc macros: `identity`, `DeriveIdentity`, `input_replace`, `mirror`, `shorten`,
-//! `issue_18089`, `issue_18840`, `issue_17479`, `issue_18898`, `disallow_cfg` and
-//! `generate_suffixed_type`.
+//! `issue_18089`, `issue_18840`, `issue_17479`, `issue_18898`, `disallow_cfg`,
+//! `generate_suffixed_type` and `select_priv_declare_output_enum`.
 //!
 //! Each file is at its fixture path under `/`, the one directory the fixture's views are of;
 //! minicore is `/sysroot/core/lib.rs` and the proc macros' crate `/sysroot/proc_macros/lib.rs`.
@@ -385,13 +386,16 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         toolchain,
         target_data_layout,
         target_arch,
+        target,
     } = FixtureWithProjectMeta::parse(fixture);
     let arch = parse_target_arch(&target_arch);
-    // The tuple is the arch's: a crate's keys and its code generator's target read the tuple.
-    let tuple = match arch {
-        Arch::Wasm32 => "wasm32-wasip1",
-        Arch::Wasm64 => "wasm64-unknown-unknown",
-        _ => "x86_64-unknown-linux-gnu",
+    // The tuple is the arch's unless `//- target:` names one: a crate's keys and its code
+    // generator's target read the tuple.
+    let tuple = match (target.as_deref(), arch) {
+        (Some(tuple), _) => tuple,
+        (None, Arch::Wasm32) => "wasm32-wasip1",
+        (None, Arch::Wasm64) => "wasm64-unknown-unknown",
+        (None, _) => "x86_64-unknown-linux-gnu",
     };
     let target = Ok(TargetData {
         tuple: Symbol::intern(tuple),
@@ -652,6 +656,23 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         }
     }
 
+    // The fixture is its own planner: a crate it says is no member, rooted in a library root,
+    // stands for a registry package or a tree the toolchain ships, which a planner pins
+    // (`base_db::CrateData::sealed`, read by `hir_def::deps::sealed`); every other crate is a
+    // member or a path dependency, which nothing pins.
+    let in_library_root = |file: base_db::FileId| {
+        ids.iter()
+            .position(|&it| it == file)
+            .is_some_and(|at| roots[planned[at].root].1 == SourceRootKind::Library)
+    };
+    let pinned: Vec<_> = graph
+        .iter()
+        .filter(|&it| !graph[it].basic.origin.is_local() && in_library_root(graph[it].basic.root_file_id))
+        .collect(); // alloc: once per fixture, a few crates
+    for (at, krate) in pinned.into_iter().enumerate() {
+        graph.seal(krate, base_db::ContentId::of("blaze v2 fixture pin 1", &(at as u64).to_le_bytes()));
+    }
+
     // Setting the crate graph maintains every crate's def map, which reads the proc macros: one
     // write sets both, so the maintainers run once and see the fixture's.
     let crates_id_map =
@@ -702,7 +723,10 @@ fn set_files(
                 SourceRoot::new_library(FileSet::default())
             }
         };
-        db.set_source_root_with_durability(id, Arc::new(root), Durability::MEDIUM);
+        // A library root's set is `HIGH`, a local one's `MEDIUM`, as base-db writes them
+        // (`base_db::FileChange`): a sealed crate's cover reads a library root's.
+        let durability = if root.is_library { Durability::HIGH } else { Durability::MEDIUM };
+        db.set_source_root_with_durability(id, Arc::new(root), durability);
     }
     LocalRoots::get(&*db).set_roots(db).to(local);
     LibraryRoots::get(&*db).set_roots(db).to(library);
@@ -899,7 +923,7 @@ fn test_proc_macro(
     ProcMacro { name: Symbol::intern(name), kind, expander, disabled: false }
 }
 
-fn default_test_proc_macros() -> [(String, ProcMacro); 11] {
+fn default_test_proc_macros() -> [(String, ProcMacro); 13] {
     [
         (
             r#"
@@ -952,6 +976,16 @@ pub fn mirror(input: TokenStream) -> TokenStream {
 "#
             .into(),
             test_proc_macro("mirror", ProcMacroKind::Bang, sync::Arc::new(MirrorProcMacroExpander)),
+        ),
+        (
+            r#"
+#[proc_macro]
+pub fn pass(input: TokenStream) -> TokenStream {
+    input
+}
+"#
+            .into(),
+            test_proc_macro("pass", ProcMacroKind::Bang, sync::Arc::new(IdentityProcMacroExpander)),
         ),
         (
             r#"
@@ -1049,6 +1083,20 @@ pub fn generate_suffixed_type(_attr: TokenStream, input: TokenStream) -> TokenSt
                 "generate_suffixed_type",
                 ProcMacroKind::Attr,
                 sync::Arc::new(GenerateSuffixedTypeProcMacroExpander),
+            ),
+        ),
+        (
+            r#"
+#[proc_macro]
+pub fn select_priv_declare_output_enum(input: TokenStream) -> TokenStream {
+    input
+}
+"#
+            .into(),
+            test_proc_macro(
+                "select_priv_declare_output_enum",
+                ProcMacroKind::Bang,
+                sync::Arc::new(DeclareOutputEnumProcMacroExpander),
             ),
         ),
     ]
@@ -1393,6 +1441,41 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
 
             struct #generated_ident;
         })
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
+        other.type_id() == TypeId::of::<Self>()
+    }
+}
+
+/// tokio-macros' `select_priv_declare_output_enum` (2.7.2, src/select.rs): for `( _ _ )`, one
+/// `_` per branch, the enum `Out` and `Mask`, every token at the call site.
+#[derive(Debug)]
+struct DeclareOutputEnumProcMacroExpander;
+impl ProcMacroExpander for DeclareOutputEnumProcMacroExpander {
+    fn expand(
+        &self,
+        _: &Db,
+        ProcMacroCall { subtree, call_site, .. }: ProcMacroCall<'_>,
+    ) -> Result<Expanded, ProcMacroExpansionError> {
+        let mut iter = subtree.iter();
+        let Ok((_, inner)) = iter.expect_subtree() else {
+            return Err(ProcMacroExpansionError::Panic("unexpected macro input".into()));
+        };
+        match inner.count() {
+            2 => untraced(quote! { call_site =>
+                pub(super) enum Out<_0, _1> { _0(_0), _1(_1), Disabled }
+                pub(super) type Mask = u8;
+            }),
+            3 => untraced(quote! { call_site =>
+                pub(super) enum Out<_0, _1, _2> { _0(_0), _1(_1), _2(_2), Disabled }
+                pub(super) type Mask = u8;
+            }),
+            _ => Err(ProcMacroExpansionError::Panic(
+                "this test macro takes two or three branches".into(),
+            )),
+        }
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {

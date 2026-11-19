@@ -139,7 +139,7 @@ pub struct Tree;
 impl Query for Tree {
     const KIND: QueryKind = QueryKind(0x601c);
     const NAME: &'static str = "cargo tree";
-    const PRODUCER: ContentId = producer("blaze v2 cargo tree 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo tree 2");
     type Key = TreeAsk;
     type Value = Cbor<Printed>;
 
@@ -191,17 +191,18 @@ fn view_input<'a, F: Files>(
         Target::Specific(triples) => triples,
         Target::Host | Target::All => &[],
     };
-    let platformed = |triple: &str, target: Option<&str>| -> Result<Platformed, LoadError> {
-        let cfg = platform_cfg(view.config, triple, view.host, target)?;
+    // `kind` `None` is the host's platform, `Some` a target's, in a build for `target`.
+    let platformed = |target: Option<&str>, kind: Option<&str>| -> Result<Platformed, LoadError> {
+        let cfg = platform_cfg(view.config, view.host, target, kind)?;
         // alloc: a platform's triple, once per `cargo tree`.
-        Ok(Platformed { triple: triple.to_owned(), cfg })
+        Ok(Platformed { triple: kind.unwrap_or(view.host).to_owned(), cfg })
     };
     let mut kinds = Kinds {
-        host: platformed(view.host, targets.first().map(String::as_str))?,
+        host: platformed(targets.first().map(String::as_str), None)?,
         targets: Vec::with_capacity(targets.len()),
     };
     for it in targets {
-        kinds.targets.push(platformed(it, Some(it))?);
+        kinds.targets.push(platformed(Some(it), Some(it))?);
     }
     let input = Input {
         resolve: view.resolve,

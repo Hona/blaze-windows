@@ -34,8 +34,6 @@ pub(crate) enum UnitError {
     /// A test run's directory under the daemon's state, `tests/<tags>`, is no name the driver
     /// can give a file, and why.
     TestDir { dir: String, why: String },
-    /// The test binary `binary`'s selector was given back before its tests were chosen.
-    NoSelector { binary: String },
     /// `cargo run`'s program ended as `how`, neither an exit nor a failure to start.
     RunEnded { how: String },
 }
@@ -87,12 +85,6 @@ impl fmt::Display for UnitError {
                     "the test run's directory {dir} is no name blaze's driver can give a file: {why}"
                 )
             }
-            UnitError::NoSelector { binary } => {
-                write!(
-                    f,
-                    "the test binary `{binary}` gave its selector back before its tests were chosen"
-                )
-            }
             UnitError::RunEnded { how } => {
                 write!(f, "the program `cargo run` started ended as {how}")
             }
@@ -110,7 +102,8 @@ impl From<UnitError> for ApiError {
 
 /// The directory of `package`'s manifest at `path`.
 pub(crate) fn manifest_dir(package: &str, path: &str) -> Result<std::path::PathBuf, UnitError> {
-    std::path::Path::new(path)
+    // The system's path: a program runs there, and a sandbox opens it.
+    blaze_core::platform::path::host(path)
         .parent()
         .filter(|it| !it.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)

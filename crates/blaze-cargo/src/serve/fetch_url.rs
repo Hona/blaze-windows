@@ -102,10 +102,12 @@ fn fetch(state: &Path, asked: Asked) -> Result<Response, String> {
     // The same check the CLI ran: a request may come from any client of the socket.
     let blaze_fetch::Asked { source, most_bytes, out } =
         blaze_fetch::request::from_fields(url, repo, rev, &digest, most_bytes, out)?;
+    // A client names `out` as the daemon does; the system writes it at its own path.
+    let out = out.map(|it| blaze_core::platform::path::host(&it));
     if let Some(out) = &out
-        && !Path::new(out).is_absolute()
+        && !out.is_absolute()
     {
-        return Err(format!("`out` is `{out}`, and the daemon takes only an absolute directory")); // alloc: error path
+        return Err(format!("`out` is `{}`, and the daemon takes only an absolute directory", out.display())); // alloc: error path
     }
     // dyn: the I/O driver, as blaze-fetch takes it
     let http: Arc<dyn Http> = HyperHttp::shared().map_err(|e| format!("{e:#}"))?; // alloc: error path
@@ -117,7 +119,7 @@ fn fetch(state: &Path, asked: Asked) -> Result<Response, String> {
     let object = fetcher.get(&source).map_err(|e| e.to_string())?; // alloc: error path
     let path = match out {
         Some(out) => {
-            let at = fetcher.materialize(&object, Path::new(&out)).map_err(|e| e.to_string())?; // alloc: error path
+            let at = fetcher.materialize(&object, &out).map_err(|e| e.to_string())?; // alloc: error path
             Some(at.display().to_string()) // alloc: the answer, once a request
         }
         None => None,

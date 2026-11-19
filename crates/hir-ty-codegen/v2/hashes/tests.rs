@@ -339,6 +339,24 @@ pub mod m {
 pub fn caller(x: u32) -> u32 { let one = m::callee(x); one * 2 }
 "#;
 
+/// Loading a wrapper by value reads the layout selected by its field's trait impl. The
+/// projection's declaration and its arguments alone are identical at all four widths.
+#[test]
+fn a_templates_key_distinguishes_projected_field_layouts() {
+    let key = |repr| {
+        let text = format!("pub trait Repr {{ type Bits; }}
+            pub struct Flags(<Flags as Repr>::Bits);
+            pub struct Word({repr}); impl Repr for Flags {{ type Bits = Word; }}
+            pub fn load(x: Flags) -> Flags {{ x }}");
+        let (db, _) = fixture("sized", &text);
+        template_by(&hashes(), &db, "load")
+    };
+    let keys = ["u8", "u16", "u32", "u64"].map(key);
+    for (i, key) in keys.iter().enumerate() {
+        assert!(!keys[..i].contains(key), "different loads must not share a template");
+    }
+}
+
 /// Unison's rule (docs/v2/plan/design/name-free-identity.md): a function's template is kept
 /// under what it does, never what it or its callees are called or where they are written. Its
 /// code, which its instance key and the link name it by, keeps the key of the store it is

@@ -751,17 +751,28 @@ pub fn trait_value_item(db: &Db, trait_: TraitId, name: Name) -> Option<Candidat
     })
 }
 
-/// For every trait declared in a module of a frozen `krate` (not in a block), what
+/// For every trait declared in a module of `krate` (not in a block), what
 /// [`trait_value_item`] answers for each name its items bind
 /// ([`hir_def::nameres::assoc_item_binding_name`], keyed as an item a `macro` names is), sorted
-/// by name and then trait. A maintained crate's are its candidate slices
-/// ([`delta::candidate_traits`]).
+/// by name and then trait: what the names table of a crate's impl table pages is written from
+/// (`frozen::pages::encode`), and for a crate read from them the whole of that table, read
+/// back. A lookup of one name never asks for this ([`in_crate_trait_value_items`]).
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
     blaze_mem::frame::current(|frame| {
         // Each with where it was found: of a trait's items of one name the first stays first,
         // as `trait_value_item` takes it.
         let mut items: Vec<(Name, TraitId, usize, CandidateId), &Frame> = Vec::new_in(frame);
+        if frozen::served(db, krate) {
+            // Every entry of the names table of the crate's pages: no scope of the crate is
+            // decoded and no trait's items are made. Each name of a trait is there once.
+            frozen::all_value_items(db, krate, |name, trait_, item| {
+                items.push((name, trait_, 0, item));
+            });
+            items.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            // alloc: the memo's result, one exact block
+            return items.iter().map(|&(name, trait_, _, item)| (name, trait_, item)).collect();
+        }
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for def in module.scope(db).declarations() {
                 let ModuleDefId::TraitId(trait_) = def else { continue };
@@ -787,8 +798,9 @@ fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)
 /// What [`trait_value_item`] answers for `name` (a name as [`hir_def::nameres::trait_item_name`]
 /// gives it) for each trait declared in a module of `krate` (not in a block), sorted by trait:
 /// the traits of the candidate slice of its text, so an item of another name added to a trait of
-/// `krate` leaves it as it was. A frozen crate's are the run of [`trait_value_items`] named
-/// `name`.
+/// `krate` leaves it as it was. A crate read from impl table pages reads the entry of the
+/// name's text there (`frozen::value_items`): one slot and one entry, and a name no trait of
+/// the crate binds is known from the slot alone.
 #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn in_crate_trait_value_items(
     db: &Db,
@@ -803,11 +815,13 @@ pub fn in_crate_trait_value_items(
             // alloc: the memo's result, grown to at most the slice's length (none when empty)
             .collect();
     }
-    let items = trait_value_items(db, krate);
-    let start = items.partition_point(|&(it, _, _)| it < name);
-    let end = items.partition_point(|&(it, _, _)| it <= name);
-    // alloc: the memo's result, one exact block (none when empty)
-    items[start..end].iter().map(|&(_, t, i)| (t, i)).collect()
+    blaze_mem::frame::current(|frame| {
+        let mut found: Vec<(TraitId, CandidateId), &Frame> = Vec::new_in(frame);
+        frozen::value_items(db, krate, name, |trait_, item| found.push((trait_, item)));
+        found.sort_unstable_by_key(|&(trait_, _)| trait_);
+        // alloc: the memo's result, one exact block (none when empty)
+        found.iter().copied().collect()
+    })
 }
 
 /// [`trait_value_item`] for each trait a probe asks of, through one
@@ -955,10 +969,18 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!(target: "blaze", "loaded_crates").entered();
     blaze_mem::frame::current(|frame| {
         let data = krate.data(db);
+        // blaze: a crate of a blaze edition loads its `std`, bstd, whatever its text says, as
+        // rustc loads the injected `std`: its paths say `std`, never the dependency's own
+        // name (docs/v2/plan/design/std.md, "The blaze edition: opting in";
+        // `hir_def::nameres::named` has the same rule for what a program links).
+        let edition_std = krate.blaze_edition(db).map(|_| span::BlazeEdition::STD);
         let mut unnamed = Vec::new_in(frame);
         unnamed.extend(data.dependencies.iter().filter(|dep| {
             let data = dep.crate_id.data(db);
-            !(dep.is_sysroot() || data.origin.is_lang() || dep.crate_id.loads_only_macros(db))
+            !(dep.is_sysroot()
+                || data.origin.is_lang()
+                || dep.crate_id.loads_only_macros(db)
+                || edition_std == Some(dep.name.symbol().as_str()))
         }));
         // Few files name a dependency, and a file's text tells which may without its tree. A
         // file `include!` puts among the items is one of the crate's as well: a root that is
@@ -1013,11 +1035,9 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
         // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate`
         // writes nothing its files do not, nor does a built-in macro but `include!`, whose
         // files are above.
-        'modules: for (_, module) in def_map.modules(db) {
-            for call in module.scope(db).all_macro_calls() {
-                if unnamed.is_empty() {
-                    break 'modules;
-                }
+        let scan_scope = |unnamed: &mut Vec<_, &Frame>, scope: &ItemScope| {
+            for call in scope.all_macro_calls() {
+                if unnamed.is_empty() { break; }
                 let def = call.loc(db).def;
                 if def.krate == krate
                     || !matches!(
@@ -1028,7 +1048,25 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
                 {
                     continue;
                 }
-                named_in(&mut unnamed, call.parse_macro_expansion(db).value.0.root());
+                named_in(unnamed, call.parse_macro_expansion(db).value.0.root());
+            }
+        };
+        for (_, module) in def_map.modules(db) {
+            if unnamed.is_empty() { break; }
+            scan_scope(&mut unnamed, module.scope(db));
+        }
+        // A macro can emit an impl inside an item-bearing block, as ICU's baked
+        // providers do inside `const _: () = { ... }`. Its method bodies are in
+        // the expansion, not the crate's source files or its module-level scopes.
+        for (_, module) in def_map.modules(db) {
+            if unnamed.is_empty() { break; }
+            for owner in impl_holders(db, frame, krate, module.scope(db)) {
+                if unnamed.is_empty() { break; }
+                for (_, block_map) in Body::of(db, owner).blocks(db) {
+                    for (_, inner) in block_map.modules(db) {
+                        scan_scope(&mut unnamed, inner.scope(db));
+                    }
+                }
             }
         }
         let mut loaded = crate::frame_set(frame);
@@ -1306,7 +1344,8 @@ impl MacroDefinitions {
 /// Whether the body of `id` may hold an impl (or, without `impls`, an item a macro or an
 /// attribute writes): its text has an `impl`, a call of a macro not proven to write none
 /// ([`macro_is_inert`]) or an attribute that is not inert. An item a macro writes has no text
-/// of its own and may. The file is parsed for the item's range only when lexing it found one.
+/// of its own and may. The item's range is read from its file's index (no parse where the
+/// index is kept); an item in a body, which has no row, is placed by the ast id map.
 pub(crate) fn may_hold<N: syntax::AstNode>(
     db: &Db,
     krate: Crate,
@@ -1318,7 +1357,7 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
     if marks.is_empty() {
         return false;
     }
-    let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+    let range = item_range(db, krate, id);
     marks.iter().any(|(at, mark)| {
         range.contains(*at)
             && match mark {
@@ -1327,6 +1366,21 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
                 BodyMark::Attribute(name) => !attribute_is_inert(name.as_str()),
             }
     })
+}
+
+/// Where `id` is written in its file: its row's position in the file's index
+/// (`hir_expand::declarative::stored::index::range`), read with no parse; an item with no row
+/// (one in a body) is placed by its file's ast id map, whose body is parsed to have it.
+pub(crate) fn item_range<N: syntax::AstNode>(
+    db: &Db,
+    krate: Crate,
+    id: hir_expand::AstId<N>,
+) -> syntax::TextRange {
+    let ast = id.value.erase();
+    match hir_expand::declarative::stored::index::range(db, id.file_id, ast, krate) {
+        Some(range) => range,
+        None => id.file_id.ast_id_map(db).get_erased(ast).text_range(),
+    }
 }
 
 /// Whether a macro called `name` in a body of `krate` writes no impl: some `macro_rules!` of
@@ -1657,6 +1711,11 @@ fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
 /// `unsafe`), an attribute that is not inert or one from a fragment, or call a macro passed in
 /// as `$name!`, and the names of the other macros they call.
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[expect(
+    blaze::narrowed_len,
+    reason = "a macro's call list ends are u32 indexes into one file's calls, bounded by the file's \
+              text, which nothing checks is under 4 GiB: a larger file needs a typed refusal at read"
+)]
 fn macro_definitions(db: &Db, file: base_db::EditionedFileId) -> MacroDefinitions {
     let text = db.file_text(file.file_id(db)).text(db);
     if !text.contains("macro_rules") {
@@ -1852,6 +1911,11 @@ struct Runs<V> {
 impl<V: Copy> Runs<V> {
     /// The runs of `values`, each `(group, value)`: run `rank[group]` holds a group's values in
     /// the order they come. Counted first, so each column is allocated once at its size.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the runs' ends are u32 and a crate's impls are not bounded below 2^32 anywhere \
+                  before this: a larger crate needs a typed refusal where impls are collected"
+    )]
     fn from_groups(frame: &Frame, rank: &[u32], values: &[(u32, V)]) -> Self {
         u32::try_from(values.len()).expect("more than 2^32 impls in a crate");
         let ends = frame.alloc_slice_fill_with(rank.len() + 1, |_| 0u32);
@@ -1890,6 +1954,11 @@ fn ranks<'f>(frame: &'f Frame, order: &[u32]) -> &'f mut [u32] {
 }
 
 /// The number of `trait_`, numbered as first seen: a new one is pushed on `trait_ids`.
+#[expect(
+    blaze::narrowed_len,
+    reason = "trait numbers are u32 and nothing bounds a crate's traits below 2^32 before this: \
+              a larger crate needs a typed refusal where impls are collected"
+)]
 fn trait_number(
     traits: &mut FrameMap<'_, TraitId, u32>,
     trait_ids: &mut Vec<TraitId, &Frame>,
@@ -1952,6 +2021,11 @@ impl<'db> SelfTys<'db> {
 
 /// The group of `self_ty`, numbered as first seen: a new one is pushed on `self_tys` with its
 /// hash.
+#[expect(
+    blaze::narrowed_len,
+    reason = "self-type groups are numbered u32 and nothing bounds a crate's self types below \
+              2^32 before this: a larger crate needs a typed refusal where impls are collected"
+)]
 fn group_of<'db>(
     groups: &mut FrameMap<'_, SimplifiedType<'db>, u32>,
     self_tys: &mut Vec<(u64, SimplifiedType<'db>), &Frame>,
@@ -2041,8 +2115,12 @@ impl<'db> InherentImpls<'db> {
     pub fn for_crate(db: &'db Db, krate: Crate) -> InherentImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
-            if let Some(frozen) = frozen::inherent_impls(db, frame, krate) {
-                return frozen;
+            if frozen::served(db, krate) {
+                // A reader of every inherent impl of a crate read from pages: the whole
+                // table. A lookup of one type reads its entry ([`Self::in_crate_for_self_ty`]).
+                let mut builder = InherentImplsBuilder::new(frame);
+                frozen::all_inherent_into(db, krate, &mut builder);
+                return builder.finish();
             }
             delta::read::inherent_impls_of_crate(db, frame, krate)
         })
@@ -2064,7 +2142,8 @@ impl<'db> InherentImpls<'db> {
     /// The inherent impls of `krate` for one type, in the order [`Self::for_crate`] holds
     /// them: the type's inherent slice and the bodies of the modules whose bodies hold impls
     /// for it, so an impl added for another type, or anything else added anywhere, leaves this
-    /// as it was. A frozen crate's are read from its frozen table.
+    /// as it was. A crate read from impl table pages reads the type's entry there, and a type
+    /// with no inherent impl in the crate is known from its slot alone.
     #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_self_ty(
         db: &'db Db,
@@ -2072,7 +2151,12 @@ impl<'db> InherentImpls<'db> {
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
         if frozen::served(db, krate) {
-            return Self::for_crate(db, krate).for_self_ty(&self_ty.0).into();
+            return blaze_mem::frame::current(|frame| {
+                let mut found: Vec<ImplId, &Frame> = Vec::new_in(frame);
+                frozen::inherent(db, krate, &self_ty.0, |it| found.push(it));
+                // alloc: the memo's value, once at its length (none when empty)
+                found.iter().copied().collect()
+            });
         }
         delta::read::inherent_impls_for(db, krate, self_ty)
     }
@@ -2168,6 +2252,27 @@ impl<'db> InherentImpls<'db> {
         self.self_tys.self_tys.iter().enumerate().map(|(i, self_ty)| (self_ty, self.impls.run(i)))
     }
 
+    /// The inherent impls for `self_ty` of `block` and the blocks around it, then of `krate`,
+    /// each run given to `for_each`: what [`Self::for_each_crate_and_block`] gives a caller
+    /// that asks every table for one type, through the readers of one type, so a crate read
+    /// from impl table pages reads the type's entry and not its whole table.
+    pub fn for_self_ty_in_crate_and_block(
+        db: &'db Db,
+        krate: Crate,
+        block: Option<BlockIdLt<'db>>,
+        self_ty: &SimplifiedType<'db>,
+        for_each: &mut impl FnMut(&[ImplId]),
+    ) {
+        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
+        for block in blocks {
+            let found = Self::in_block_for_self_ty(db, block, SelfTyKey(*self_ty));
+            if !found.is_empty() {
+                for_each(found);
+            }
+        }
+        for_each(Self::in_crate_for_self_ty(db, krate, SelfTyKey(*self_ty)));
+    }
+
     pub fn for_each_crate_and_block(
         db: &'db Db,
         krate: Crate,
@@ -2214,6 +2319,11 @@ impl<'db, 'f> TraitImplsBuilder<'db, 'f> {
         trait_number(&mut self.traits, &mut self.trait_ids, trait_)
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "rows are numbered u32 and nothing bounds a crate's impl rows below 2^32 before \
+                  this: a larger crate needs a typed refusal where impls are collected"
+    )]
     fn row(&mut self, t: u32, self_ty: SimplifiedType<'db>) -> u32 {
         let row_keys = &mut self.row_keys;
         *self.rows.entry((t, self_ty)).or_insert_with(|| {
@@ -2324,9 +2434,14 @@ impl<'db> TraitImpls<'db> {
     pub fn for_crate(db: &'db Db, krate: Crate) -> Arc<TraitImpls<'db>> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
-            if let Some(frozen) = frozen::trait_impls(db, frame, krate) {
+            if frozen::served(db, krate) {
+                // A reader of every trait impl of a crate read from pages: the whole table.
+                // A lookup reads a trait's entry or a row's ([`Self::for_crate_and_trait`],
+                // [`Self::in_crate_for_trait_and_self_ty`]).
+                let mut builder = TraitImplsBuilder::new(frame);
+                frozen::all_traits_into(db, krate, &mut builder);
                 // alloc: the memo's handle, shared by `for_crate_and_deps`.
-                return Arc::new(frozen);
+                return Arc::new(builder.finish());
             }
             // alloc: the memo's handle, shared by `for_crate_and_deps`.
             Arc::new(delta::read::trait_impls_of_crate(db, frame, krate))
@@ -2350,14 +2465,16 @@ impl<'db> TraitImpls<'db> {
     /// The impls of `trait_` in `krate`, as a table of that trait alone, in the order
     /// [`Self::for_crate`] holds them: the bucket every narrow memo of one crate reads. Reads
     /// the trait's slice and the bodies of the modules whose bodies hold impls of it, so an
-    /// impl of another trait, or anything else added anywhere, leaves this as it was. A frozen
-    /// crate's is read from its frozen table.
+    /// impl of another trait, or anything else added anywhere, leaves this as it was. A crate
+    /// read from impl table pages reads the trait's entry and its rows there: for a reader of
+    /// every impl of the trait. One row or the blanket impls are read alone
+    /// ([`Self::served_row`], [`Self::served_blanket`]).
     #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate_and_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> TraitImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let mut builder = TraitImplsBuilder::new(frame);
             if frozen::served(db, krate) {
-                Self::for_crate(db, krate).merge_trait_into(trait_, &mut builder);
+                frozen::trait_into(db, krate, trait_, &mut builder);
             } else {
                 delta::read::trait_impls_into(db, krate, trait_, &mut builder);
             }
@@ -2399,6 +2516,13 @@ impl<'db> TraitImpls<'db> {
             let loaded = loaded_crates(db, krate);
             let self_crate = simplified_type_module(db, &self_ty.0).map(|it| it.krate(db));
             for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), self_crate) {
+                if frozen::served(db, loaded[at]) {
+                    // The row's entry alone, impls then derives; none is known from its slot.
+                    frozen::row(db, loaded[at], trait_, &self_ty.0, |it| {
+                        found.push(it.either(AnyImplId::from, AnyImplId::from))
+                    });
+                    continue;
+                }
                 let impls = Self::for_crate_and_trait(db, loaded[at], trait_);
                 let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
                 found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
@@ -2416,6 +2540,10 @@ impl<'db> TraitImpls<'db> {
             let mut found = Vec::new_in(frame);
             let loaded = loaded_crates(db, krate);
             for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), None) {
+                if frozen::served(db, loaded[at]) {
+                    frozen::blanket(db, loaded[at], trait_, |it| found.push(it));
+                    continue;
+                }
                 found.extend_from_slice(
                     Self::for_crate_and_trait(db, loaded[at], trait_).blanket_impls(trait_),
                 );
@@ -2433,10 +2561,54 @@ impl<'db> TraitImpls<'db> {
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
+        if frozen::served(db, krate) {
+            return blaze_mem::frame::current(|frame| {
+                let mut found: Vec<ImplId, &Frame> = Vec::new_in(frame);
+                frozen::row(db, krate, trait_, &self_ty.0, |it| {
+                    if let Either::Left(it) = it {
+                        found.push(it);
+                    }
+                });
+                // alloc: the memo's value, once at its length (none when empty)
+                found.iter().copied().collect()
+            });
+        }
         Self::for_crate_and_trait(db, krate, trait_)
             .for_trait_and_self_ty(trait_, &self_ty.0)
             .0
             .into()
+    }
+
+    /// Every trait impl of `krate` alone for one type, built-in derives among them: per
+    /// trait, its impls and then its derives. What [`Self::for_self_ty`] gives of the crate's
+    /// whole table. A crate read from impl table pages reads the type's entry and its rows
+    /// (`frozen::pages::for_self_ty`: `k + 2` reads for `k` rows), never the whole table; a
+    /// type with no trait impl there is known from its slot alone.
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
+    pub fn in_crate_for_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        blaze_mem::frame::current(|frame| {
+            let mut found: Vec<AnyImplId, &Frame> = Vec::new_in(frame);
+            if frozen::served(db, krate) {
+                frozen::for_self_ty(db, krate, &self_ty.0, |it| {
+                    found.push(either::for_both!(it, it => it.into()))
+                });
+            } else {
+                Self::for_crate(db, krate).for_self_ty(&self_ty.0, |run| match run {
+                    Either::Left(impls) => {
+                        found.extend(impls.iter().map(|&it| AnyImplId::from(it)))
+                    }
+                    Either::Right(derives) => {
+                        found.extend(derives.iter().map(|&it| AnyImplId::from(it)))
+                    }
+                });
+            }
+            // alloc: the memo's value, once at its length (none when empty)
+            found.iter().copied().collect()
+        })
     }
 
     /// The impls of one trait for one type in `block` alone, without the built-in derives.
@@ -2491,6 +2663,65 @@ impl<'db> TraitImpls<'db> {
 }
 
 impl<'db> TraitImpls<'db> {
+    /// The impls of `trait_` for `self_ty` in `krate`, which is read from impl table pages
+    /// (`frozen::served`), as a table of that row alone: the row's entry is read and nothing
+    /// else of the trait. Empty when the trait has no impl for the type there.
+    pub(in crate::method_resolution) fn served_row(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: &SimplifiedType<'db>,
+    ) -> TraitImpls<'db> {
+        blaze_mem::frame::current(|frame| {
+            let mut builder = TraitImplsBuilder::new(frame);
+            let mut row = None;
+            frozen::row(db, krate, trait_, self_ty, |it| {
+                let row = *row.get_or_insert_with(|| {
+                    let t = builder.trait_(trait_);
+                    builder.row(t, *self_ty)
+                });
+                match it {
+                    Either::Left(it) => builder.push_impl(row, it),
+                    Either::Right(it) => builder.push_derive(row, it),
+                }
+            });
+            builder.finish()
+        })
+    }
+
+    /// The blanket impls of `trait_` in `krate`, which is read from impl table pages, as a
+    /// table of them alone: the trait's entry is read and none of its rows.
+    pub(in crate::method_resolution) fn served_blanket(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> TraitImpls<'db> {
+        blaze_mem::frame::current(|frame| {
+            let mut builder = TraitImplsBuilder::new(frame);
+            let t = builder.trait_(trait_);
+            frozen::blanket(db, krate, trait_, |it| builder.push_blanket(t, it));
+            builder.finish()
+        })
+    }
+
+    /// The blanket impls of `trait_` in `krate` alone, each given to `each` in the order they
+    /// were found: the trait's entry of a crate read from impl table pages, the trait's
+    /// table ([`Self::for_crate_and_trait`]) of one that is not. Never the crate's whole table.
+    pub fn each_blanket_in_crate(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+        mut each: impl FnMut(ImplId),
+    ) {
+        if frozen::served(db, krate) {
+            frozen::blanket(db, krate, trait_, each);
+            return;
+        }
+        for &it in Self::for_crate_and_trait(db, krate, trait_).blanket_impls(trait_) {
+            each(it);
+        }
+    }
+
     fn collect_def_map(db: &'db Db, frame: &Frame, def_map: &DefMap) -> Self {
         let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
         let mut builder = TraitImplsBuilder::new(frame);
@@ -2902,6 +3133,9 @@ mod inert_attribute_tests {
     fn inert_attributes_as_a_linear_search() {
         let mut names: Vec<String> = Vec::new();
         for name in INERT_ATTRIBUTES {
+            // This list is a choice among the built-in attributes (those that write no
+            // item), not a second table of them: each is a row of the one table.
+            assert!(syntax::builtin_attrs::find(name).is_some(), "{name}");
             names.push((*name).to_owned());
             names.push(format!("{name}_"));
             names.push(format!("r#{name}"));

@@ -3,13 +3,19 @@
 //!
 //! The invariant: a site `reach` discharges is not reached, or its condition holds, in every
 //! run of the body's MIR. Held here as: a body all of whose panic sites are discharged does
-//! not panic when the evaluator runs it. Hegel draws the body (guards over variants, bounds,
+//! not panic when the evaluator runs it. The tape draws the body (guards over variants, bounds,
 //! lengths and linear arithmetic around one site), the arguments (the ends of `usize` among
 //! them) and whether the crate keeps overflow checks; the control plants an unsound model
 //! entry, which the oracle catches.
+//!
+//! The overflow invariant (docs/v2/plan/design/explicit-overflow.md): an integer operation
+//! `reach::overflow_of_body` shows fits does not overflow in any run, and the proof is the
+//! same with and without overflow checks. Held as: a body all of whose operations are shown
+//! to fit runs with overflow checks without panicking, and its proof without them agrees; the
+//! control plants a `+` always taken to fit, which the oracle catches.
 
 use base_db::Db;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_expand::fixture;
 use hir_ty::{InferBodyId, ParamEnvAndCrate, db::HirDatabase as _, next_solver::GenericArgs};
@@ -124,72 +130,75 @@ fn check(program: &Program) -> Result<Verdict, String> {
     })
 }
 
-fn below(tc: &TestCase, n: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().max_value(n - 1))
+/// Below `n`, at least 1.
+fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+    tape.int_in(0..=n - 1, label)
 }
 
-fn pick<'a>(tc: &TestCase, of: &[&'a str]) -> &'a str {
-    of[below(tc, of.len() as u32) as usize]
+fn pick<'a>(tape: &Tape, of: &[&'a str], label: &'static str) -> &'a str {
+    *tape.one_of(of, label)
 }
 
 /// A linear expression over `a`, `b` and the length.
-fn linear(tc: &TestCase) -> String {
-    let base = pick(tc, &["a", "b", "v.len()", "0", "1", "2"]);
-    match below(tc, 6) {
-        0 => format!("{base} + {}", pick(tc, &["1", "2", "b"])), // alloc: a test's text
-        1 => format!("{base} - {}", pick(tc, &["1", "2", "a"])), // alloc: a test's text
+fn linear(tape: &Tape) -> String {
+    let base = pick(tape, &["a", "b", "v.len()", "0", "1", "2"], "base");
+    match below(tape, 6, "linear") {
+        0 => format!("{base} + {}", pick(tape, &["1", "2", "b"], "added")), // alloc: a test's text
+        1 => format!("{base} - {}", pick(tape, &["1", "2", "a"], "taken")), // alloc: a test's text
         2 => format!("{base} / 2"),                             // alloc: a test's text
         3 => format!("a + (b - a) / 2"),                        // alloc: a test's text
         _ => base.to_owned(),                                   // alloc: a test's text
     }
 }
 
-fn guard(tc: &TestCase) -> String {
-    match below(tc, 8) {
+fn guard(tape: &Tape) -> String {
+    match below(tape, 8, "guard") {
         0 => "!v.is_empty()".to_owned(), // alloc: a test's text
         1 => "o.is_some()".to_owned(),   // alloc: a test's text
         2 => "d != 0".to_owned(),        // alloc: a test's text
         3 => "a < b && b <= v.len()".to_owned(), // alloc: a test's text
         _ => {
-            let relation = pick(tc, &["<", "<=", ">", ">=", "!=", "=="]);
-            format!("{} {relation} {}", linear(tc), linear(tc)) // alloc: a test's text
+            let relation = pick(tape, &["<", "<=", ">", ">=", "!=", "=="], "relation");
+            format!("{} {relation} {}", linear(tape), linear(tape)) // alloc: a test's text
         }
     }
 }
 
-fn site(tc: &TestCase) -> String {
-    match below(tc, 7) {
+fn site(tape: &Tape) -> String {
+    match below(tape, 7, "site") {
         0 => "o.unwrap()".to_owned(),         // alloc: a test's text
         1 => "100 / d".to_owned(),            // alloc: a test's text
         2 => "*v.first().unwrap()".to_owned(), // alloc: a test's text
-        3 => format!("v[{}] ^ v[{}]", linear(tc), linear(tc)), // alloc: a test's text
-        _ => format!("v[{}]", linear(tc)),    // alloc: a test's text
+        3 => format!("v[{}] ^ v[{}]", linear(tape), linear(tape)), // alloc: a test's text
+        _ => format!("v[{}]", linear(tape)),  // alloc: a test's text
     }
 }
 
-fn drawn(tc: &TestCase) -> Program {
+fn drawn(tape: &Tape) -> Program {
     let ends = [0, 1, 2, 3, 4, 5, usize::MAX - 1, usize::MAX];
     Program {
-        guards: (0..below(tc, 4)).map(|_| guard(tc)).collect(),
-        site: site(tc),
-        slice: (0..below(tc, 5)).collect(),
-        a: ends[below(tc, ends.len() as u32) as usize],
-        b: ends[below(tc, ends.len() as u32) as usize],
-        option: (below(tc, 2) == 0).then_some(7),
-        divisor: below(tc, 3),
-        overflow_checks: below(tc, 2) == 0,
+        guards: (0..below(tape, 4, "guards")).map(|_| guard(tape)).collect(),
+        site: site(tape),
+        slice: (0..below(tape, 5, "slice length")).collect(),
+        a: ends[below(tape, ends.len() as u32, "a") as usize],
+        b: ends[below(tape, ends.len() as u32, "b") as usize],
+        option: (below(tape, 2, "option") == 0).then_some(7),
+        divisor: below(tape, 3, "divisor"),
+        overflow_checks: below(tape, 2, "overflow checks") == 0,
     }
 }
 
 /// The invariant: a body all of whose panic sites `reach` discharges does not panic when the
 /// evaluator runs it. Random guards (variants, bounds, lengths, linear arithmetic, `&&`)
 /// around a random site, random arguments, both overflow profiles.
-#[hegel::test(test_cases = 150)]
-fn a_body_whose_sites_are_discharged_does_not_panic(tc: TestCase) {
-    let program = drawn(&tc);
-    if let Err(what) = check(&program) {
-        panic!("{what}");
-    }
+#[test]
+fn a_body_whose_sites_are_discharged_does_not_panic() {
+    blaze_sim::check(Config::cases(150), |tape| {
+        let program = drawn(tape);
+        if let Err(what) = check(&program) {
+            panic!("{what}");
+        }
+    })
 }
 
 fn program(guards: &[&str], site: &str, slice: &[u32], a: usize, b: usize) -> Program {
@@ -255,4 +264,344 @@ fn the_oracle_catches_a_model_that_says_first_is_always_some() {
     PLANT_FIRST_ALWAYS_SOME.set(false);
     let Err(what) = caught else { panic!("the planted model was not caught: {caught:?}") };
     assert!(what.contains("is discharged, and the run panics"), "{what}");
+}
+
+
+/// A `match` of `arms` arms, each through `Option::and_then` and a
+/// `let .. else`, like rune's `dispatch_action`.
+fn dispatch_source(arms: usize) -> String {
+    let mut variants = String::new();
+    let mut fields = String::new();
+    let mut body = String::new();
+    for i in 0..arms {
+        variants += &format!("A{i}(P, bool), ");
+        fields += &format!("h{i}: Option<fn(u32) -> bool>, ");
+        body += &format!(
+            "Action::A{i}(p, b) => {{ let Some(f) = node(s, p.0).and_then(|n| n.h{i}) else {{ return false }}; let k = p.0; if b {{ s.held = {i}; s.keep = Some(p); }} f(k) }}\n"
+        );
+    }
+    format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub enum Action {{ {variants} }}\n\
+         pub struct Node {{ {fields} }}\n\
+         pub struct P(u32);\nimpl Drop for P {{ fn drop(&mut self) {{}} }}\npub struct S {{ nodes: Option<Node>, held: u32, keep: Option<P> }}\n\
+         fn node(s: &S, p: u32) -> Option<&Node> {{ if p == 0 {{ None }} else {{ match &s.nodes {{ Some(n) => Some(n), None => None }} }} }}\n\
+         pub fn probe(s: &mut S, a: Action) -> bool {{\n\
+         let repeat = match a {{ Action::A1(..) => true, _ => false }};\n\
+         let ran = match a {{\n{body}}};\n\
+         ran && !repeat\n}}\n"
+    )
+}
+
+#[test]
+fn a_wide_dispatch_proof_scales() {
+    let mut prev: Option<(usize, u64, u64)> = None;
+    let mut at_40: Option<(u64, u64)> = None;
+    for arms in [20usize, 40, 80, 160, 320, 640] {
+        let source = dispatch_source(arms);
+        let db = fixture::db(&source).into_db();
+        let krate = crate_named(&db, "kernel");
+        blaze_query::db::attach(&db, || {
+            let probe = fn_named(&db, krate, "probe");
+            let def = DefWithBodyId::FunctionId(probe);
+            let body = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers");
+            let blocks = body.basic_blocks.len();
+            let start = std::time::Instant::now();
+            let reach = reach::of_body(&db, def);
+            let visits = reach::PROOF_VISITS.get();
+            eprintln!(
+                "{arms} arms, {blocks} blocks, {} locals, {} steps: {visits} visits, work {}/{}, stopped {:?}, {:?}",
+                body.locals.len(),
+                reach.steps,
+                reach.work,
+                reach.bound,
+                reach.stopped,
+                start.elapsed()
+            );
+            assert_eq!(reach.refused, None, "{arms} arms refused: {:?}", reach.refusal());
+            assert_eq!(body.basic_blocks.iter().filter(|(b, _)| reach.dead(*b)).count(), 7 * arms + 2);
+            // A path carries one exclusion per preceding arm. None is a transitive or
+            // linear premise; each question should inspect only a bounded number of facts.
+            // Counts fact inspections and endpoint lookups, not allocations or wall time.
+            assert!(visits <= 80 * blocks as u64, "{blocks} blocks, {visits} visits");
+            // Near-linear work growth: doubling the arms raises work per step by at most 5/4
+            // (matches `reach_work::work_grows_near_linearly_with_the_body`), and a 16x span
+            // (40 -> 640 arms) raises work per step by at most 3/2.
+            if arms == 40 {
+                at_40 = Some((reach.steps, reach.work));
+            }
+            if let Some((prev_arms, prev_steps, prev_work)) = prev
+                && prev_arms >= 40
+            {
+                assert!(
+                    4 * reach.work * prev_steps <= 5 * prev_work * reach.steps,
+                    "work/step grew faster than 5/4 from {prev_arms} to {arms} arms: \
+                     {prev_work}/{prev_steps} -> {}/{}",
+                    reach.work,
+                    reach.steps,
+                );
+            }
+            if arms == 640
+                && let Some((steps_40, work_40)) = at_40
+            {
+                assert!(
+                    2 * reach.work * steps_40 <= 3 * work_40 * reach.steps,
+                    "work/step grew faster than 3/2 from 40 to 640 arms: \
+                     {work_40}/{steps_40} -> {}/{}",
+                    reach.work,
+                    reach.steps,
+                );
+            }
+            prev = Some((arms, reach.steps, reach.work));
+        });
+    }
+}
+
+/// The most implications any joined state of `probe` holds, where `probe` joins a `bool` of
+/// two comparisons `joins` times, each read once and then gone (a drop flag's shape).
+fn most_implications(joins: u32) -> usize {
+    let mut body = String::new();
+    for n in 0..joins {
+        body += &format!(
+            "{{ let b{n} = x < {} && y < {} && x != {}; if b{n} {{ r += 1; }} }}\n",
+            n + 10,
+            n + 5,
+            n + 20
+        );
+    }
+    // alloc: a test's fixture
+    let source = format!(
+        "{MINICORE}//- /lib.rs crate:kernel\n\
+         pub fn probe(x: u32, y: u32) -> u32 {{\n    let mut r = 0u32;\n{body}    r\n}}\n"
+    );
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        reach::MOST_IMPLICATIONS.set(0);
+        let reach = reach::of_body(&db, def);
+        assert_eq!(reach.refused, None);
+        reach::MOST_IMPLICATIONS.get()
+    })
+}
+
+/// The invariant: what a join implies of a joined `bool` is forgotten once no later read can
+/// reach that value, so the implications a state holds do not grow with the joins before
+/// it. rune's `dispatch_action` carried 18,570 to its end and took hours (INTEGRATION I49).
+#[test]
+fn a_join_forgets_the_implications_of_values_gone() {
+    let (few, many) = (most_implications(2), most_implications(24));
+    assert!(few > 0, "the shape makes no implications to forget");
+    assert_eq!(few, many, "the implications grew with the joins: {few} for 2, {many} for 24");
+}
+
+/// A body with no loop has each block walked once, after all paths into it.
+#[test]
+fn a_body_with_no_loop_walks_each_block_once() {
+    let source = dispatch_source(24);
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).expect("lowers").basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks <= blocks, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm() {
+    let source = dispatch_source(32).replace("ran && !repeat", "let mut i = s.held; while i > 0 { i -= 1; } ran && !repeat");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let def = DefWithBodyId::FunctionId(fn_named(&db, krate, "probe"));
+        let blocks = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)).unwrap().basic_blocks.len();
+        reach::WALKS.set(0);
+        assert_eq!(reach::of_body(&db, def).refused, None);
+        let walks = reach::WALKS.get();
+        assert!(walks < blocks + 100, "{walks} walks of {blocks} blocks");
+    });
+}
+
+#[test]
+fn iterating_recursive_effects_proves_the_instance_sites_only_once() {
+    let source = format!("{MINICORE}//- /lib.rs crate:kernel\nfn probe(n: u32) -> u32 {{ if n > 0 {{ next(n - 1) }} else {{ 0 }} }}\nfn next(n: u32) -> u32 {{ probe(n) }}");
+    let db = fixture::db(&source).into_db();
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let probe = fn_named(&db, krate, "probe");
+        reach::COUNT_BODY.set(Some(probe.into()));
+        reach::COUNT_PROOFS.set(0);
+        crate::fn_purity_generic(&db, probe);
+        reach::COUNT_BODY.set(None);
+        assert_eq!(reach::COUNT_PROOFS.get(), 1);
+    });
+}
+/// A body for the overflow proof (`reach::overflow_of_body`): `probe`'s guards around one
+/// integer operation over `a`, `b` and the length, and the arguments `run` calls it with.
+#[derive(Clone, Debug)]
+struct Arith {
+    guards: Vec<String>,
+    site: String,
+    len: u32,
+    a: usize,
+    b: usize,
+}
+
+impl Arith {
+    fn source(&self, overflow_checks: bool) -> String {
+        let mut body = self.site.clone(); // clone: the text grows around it
+        for guard in self.guards.iter().rev() {
+            body = format!("if {guard} {{ {body} }} else {{ 0 }}"); // alloc: a test's text
+        }
+        let elements: Vec<String> = (0..self.len).map(|it| it.to_string()).collect();
+        let meta = if overflow_checks { " cfg:overflow_checks" } else { "" };
+        // alloc: a test's fixture
+        format!(
+            "{MINICORE}//- /lib.rs crate:kernel{meta}\n\
+             pub fn probe(v: &[u32], a: usize, b: usize) -> usize {{\n    {body}\n}}\n\
+             pub fn run() -> usize {{\n    let v: [u32; {}] = [{}];\n    probe(&v, {}, {})\n}}\n",
+            self.len,
+            elements.join(", "),
+            self.a,
+            self.b,
+        )
+    }
+}
+
+/// Whether every integer operation of `probe` is shown to fit, in the crate of `source`.
+fn fits_everywhere(source: &str) -> (bool, Option<(Db, FunctionId)>) {
+    let db = fixture::db(source).into_db();
+    let krate = crate_named(&db, "kernel");
+    let (fits, probe) = blaze_query::db::attach(&db, || {
+        let probe = fn_named(&db, krate, "probe");
+        let found = reach::overflow_of_body(&db, DefWithBodyId::FunctionId(probe));
+        (found.refused.is_empty() && found.sites.iter().all(|it| it.2.is_none()), probe)
+    });
+    (fits, Some((db, probe)))
+}
+
+/// The overflow oracle: whether every operation was shown to fit, or what breaks the
+/// invariant. The proof is the same with and without overflow checks, and a body it shows
+/// fits runs with overflow checks without panicking.
+fn check_overflow(program: &Arith) -> Result<bool, String> {
+    let (unchecked, _) = fits_everywhere(&program.source(false));
+    let source = program.source(true);
+    let (fits, made) = fits_everywhere(&source);
+    if fits != unchecked {
+        // alloc: a test's message
+        return Err(format!("the proof differs by profile: {unchecked} without checks, {fits} with\n{source}"));
+    }
+    let Some((db, _)) = made else { return Err("no database".to_owned()) };
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        let run = fn_named(&db, krate, "run");
+        let env = ParamEnvAndCrate { param_env: db.trait_environment(run.into()), krate }.store();
+        let body = db
+            .monomorphized_runtime_mir_body(run.into(), GenericArgs::empty().store(), env)
+            .map_err(|error| format!("`run` does not lower: {error:?}\n{source}"))?; // alloc: a test's message
+        let ran = interpret_mir(&db, body, None).and_then(|(value, _)| value);
+        let panicked = match ran {
+            Ok(_) => false,
+            // alloc: a test's message
+            Err(error) => match format!("{error:?}") {
+                said if said.contains("Panic") => true,
+                said => return Err(format!("the evaluator could not run it: {said}\n{source}")),
+            },
+        };
+        if fits && panicked {
+            // alloc: a test's message
+            return Err(format!("every operation of `probe` is shown to fit, and the run overflows:\n{source}"));
+        }
+        Ok(fits)
+    })
+}
+
+fn operand(tape: &Tape) -> &'static str {
+    pick(tape, &["a", "b", "v.len()", "1", "2", "63", "64", "1000"], "operand")
+}
+
+fn arith_guard(tape: &Tape) -> String {
+    match below(tape, 6, "guard") {
+        0 => format!("{} < {}", operand(tape), operand(tape)), // alloc: a test's text
+        1 => format!("{} <= {}", operand(tape), operand(tape)), // alloc: a test's text
+        2 => "a < 1000 && b < 1000".to_owned(),                // alloc: a test's text
+        3 => "b < 64".to_owned(),                              // alloc: a test's text
+        _ => {
+            let relation = pick(tape, &["<", "<=", ">", ">=", "!=", "=="], "relation");
+            format!("{} {relation} {}", linear(tape), linear(tape)) // alloc: a test's text
+        }
+    }
+}
+
+fn arith_site(tape: &Tape) -> String {
+    let op = pick(tape, &["+", "-", "*", "<<", ">>"], "op");
+    // alloc: a test's text
+    match below(tape, 4, "site") {
+        0 => format!("{} {op} {} {} {}", operand(tape), operand(tape), pick(tape, &["+", "-"], "second op"), operand(tape)),
+        1 => format!("{{ let mut x = {}; x {op}= {}; x }}", operand(tape), operand(tape)),
+        _ => format!("{} {op} {}", operand(tape), operand(tape)),
+    }
+}
+
+fn drawn_arith(tape: &Tape) -> Arith {
+    let ends = [0, 1, 2, 3, 63, 64, 999, usize::MAX / 2, usize::MAX - 1, usize::MAX];
+    Arith {
+        guards: (0..below(tape, 4, "guards")).map(|_| arith_guard(tape)).collect(),
+        site: arith_site(tape),
+        len: below(tape, 5, "len"),
+        a: ends[below(tape, ends.len() as u32, "a") as usize],
+        b: ends[below(tape, ends.len() as u32, "b") as usize],
+    }
+}
+
+/// The invariant: an operation `overflow_of_body` shows fits does not overflow when the
+/// evaluator runs it with overflow checks, and the proof is the same in both profiles.
+/// Random guards over `a`, `b` and the length around a random `+ - * << >>`, plain or
+/// compound, random arguments at the ends of `usize`.
+#[test]
+fn an_operation_shown_to_fit_does_not_overflow() {
+    blaze_sim::check(Config::cases(150), |tape| {
+        let program = drawn_arith(tape);
+        if let Err(what) = check_overflow(&program) {
+            panic!("{what}");
+        }
+    })
+}
+
+fn arith(guards: &[&str], site: &str, a: usize, b: usize) -> Arith {
+    Arith {
+        guards: guards.iter().map(|it| (*it).to_owned()).collect(), // alloc: a test's text
+        site: site.to_owned(),                                      // alloc: a test's text
+        len: 2,
+        a,
+        b,
+    }
+}
+
+/// The oracle sees both sides: a guarded `+` is shown to fit and runs; the same `+` bare is
+/// not shown, and its run with overflow checks panics.
+#[test]
+fn the_overflow_oracle_tells_a_guarded_add_from_a_bare_one() {
+    let guarded = arith(&["a < 1000 && b < 1000"], "a + b", usize::MAX, 1);
+    assert_eq!(check_overflow(&guarded), Ok(true));
+    let bare = arith(&[], "a + b", usize::MAX, 1);
+    assert_eq!(check_overflow(&bare), Ok(false));
+    let shift = arith(&["b < 64"], "a << b", 1, 63);
+    assert_eq!(check_overflow(&shift), Ok(true));
+}
+
+/// The control: with a bug planted that takes every `+` to fit, `a + b` at `usize::MAX` is
+/// shown to fit, and the oracle refuses it.
+#[test]
+fn the_overflow_oracle_catches_an_add_taken_to_fit() {
+    let bare = arith(&[], "a + b", usize::MAX, 1);
+    reach::PLANT_ADD_ALWAYS_FITS.set(true);
+    let caught = check_overflow(&bare);
+    reach::PLANT_ADD_ALWAYS_FITS.set(false);
+    let Err(what) = caught else { panic!("the planted bug was not caught: {caught:?}") };
+    assert!(what.contains("shown to fit, and the run overflows"), "{what}");
 }

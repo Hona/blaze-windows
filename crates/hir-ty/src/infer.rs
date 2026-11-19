@@ -988,7 +988,7 @@ fn trait_item_struct_path_def(db: &Db, trait_: TraitId, name: &Name) -> Option<S
 impl InferenceDiagnostic {
     /// Whether this is an error that leaves the body tainted by errors, like rustc's
     /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
-    pub(crate) fn taints_body(&self) -> bool {
+    pub fn taints_body(&self) -> bool {
         let is_lint = |diag: &PathLoweringDiagnostic| {
             matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
         };
@@ -1246,7 +1246,6 @@ pub enum PointerCast {
     /// Go from a mut raw pointer to a const raw pointer.
     MutToConstPointer,
 
-    #[allow(dead_code)]
     /// Go from `*const [T; N]` to `*const T`
     ArrayToPointer,
 
@@ -1413,6 +1412,14 @@ pub struct InferenceResult<'db> {
 }
 
 impl InferenceResult<'_> {
+    /// Creating this closure as a function pointer evaluates no user code and reads no
+    /// enclosing local. Its body runs when the pointer is called, not when it is made.
+    pub fn constant_closure_pointer(&self, expr: ExprId) -> bool {
+        matches!(self.expr_adjustments.get(&expr).unwrap_or_default(),
+            [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }])
+            && self.closures_data.get(&expr).is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+    }
+
     /// The heap bytes dropping the result frees, not its own size: every column's buffers by
     /// their length, the boxed lists of unstable candidates, and each closure's captures and
     /// fake reads. Interned and shared values (types, generic arguments, predicates, symbols)
@@ -2634,6 +2641,10 @@ impl<'db, 'f> TupleFieldTypes<'db, 'f> {
 
     /// The place of `tys`, which is added at the end if it is new: `IndexSet::insert_full`'s
     /// index.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "tuple-type places are u32 in the inference record; a body with 2^32 tuple types needs a typed refusal from inference"
+    )]
     pub(crate) fn insert(&mut self, tys: Tys<'db>) -> u32 {
         let TupleFieldTypes { tys: list, places } = self;
         *places.entry(tys).or_insert_with(|| {

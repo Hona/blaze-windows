@@ -1,0 +1,47 @@
+name: Windows compiler regressions
+on:
+  push:
+    branches: [windows/int, windows/int-sync, 'windows/compiler-check/*']
+permissions:
+  contents: read
+jobs:
+  regressions:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.5'
+      - name: Verify row directory commit, derived impl publication and const backing storage
+        run: |
+          foreach ($case in @(
+              @('blaze-graph','a_held_reader_does_not_own_the_core_its_writer_needs'),
+              @('blaze-query','an_absent_row_page_does_not_commit_an_ingredients_directory'),
+              @('hir-ty','an_expansion_adding_only_an_unnamed_const_publishes_its_trait_impl'),
+              @('hir-ty-mir','a_reference_to_part_of_an_allocation_keeps_all_of_it'),
+              @('hir-ty-pure','saturating_by_conclusion_is_saturating_by_premise'),
+              @('hir-ty-pure','a_join_proves_a_shared_premise_once_and_propagates_backwards'),
+              @('hir-ty-pure','a_wide_dispatch_proof_scales'),
+              @('hir-ty-pure','a_join_forgets_the_implications_of_values_gone'),
+              @('hir-ty-pure','a_body_with_no_loop_walks_each_block_once'),
+              @('hir-ty-pure','a_loop_after_the_dispatch_does_not_rejoin_each_partial_arm'),
+              @('hir-ty-pure','iterating_recursive_effects_proves_the_instance_sites_only_once'),
+              @('hir-ty-pure','work_grows_near_linearly_with_the_body'))) {
+            $crate, $filter = $case
+            $result = cargo test --locked --lib -p $crate $filter -- --show-output --test-threads=1
+            $status = $LASTEXITCODE
+            $result
+            if ($status -or -not ($result -match 'test result: ok\. 1 passed;')) { throw "$crate $filter failed or selected no test" }
+          }

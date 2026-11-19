@@ -28,7 +28,7 @@ use crate::serve::work::Failed;
 
 /// What the job says of its linted packages' items over every configuration they were
 /// checked in, `ok` whether every unit built, `built` the units it built.
-pub(super) fn report(job: &Job, reader: Option<UnitReader>, ok: bool, built: &[u32]) -> Result<Vec<Diagnostic>, ApiError> {
+pub(super) fn report(job: &Job, reader: impl FnOnce() -> Result<UnitReader, ApiError>, ok: bool, built: &[u32]) -> Result<Vec<Diagnostic>, ApiError> {
     let mut linted: Vec<(&str, String, usize)> = Vec::new(); // alloc: once per job, a row per linted unit
     for &unit in built {
         let unit = unit as usize;
@@ -50,10 +50,7 @@ pub(super) fn report(job: &Job, reader: Option<UnitReader>, ok: bool, built: &[u
                 .to_owned(),
         )]);
     }
-    let Some(reader) = reader else {
-        let what = "the lints over every configuration are given with no task reading the front end, and one still does";
-        return Err(ApiError::new(what, None));
-    };
+    let reader = reader()?;
     linted.sort();
     let db = reader.db();
     let mut said: Vec<(u32, blaze_diagnostics::Diag)> = Vec::new(); // alloc: once per job

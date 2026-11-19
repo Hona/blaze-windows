@@ -4,7 +4,7 @@
 //! `DEP_<links>_<KEY>` of the runs it depends on), its result kept in the store by what it read
 //! ([`blaze_usercode::run`]), a script that provably prints only constants not run at all
 //! ([`blaze_usercode::script::inert`]), and what it printed applied as cargo applies it: its
-//! cfgs and env to its package's units through the job's writer ([`Writer::ran`]), its link
+//! cfgs and env to its package's units through the job's writer ([`Asks::ran`]), its link
 //! libraries and search paths to what links them, its metadata to its dependents' scripts.
 //!
 //! A run outside the sandbox is one `BLAZE_SANDBOX=off` or the workspace's
@@ -46,12 +46,12 @@ use blaze_usercode::{
 };
 
 use super::{
-    Job, Real, UnitWriter,
+    Job, Real,
     error::{UnitError, manifest_dir},
     package_of, say,
 };
 use crate::serve::native::NativeDir;
-use crate::serve::work::{RunPuts, Runs, Writer};
+use crate::serve::work::{Asks, Looked, RunPuts, Runs, Seen};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
 /// what elision said of it: `verify`, or unset.
@@ -102,6 +102,8 @@ fn rechecks_in(env: &[(String, String)]) -> Result<bool, ApiError> {
 /// What a build script's run told cargo, for what depends on it.
 #[derive(Debug)]
 pub(crate) struct Applied {
+    #[cfg(windows)]
+    pub(crate) result: blaze_ids::ContentId,
     /// The run's package.
     pub(crate) package_id: String,
     pub(crate) links: Option<String>,
@@ -154,12 +156,19 @@ fn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {
     }
     let units = job.units();
     let Some(u) = units.graph.units.get(compile) else { return Ok(None) };
-    let root = u.target.src_path.to_string_lossy().into_owned();
+    let root = script_root(&u.target.src_path);
     // A root file whose bytes fail their check stopped the job as it was lowered.
-    let Ok(Some((_, _, bytes))) = job.mounted.read(&root) else { return Ok(None) };
+    let Some((_, _, bytes)) = job.mounted.read(&root).map_err(|why| format!("reading build script {root}: {why}"))? else { return Ok(None) };
     let Some(plan) = units.plans.get(compile) else { return Ok(None) };
-    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
-    Ok(script::inert(Path::new(&root), &files, &plan.rustflags))
+    let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(root.as_ref()), bytes.to_vec())].into();
+    Ok(script::inert(Path::new(root.as_ref()), &files, &plan.rustflags))
+}
+
+/// A target's `src_path` is a daemon name, but its PathBuf may have acquired a native
+/// separator on the join with the target's relative path. Mounted reads use `/`.
+fn script_root(path: &Path) -> std::borrow::Cow<'_, str> {
+    let root = path.to_string_lossy();
+    if cfg!(windows) && root.contains('\\') { root.replace('\\', "/").into() } else { root }
 }
 
 /// What std's own build script compiled by unit `compile` prints, from blaze's port of it
@@ -173,9 +182,7 @@ fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
         units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
     let package = package_of(units, u).map_err(|it| it.what)?;
     let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
-    let root = u.target.src_path.to_string_lossy();
-    // On Windows a `Path::join` puts a `\` in the daemon's `/`-separated names.
-    let root = if cfg!(windows) { root.replace('\\', "/").into() } else { root };
+    let root = script_root(&u.target.src_path);
     let read = |path: &str| match job.mounted.read(path) {
         Ok(Some((_, _, bytes))) => Ok(bytes),
         Ok(None) => Err(format!("{path} is not among the build's files")),
@@ -213,11 +220,7 @@ fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsStrin
         native: &job.input.native,
     };
     let unit = script_unit(&of, run)?;
-    let env = inherited(
-        &job.input.config.invocation.env,
-        job.plan(run).map_err(|it| it.what)?,
-        !outside(job, run),
-    );
+    let env = started_in(job, run, &unit)?;
     let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
     Ok((unit, vars))
 }
@@ -302,7 +305,8 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .out_dir
         .clone()
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
-    let manifest_path = PathBuf::from(&package.manifest_path);
+    // The script sees the system's paths: the daemon's names (/C:/a on Windows) turned so.
+    let manifest_path = blaze_core::platform::path::host(&package.manifest_path);
     let manifest_dir =
         manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
     let targets = targets(units, &unit.pkg_id);
@@ -315,8 +319,20 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     };
     let target = triple_of(unit, of.host).to_owned();
     let config_env = native_env(of, &package.name, &target, &unit.features)?;
-    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
-    let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
+    // The run's kind's rustflags, as its plan gives them to the script (cargo's
+    // `CARGO_ENCODED_RUSTFLAGS`; a run compiles nothing, so its plan's own `rustflags` are
+    // none), and the cfg cargo's probe of the kind gives with them (`TargetInfo`'s `--print
+    // cfg`, which asks as for a proc macro too): `CARGO_CFG_TARGET_FEATURE` has `crt-static`
+    // when the flags turn it on, so `cc` compiles with `/MT`.
+    let run_flags: Vec<String> = var(plan, "CARGO_ENCODED_RUSTFLAGS")
+        .filter(|it| !it.is_empty())
+        .map(|it| it.split('\x1f').map(str::to_owned).collect())
+        .unwrap_or_default();
+    let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&run_flags)?;
+    let target_cfgs = blaze_units::stdlib::target::target_cfg(
+        &target,
+        &blaze_units::stdlib::target::CfgArgs { proc_macro: true, ..cfg_args },
+    )?;
     let profile = &unit.profile;
     let release = var(plan, "PROFILE").ok_or_else(|| {
         UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string()
@@ -339,7 +355,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         })
         .collect::<Result<_, String>>()?;
     // `<profile>/build/<package>-<hash>/out`, or `<profile>/build/<package>/<hash>/out`.
-    let profile_dir = Path::new(&out_dir)
+    let profile_dir = blaze_core::platform::path::host(&out_dir)
         .ancestors()
         .find(|it| it.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
@@ -393,10 +409,10 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         target,
         host: of.host.to_owned(),
         target_cfgs,
-        rustflags: plan.rustflags.clone(),
+        rustflags: run_flags,
         jobs,
         script: of.program.clone(),
-        out_dir: PathBuf::from(&out_dir),
+        out_dir: blaze_core::platform::path::host(&out_dir),
         tools: bs::Tools {
             cargo: of.launcher.to_path_buf(),
             rustc: exe("rustc"),
@@ -467,6 +483,11 @@ pub(crate) const TEMP_NAMES: &[&str] = &["NIX_BUILD_TOP", "TEMP", "TEMPDIR", "TM
 
 /// What a sandboxed run's [`TEMP_NAMES`] but `TMPDIR` are: the sandbox's own empty `/tmp`, the
 /// same in every shell.
+#[expect(
+    blaze::tmp_path,
+    reason = "inside the sandbox /tmp is its own empty directory, the same in every shell, so a \
+              run's temporary variables name it by that path"
+)]
 pub(crate) const SANDBOX_TEMP: &str = "/tmp";
 
 /// The environment a script is started in: the job's whole environment but [`JOB_ONLY`], what
@@ -497,6 +518,102 @@ pub(crate) fn inherited(
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
 
+/// The environment run `run`, of script `unit`, is started in: [`inherited`], and on Windows,
+/// for a sandboxed script built for an MSVC target when the job's environment is not a
+/// developer prompt's (it has no `VCINSTALLDIR`), that prompt's variables over it, its `PATH`
+/// in front of the job's ([`blaze_core::platform::msvc`]): in the AppContainer a C compiler can
+/// find Visual Studio by them alone. An unsandboxed run finds it as it would outside blaze.
+pub(crate) fn started_in(
+    job: &Job,
+    run: usize,
+    unit: &bs::Unit,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let sandboxed = !outside(job, run);
+    #[cfg_attr(not(windows), expect(unused_mut, reason = "only Windows adds to it"))]
+    let mut env = inherited(
+        &job.input.config.invocation.env,
+        job.plan(run).map_err(|it| it.what)?,
+        sandboxed,
+    );
+    #[cfg(windows)]
+    if sandboxed {
+        developer_prompt(job, unit, &mut env)?;
+        // The stand-in is a link under the daemon's state directory, not beside its std
+        // sources; the AppContainer also has its own LOCALAPPDATA. Give it the daemon's std.
+        let std = crate::toolchain::library::found()?;
+        env.retain(|(name, _)| !name.eq_ignore_ascii_case(crate::toolchain::library::VAR));
+        env.push((crate::toolchain::library::VAR.into(), std.dir.as_os_str().to_owned()));
+    }
+    #[cfg(not(windows))]
+    let _ = unit;
+    Ok(env)
+}
+
+/// [`started_in`]'s developer prompt, set over `env`.
+#[cfg(windows)]
+fn developer_prompt(
+    job: &Job,
+    unit: &bs::Unit,
+    env: &mut Vec<(OsString, OsString)>,
+) -> Result<(), String> {
+    use blaze_core::platform::msvc;
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let Some(target) = msvc::targets(&unit.target).then(|| msvc::arch(&unit.target)).flatten()
+    else {
+        return Ok(());
+    };
+    if named(env, "VCINSTALLDIR").is_some() {
+        return Ok(());
+    }
+    let host = msvc::arch(std::env::consts::ARCH)
+        .ok_or_else(|| format!("blaze runs on {}, which has no MSVC tools", std::env::consts::ARCH))?;
+    let developer = job.msvc.get_or_init(|| {
+        let _span = tracing::info_span!(target: "blaze", "build script: discover the MSVC installation").entered();
+        msvc::find()
+    }).as_ref().map_err(|why| {
+        format!(
+            "the build script of `{}` for {} is started with a Visual Studio developer prompt's \
+             variables, as the sandbox can't find Visual Studio on its own, and {why}",
+            unit.package.name, unit.target
+        )
+    })?;
+    prompted(env, developer, host, target)
+}
+
+/// `env` with `developer`'s prompt for `host` and `target` over it. The job's `PATH`, under
+/// whatever case of its name the job gave it (`Path`, as Windows keeps it), is the prompt's tail
+/// and keeps that name, as every name the prompt sets replaces the job's of any case: Windows
+/// reads a name in any case, and of two that differ only so a program sees one.
+#[cfg(windows)]
+fn prompted(
+    env: &mut Vec<(OsString, OsString)>,
+    developer: &blaze_core::platform::msvc::Developer,
+    host: &str,
+    target: &str,
+) -> Result<(), String> {
+    let named = |env: &[(OsString, OsString)], name: &str| {
+        env.iter().position(|(it, _)| it.eq_ignore_ascii_case(name))
+    };
+    let (path_name, path) = match named(env, "PATH") {
+        Some(at) => {
+            let (name, value) = env.swap_remove(at);
+            (name, Some(value))
+        }
+        None => ("PATH".into(), None),
+    };
+    for (name, value) in developer.variables(host, target, path.as_ref())? {
+        let name = if name == "PATH" { path_name.clone() } else { name };
+        if let Some(at) = named(env, &name.to_string_lossy()) {
+            env.swap_remove(at);
+        }
+        env.push((name, value));
+    }
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
 /// How a run ended, judged as cargo judges it.
 #[derive(Debug)]
 pub(crate) struct Judged {
@@ -523,15 +640,25 @@ pub(crate) fn script_at(unit: &bs::Unit) -> Text {
 
 /// What a sandboxed script may print, checked before cargo reads it
 /// ([`crate::directives`]); `None` when it may print it all.
-pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<Report> {
+pub(crate) fn refused(
+    unit: &bs::Unit,
+    env: &[(OsString, OsString)],
+    stdout: &[u8],
+    link_dirs: &[PathBuf],
+) -> Option<Report> {
     // The store of pinned native inputs of the home this daemon lays them out in
     // ([`super::Real`]'s `native`): the same variables decide both.
-    let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
+    let native = blaze_manifest::user_config::home().ok().map(|it| it.join(crate::serve::native::NATIVE));
+    let windows = unit.host.contains("windows");
+    let system = if windows { crate::directives::windows_system_dirs(env) } else { Vec::new() };
     let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
         native: native.as_deref(),
+        system: &system,
+        msvc: unit.target.ends_with("-windows-msvc"),
+        windows,
     };
     let refused = crate::directives::refused(stdout, &ran);
     (!refused.is_empty())
@@ -573,7 +700,7 @@ pub(crate) fn judge(
         Ok(output) => {
             let diagnostics = warnings(&output.log_messages);
             if let Some(link_dirs) = checked
-                && let Some(report) = refused(unit, &value.stdout, link_dirs)
+                && let Some(report) = refused(unit, env, &value.stdout, link_dirs)
             {
                 return Judged { output: None, diagnostics, failure: Some(report) };
             }
@@ -685,14 +812,21 @@ fn checkout_without_git(dir: &Path, stderr: &[u8]) -> Option<PathBuf> {
     if !stderr.windows(SAID.len()).any(|it| it == SAID) {
         return None;
     }
-    let root = dir.ancestors().find(|root| {
+    let root = git_checkout(dir)?;
+    (!root.join(".git").exists()).then(|| root.to_owned())
+}
+
+/// The root of blaze's checkout of a git dependency that the package directory `dir` is in:
+/// `<sources>/git/checkouts/<ident>/<commit>`, the commit's whole tree
+/// ([`crate::serve::fetch::keep_on_disk`]).
+fn git_checkout(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|root| {
         let commit = root.file_name().and_then(|it| it.to_str()).is_some_and(|it| {
             matches!(it.len(), 40 | 64) && it.bytes().all(|it| it.is_ascii_hexdigit())
         });
         commit
             && root.parent().and_then(Path::parent).is_some_and(|it| it.ends_with("git/checkouts"))
-    })?;
-    (!root.join(".git").exists()).then(|| root.to_owned())
+    })
 }
 
 /// `report` with the last [`TAIL`] lines of `text` that are not cargo directives, each a fact
@@ -724,12 +858,14 @@ pub(crate) fn executed(package_id: &str, output: &Output, out_dir: &str) -> Buil
 
 /// The files a run left in its `OUT_DIR`, by `/`-separated path under it, moved out of its
 /// value. A directory (no bytes) is no file: it is there on disk, which the run restored.
-fn out_files(files: Vec<OutFile>) -> Vec<(String, Vec<u8>)> {
+/// The files of a run's result as the front end applies them ([`blaze_lower::Ran::files`]):
+/// each the result's own bytes, shared, never a copy.
+fn out_files(files: Vec<OutFile>) -> Vec<(String, Arc<[u8]>)> {
     files.into_iter().filter_map(|file| Some((file.path, file.bytes?))).collect()
 }
 
 /// Every file under `dir`, by `/`-separated path: what a run outside the sandbox left.
-fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn walk(dir: &Path) -> Result<Vec<(String, Arc<[u8]>)>, String> {
     let mut out = Vec::new();
     let mut pending = vec![PathBuf::new()];
     while let Some(rel) = pending.pop() {
@@ -754,7 +890,9 @@ fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             } else if kind.is_file() {
                 let bytes = std::fs::read(entry.path())
                     .map_err(|error| format!("{}: {error}", entry.path().display()))?;
-                out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+                // alloc: once a file, its bytes moved into the one allocation the front end
+                // shares (the read buffer let go)
+                out.push((rel.to_string_lossy().replace('\\', "/"), Arc::<[u8]>::from(bytes)));
             }
         }
     }
@@ -782,14 +920,20 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
-        How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
+        How::Sandboxed(prepared) if !matches!(prepared.spec.mode, blaze_usercode::run::Mode::Normal | blaze_usercode::run::Mode::Declared { verify: false, .. }) => {
             false
         }
         How::Sandboxed(prepared) => {
             let guard = blaze_cas::enter();
             // Every input the kept run is checked against is asked through this: what a
             // hit read by its bytes is noted for the no-op lane ([`ReadBytes`]).
-            let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default() };
+            let units = job.units();
+            let roots = [
+                Path::new(units.target_dir.as_str()),
+                Path::new(units.build_dir.as_str()),
+                Path::new(job.input.config.std.as_str()),
+            ];
+            let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default(), roots };
             let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut noting);
             let hit = matches!(
                 blaze_usercode::index::find(
@@ -801,6 +945,11 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
                 Ok(blaze_usercode::index::Found::Hit { .. })
             );
             if hit {
+                // Cargo declarations suffice for Cargo-rule replay, not a claim about all
+                // reads by the sandboxed child in a whole-request certificate.
+                if matches!(prepared.spec.mode, blaze_usercode::run::Mode::Declared { .. }) {
+                    noting.read.unseen = Some(prepared.spec.command.dir.clone());
+                }
                 job.script_reads.lock().note(unit, noting.read);
             }
             hit
@@ -823,6 +972,43 @@ pub(crate) struct ReadBytes {
     /// A run hashed everything below a directory (`rerun-if-changed` of one, or a package
     /// whole): any file may be under it.
     pub(crate) trees: bool,
+    /// The variables the runs were checked against by name: each one a kept run, or a
+    /// program it started, asked for (`env::var`, `getenv`; a `rerun-if-env-changed`). What
+    /// the no-op lane compares of the request's environment for the scripts' sake, beside
+    /// what a walk of the environment sees (`UnitWriter::env_named`). A name that is not
+    /// text names no variable of a request, whose environment is text.
+    pub(crate) env: Vec<String>,
+    /// Each file the runs were checked against that is under one of the build's directories
+    /// (its target and build directories, the standard library's builds), there or not: a
+    /// change heard at one is never another request's output placed beside this build's
+    /// (`UnitWriter::read_outside`).
+    pub(crate) paths: Vec<std::path::PathBuf>,
+    /// Each directory under or above one of those that a run listed, looked at or hashed
+    /// whole: any path under it is one the run read.
+    pub(crate) listed: Vec<std::path::PathBuf>,
+    /// Every read of the machine's files the noted runs' records rest on, wherever it is
+    /// (under the checkout, under the build's directories, a system header), with what was
+    /// there when the record held: what a request certificate names of a build script
+    /// (`UnitWriter::read_seen`). For a run found kept: each question its check asked the
+    /// disk and the answer the hit rests on ([`Noting`]). For a run that ran: its trace
+    /// ([`ReadBytes::note_ran`]).
+    ///
+    /// The invariant: every input of a noted run that is neither here nor in [`ReadBytes::env`]
+    /// is a function of the request's base. A record's key is its run key (the script's
+    /// code and what the plan gave it: its arguments, its given variables, its roots, all
+    /// made from the config and the units before it) and each name of its shape with its
+    /// value. A shape's names are: files, listings and trees, every one asked of the disk
+    /// through [`Noting`] and so here; marks, answered with a root's path, the plan's;
+    /// variables asked by name, in `env`; the walk of the environment, a fixed set every
+    /// certificate compares (`serve::job::read_unasked`); and what cannot be traced (the
+    /// clock, randomness), which the record is kept in spite of and a build finds it kept
+    /// with. What a script read that its trace did not see is in neither: that is the
+    /// sandbox's hole, not this list's, and the run's own record has it too.
+    pub(crate) seen: Vec<Seen>,
+    /// A directory a noted run's check walked by a question no [`Looked`] is of (its names
+    /// or one entry, asked on their own): the run's reads are not all in `seen`, and no
+    /// certificate is written of its build.
+    pub(crate) unseen: Option<std::path::PathBuf>,
 }
 
 impl ReadBytes {
@@ -835,6 +1021,63 @@ impl ReadBytes {
         self.runs.push(unit as u32);
         self.names.extend(read.names);
         self.trees |= read.trees;
+        self.env.extend(read.env);
+        self.paths.extend(read.paths);
+        self.listed.extend(read.listed);
+        self.seen.extend(read.seen);
+        if self.unseen.is_none() {
+            self.unseen = read.unseen;
+        }
+    }
+
+    /// Run `unit` ran and its result is kept under what it read, `traced`, by real paths:
+    /// its reads are noted at the values its record holds them at, as [`fresh`] notes a kept
+    /// run's. A tree hashed whole is a path [`blaze_usercode::trace::walked`] reads back; a
+    /// tree or a listing that was no directory is among the files, with nothing there, as
+    /// `blaze_usercode::index::Shape::values` has it.
+    fn note_ran(&mut self, unit: usize, traced: &blaze_core::Traced) {
+        if self.noted(unit) {
+            return;
+        }
+        self.runs.push(unit as u32);
+        for (path, hash) in &traced.files {
+            match blaze_usercode::trace::walked(path) {
+                Some((dir, package)) => {
+                    self.trees = true;
+                    // alloc: a path, once a tree a run read
+                    self.seen.push(Seen { how: Looked::Tree { package }, path: dir.to_owned(), hash: *hash });
+                }
+                None => {
+                    if let Some(name) = path.file_name().and_then(|it| it.to_str())
+                        && name.ends_with(".rs")
+                    {
+                        self.names.push(name.to_owned()); // alloc: a name, once a Rust file a run read
+                    }
+                    // clone: a path, once a file a run read
+                    self.seen.push(Seen { how: Looked::File, path: path.clone(), hash: *hash });
+                }
+            }
+        }
+        for (path, hash) in &traced.dirs {
+            let (how, at) = match blaze_usercode::trace::walked(path) {
+                Some((dir, package)) => {
+                    self.trees = true;
+                    (Looked::Tree { package }, dir)
+                }
+                None => (Looked::Listing, path.as_path()),
+            };
+            // alloc: a path, once a directory a run read
+            self.seen.push(Seen { how, path: at.to_owned(), hash: Some(*hash) });
+        }
+        for (name, _) in &traced.env {
+            // The walk's own entry names no variable; a name that is not text names none of
+            // a request, whose environment is text.
+            if let Some(name) = name.to_str()
+                && name != blaze_usercode::trace::ALL_ENV_NAME
+            {
+                self.env.push(name.to_owned()); // alloc: a name, once a variable a run read
+            }
+        }
     }
 
     /// Whether the reads of run `unit` are noted.
@@ -853,6 +1096,26 @@ impl ReadBytes {
 struct Noting<'a, I> {
     inner: &'a mut I,
     read: ReadBytes,
+    /// The build's directories: its target and build directories and the standard
+    /// library's builds. A path read under one is noted ([`ReadBytes::paths`]).
+    roots: [&'a Path; 3],
+}
+
+impl<I> Noting<'_, I> {
+    /// A file asked of at `path`: noted when it is under one of the build's directories.
+    fn file_at(&mut self, path: &Path) {
+        if self.roots.iter().any(|root| path.starts_with(root)) {
+            self.read.paths.push(path.to_owned()); // alloc: a path, once a file a kept run read there
+        }
+    }
+
+    /// A directory listed, looked at or hashed whole at `path`: noted when it is under one of
+    /// the build's directories, or above one.
+    fn listed_at(&mut self, path: &Path) {
+        if self.roots.iter().any(|root| path.starts_with(root) || root.starts_with(path)) {
+            self.read.listed.push(path.to_owned()); // alloc: a path, once a directory a kept run listed there
+        }
+    }
 }
 
 impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<'_, I> {
@@ -865,19 +1128,32 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
         {
             self.read.names.push(name.to_owned()); // alloc: a name, once a Rust file a kept run read
         }
-        self.inner.file(path)
+        self.file_at(path);
+        let hash = self.inner.file(path)?;
+        // alloc: a path, once a file a kept run read
+        self.read.seen.push(Seen { how: Looked::File, path: path.to_owned(), hash });
+        Ok(hash)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, I::Error> {
         // A listing's names, no file's bytes.
-        self.inner.dir(path)
+        self.listed_at(path);
+        let hash = self.inner.dir(path)?;
+        // alloc: a path, once a directory a kept run listed
+        self.read.seen.push(Seen { how: Looked::Listing, path: path.to_owned(), hash });
+        Ok(hash)
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
+        if let Some(name) = name.to_str() {
+            self.read.env.push(name.to_owned()); // alloc: a name, once a variable a kept run read
+        }
         self.inner.env(name)
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
+        // What a walk of the environment sees is a fixed set, compared for every answer
+        // (`serve::job::read_unasked`): nothing to note.
         self.inner.env_all()
     }
 
@@ -887,17 +1163,32 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
         out: &mut blaze_usercode::trace::Names<'_>,
     ) -> Result<bool, I::Error> {
         self.read.trees = true;
+        self.listed_at(path);
+        // Asked on its own (not inside the inner's walk of a tree): no read names it.
+        if self.read.unseen.is_none() {
+            self.read.unseen = Some(path.to_owned()); // alloc: a path, once a run
+        }
         self.inner.names(path, out)
     }
 
     fn entry(&mut self, path: &Path) -> Result<blaze_usercode::trace::Entry, I::Error> {
         self.read.trees = true;
+        self.listed_at(path);
+        // As `names`.
+        if self.read.unseen.is_none() {
+            self.read.unseen = Some(path.to_owned()); // alloc: a path, once a run
+        }
         self.inner.entry(path)
     }
 
     fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, I::Error> {
         self.read.trees = true;
-        self.inner.tree(dir, package)
+        self.listed_at(dir);
+        // The inner walks the tree itself: one read, by its hash.
+        let hash = self.inner.tree(dir, package)?;
+        // alloc: a path, once a tree a kept run hashed
+        self.read.seen.push(Seen { how: Looked::Tree { package }, path: dir.to_owned(), hash });
+        Ok(hash)
     }
 }
 
@@ -943,7 +1234,7 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
         .ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
     plan.outputs
         .first()
-        .map(PathBuf::from)
+        .map(|it| blaze_core::platform::path::host(it))
         .ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
 }
 
@@ -954,21 +1245,59 @@ pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, Ap
 /// ([`blaze_usercode::roots::verify`]). blaze's own sources directory
 /// ([`blaze_units::query::BuildConfig::sources`]), where every registry and git package is
 /// kept, is machine-wide: a run that read there outside its own package can still be shared
-/// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's.
+/// with another checkout. Never `$CARGO_HOME`: a build reads nothing of cargo's. Each look
+/// at the disk resolving a root's links makes is the build's own
+/// ([`crate::serve::work::JobInput::looks`]).
 pub(crate) fn build_roots(job: &Job) -> RootMap {
+    let looks = &job.input.looks;
     RootMap::default()
-        .with(Role::Target, Path::new(&job.units().target_dir))
-        .with(Role::Workspace, Path::new(&job.input.config.invocation.root))
-        .with(Role::Tools, &job.shared.tools)
-        .with(Role::Launcher, &job.shared.launcher)
+        .with(Role::Target, &blaze_core::platform::path::host(&job.units().target_dir), looks)
+        .with(Role::Workspace, Path::new(&job.input.config.invocation.root), looks)
+        .with(Role::Tools, &job.shared.tools, looks)
+        .with(Role::Launcher, &job.shared.launcher, looks)
         .with_sources(Path::new(&job.input.config.sources))
 }
 
 /// [`build_roots`] with `unit`'s own: what [`script::prepare`] gives its run.
 pub(crate) fn run_roots(job: &Job, unit: &bs::Unit) -> RootMap {
     build_roots(job)
-        .with(Role::Package, &unit.package.manifest_dir)
-        .with(Role::OutDir, &unit.out_dir)
+        .with(Role::Package, &unit.package.manifest_dir, &job.input.looks)
+        .with(Role::OutDir, &unit.out_dir, &job.input.looks)
+}
+
+/// The source payload containing `package`, if Blaze fetched it. A Git dependency's
+/// payload is its checkout: a member may read assets beside it. A registry package is
+/// one archive. Never walk up looking for `.git` on disk or leave the verified payload.
+#[cfg(windows)]
+fn fetched_input(sources: &Path, package: &Path) -> Option<PathBuf> {
+    use std::path::Component::Normal;
+    let mut parts = package.strip_prefix(sources).ok()?.components();
+    let (Some(Normal(kind)), Some(Normal(sub)), Some(Normal(index)), Some(Normal(revision))) =
+        (parts.next(), parts.next(), parts.next(), parts.next()) else { return None };
+    if parts.any(|p| !matches!(p, Normal(_))) { return None; }
+    ((kind == "git" && sub == "checkouts") || (kind == "registry" && sub == "src"))
+        .then(|| sources.join(kind).join(sub).join(index).join(revision))
+}
+
+/// Bundled native sources may live in a build-dependency: its code, inside the script,
+/// opens files relative to its own compile-time CARGO_MANIFEST_DIR (e.g. luau0-src).
+#[cfg(windows)]
+fn script_inputs(job: &Job, compile: usize, read: &mut Vec<PathBuf>) -> Result<(), ApiError> {
+    let units = job.units();
+    let sources = blaze_core::platform::path::host(&job.input.config.sources);
+    let mut seen = vec![false; units.graph.units.len()]; // alloc: visit each compiled dependency once
+    let mut pending = vec![compile]; // alloc: the script's dependency walk
+    while let Some(index) = pending.pop() {
+        let unit = job.unit(index)?;
+        if std::mem::replace(&mut seen[index], true) { continue; }
+        let package = package_of(units, unit)?;
+        let dir = manifest_dir(&package.name, &package.manifest_path)?;
+        if let Some(input) = fetched_input(&sources, &dir) { read.push(input); }
+        pending.extend(unit.dependencies.iter().map(|dep| dep.index));
+    }
+    let std = crate::toolchain::library::found().map_err(|why| ApiError::new(why, None))?;
+    read.push(std.dir.clone()); // clone: the launch spec owns its roots
+    Ok(())
 }
 
 /// Run `run` ready to begin; none while its script is not built.
@@ -996,7 +1325,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         },
     };
     let script_path = match &program {
-        Some((path, _)) => PathBuf::from(path),
+        Some((path, _)) => blaze_core::platform::path::host(path),
         None => named_program(units, compile)?,
     };
     let of = Of {
@@ -1010,18 +1339,57 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let unit = script_unit(&of, run)
         .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    let env = inherited(&job.input.config.invocation.env, job.plan(run)?, !outside(job, run));
+    let env = started_in(job, run, &unit)
+        .map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let Some((_, code)) = program else {
-        let disk = blaze_usercode::inputs::Disk::new(Vec::new());
+        let disk = blaze_usercode::inputs::Disk::new(Vec::new(), &job.input.looks);
         return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
-        PathBuf::from(&job.input.config.invocation.root),
-        PathBuf::from(&units.target_dir),
         job.shared.launcher.clone(),
         job.shared.tools.clone(),
     ];
+    // Don't grant a Windows script the entire mutable workspace or build tree under
+    // a package-scoped key. Sibling inputs require a separately keyed read grant.
+    if !cfg!(windows) {
+        read.push(blaze_core::platform::path::host(&job.input.config.invocation.root));
+        read.push(blaze_core::platform::path::host(&units.target_dir));
+    }
+    #[cfg(windows)]
+    for dep in &job.unit(run)?.dependencies {
+        if let Some(output) = job.scripts[dep.index].get() { read.push(PathBuf::from(&output.out_dir)); }
+    }
+    #[cfg(windows)]
+    let mut mutable = Vec::new(); // alloc: explicit mutable grants only
+    // A git dependency's script reads its repository at the commit, as cargo's checkout (the
+    // whole repository) lets it: an asset beside its package (betteroffice-fonts-intl reads
+    // `../../packages/fonts-intl/assets`). The tree is the commit's, fixed by it, and in
+    // blaze's sources, which every checkout of the build shares ([`build_roots`]).
+    if let Some(root) = git_checkout(&unit.package.manifest_dir) {
+        read.push(root.to_owned());
+    }
+    #[cfg(windows)]
+    if !outside(job, run) { script_inputs(job, compile, &mut read)?; }
+    #[cfg(windows)]
+    if let Some((_, paths)) = job.input.config.invocation.env.iter().find(|(name, _)| name == "BLAZE_SCRIPT_READ") {
+        // A checkout cannot choose these via a gitfile, PATH or Cargo's [env]. This is the
+        // caller's environment, before any values from the project are applied.
+        for path in std::env::split_paths(paths) {
+            if !path.is_absolute() || path.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} is not an absolute file or directory below a volume root", path.display()), None));
+            }
+            let resolved = std::fs::canonicalize(&path).map_err(|e| ApiError::new(format!("BLAZE_SCRIPT_READ: {}: {e}", path.display()), None))?;
+            if resolved.parent().is_none() {
+                return Err(ApiError::new(format!("BLAZE_SCRIPT_READ: {} resolves to a volume root", path.display()), None));
+            }
+            mutable.push(resolved.clone());
+            read.push(resolved);
+        }
+    }
+    // Each declared cache is read and written where the caller says ([`Place::caches`]): not a
+    // read root of its key.
+    let caches = declared_caches(&job.input.config.invocation.env)?;
     // Each pinned native input it is given is read where it is laid out, and its digest is
     // part of the run's key ([`Place::pinned`]).
     let pinned: Vec<(String, String)> = given(&job.input.native, &unit)
@@ -1030,20 +1398,35 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             (it.input.env.clone(), format!("sha256:{}", it.input.sha256)) // clone: the run's own, once an input a run
         })
         .collect();
+    read.sort_unstable();
     read.dedup();
+    #[cfg(windows)]
+    let declared_inputs = if outside(job, run) || crate::sandbox::v2::OBSERVES_READS { None } else {
+        let why = |what| ApiError::new(what, Some(unit.package.descr()));
+        let roots = declared::roots(&read).map_err(why)?;
+        let host = declared::given(job, run, &unit, &env, &roots, mutable).map_err(why)?;
+        Some((host, roots))
+    };
+    #[cfg(windows)]
+    let declared = declared_inputs.as_ref().map(|(host, _)| *host);
+    #[cfg(not(windows))]
+    let declared = None;
     let place = Place {
         code,
         read,
         pinned,
+        caches,
         network: false,
         memory: None,
-        mode: match rechecks(job)? {
-            true => blaze_usercode::run::Mode::Verify,
-            false => blaze_usercode::run::Mode::Normal,
+        mode: match (declared, rechecks(job)?) {
+            (Some(host), verify) => blaze_usercode::run::Mode::Declared { verify, host },
+            _ if !crate::sandbox::v2::OBSERVES_READS => blaze_usercode::run::Mode::Unobserved,
+            (_, true) => blaze_usercode::run::Mode::Verify,
+            (_, false) => blaze_usercode::run::Mode::Normal,
         },
         roots: build_roots(job),
     };
-    let prepared = script::prepare(&unit, &env, &place)
+    let prepared = script::prepare(&unit, &env, &place, &job.input.looks)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
     // The variable the script reads is the layout, whatever else set it (a check, not a
     // fallback: `native_env` forces it).
@@ -1067,7 +1450,16 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             ));
         }
     }
-    let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
+    // What a check of the run's inputs answers from: a variable by name from all of the
+    // environment it is started in, and a walk of it as its sandbox shows one, the walk set
+    // ([`blaze_usercode::confine::walk_sees`]). A run outside the sandbox is given all of it.
+    let disk = match outside(job, run) {
+        // clone: once per run prepared, the environment its checks answer from
+        true => blaze_usercode::inputs::Disk::new(prepared.env.clone(), &job.input.looks),
+        false => prepared.disk(&job.input.looks),
+    };
+    #[cfg(windows)]
+    let disk = match declared_inputs { Some((_, roots)) => disk.declared_inputs(roots), None => disk };
     let how = match outside(job, run) {
         true => {
             // Outside the sandbox nothing is lent: the program is given its whole environment,
@@ -1116,6 +1508,10 @@ struct LeftRun {
 
 /// Each run's directory this process left cargo's files in, by its path: a few dozen a
 /// build, scanned. In memory only: a restarted daemon writes each once.
+#[expect(
+    blaze::process_static,
+    reason = "one row per run directory the daemon left cargo's files in, never capped: the daemon should own it"
+)]
 static LEFT_RUNS: blaze_core::lock::Lock<Vec<(PathBuf, LeftRun)>> =
     blaze_core::lock::Lock::new("serve.unit.script.left_runs", Vec::new());
 
@@ -1346,6 +1742,10 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
             // alloc: once a miss
             .collect();
         let mut miss = blaze_kernel::Miss::of_parts(RUN, subject, item, hasher.finish(), parts);
+        if prepared.spec.mode == blaze_usercode::run::Mode::Unobserved {
+            miss.missed = blaze_kernel::Missed::Always(crate::sandbox::v2::NOT_TRACED_ON_WINDOWS.into());
+            return miss;
+        }
         miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
         miss
     })
@@ -1410,6 +1810,8 @@ fn with_reads(mut miss: blaze_kernel::Miss, traced: &blaze_core::Traced) -> blaz
     }
     for (name, value) in &traced.env {
         let named = match name == trace::ALL_ENV_NAME {
+            // "All" is what a walk of its environment sees: the variables blaze gives it
+            // and the walk set, never the whole of the shell the build was started in.
             true => "the names of every environment variable (it read them all)".to_owned(), // alloc: as `walked`
             false => format!("the variable {} it read", name.display()), // alloc: as `walked`
         };
@@ -1490,10 +1892,50 @@ fn live_record(
 }
 
 /// `path` as the driver names it, under its root `/`.
+/// The caches the caller declares to every build script it runs (`BLAZE_SCRIPT_CACHES`, its own
+/// environment, never the project's): a list of the system's paths whose entries are each
+/// `VARIABLE=DIRECTORY`. A script is told each variable, naming its directory, which it may
+/// read and write and which is kept across runs: a download cache (rune-desktop's
+/// `GHOSTTY_VT_CACHE_DIR`). What is in one is in no key ([`Place::caches`]). Each directory is
+/// made if missing, and named as the system resolves it; an entry that is not a variable's
+/// name and an absolute directory below a volume's root, or a variable named twice, is refused,
+/// naming it.
+fn declared_caches(env: &[(String, String)]) -> Result<Vec<(String, PathBuf)>, ApiError> {
+    const NAME: &str = "BLAZE_SCRIPT_CACHES";
+    let Some((_, list)) = env.iter().find(|(name, _)| name == NAME) else { return Ok(Vec::new()) };
+    // alloc: an error path.
+    let refused = |what: String| ApiError::new(format!("{NAME}: {what}"), None);
+    let mut caches: Vec<(String, PathBuf)> = Vec::new(); // alloc: the caller's few caches, once a run
+    for entry in std::env::split_paths(list) {
+        let text = entry.to_string_lossy();
+        let Some((name, dir)) = text.split_once('=') else {
+            return Err(refused(format!("`{text}` is no VARIABLE=DIRECTORY")));
+        };
+        if name.is_empty() || !name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'_') {
+            return Err(refused(format!("`{name}` is no variable's name")));
+        }
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() || dir.parent().is_none() {
+            return Err(refused(format!("{} is not an absolute directory below a volume's root", dir.display())));
+        }
+        std::fs::create_dir_all(&dir).map_err(|error| refused(format!("making {}: {error}", dir.display())))?;
+        let dir = std::fs::canonicalize(&dir).map_err(|error| refused(format!("{}: {error}", dir.display())))?;
+        if caches.iter().any(|(it, _)| it.eq_ignore_ascii_case(name)) {
+            return Err(refused(format!("`{name}` is named twice")));
+        }
+        caches.push((name.to_owned(), dir));
+    }
+    caches.sort();
+    Ok(caches)
+}
 fn file_name(path: &Path) -> Result<FileName, String> {
-    path.to_str().and_then(|it| FileName::new(it.trim_start_matches('/'))).ok_or_else(|| {
-        format!("{} is not a path blaze can write cargo's files of a run at", path.display())
-    })
+    let refused = || format!("{} is not a path blaze can write cargo's files of a run at", path.display());
+    let text = path.to_str().ok_or_else(refused)?;
+    // A name is `/`-separated on every system; a path joined on Windows has `\` between its
+    // parts, which no Windows file name holds.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/"); // alloc: a name, three a run written
+    FileName::new(text.trim_start_matches('/')).ok_or_else(refused)
 }
 
 pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {
@@ -1623,7 +2065,7 @@ impl ScriptRun {
         start: &Start,
         value: Value,
         began: SystemTime,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1639,7 +2081,12 @@ impl ScriptRun {
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let link_dirs: Vec<PathBuf> = match start.how {
             How::Outside(_) => Vec::new(),
-            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env) {
+            _ => match crate::directives::link_dirs(&job.units().link_dirs, &start.env).and_then(
+                |mut it| {
+                    it.extend(crate::directives::machine_link_dirs(&start.env)?);
+                    Ok(it)
+                },
+            ) {
                 // The layouts of the pinned native inputs it was given may be searched and
                 // be an rpath: each is the verified unpacking of its pinned archive.
                 Ok(mut it) => {
@@ -1668,6 +2115,8 @@ impl ScriptRun {
             self.state = State::Done;
             return Some(false);
         };
+        #[cfg(windows)]
+        let mut result = declared::result(&value);
         let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {
@@ -1678,10 +2127,25 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
+        #[cfg(windows)]
+        if matches!(start.how, How::Outside(_)) {
+            let mut hash = blaze_ids::Hasher::new("Windows outside dependency result 1");
+            hash.id(&result);
+            for (path, bytes) in &files { hash.part(path.as_bytes()).part(bytes); }
+            result = hash.finish();
+        }
+        // The lowering knows the run by the daemon's name of its OUT_DIR (`/C:/a` on Windows),
+        // the plan's; the script ran at the system's path of it.
+        let Some(named) = job.units().plans.get(self.unit).and_then(|it| it.out_dir.clone()) else {
+            let what = format!("the build script run of unit {} has no OUT_DIR in its plan", self.unit);
+            return self.error(what, out);
+        };
         let ran = blaze_lower::Ran {
             cfgs: output.cfgs.clone(),
-            env: output.env.clone(),
-            out_dir: out_dir.clone(),
+            // alloc: once a run applied, its variables, which `output` keeps beside: shared by
+            // every crate the front end applies them to
+            env: output.env.as_slice().into(),
+            out_dir: named,
             files,
         };
         let Some(writer) = writer else {
@@ -1700,7 +2164,7 @@ impl ScriptRun {
         };
         out.push(Response::BuildScript(executed(&package_id, &output, &out_dir)));
         let links = start.unit.package.links.clone();
-        let applied = Applied { package_id, links, output, out_dir };
+        let applied = Applied { package_id, links, output, out_dir, #[cfg(windows)] result };
         if job.scripts[self.unit].set(applied).is_err() {
             return self.error(
                 format!("the build script run of unit {} ended twice in one job", self.unit),
@@ -1859,8 +2323,8 @@ impl Writing {
 impl Runs<Real> for ScriptRun {
     fn start(
         &mut self,
-        store: &Store,
-        writer: Option<&mut UnitWriter>,
+        store: &mut Store,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1888,7 +2352,7 @@ impl Runs<Real> for ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1915,7 +2379,7 @@ impl ScriptRun {
     fn begin(
         &mut self,
         store: &Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2033,7 +2497,7 @@ impl ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut UnitWriter>,
+        writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -2064,11 +2528,19 @@ impl ScriptRun {
         let value = match (run, &*how) {
             (Some(run), How::Sandboxed(prepared)) => {
                 let mut checked = None;
+                let began = run.began();
                 let completed = run.complete(
                     completion,
                     store,
                     disk,
-                    |exit| script::cargo_rule(unit, env, exit),
+                    |exit| {
+                        let mut rule = script::cargo_rule(unit, env, exit)?;
+                        if matches!(prepared.spec.mode, blaze_usercode::run::Mode::Declared { .. }) {
+                            // Whole environment already in the key, including absent variables.
+                            rule.env.clear();
+                        }
+                        Ok(rule)
+                    },
                     |traced| {
                         // What the run read and who read it, as events of the build's
                         // profile, before its key takes anything out of the trace.
@@ -2085,6 +2557,9 @@ impl ScriptRun {
                         }
                         script::keyed(prepared, traced)
                     },
+                    // Its reads are hashed as it ends: one changed since it began is kept
+                    // under no key (`blaze_usercode::run::NotKept::Moved`).
+                    |traced| began.moved(traced),
                 );
                 match completed {
                     Ok(completed) => {
@@ -2095,55 +2570,76 @@ impl ScriptRun {
                         if let Some(miss) = self.missed.take() {
                             self.puts.misses.push(with_reads(miss, &completed.traced));
                         }
-                        let value = completed.value;
-                        // A pure key's hit verified across checkouts, run again and otherwise:
-                        // retracted before the run is kept under the pure key, which then
-                        // keeps this checkout's own here alone.
-                        let differed = match pure::retract(
-                            &job,
-                            run_unit,
-                            unit,
-                            store,
-                            &prepared.spec.roots,
-                            &value,
-                        ) {
-                            Ok(None) => None,
-                            Ok(Some((what, puts))) => {
-                                self.puts.extend(puts);
-                                Some(what)
-                            }
-                            Err((what, puts)) => {
-                                self.puts.extend(puts);
-                                return self.error(what, out);
-                            }
-                        };
-                        match pure::keep(
-                            &job,
-                            run_unit,
-                            unit,
-                            checked,
-                            store,
-                            prepared.script_env(),
-                            &prepared.spec.roots,
-                            &value,
-                        ) {
-                            Ok(puts) => self.puts.extend(puts),
-                            Err((what, puts)) => {
-                                self.puts.extend(puts);
-                                return self.error(what, out);
-                            }
-                        }
-                        if let Some(what) = differed {
-                            let what = format!(
-                                "the build script of `{}`: run again, it gave other than the result \
-                                 its pure key found, verified across checkouts for the same inputs ({what}): it \
-                                 depends on where its roots are, so it is recorded as doing so and no checkout is \
-                                 given that result again",
-                                unit.package.descr()
+                        // A run whose reads moved after it began is this build's alone: kept
+                        // under no key (its sandboxed one or its pure one), compared with
+                        // nothing kept, and its reads are no certificate's, since they need
+                        // not be what it read. Said by name; the next build runs it again.
+                        if let Some(not_kept) = completed.not_kept {
+                            tracing::info!(
+                                target: "blaze",
+                                package = %unit.package.descr(),
+                                not_kept = not_kept.word(),
+                                "a build script's run kept under no key: {not_kept}"
                             );
-                            return self.error(what, out);
+                            completed.value
+                        } else {
+                            // What it read, at the values its result is kept under, for its
+                            // build's request certificate ([`ReadBytes::seen`]). Not of a run
+                            // that is checked: a build runs that one again whatever is kept,
+                            // so no certificate answers for it.
+                            if prepared.spec.mode == blaze_usercode::run::Mode::Normal {
+                                job.script_reads.lock().note_ran(run_unit, &completed.traced);
+                            }
+                            let value = completed.value;
+                            // A pure key's hit verified across checkouts, run again and
+                            // otherwise: retracted before the run is kept under the pure key,
+                            // which then keeps this checkout's own here alone.
+                            let differed = match pure::retract(
+                                &job,
+                                run_unit,
+                                unit,
+                                store,
+                                &prepared.spec.roots,
+                                &value,
+                            ) {
+                                Ok(None) => None,
+                                Ok(Some((what, puts))) => {
+                                    self.puts.extend(puts);
+                                    Some(what)
+                                }
+                                Err((what, puts)) => {
+                                    self.puts.extend(puts);
+                                    return self.error(what, out);
+                                }
+                            };
+                            match pure::keep(
+                                &job,
+                                run_unit,
+                                unit,
+                                checked,
+                                store,
+                                prepared.script_env(),
+                                &prepared.spec.roots,
+                                &value,
+                            ) {
+                                Ok(puts) => self.puts.extend(puts),
+                                Err((what, puts)) => {
+                                    self.puts.extend(puts);
+                                    return self.error(what, out);
+                                }
+                            }
+                            if let Some(what) = differed {
+                                let what = format!(
+                                    "the build script of `{}`: run again, it gave other than the result \
+                                     its pure key found, verified across checkouts for the same inputs ({what}): it \
+                                     depends on where its roots are, so it is recorded as doing so and no checkout is \
+                                     given that result again",
+                                    unit.package.descr()
+                                );
+                                return self.error(what, out);
+                            }
+                            value
                         }
-                        value
                     }
                     Err(error) => {
                         // alloc: error path
@@ -2246,6 +2742,8 @@ impl ScriptRun {
 }
 
 pub(crate) mod pure;
+#[cfg(windows)]
+mod declared;
 mod said;
 
 #[cfg(test)]

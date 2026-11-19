@@ -1113,7 +1113,7 @@ fn impls_keep_their_order_and_their_reservation_bit() {
     use crate::{
         ImplId, Lookup,
         attrs::AttrFlags,
-        nameres::frozen::{self, Frozen, Mode},
+        nameres::frozen::{self, Mode},
         src::HasSource,
     };
     use syntax::view::AstNode;
@@ -1158,9 +1158,8 @@ impl Tr for D {}
         assert_eq!(scope.inherent_impls().count(), 1);
     }
 
-    let bytes = frozen::encode(&db, krate).unwrap();
-    let frozen = Frozen { bytes: bytes.into(), mode: Mode::Verify };
-    frozen::set(&mut db, [(krate, frozen)].into_iter().collect());
+    let bytes = frozen::pages::encode(&db, krate).unwrap();
+    frozen::serve_pages(&mut db, &[(krate, bytes)], Mode::Verify);
     let def_map = crate_def_map(&db, krate);
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert_eq!(scope.trait_impls_without_reservation().count(), 2);
@@ -1200,5 +1199,51 @@ enum Empty {}
             assert_eq!(variants("E"), [of("A"), of("B"), of("C")]);
             assert_eq!(variants("Empty"), Vec::<VariantId>::new());
         },
+    );
+}
+
+#[test]
+fn name_read_classifies_nameres_reads_with_host_file_separators() {
+    use std::ops::ControlFlow;
+
+    use base_db::{Crate, Db};
+    use blaze_query::db::Database as _;
+
+    use crate::nameres::{NameRead, name_read};
+
+    #[blaze_query::tracked(returns(ref))]
+    fn probe_nameres_reads(db: &Db, krate: Crate) -> Vec<(&'static str, Option<NameRead>)> {
+        let ((), reads) = blaze_query::db::capture_reads(db, || {
+            let def_map = crate_def_map(db, krate);
+            let _ = def_map.module(db, def_map.root).scope(db).get(&hir_expand::name::Name::new_symbol_root(
+                intern::Symbol::intern("S"),
+            ));
+        });
+        let reads = reads.expect("nameres reads are shareable");
+        let storage = db.storage();
+        let mut out = Vec::new();
+        reads.for_each_read(storage, |read| {
+            let name = storage.read_name(read.key, read.kind);
+            if matches!(
+                name,
+                "crate_local_def_map" | "DefMapPair" | "def_map" | "Modules::module" | "ModuleScope::name"
+            ) {
+                out.push((name, name_read(db, read.key, read.kind)));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        out
+    }
+
+    let db = fixture::db("struct S;").into_db();
+    let krate = db.fetch_test_crate();
+    let seen = probe_nameres_reads(&db, krate);
+    assert!(
+        seen.iter().any(|(name, read)| *name == "crate_local_def_map" && *read == Some(NameRead::Handle)),
+        "expected crate_local_def_map to classify as Handle on every host: {seen:#?}"
+    );
+    assert!(
+        seen.iter().all(|(_, read)| read.is_some()),
+        "nameres reads must not return None due to host path separators: {seen:#?}"
     );
 }

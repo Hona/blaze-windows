@@ -1144,15 +1144,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.cached_ptr_size
     }
 
-    fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> PlaceTy<'db> {
+    /// The type of the place `ty` projected by `proj`, normalized: a field's declared type may
+    /// be an alias (`<M as Members>::Repr`), and every reader of a place's type (its
+    /// discriminant, its layout, a deref) asks what it is, not what it was written as. rustc
+    /// normalizes there too (codegen's `monomorphize` of each place type); read as written, the
+    /// discriminant of `w.0: <(B, A) as Mem>::Repr` was 0 whatever variant `w.0` held, since an
+    /// alias is no enum.
+    fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> Result<'db, PlaceTy<'db>> {
         let pair = (ty, proj);
         if let Some(r) = self.projected_ty_cache.borrow().get(&pair) {
-            return *r;
+            return Ok(*r);
         }
         let (ty, proj) = pair;
-        let r = ty.projection_ty(&self.infcx, &proj, self.param_env.param_env);
+        let mut r = ty.projection_ty(&self.infcx, &proj, self.param_env.param_env);
+        r.ty = self.normalized(r.ty, "the type of a place")?;
         self.projected_ty_cache.borrow_mut().insert((ty, proj), r);
-        r
+        Ok(r)
     }
 
     fn place_addr_and_ty_and_metadata<'b>(
@@ -1167,7 +1174,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mut behind_deref = false;
         for proj in p.projection.as_slice() {
             let prev_ty = ty;
-            ty = self.projected_ty(ty, *proj);
+            ty = self.projected_ty(ty, *proj)?;
             match proj {
                 ProjectionElem::Deref => {
                     let size = self.ptr_size();
@@ -1335,7 +1342,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn place_ty<'b>(&'b self, p: &StoredPlace, locals: &'b Locals<'db>) -> Result<'db, Ty<'db>> {
         let mut ty = PlaceTy::from_ty(locals.body.locals[p.local].ty.as_ref());
         for proj in p.projection.as_slice() {
-            ty = self.projected_ty(ty, *proj);
+            ty = self.projected_ty(ty, *proj)?;
         }
         Ok(ty.ty)
     }
@@ -3079,6 +3086,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn compute_discriminant(&self, ty: Ty<'db>, bytes: &[u8]) -> Result<'db, i128> {
+        // Only a type that is no enum has the discriminant 0; an alias may be one.
+        let ty = self.normalized(ty, "the type whose discriminant is read")?;
         let layout = self.layout(ty)?;
         let TyKind::Adt(adt_def, _) = ty.kind() else {
             return Ok(0);
@@ -3954,7 +3963,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         {
             // alloc: error path
             return Err(MirEvalError::NotSupported(format!(
-                "{} (of `{ty:?}`), computed from a `TypeId` and read by {}: its type has a raw                  pointer, a `dyn` or a union that may hold a `TypeId`, where the id of the                  evaluation that made it cannot be found and given this one's",
+                "{} (of `{ty:?}`), computed from a `TypeId` and read by {}: its type has a raw \
+                 pointer, a `dyn` or a union that may hold a `TypeId`, where the id of the \
+                 evaluation that made it cannot be found and given this one's",
                 whose(),
                 evaluated(self.db, self.owner)
             )));
@@ -5059,7 +5070,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let Some(ty) = source.type_id_ty(id) else {
             not_supported!(
-                "a `TypeId` in a constant read by another evaluation, which the evaluation that                  made the constant did not make (its bytes are {id:#x})"
+                "a `TypeId` in a constant read by another evaluation, which the evaluation that \
+                 made the constant did not make (its bytes are {id:#x})"
             );
         };
         let own = self.type_id(ty);
@@ -5150,9 +5162,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             if addr.is_of_nothing(size) {
                                 return Ok(());
                             }
-                            let bytes = this.read_memory(addr, size)?;
-                            mm.memory.insert(addr_usize, bytes);
-                            this.note_align(mm, addr_usize);
+                            let bytes = keep(this, mm, addr_usize, size)?;
                             let depth = stack_depth_limit - 1;
                             rec(this, bytes, t, locals, mm, depth, pointee_shared)?;
                         }
@@ -5170,9 +5180,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     if addr.is_of_nothing(size) {
                                         return Ok(());
                                     }
-                                    let b = this.read_memory(addr, size)?;
-                                    mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
-                                    this.note_align(mm, addr.to_usize(this.cached_ptr_size));
+                                    let b = keep(this, mm, addr.to_usize(this.cached_ptr_size), size)?;
                                     let depth = stack_depth_limit - 1;
                                     for (offset, part, count) in this.unsized_parts(t, meta)? {
                                         let size = this.size_of_sized(
@@ -5216,9 +5224,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             if addr.is_of_nothing(size) {
                                 return Ok(());
                             }
-                            let b = this.read_memory(addr, size)?;
-                            mm.memory.insert(addr.to_usize(this.cached_ptr_size), b);
-                            this.note_align(mm, addr.to_usize(this.cached_ptr_size));
+                            let b = keep(this, mm, addr.to_usize(this.cached_ptr_size), size)?;
                             // Elements that take no room may be `usize::MAX` in number.
                             let plain = element_size == 0
                                 || check_inner.is_some_and(|ty| this.holds_no_pointer(ty));
@@ -5386,6 +5392,36 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 _ => (),
             }
             Ok(())
+        }
+        /// The `size` bytes at `addr` a reference points to, keeping the whole allocation they
+        /// are in under its start, as rustc's constant keeps the allocation a reference points
+        /// into: what is past the referenced bytes is read through it too. `c"LOC".to_bytes()`
+        /// is the three bytes of a four-byte allocation whose NUL a `PCSTR` reads; kept as the
+        /// three alone, the byte after them was another piece's (wgpu-hal's D3D12 input
+        /// layout's semantic name, refused with `E_INVALIDARG`, INTEGRATION I57). Bytes in no
+        /// allocation the evaluation tracks are kept as they are pointed to.
+        fn keep<'a, 'db, M: Machine<'db>>(
+            this: &'a Evaluator<'db, M>,
+            mm: &mut ComplexMemoryMap<'db>,
+            addr: usize,
+            size: usize,
+        ) -> Result<'db, &'a [u8]> {
+            let pointed = this.read_memory(Address::from_usize(addr, this.cached_ptr_size), size)?;
+            let whole = this.allocation_at(addr).filter(|it| addr + size <= it.start + it.size);
+            match whole {
+                Some(Allocated { start, size: whole, .. }) => {
+                    if !mm.memory.get(&start).is_some_and(|it| it.len() >= whole) {
+                        let at = Address::from_usize(start, this.cached_ptr_size);
+                        mm.memory.insert(start, this.read_memory(at, whole)?);
+                        this.note_align(mm, start);
+                    }
+                }
+                None => {
+                    mm.memory.insert(addr, pointed);
+                    this.note_align(mm, addr);
+                }
+            }
+            Ok(pointed)
         }
         /// Keeps the whole allocation `addr` is in, the type of which a raw pointer does not
         /// say, and what every word of it that is in another allocation or a static points

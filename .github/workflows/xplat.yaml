@@ -1,0 +1,420 @@
+# Cross-platform batch gate on GitHub-hosted Linux (x86-64) and macOS (arm64) runners.
+# Upstream's own CI (blaze.yaml, warm.yaml, bench.yaml, nix-live.yaml) requires upstream's private
+# `ix` runners, so those jobs cannot run on the fork. This workflow builds blaze without Nix (the
+# pinned nightly from harness/toolchain and the pinned LLVM via .github/scripts/llvm.py), runs the
+# unit suites of the crates the Windows port touched (continuing past failures), and runs a
+# hello-world check/build/run/test/noop/edit smoke under the built blaze binary.
+#
+# Triggered ONLY by pushes to `windows/batch` (the single batch-gate trigger) or manually via
+# workflow_dispatch (including `mode: control` to run the identical gate on upstream merge-base
+# e41ed591d and diff regressions test-by-test).
+name: Cross-platform (Linux & macOS)
+
+on:
+  push:
+    branches: [windows/batch]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "branch (default), control (upstream base e41ed591d), or preflight (toolchain + LLVM only)"
+        type: choice
+        default: branch
+        options:
+          - branch
+          - control
+          - preflight
+      revision:
+        description: "Optional commit SHA or ref to test (overrides mode default)"
+        type: string
+        default: ""
+      crates:
+        description: "Optional space-separated crate specs override for units (e.g. 'blaze-core blaze-cas')"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xplat-${{ github.ref }}-${{ inputs.mode || 'branch' }}-${{ inputs.revision || 'head' }}
+  cancel-in-progress: false
+
+env:
+  CONTROL_REV: e41ed591da1d4dac6cee0f9da6179a651c82ff8d
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_RETRY: '10'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_BACKTRACE: '0'
+  RUST_MIN_STACK: '16777216'
+  XPLAT_MODE: ${{ inputs.mode || 'branch' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: preflight (${{ matrix.platform }})
+    if: inputs.mode == 'preflight'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu }
+          - { platform: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ inputs.revision != '' && 0 || 1 }}
+          persist-credentials: false
+      - name: Select target revision
+        if: inputs.revision != ''
+        env:
+          TARGET_REV: ${{ inputs.revision }}
+        run: |
+          git checkout --detach "$TARGET_REV"
+          git log -1 --oneline
+      - name: Linux user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Linux locked memory for io_uring registered buffers
+        if: runner.os == 'Linux'
+        run: |
+          worker=$(pgrep -o -f Runner.Worker) || { echo "::error::no Runner.Worker process found"; exit 1; }
+          sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+          prlimit --pid "$worker" --memlock
+      - name: Verify locked memory limit
+        if: runner.os == 'Linux'
+        run: |
+          [ "$(ulimit -l)" = unlimited ] || { echo "::error::RLIMIT_MEMLOCK is $(ulimit -l)"; exit 1; }
+      - uses: ./.github/actions/rustup
+      - name: Install pinned nightly from harness/toolchain
+        run: |
+          tc=$(cat harness/toolchain)
+          rustup toolchain install "$tc" --profile minimal
+          rustup default "$tc"
+          rustc -V
+          cargo -V
+      - id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/lib/blaze-llvm/${{ matrix.triple }}
+          key: xplat-llvm-${{ matrix.triple }}-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}
+      - if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Fetch pinned LLVM via llvm.py (no Nix)
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-llvm
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$TRIPLE\", \"dir\": \"/usr/local/lib/blaze-llvm/$TRIPLE\"}"
+          echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$TRIPLE" >> "$GITHUB_ENV"
+          echo "/usr/local/lib/blaze-llvm/$TRIPLE/bin" >> "$GITHUB_PATH"
+      - name: Verify toolchain, LLVM, and runner headroom
+        run: |
+          uname -a
+          rustc -V
+          "$LLVM_SYS_231_PREFIX/bin/llvm-config" --version
+          df -h
+          if [ "$RUNNER_OS" = Linux ]; then free -h; else vm_stat; fi
+
+  engine:
+    name: engine + hello (${{ matrix.platform }})
+    if: inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 210
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu, cargo_jobs: '3', test_threads: '2' }
+          - { platform: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin, cargo_jobs: '2', test_threads: '1' }
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ (inputs.mode == 'control' || inputs.revision != '') && 0 || 1 }}
+          persist-credentials: false
+      - name: Stage gate runner and select target revision
+        env:
+          MODE: ${{ inputs.mode || 'branch' }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          cp .github/scripts/xplat-gate.sh "$RUNNER_TEMP/xplat-gate.sh"
+          chmod +x "$RUNNER_TEMP/xplat-gate.sh"
+          target="$REVISION"
+          if [ -z "$target" ] && [ "$MODE" = control ]; then
+            target="$CONTROL_REV"
+          fi
+          if [ -n "$target" ]; then
+            git checkout --detach "$target"
+          fi
+          rev=$(git rev-parse --short HEAD)
+          echo "Testing revision: $rev ($(git log -1 --oneline))"
+          echo "XPLAT_REV=$rev" >> "$GITHUB_ENV"
+      - name: Place CARGO_TARGET_DIR on the largest volume
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ -d /mnt ] && [ -w /mnt ]; then
+            mkdir -p /mnt/blaze-target
+            echo "CARGO_TARGET_DIR=/mnt/blaze-target" >> "$GITHUB_ENV"
+          else
+            echo "CARGO_TARGET_DIR=$PWD/target" >> "$GITHUB_ENV"
+          fi
+          df -h
+      - name: Linux user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Linux locked memory for io_uring registered buffers
+        if: runner.os == 'Linux'
+        run: |
+          worker=$(pgrep -o -f Runner.Worker) || { echo "::error::no Runner.Worker process found"; exit 1; }
+          sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+          prlimit --pid "$worker" --memlock
+      - name: Verify locked memory limit
+        if: runner.os == 'Linux'
+        run: |
+          [ "$(ulimit -l)" = unlimited ] || { echo "::error::RLIMIT_MEMLOCK is $(ulimit -l)"; exit 1; }
+      - uses: ./.github/actions/rustup
+      - name: Install pinned nightly from harness/toolchain
+        run: |
+          tc=$(cat harness/toolchain)
+          rustup toolchain install "$tc" --profile minimal
+          rustup default "$tc"
+          rustc -V
+      - id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/lib/blaze-llvm/${{ matrix.triple }}
+          key: xplat-llvm-${{ matrix.triple }}-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}
+      - if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Fetch pinned LLVM via llvm.py (no Nix)
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-llvm
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$TRIPLE\", \"dir\": \"/usr/local/lib/blaze-llvm/$TRIPLE\"}"
+          echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$TRIPLE" >> "$GITHUB_ENV"
+          echo "/usr/local/lib/blaze-llvm/$TRIPLE/bin" >> "$GITHUB_PATH"
+      - name: Build blaze (--release, no Nix)
+        id: build
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/xplat-engine/logs"
+          cargo build --locked --release -p blaze-engine --bin blaze 2>&1 | tee "$RUNNER_TEMP/xplat-engine/logs/build.log"
+          ln -f "$CARGO_TARGET_DIR/release/blaze" "$CARGO_TARGET_DIR/release/blaze-engine"
+          "$CARGO_TARGET_DIR/release/blaze" --version
+      - name: Record engine build failure for summary
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          {
+            echo "#### \`blaze-engine\` build failed (\`${PLATFORM}\`)"
+            echo ""
+            echo '```text'
+            tail -n 60 "$RUNNER_TEMP/xplat-engine/logs/build.log"
+            echo '```'
+          } | tee "$RUNNER_TEMP/xplat-engine/hello-failures.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run blaze-engine unit tests (--release)
+        id: engine_units
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/xplat-gate.sh" units custom "$RUNNER_TEMP/xplat-engine/engine-units" "${{ matrix.test_threads }}" "blaze-engine" release
+      - name: Run hello-world check, build, run, test, noop, edit under built blaze
+        id: hello
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/xplat-gate.sh" hello "$CARGO_TARGET_DIR/release/blaze" "$RUNNER_TEMP/xplat-engine"
+      - name: Upload engine & hello-world logs and summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xplat-engine-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/xplat-engine/hello-*.tsv
+            ${{ runner.temp }}/xplat-engine/hello-*.md
+            ${{ runner.temp }}/xplat-engine/engine-units/results.tsv
+            ${{ runner.temp }}/xplat-engine/engine-units/failures.md
+            ${{ runner.temp }}/xplat-engine/engine-units/failed-tests.txt
+            ${{ runner.temp }}/xplat-engine/engine-units/summary.md
+            ${{ runner.temp }}/xplat-engine/logs/**
+            ${{ runner.temp }}/xplat-engine/engine-units/logs/**
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Fail job if engine units or hello-world failed
+        if: steps.engine_units.outcome == 'failure' || steps.hello.outcome == 'failure'
+        run: |
+          echo "::error::engine_units=${{ steps.engine_units.outcome }}, hello=${{ steps.hello.outcome }}"
+          exit 1
+
+  units:
+    name: units-${{ matrix.group }} (${{ matrix.platform }})
+    if: inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu, group: core, needs_llvm: false, cargo_jobs: '3', test_threads: '2' }
+          - { platform: linux-x64, os: ubuntu-latest, triple: x86_64-unknown-linux-gnu, group: llvm, needs_llvm: true,  cargo_jobs: '3', test_threads: '1' }
+          - { platform: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin,     group: core, needs_llvm: false, cargo_jobs: '2', test_threads: '1' }
+          - { platform: macos-arm64, os: macos-latest, triple: aarch64-apple-darwin,     group: llvm, needs_llvm: true,  cargo_jobs: '2', test_threads: '1' }
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ (inputs.mode == 'control' || inputs.revision != '') && 0 || 1 }}
+          persist-credentials: false
+      - name: Stage gate runner and select target revision
+        env:
+          MODE: ${{ inputs.mode || 'branch' }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          cp .github/scripts/xplat-gate.sh "$RUNNER_TEMP/xplat-gate.sh"
+          chmod +x "$RUNNER_TEMP/xplat-gate.sh"
+          target="$REVISION"
+          if [ -z "$target" ] && [ "$MODE" = control ]; then
+            target="$CONTROL_REV"
+          fi
+          if [ -n "$target" ]; then
+            git checkout --detach "$target"
+          fi
+          rev=$(git rev-parse --short HEAD)
+          echo "Testing revision: $rev ($(git log -1 --oneline))"
+          echo "XPLAT_REV=$rev" >> "$GITHUB_ENV"
+      - name: Place CARGO_TARGET_DIR on the largest volume
+        run: |
+          if [ "$RUNNER_OS" = Linux ] && [ -d /mnt ] && [ -w /mnt ]; then
+            mkdir -p /mnt/blaze-target
+            echo "CARGO_TARGET_DIR=/mnt/blaze-target" >> "$GITHUB_ENV"
+          else
+            echo "CARGO_TARGET_DIR=$PWD/target" >> "$GITHUB_ENV"
+          fi
+          df -h
+      - name: Linux user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Linux locked memory for io_uring registered buffers
+        if: runner.os == 'Linux'
+        run: |
+          worker=$(pgrep -o -f Runner.Worker) || { echo "::error::no Runner.Worker process found"; exit 1; }
+          sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+          prlimit --pid "$worker" --memlock
+      - name: Verify locked memory limit
+        if: runner.os == 'Linux'
+        run: |
+          [ "$(ulimit -l)" = unlimited ] || { echo "::error::RLIMIT_MEMLOCK is $(ulimit -l)"; exit 1; }
+      - uses: ./.github/actions/rustup
+      - name: Install pinned nightly from harness/toolchain
+        run: |
+          tc=$(cat harness/toolchain)
+          rustup toolchain install "$tc" --profile minimal
+          rustup default "$tc"
+          rustc -V
+      - if: matrix.needs_llvm
+        id: llvm-cache
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/lib/blaze-llvm/${{ matrix.triple }}
+          key: xplat-llvm-${{ matrix.triple }}-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}
+      - if: matrix.needs_llvm && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Fetch pinned LLVM via llvm.py (no Nix)
+        if: matrix.needs_llvm
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          sudo mkdir -p /usr/local/lib/blaze-llvm
+          sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+          python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$TRIPLE\", \"dir\": \"/usr/local/lib/blaze-llvm/$TRIPLE\"}"
+          echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$TRIPLE" >> "$GITHUB_ENV"
+          echo "/usr/local/lib/blaze-llvm/$TRIPLE/bin" >> "$GITHUB_PATH"
+      - name: Run touched-crate unit suites (continuing past failures)
+        id: run_units
+        continue-on-error: true
+        env:
+          CRATES_OVERRIDE: ${{ inputs.crates }}
+        run: |
+          # When an explicit crate override is passed, run it in the `llvm` job (which has LLVM)
+          # and skip duplicating it in `core`.
+          if [ -n "$CRATES_OVERRIDE" ] && [ "${{ matrix.group }}" = core ]; then
+            echo "crates override given; handled by units-llvm job"
+            exit 0
+          fi
+          "$RUNNER_TEMP/xplat-gate.sh" units "${{ matrix.group }}" "$RUNNER_TEMP/xplat-units" "${{ matrix.test_threads }}" "$CRATES_OVERRIDE" dev
+      - name: Upload unit suite logs and summaries
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xplat-units-${{ matrix.platform }}-${{ matrix.group }}
+          path: |
+            ${{ runner.temp }}/xplat-units/results.tsv
+            ${{ runner.temp }}/xplat-units/failures.md
+            ${{ runner.temp }}/xplat-units/failed-tests.txt
+            ${{ runner.temp }}/xplat-units/summary.md
+            ${{ runner.temp }}/xplat-units/logs/**
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Fail job if any unit suite failed
+        if: steps.run_units.outcome == 'failure'
+        run: |
+          echo "::error::one or more unit suites failed in ${{ matrix.platform }} / ${{ matrix.group }} (see summary and logs artifact)"
+          exit 1
+
+  summary:
+    name: summary
+    needs: [engine, units]
+    if: always() && inputs.mode != 'preflight' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: xplat-*
+          path: ${{ runner.temp }}/all-results
+      - name: Write combined Linux & macOS batch summary
+        env:
+          XPLAT_REV: ${{ inputs.revision || (inputs.mode == 'control' && 'e41ed591d' || github.sha) }}
+        run: |
+          set -o pipefail
+          chmod +x .github/scripts/xplat-gate.sh
+          .github/scripts/xplat-gate.sh summary "$RUNNER_TEMP/all-results" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Reflect combined gate status
+        env:
+          ENGINE: ${{ needs.engine.result }}
+          UNITS: ${{ needs.units.result }}
+        run: |
+          echo "engine=$ENGINE units=$UNITS"
+          if [ "$ENGINE" != "success" ] || [ "$UNITS" != "success" ]; then
+            echo "::error::cross-platform batch gate had failures (engine=$ENGINE, units=$UNITS)"
+            exit 1
+          fi

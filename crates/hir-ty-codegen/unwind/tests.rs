@@ -76,7 +76,7 @@ fn windows_stencil_code_has_pads_of_its_guarded_calls() {
     let windows = UnwindRef::Windows { len: 20, info: &[1, 0, 0, 0] };
     let made = FunctionUnwind::of_stencil(&stencil(windows, &calls, &[], &lines)).unwrap();
     let mut pads = seh::Pads::default();
-    pads.returning(9);
+    pads.returning(9, false);
     let frame = Frame::Windows(seh::Frame { len: 20, info: vec![1, 0, 0, 0] });
     assert_eq!(made, Some(FunctionUnwind { frame, landing_pads: pads.finish() }));
 

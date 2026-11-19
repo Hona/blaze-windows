@@ -53,8 +53,6 @@ pub(crate) struct Built {
     pub roots: Vec<(String, usize)>,
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand.
     pub link_dirs: Vec<String>,
-    /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
-    pub sandboxed_tests: bool,
     /// The pinned native inputs the graph's build script runs are given ([`crate::query::Units::native`]).
     pub native: Vec<crate::query::NativeInput>,
 }
@@ -181,7 +179,11 @@ pub(crate) fn units(
         // alloc: the spec is how a unit names its package (`Unit::pkg_id`), once per package.
         packages_by_spec.insert(id.to_spec().to_string(), (*id, package));
     }
-    let opt_out = match super::sandbox::workspace(ws.custom_metadata(), ws.root_manifest()) {
+    let opt_out = match super::sandbox::workspace(
+        ws.custom_metadata(),
+        ws.root_manifest(),
+        &host.triple,
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
@@ -202,8 +204,18 @@ pub(crate) fn units(
         if own.build_script_outside || opt_out.unsandboxed(id.name().as_str()) {
             unsandboxed.insert(spec.as_str());
         }
-        if own.tests != TestSandbox::default() {
-            test_sandbox.insert(*id, own.tests);
+        // Whether a member's tests run sandboxed by default is the host's
+        // (`sandbox::tests_sandboxed_by_default`), decided here once, into its plan.
+        let tests = match package.is_member {
+            true => super::sandbox::tests_on(
+                own.tests,
+                own.tests_opted_in || opt_out.sandboxed_tests,
+                &host.triple,
+            ),
+            false => own.tests,
+        };
+        if tests != TestSandbox::default() {
+            test_sandbox.insert(*id, tests);
         }
     }
     let request = Request {
@@ -291,7 +303,9 @@ pub(crate) fn units(
         (Some(dir), _) => PathBuf::from(dir),
         (None, Some(dir)) => dir.to_path_buf(),
         (None, None) if spec.foreign.is_some() => PathBuf::from(FOREIGN_TARGET),
-        (None, None) if Path::new(&spec.builds).is_absolute() => {
+        // `has_root`, as for `spec.std` below: on Windows the daemon names `D:\a` as `/D:/a`,
+        // which has no prefix and so is not `is_absolute`.
+        (None, None) if Path::new(&spec.builds).has_root() => {
             blaze_manifest::home::build_dir(Path::new(&spec.builds), ws.root())
         }
         (None, None) => {
@@ -302,8 +316,17 @@ pub(crate) fn units(
             )));
         }
     };
+    // An explicit directory may come from the host environment or a config file. It
+    // enters the graph (including OUT_DIR) in the same namespace as mounted sources.
+    let target_dir = match build_path(target_dir) {
+        Ok(path) => path,
+        Err(error) => return Ok(fail(error.into())),
+    };
     let build_dir = match config.build_dir(ws.root_manifest()) {
-        Ok(Some(dir)) => dir,
+        Ok(Some(dir)) => match build_path(dir) {
+            Ok(path) => path,
+            Err(error) => return Ok(fail(error.into())),
+        },
         Ok(None) => target_dir.clone(),
         Err(error) => return Ok(fail(error)),
     };
@@ -506,23 +529,14 @@ pub(crate) fn units(
         }
     }
     if let Some(ask) = &spec.foreign {
-        let ours = |at: &Path| at.display().to_string();
-        let prefixes = [
-            ours(&Path::new(FOREIGN_TARGET).join(&ask.triple).join(&dir_name)),
-            ours(
-                &Path::new(FOREIGN_TARGET)
-                    .join(super::plan::macro_dir(&ask.triple))
-                    .join(&dir_name),
-            ),
-            ours(&Path::new(FOREIGN_TARGET).join(&dir_name)),
-        ];
+        let prefixes = foreign_prefixes(&ask.triple, &dir_name);
         for plan in &mut plans {
             rebase(plan, &prefixes, &ask.out);
         }
     }
 
     // A foreign load builds another build's dependencies, whose profile is that build's.
-    let notes = match &spec.foreign {
+    let mut notes = match &spec.foreign {
         Some(_) => Vec::new(),
         None => strip_notes(
             &profiles.strips(),
@@ -534,6 +548,11 @@ pub(crate) fn units(
                 .map(|(_, plan)| plan.rustflags.as_slice()),
         ),
     };
+    // A retired experiment the root manifest still lists: said by the build of this
+    // workspace, not by a foreign load of another's dependencies.
+    if spec.foreign.is_none() {
+        notes.extend(opt_out.notes);
+    }
 
     let checksums = resolved.resolve.checksums();
     let const_macros_on = super::sandbox::const_macros_on(ws.custom_metadata());
@@ -557,6 +576,7 @@ pub(crate) fn units(
                 manifest_path,
                 package.is_member,
                 checksum,
+                git_tree(&resolved.pins, *id),
                 tests,
                 const_macros,
             )),
@@ -613,9 +633,15 @@ pub(crate) fn units(
         finished: planned.finished,
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
-        sandboxed_tests: opt_out.sandboxed_tests,
         native,
     }))
+}
+
+fn build_path(path: PathBuf) -> Result<PathBuf, blaze_core::platform::path::PathError> {
+    if cfg!(windows) && path.is_absolute() {
+        return blaze_core::platform::path::daemon(&path).map(PathBuf::from);
+    }
+    Ok(path)
 }
 
 /// What a build says of each `strip` it accepts and does not honour yet (ledger D44): one note
@@ -682,6 +708,25 @@ fn jobs(config: &blaze_manifest::Config<Snap>, asked: Option<u32>) -> anyhow::Re
 /// Where a foreign workspace's plans are made before their directory is put as
 /// [`ForeignAsk::out`].
 const FOREIGN_TARGET: &str = "/@blaze-foreign-target";
+
+/// Prefixes of the virtual output names in the plan, never host filesystem paths.
+fn foreign_prefixes(triple: &str, profile: &str) -> [String; 3] {
+    [
+        format!("{FOREIGN_TARGET}/{triple}/{profile}"),
+        format!("{FOREIGN_TARGET}/{}/{profile}", super::plan::macro_dir(triple)),
+        format!("{FOREIGN_TARGET}/{profile}"),
+    ]
+}
+
+#[cfg(test)]
+mod foreign_names {
+    #[test]
+    fn the_virtual_std_profile_matches_its_planned_artifact() {
+        let artifact = "/@blaze-foreign-target/x86_64-pc-windows-msvc/debug/build/alloc/out/liballoc.rlib";
+        let roots = super::foreign_prefixes("x86_64-pc-windows-msvc", "debug");
+        assert_eq!(artifact.strip_prefix(&roots[0]), Some("/build/alloc/out/liballoc.rlib"));
+    }
+}
 
 /// Each path of `plan` under one of `prefixes` put under `out` instead.
 fn rebase<P: AsRef<str>>(plan: &mut UnitPlan, prefixes: &[P], out: &str) {
@@ -762,16 +807,17 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
             }
         }
     };
-    let platform = |triple: &str| -> Result<(Platformed, Vec<String>), LoadError> {
+    let platform = |kind: Option<&str>| -> Result<(Platformed, Vec<String>), LoadError> {
+        let triple = kind.unwrap_or(&spec.host);
         let rustflags =
-            super::plan::platform_rustflags(config, triple, &spec.host, target.as_deref())?;
+            super::plan::platform_rustflags(config, &spec.host, target.as_deref(), kind)?;
         let args = CfgArgs::from_flags(&rustflags).map_err(error)?;
         let cfg =
             platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)?;
         Ok((Platformed { triple: triple.to_owned(), cfg }, rustflags))
     };
-    let (host, host_flags) = platform(&spec.host)?;
-    let (target, target_flags) = match target.as_deref().map(platform).transpose()? {
+    let (host, host_flags) = platform(None)?;
+    let (target, target_flags) = match target.as_deref().map(|it| platform(Some(it))).transpose()? {
         Some((it, flags)) => (Some(it), flags),
         None => (None, Vec::new()),
     };
@@ -1430,14 +1476,28 @@ fn foreign_profiles(
     Ok(profiles)
 }
 
+/// The digest `blaze.lock` pins a git package's tree by, which the load required before it
+/// located the package ([`blaze_audit::source::require_git`]); `None` for any other source.
+fn git_tree(pins: &blaze_audit::pins::SourcePins, id: PackageId) -> Option<String> {
+    let source = id.source_id();
+    if !source.is_git() {
+        return None;
+    }
+    let commit = source.precise_git_fragment()?;
+    pins.git(source.url().as_str(), commit).map(|it| it.tree.to_string())
+}
+
 /// A package as the build names it. `checksum` is the resolve's, in hex: kept only for a
-/// crates.io package, whose `.crate` it is the SHA-256 of.
+/// crates.io package, whose `.crate` it is the SHA-256 of. `tree` is a git package's pinned
+/// tree digest ([`git_tree`]).
+#[allow(clippy::too_many_arguments)] // a package's parts, each once
 fn package_plan(
     id: PackageId,
     manifest: &Manifest,
     manifest_path: &Path,
     is_member: bool,
     checksum: Option<&str>,
+    tree: Option<String>,
     tests: TestSandbox,
     const_macros: Option<String>,
 ) -> PackagePlan {
@@ -1456,6 +1516,7 @@ fn package_plan(
         checksum: checksum
             .filter(|_| id.source_id().is_crates_io())
             .and_then(blaze_format::hex::decode::<32>),
+        tree,
         tests,
         const_macros,
     }

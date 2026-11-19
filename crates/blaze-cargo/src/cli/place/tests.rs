@@ -138,7 +138,8 @@ fn config_files_outside_the_checkout() {
     ];
     let files = config_files(&place, &configs, Some(&home)).unwrap();
     let named: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
-    let utf8 = |path: PathBuf| path.to_str().unwrap().to_owned();
+    // As the daemon names them (`/C:/a` on Windows).
+    let utf8 = |path: PathBuf| blaze_core::platform::path::daemon(&path).unwrap();
     assert_eq!(named, [
         utf8(dir.join(".cargo/config.toml")),
         utf8(home.join("config.toml")),

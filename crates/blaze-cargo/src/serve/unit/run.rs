@@ -17,13 +17,16 @@ use blaze_units::schema::Mode;
 use std::alloc::Global;
 
 use super::{
-    Job, Real, UnitWriter, codegen,
+    Job, Real, codegen,
     error::{UnitError, manifest_dir},
     package_of,
 };
-use crate::serve::work::{RunPuts, Runs};
+use crate::serve::work::{Asks, RunPuts, Runs};
 
 pub(crate) mod inproc;
+pub(crate) mod launch;
+#[blaze::sans_io]
+pub(crate) mod needs;
 #[cfg(test)]
 mod tests;
 
@@ -31,7 +34,7 @@ mod tests;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Launch {
     /// From its executable as linked: a profile compiled whole (a release one, as
-    /// `blaze_lazy::allow` decides), or a run under `target.<triple>.runner`, which takes a file.
+    /// `blaze_lazy::allow` decides), a native Windows PE, or a run under `target.<triple>.runner`.
     File,
     /// On the daemon's code memory (docs/v2/plan/design/compile-time.md): a dev
     /// executable ([`inproc::runs_in_process`]), linked with the start hook's reservations and
@@ -49,7 +52,13 @@ pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on i
     (`blaze_inproc_start`, blaze's dev runtime) lays the daemon's code memory over its code before \
     `main`. blaze links that runtime into every binary and test of a dev build of this machine's \
     own target as it links std (library/blaze_inproc_rt), on Linux (x86_64, AArch64) and macOS \
-    (AArch64); a program of another platform has none, and does not run";
+    (AArch64). Native Windows x64 processes start from linked PE files instead";
+
+/// The Windows x64 host starts its native executable as a file in a job object. Select that
+/// ABI before choosing live code at link or launch time, never because a runtime is missing.
+fn native_pe(host: &str, target: &str) -> bool {
+    host == "x86_64-pc-windows-msvc" && target == host
+}
 
 /// How the process of unit `unit` starts; `runner` says it runs under a
 /// `target.<triple>.runner`. What a `run` and a test binary both start through.
@@ -59,6 +68,9 @@ pub(crate) fn launch(job: &Job, unit: usize, runner: bool) -> Result<Launch, Str
     }
     let u = job.unit(unit).map_err(|it| it.what)?;
     let policy = codegen::policy(job, unit, codegen::toolchain(job, unit)?)?;
+    if policy.mode == BuildMode::Output && native_pe(&job.input.config.host, &policy.toolchain.target) {
+        return Ok(Launch::File);
+    }
     // Only a build not made live asks why: a live one is a dev executable.
     let why = match policy.mode {
         BuildMode::Live => None,
@@ -82,6 +94,8 @@ pub(crate) fn launch_of(
     match allows_live(profile, policy) {
         Ok(()) => match (policy.mode, not_in_process) {
             (BuildMode::Live, _) => Ok(Launch::InProcess),
+            // A launcher's program starts as a file: the file is the launcher.
+            (BuildMode::Launched, _) => Ok(Launch::File),
             (_, Some(why)) => Err(format!(
                 "`{target}` runs under profile `{profile}`, so on the daemon's code memory, and can't: {why}. \
                  {NOT_IN_PROCESS}"
@@ -277,8 +291,8 @@ pub(crate) fn start(
         true => Sandbox::Off,
         false => Sandbox::On {
             read: vec![
-                PathBuf::from(&config.invocation.root),
-                PathBuf::from(&units.target_dir),
+                blaze_core::platform::path::host(&config.invocation.root),
+                blaze_core::platform::path::host(&units.target_dir),
                 manifest_dir,
             ],
             write: Vec::new(),
@@ -287,11 +301,13 @@ pub(crate) fn start(
             services: Vec::new(),
         },
     };
+    // clone: the daemon's name of the program, which its code memory is kept under; once per run
+    let named = program.clone();
     let command = Command {
-        program: PathBuf::from(program),
+        program: blaze_core::platform::path::host(&program),
         args: args.into_iter().map(OsString::from).collect(),
         env,
-        dir: PathBuf::from(&config.invocation.cwd),
+        dir: blaze_core::platform::path::host(&config.invocation.cwd),
         stdin: Vec::new(),
         sandbox,
         memory: None,
@@ -304,7 +320,7 @@ pub(crate) fn start(
             let loaded = job
                 .shared
                 .dev_runs
-                .loaded(&command.program.to_string_lossy())
+                .loaded(&named)
                 .map_err(|what| ApiError::new(what, None))?;
             let (command, started) =
                 loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
@@ -317,8 +333,8 @@ pub(crate) fn start(
 impl Runs<Real> for Program {
     fn start(
         &mut self,
-        _store: &Store,
-        _writer: Option<&mut UnitWriter>,
+        _store: &mut Store,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -337,7 +353,7 @@ impl Runs<Real> for Program {
         &mut self,
         completion: Completion,
         _store: &mut Store,
-        _writer: Option<&mut UnitWriter>,
+        _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

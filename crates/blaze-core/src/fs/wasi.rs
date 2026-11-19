@@ -49,6 +49,16 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     ))
 }
 
+/// [`crate::Effect::CopyData`]: refused, as WASI has no call that says where a file's holes
+/// are or copies between files in the kernel; nothing copies through memory instead.
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    Err(refused(
+        to,
+        format_args!("copying the data of {} to it", from.display()),
+        "WASI has no call that finds a file's data extents, and blaze does not copy through memory instead",
+    ))
+}
+
 /// [`crate::Effect::Times`]: the access and modification times of `path`, through a symbolic
 /// link, both `modified_ns` since the epoch (WASI's `path_filestat_set_times`, whose times are
 /// 64-bit nanoseconds, so every `modified_ns` fits). An error names `path`.
@@ -83,7 +93,7 @@ fn mode(kind: std::fs::FileType) -> Option<u32> {
 /// The [`Stamp`] of what `meta` says of a name, not followed through a symlink; unknown where
 /// its kind or a time can't be said. The change time is std's `created`, which on WASI is
 /// `filestat`'s `ctim`, the inode's change time.
-fn stamp_of(meta: &Metadata) -> Stamp {
+pub(super) fn stamp_of(meta: &Metadata) -> Stamp {
     use std::os::wasi::fs::MetadataExt as _;
     let (Some(mode), Some(mtime_ns), Some(ctime_ns)) =
         (mode(meta.file_type()), ns(meta.modified()), ns(meta.created()))

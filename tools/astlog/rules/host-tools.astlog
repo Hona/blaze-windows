@@ -1,0 +1,26 @@
+;; Portable build, source and CLI modules must not acquire their own OS driver. Keep
+;; this positive list small: sandbox/windows, daemon detach and interactive run have
+;; deliberately different handle and console contracts. Clippy resolves Command aliases.
+(rule (portable-tool-node n)
+  (match rust "[(call_expression) (use_declaration)] @n")
+  (file-path n path)
+  (text-match path "(crates[/\\\\]blaze-(cargo[/\\\\]src[/\\\\](cli[/\\\\](doc|edits|observe|perf|pprof)|serve[/\\\\]unit[/\\\\](artifact|script|test))|registry[/\\\\]src[/\\\\](git|auth[/\\\\]process))\\.rs|host-tools-fixture\\.rs)$"))
+
+(rule (raw-tool-command call)
+  (match rust "(call_expression function: (scoped_identifier) @f) @call")
+  (text-match f "(^|::)Command::new$")
+  (portable-tool-node call))
+
+(rule (direct-host-call call)
+  (match rust "(call_expression function: (scoped_identifier) @f) @call")
+  (text-match f "^(::)?(libc|windows_sys|winapi|std::os::(windows|unix))::")
+  (portable-tool-node call))
+
+(rule (direct-host-import decl)
+  (match rust "(use_declaration argument: (_) @u) @decl")
+  (text-match u "^(::)?(libc|windows_sys|winapi|std::os::(windows|unix))(::|$)")
+  (portable-tool-node decl))
+
+(lint raw-tool-command error "construct helper commands with blaze_core::platform::command::command and their working directory")
+(lint direct-host-call error "portable build logic must call the platform driver rather than an OS API")
+(lint direct-host-import error "keep OS imports in the platform driver, not in portable build logic")

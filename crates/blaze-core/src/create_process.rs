@@ -71,28 +71,39 @@ fn push_arg(line: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
             String::from_utf16_lossy(arg)
         )));
     }
-    let quoted =
-        arg.is_empty() || arg.iter().any(|&it| it == u16::from(b' ') || it == u16::from(b'\t'));
+    quote(arg.iter().copied(), |unit| line.push(unit));
+    Ok(())
+}
+
+/// UTF-16 units consumed by an argument, not including the separating space. Measure with
+/// exactly the encoder used for CreateProcessW: a quoted trailing backslash counts twice.
+pub fn argument_units(arg: impl Iterator<Item = u16> + Clone) -> usize {
+    let mut units = 0;
+    quote(arg, |_| units += 1);
+    units
+}
+
+fn quote(arg: impl Iterator<Item = u16> + Clone, mut emit: impl FnMut(u16)) {
+    let quoted = arg.clone().next().is_none() || arg.clone().any(|it| it == u16::from(b' ') || it == u16::from(b'\t'));
     if quoted {
-        line.push(QUOTE);
+        emit(QUOTE);
     }
     let mut slashes = 0;
-    for &unit in arg {
+    for unit in arg {
         if unit == SLASH {
             slashes += 1;
         } else {
             if unit == QUOTE {
-                line.extend(std::iter::repeat_n(SLASH, slashes + 1));
+                for _ in 0..=slashes { emit(SLASH); }
             }
             slashes = 0;
         }
-        line.push(unit);
+        emit(unit);
     }
     if quoted {
-        line.extend(std::iter::repeat_n(SLASH, slashes));
-        line.push(QUOTE);
+        for _ in 0..slashes { emit(SLASH); }
+        emit(QUOTE);
     }
-    Ok(())
 }
 
 /// [`environment`] of names and values in code units.
@@ -116,7 +127,9 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
                 String::from_utf16_lossy(&name)
             )));
         }
-        by_name.push((upper(&name), given, name, value));
+        // alloc: once per variable, its comparison key for sorting the environment block
+        let key: Vec<_> = name.iter().copied().map(crate::platform::env::upper_unit).collect();
+        by_name.push((key, given, name, value));
     }
     by_name.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     by_name.dedup_by(|later, kept| later.0 == kept.0);
@@ -135,30 +148,13 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
     Ok(block)
 }
 
-/// Each code unit in upper case where that is one code unit, as Windows compares names.
-fn upper(units: &[u16]) -> Vec<u16> {
-    units
-        .iter()
-        .map(|&unit| {
-            let Some(c) = char::from_u32(u32::from(unit)) else { return unit };
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(one), None) => u16::try_from(u32::from(one)).unwrap_or(unit),
-                _ => unit,
-            }
-        })
-        // alloc: once per variable of a process spawned, its name's sort key
-        .collect()
-}
-
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
-    use hegel::{PrintableGenerator, TestCase};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -359,37 +355,42 @@ mod tests {
         assert_eq!(environment(&[("é", "1"), ("É", "2")]).unwrap(), "É=2\0\0");
     }
 
+    /// UTF-16 units from `alphabet`'s, `len.start` to `len.end - 1` of them.
     fn units(
+        tape: &Tape,
         alphabet: &'static str,
         len: std::ops::Range<usize>,
-    ) -> impl PrintableGenerator<Vec<u16>> {
-        gs::vecs(gs::sampled_from(alphabet.encode_utf16().collect::<Vec<_>>()))
-            .min_size(len.start)
-            .max_size(len.end - 1)
+        label: &'static str,
+    ) -> Vec<u16> {
+        let alphabet: Vec<u16> = alphabet.encode_utf16().collect();
+        tape.vec(len.start..=len.end - 1, label, |tape| *tape.one_of(&alphabet, label))
     }
 
-    #[hegel::test]
-    fn the_runtime_reads_back_the_arguments_as_the_reference_does(tc: TestCase) {
-        let args = tc.draw(gs::vecs(units("a \t\"\\\né", 0..8)).max_size(4));
-        let program = wide(r"C:\p q\a.exe");
-        let ours = wide_command_line(&program, &args).unwrap();
-        assert_eq!(&split(&ours[..ours.len() - 1]), &args);
-        assert_eq!(&split(&reference_line(&program, &args)), &args);
+    #[test]
+    fn the_runtime_reads_back_the_arguments_as_the_reference_does() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let args = tape.vec(0..=4, "args", |tape| units(tape, "a \t\"\\\né", 0..8, "arg"));
+            let program = wide(r"C:\p q\a.exe");
+            let ours = wide_command_line(&program, &args).unwrap();
+            assert_eq!(&split(&ours[..ours.len() - 1]), &args);
+            assert_eq!(&split(&reference_line(&program, &args)), &args);
+        })
     }
 
-    #[hegel::test]
-    fn ascii_names_make_the_reference_block(tc: TestCase) {
-        let env = tc.draw(
-            gs::vecs(gs::tuples!(gs::booleans(), units("aAbB_", 1..3), units("a=\\", 0..3)))
-                .max_size(5),
-        );
-        let env: Vec<(Vec<u16>, Vec<u16>)> = env
-            .into_iter()
-            .map(|(drive, name, value)| {
-                let name = if drive { [vec![EQUALS], name].concat() } else { name };
-                (name, value)
-            })
-            .collect();
-        assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
+    #[test]
+    fn ascii_names_make_the_reference_block() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let env = tape.vec(0..=5, "env", |tape| {
+                (tape.bool("drive"), units(tape, "aAbB_", 1..3, "name"), units(tape, "a=\\", 0..3, "value"))
+            });
+            let env: Vec<(Vec<u16>, Vec<u16>)> = env
+                .into_iter()
+                .map(|(drive, name, value)| {
+                    let name = if drive { [vec![EQUALS], name].concat() } else { name };
+                    (name, value)
+                })
+                .collect();
+            assert_eq!(wide_environment(env.clone()).unwrap(), reference_environment(&env));
+        })
     }
 }

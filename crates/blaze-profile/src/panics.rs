@@ -544,6 +544,16 @@ pub(crate) fn since(next: &mut u64, into: &mut Vec<Raised>) -> u64 {
     skipped
 }
 
+/// The latest recorded panic, without symbolizing its stack or consuming history's cursor.
+/// Status can name a dead worker even if it died before handing its result to the daemon.
+pub fn latest() -> Option<(String, Option<String>, Option<String>)> {
+    let end = NEXT.load(Ordering::Acquire);
+    (end.saturating_sub(KEPT as u64)..end).rev().find_map(|n| match read(n) {
+        Found::Whole(it) => Some((it.thread, it.location, it.message)),
+        Found::Writing | Found::Gone => None,
+    })
+}
+
 /// A row of the schema's `panics` table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanicRow {

@@ -170,7 +170,12 @@ impl Fixture {
     pub(crate) fn open(&self, ask: &Ask<'_>) -> ViewId {
         let files: Vec<(&str, &[u8])> =
             ask.files.iter().map(|(path, text)| (*path, text.as_bytes())).collect();
-        let mut env: Vec<(String, String)> = vec![("HOME".to_owned(), "/home/u".to_owned())];
+        // The home as each system names it: cargo's home is `.cargo` under `USERPROFILE` on
+        // Windows, under `HOME` elsewhere, so the fixture's is one on every host.
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".to_owned(), "/home/u".to_owned()),
+            ("USERPROFILE".to_owned(), "/home/u".to_owned()),
+        ];
         env.extend(ask.env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
         env.sort();
         let mut mounts = vec![mount(WS, "ws"), library_mount(self.library, COMMIT)];
@@ -280,6 +285,20 @@ fn roots_named(units: &Units) -> Vec<String> {
 }
 
 const A: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+
+#[cfg(windows)]
+#[test]
+fn an_external_target_dir_names_generated_sources_in_the_mount_namespace() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/build.rs", "fn main() {}"), ("ws/src/lib.rs", "")];
+    let env = [("CARGO_TARGET_DIR", "c:/external/target")];
+    let units = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&files) })));
+    assert_eq!(units.target_dir, "/C:/external/target");
+    let run = units.graph.units.iter().position(|u| !u.is_std && u.mode == Mode::RunCustomBuild).unwrap();
+    let out = units.plans[run].out_dir.as_deref().unwrap();
+    assert!(out.starts_with("/C:/external/target/"), "{out}");
+    assert!(units.plans.iter().any(|p| p.env.iter().any(|(k,v)| k == "OUT_DIR" && v == out)));
+}
 
 #[test]
 fn one_package_plans_its_library_and_binary_with_the_standard_library() {
@@ -755,6 +774,72 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     }
 }
 
+/// The invariant: the build's rustflags for a platform reach every unit of its standard library
+/// built for it, as cargo's `-Zbuild-std` passes them, and none of std's build scripts, which
+/// are the host's: the front end compiles `core` with the cfg they give (`-C
+/// target-feature=+crt-static` picks its `/defaultlib:libcmt`), never the platform's bare one.
+#[test]
+fn the_rustflags_reach_the_standard_librarys_units_for_the_platform() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let flag = "--cfg=blaze_std_flag";
+    let planned =
+        ready(fixture.plan(fixture.open(&Ask { env: &[("RUSTFLAGS", flag)], ..ask(&files) })));
+    let has = |plan: &UnitPlan| {
+        plan.cfgs.iter().any(|it| it == "blaze_std_flag")
+            || plan.rustflags.iter().any(|it| it == flag)
+    };
+    let std = std_plans(&planned);
+    let (scripts, crates): (Vec<_>, Vec<_>) = std.iter().partition(|((_, target, mode), _)| {
+        *mode == Mode::RunCustomBuild || target.starts_with("build-script")
+    });
+    assert!(!crates.is_empty());
+    for ((package, target, mode), plan) in &crates {
+        assert!(has(plan), "{package} {target} {mode:?}: {plan:?}");
+    }
+    for ((package, target, mode), plan) in &scripts {
+        assert!(!has(plan), "{package} {target} {mode:?}: {plan:?}");
+    }
+}
+
+/// The invariant: with `--target` of the host's own triple the target's rustflags reach the
+/// target's standard library and never the host's, which its build scripts link: cargo gives a
+/// host unit none of them, so the host's std is told the platform's own cfg (no `crt-static`
+/// of the target's flags: a build script linked with the dynamic VC runtime and a `core`
+/// asking for the static one is LNK2038).
+#[test]
+fn with_a_target_of_the_hosts_own_triple_the_hosts_std_has_none_of_the_targets_rustflags() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let flag = "--cfg=blaze_std_flag";
+    let files = [files[0], files[1], ("ws/build.rs", "fn main() {}\n")];
+    let ask = Ask { args: &["--target", HOST], env: &[("RUSTFLAGS", flag)], ..ask(&files) };
+    let planned = ready(fixture.plan(fixture.open(&ask)));
+    let has = |plan: &UnitPlan| {
+        plan.cfgs.iter().any(|it| it == "blaze_std_flag")
+            || plan.rustflags.iter().any(|it| it == flag)
+    };
+    let mut seen = [0, 0];
+    for (unit, plan) in planned.graph.units.iter().zip(&planned.plans) {
+        let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
+        if !unit.is_std || script {
+            continue;
+        }
+        let what = format!("{} {} {:?}", unit.pkg_id, unit.target.name, unit.platform);
+        match unit.platform {
+            Some(_) => {
+                assert!(has(plan), "{what}: {plan:?}");
+                seen[1] += 1;
+            }
+            None => {
+                assert!(!has(plan), "{what}: {plan:?}");
+                seen[0] += 1;
+            }
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "a std unit of each platform: {seen:?}");
+}
+
 /// Each unit of the standard library that both `a` and `b` plan whose plan (its outputs, its
 /// `OUT_DIR`, its variables, its hashes) is not the same in both, by package, target and mode;
 /// and how many units they share.
@@ -1078,10 +1163,12 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
     let source = format!("git+https://github.com/o/r?rev={commit}#{commit}");
     let ident = blaze_resolve::SourceId::from_url(&source).unwrap().git_ident();
     let at = format!("{SOURCES}/git/checkouts/{ident}/{commit}");
+    let tree = format!("blake3:{}", "ab".repeat(32));
+    let blaze_lock = format!("version = 1\n\n[git.\"https://github.com/o/r\"]\n{commit} = \"{tree}\"\n");
     let fetch = Fetch {
         what: "git repository `https://github.com/o/r`".to_owned(),
         url: "https://github.com/o/r".to_owned(),
-        kind: FetchKind::Git { commit: commit.to_owned() },
+        kind: FetchKind::Git { commit: commit.to_owned(), tree },
         at: at.clone(),
     };
     let manifest =
@@ -1092,9 +1179,25 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
          [[package]]\nname = \"r-sys\"\nversion = \"0.1.0\"\nsource = \"{source}\"\n"
     );
     let fixture = Fixture::new();
+    // Without its tree pinned in `blaze.lock`, the git package is refused before its
+    // checkout is asked for: the commit (SHA-1) pins nothing.
+    let unpinned = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+    ];
+    let Planned::Failed(error) = fixture.plan(fixture.open(&ask(&unpinned))) else {
+        panic!("an unpinned git package was located");
+    };
+    assert!(
+        error.what.contains("weak_source_pin") && error.what.contains("blaze audit pin") && error.what.contains(commit),
+        "{}",
+        error.what
+    );
     let files = [
         ("ws/Cargo.toml", manifest.as_str()),
         ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
         ("ws/src/lib.rs", ""),
     ];
     assert_eq!(fixture.plan(fixture.open(&ask(&files))), Planned::Needs(vec![fetch]));
@@ -1108,6 +1211,7 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
     let fetched = [
         ("ws/Cargo.toml", manifest.as_str()),
         ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
         ("ws/src/lib.rs", ""),
         ("co/Cargo.toml", root),
         ("co/crates/r/Cargo.toml", r),
@@ -1205,7 +1309,6 @@ impl Query for HostMacros {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
-                sandboxed_tests: built.sandboxed_tests,
                 native: built.native,
             }),
             super::Staged::Needs(fetches) => Planned::Needs(fetches),
@@ -1603,14 +1706,19 @@ fn the_sandbox_opt_outs_are_the_manifests() {
     );
 }
 
-// The tests' opt-ins as the plan carries them: the workspace's `sandboxed-tests` experiment,
-// `a`'s `tests = true` with one test out, `b`'s `tests = false`, and `d`, outside the
-// workspace, whose own table is not read.
+// The tests' sandbox as the plan carries it, for a Linux host (`HOST`), which sandboxes tests by
+// default: `c`, which says nothing, is; `a`'s `tests = true` (the default said out loud) with
+// one test out; `b`'s `tests = false`; and `d`, outside the workspace, whose own table is not
+// read. A workspace that still lists `sandboxed-tests` plans the same there, with one note
+// (on macOS it is the opt-in: `sandbox::tests_on`).
 #[test]
 fn the_tests_opt_ins_are_the_manifests() {
     let fixture = Fixture::new();
-    let root = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n\n\
-                [workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n";
+    let root = |experimental: &str| {
+        format!(
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n{experimental}"
+        )
+    };
     let package = |name: &str, extra: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}")
     };
@@ -1622,34 +1730,50 @@ fn the_tests_opt_ins_are_the_manifests() {
     let b = package("b", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
     let c = package("c", "");
     let d = package("d", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
-    let files = [
-        ("ws/Cargo.toml", root),
-        ("ws/a/Cargo.toml", a.as_str()),
-        ("ws/a/src/lib.rs", ""),
-        ("ws/b/Cargo.toml", b.as_str()),
-        ("ws/b/src/lib.rs", ""),
-        ("ws/c/Cargo.toml", c.as_str()),
-        ("ws/c/src/lib.rs", ""),
-        ("d/Cargo.toml", d.as_str()),
-        ("d/src/lib.rs", ""),
-    ];
-    let units = ready(
-        fixture.plan(fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) })),
-    );
-    assert!(units.sandboxed_tests);
+    let plain = root("");
+    let retired = root("\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n");
+    let plan = |root: &str| {
+        let files = [
+            ("ws/Cargo.toml", root),
+            ("ws/a/Cargo.toml", a.as_str()),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", b.as_str()),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/c/Cargo.toml", c.as_str()),
+            ("ws/c/src/lib.rs", ""),
+            ("d/Cargo.toml", d.as_str()),
+            ("d/src/lib.rs", ""),
+        ];
+        ready(fixture.plan(
+            fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) }),
+        ))
+    };
+    let units = plan(&plain);
+    assert!(units.notes.is_empty(), "{:?}", units.notes);
     let of = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap();
     assert_eq!(
         of("a").tests,
-        TestSandbox { all: false, opted_in: true, tests: vec!["net::reaches".to_owned()] }
+        TestSandbox { tests: vec!["net::reaches".to_owned()], ..TestSandbox::default() }
     );
-    assert_eq!(of("b").tests, TestSandbox { all: true, opted_in: false, tests: Vec::new() });
+    assert_eq!(of("b").tests, TestSandbox { all: true, ..TestSandbox::default() });
     assert_eq!(of("c").tests, TestSandbox::default());
     assert_eq!(of("d").tests, TestSandbox::default());
     for (name, sandboxed) in [("a", true), ("b", false), ("c", true), ("d", true)] {
-        assert_eq!(of(name).tests_sandboxed(units.sandboxed_tests), sandboxed, "{name}");
+        assert_eq!(of(name).tests_sandboxed(), sandboxed, "{name}");
     }
-    assert!(!of("c").tests_sandboxed(false) && of("a").tests_sandboxed(false));
     assert!(units.packages.iter().all(|it| it.checksum.is_none()), "no package is from crates.io");
+
+    let listed = plan(&retired);
+    assert_eq!(listed.packages, units.packages, "the retired experiment changes no package");
+    assert_eq!(listed.notes.len(), 1, "{:?}", listed.notes);
+    assert!(
+        listed.notes[0].starts_with(
+            "`sandboxed-tests` in `experimental` under [workspace.metadata.blaze] of \
+             /home/u/ws/Cargo.toml does nothing on x86_64-unknown-linux-gnu"
+        ),
+        "{}",
+        listed.notes[0]
+    );
 
     let unknown = "[workspace]\nmembers = [\"c\"]\nresolver = \"3\"\n\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-test\"]\n";
     let files =

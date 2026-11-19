@@ -38,13 +38,15 @@ use super::{
     job::{DURABLE_WITHIN, ENDED_LOST, ENDED_ROWS, RECHECK},
     plane::{Inline, Runner},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
-        Library, Output, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer,
-        applying_fallible,
+        Asks, Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb,
+        KeptPut, Library, Output, Phase, PhaseDone, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps,
+        Writer, applying_fallible,
     },
 };
 
 const SOCKET: &str = "run/blaze/v2.sock";
+/// The socket of a second home's daemon on the same machine.
+const OTHER_SOCKET: &str = "run/blaze/other.sock";
 const STATE: &str = "cache/blaze/v2";
 /// [`Options::std`]: the machine's, outside every state directory.
 const STD: &str = "cache/blaze/std/0b";
@@ -65,6 +67,10 @@ fn name(it: &str) -> FileName {
 }
 
 thread_local! {
+    /// The crates the fakes' writer gives the front end's carry ([`Writer::view_crates`]):
+    /// none but for a test of the carry.
+    static CARRY_CRATES: std::cell::RefCell<Vec<crate::serve::front_carry::CrateRoot>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// How many times the load ran on this thread (tasks run inline, on the test's).
     static PLANS: Cell<usize> = const { Cell::new(0) };
     /// The configuration of each run of the load.
@@ -77,6 +83,9 @@ thread_local! {
     static FAILS_FETCHES: Cell<bool> = const { Cell::new(false) };
     /// How many times a writer applied what was asked of it.
     static APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// How many of a writer's applies ran outside a write's task (`job::IN_WRITE_TASK`): on
+    /// the loop, in its turn.
+    static LOOP_APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The build script's run whose write fails with an error as it is applied, as a real
@@ -89,10 +98,19 @@ thread_local! {
     /// The unit whose compile ends in an error that is no refusal, as an `Unsupported` codegen
     /// error of the 2026-10-31 `blaze test --workspace` did.
     static ERRS_COMPILE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Set, unit 3's store saves a body entries' session of its crate `app` ([`body_session`]),
+    /// a newer one each save, as a real unit's serve of its bodies does.
+    static BODY_SESSIONS: Cell<bool> = const { Cell::new(false) };
+    /// How many body entries' sessions the fakes saved.
+    static BODY_SAVES: Cell<u8> = const { Cell::new(0) };
+    /// Each lowering's `JobInput::body_marks`, in order.
+    static BODY_MARKS_SEEN: RefCell<Vec<BTreeMap<String, blaze_cas::Key>>> = const { RefCell::new(Vec::new()) };
     /// Each compile's unit, and the runs applied in the front end it read.
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
     static PHASES: RefCell<Vec<(usize, Phase)>> = const { RefCell::new(Vec::new()) };
+    static PROBED_FRESH: Cell<Option<usize>> = const { Cell::new(None) };
+    static REPLAYED_NAMES: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each reach's runs applied in the front ends it read: its view's from, then its to.
     static REACHED: RefCell<Vec<(Vec<usize>, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each edit's and each build ahead's choice's runs applied in the front end it read.
@@ -109,6 +127,9 @@ thread_local! {
     static ANEW: Cell<usize> = const { Cell::new(0) };
     /// How many kept front ends were stored ([`Steps::store_kept`]).
     static STORES: Cell<usize> = const { Cell::new(0) };
+    /// How many kept front ends' members were stored, the second store of one
+    /// (`Jobs::store_members`): as many as members a restart reads from pages.
+    static MEMBER_STORES: Cell<usize> = const { Cell::new(0) };
     /// The checkout whose kept front end leaves nothing for the store: a job that puts
     /// nothing new, and may still have read what another job put.
     static PUTS_NOTHING: RefCell<String> = const { RefCell::new(String::new()) };
@@ -123,6 +144,13 @@ thread_local! {
     static KEEPS_FOR: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     /// How many of its runs started.
     static KEEPS_STARTED: Cell<usize> = const { Cell::new(0) };
+    /// ... and files this test suite's index head, its record put as the run's own
+    /// ([`Keeps`]), or lets the suite's head go: the runner's `Suited::ended` and
+    /// `Suited::refused`, as `RunPuts::heads` hands them to the loop.
+    static TESTS_HEAD: Cell<Option<crate::serve::work::HeadFiled>> = const { Cell::new(None) };
+    /// The test suites' head marks the last start handed to the steps
+    /// (`Steps::test_heads_marked`).
+    static HEADS_MARKED: RefCell<Vec<crate::serve::local::TestHeadMark>> = const { RefCell::new(Vec::new()) };
     /// How many lowerings anew found in the store all a build of their checkout left for it
     /// ([`kept_key`]): what a restarted daemon's first build reads instead of working it out.
     static KEPT_READS: Cell<usize> = const { Cell::new(0) };
@@ -136,6 +164,9 @@ thread_local! {
     static SIDE_OUTPUT: Cell<bool> = const { Cell::new(false) };
     /// Whether the program's compile warns twice, as its unit.
     static WARNS: Cell<bool> = const { Cell::new(false) };
+    /// Whether the fake load says no warning: by default it warns its manifest's text, which
+    /// every answer then says (and which the thin client hands to the engine to print).
+    static QUIET_LOAD: Cell<bool> = const { Cell::new(false) };
     /// Whether a writer's apply fails as a whole, an error of the writer's own that no unit's
     /// write owns: it ends the job.
     static FAILS_APPLY: Cell<bool> = const { Cell::new(false) };
@@ -147,9 +178,78 @@ thread_local! {
     /// Whether the first unit's compile shares [`SHARED`] in the standard library's shared
     /// store, as a std unit made here does.
     static SHARES: Cell<bool> = const { Cell::new(false) };
+    /// Where the fakes' kept front end puts [`SEALED_RECORD`], the front-end record of the
+    /// sealed crate unit 0 is (a registry crate's, as `deps::store` routes it): `None` puts
+    /// none of it.
+    static SEALED_INTO: Cell<Option<crate::serve::work::PutInto>> = const { Cell::new(None) };
+    /// Whether the job's lowering anew found [`SEALED_RECORD`] through its home's look, as a
+    /// real front end serves a dependency from its record: unit 0 then builds nothing.
+    static SEALED_FOUND: Cell<bool> = const { Cell::new(false) };
+    /// How many times unit 0, the sealed crate, was built for want of its record.
+    static SEALED_BUILDS: Cell<usize> = const { Cell::new(0) };
+    /// The planted bug of `a_builds_store_reads_all_pass_through_direct`: the fakes' lowering
+    /// reads the store around `serve::direct`, as a read left on the old pooled path would.
+    static READS_AROUND_DIRECT: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// Whether the fakes keep the model of the units that stand (`job::standing`): a record a
+    /// unit, made over its sources' version, the records of the units it depends on and the
+    /// request's `STANDING`, kept in [`STAND_RECORDS`]. Off but in those tests.
+    static STAND_MODEL: Cell<bool> = const { Cell::new(false) };
+    /// The units the fakes' front end says are sealed ([`Front::sealed`]).
+    static STAND_SEALED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Each unit's dependencies, as the test's plan has them: what a record is made over, and
+    /// how many units [`Front::sealed`] answers of.
+    static STAND_DEPS: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
+    /// Each unit's sources' version, 0 unless an edit of the test's moved it.
+    static STAND_VERSIONS: RefCell<BTreeMap<usize, u64>> = const { RefCell::new(BTreeMap::new()) };
+    /// The request's `STANDING`, as the job's lowering saw it.
+    static STAND_ENV: RefCell<String> = const { RefCell::new(String::new()) };
+    /// The fakes' store of records, by unit: what each unit's last store put, what a unit that
+    /// stands finds ([`Front::stand`]).
+    static STAND_RECORDS: RefCell<BTreeMap<usize, ContentId>> =
+        const { RefCell::new(BTreeMap::new()) };
+    /// Each unit's record as a build ended it, made or stood, in the order they ended.
+    static STAND_ENDED: RefCell<Vec<(usize, ContentId)>> = const { RefCell::new(Vec::new()) };
+    /// Each unit stood in its one task ([`Front::stand`]), in order.
+    static STOOD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Set while a standing unit's task runs its store, which replays the record it found.
+    static STANDING_TASK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The record unit `unit` is made into now, in the model of the units that stand
+/// ([`STAND_MODEL`]): of its sources' version, the request's `STANDING` and the record of each
+/// unit it depends on (none for one that has none, as a build script's run).
+fn made_record(unit: usize) -> ContentId {
+    let version = STAND_VERSIONS.with_borrow(|it| it.get(&unit).copied().unwrap_or(0));
+    let mut hasher = Hasher::new("blaze serve tests standing record");
+    hasher.part(&(unit as u64).to_le_bytes()).part(&version.to_le_bytes());
+    STAND_ENV.with_borrow(|it| {
+        hasher.part(it.as_bytes());
+    });
+    let deps = STAND_DEPS.with_borrow(|it| it.get(unit).cloned().unwrap_or_default()); // clone: a test's plan, read out of its cell
+    for dep in deps {
+        let record = STAND_RECORDS.with_borrow(|it| it.get(&dep).copied());
+        hasher.part(&record.map_or([0; 32], |it| it.0));
+    }
+    hasher.finish()
+}
+
+/// The front-end record of the sealed crate the fakes' unit 0 is ([`SEALED_INTO`]).
+const SEALED_RECORD: &[u8] = b"a sealed crate's front-end record\n";
+
+fn sealed_key() -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests sealed", SEALED_RECORD))
 }
 
 const SHARED: &[u8] = b"a std unit's record\n";
+
+/// The `n`th body entries' session the fakes save: its root, and the value under it.
+fn body_session(n: u8) -> (blaze_cas::Key, Vec<u8>) {
+    let bytes = format!("the fakes' body entries' session {n}\n").into_bytes();
+    (blaze_cas::Key(ContentId::of("blaze serve tests body session", &bytes)), bytes)
+}
 
 fn shared_key() -> blaze_cas::Key {
     blaze_cas::Key(ContentId::of("blaze serve tests shared", SHARED))
@@ -172,6 +272,20 @@ const SHARED_KEPT: &[u8] = b"what every checkout's build left for the store\n";
 
 fn shared_kept_key() -> blaze_cas::Key {
     blaze_cas::Key(ContentId::of("blaze serve tests kept shared", SHARED_KEPT))
+}
+
+/// What the fakes' second store of `checkout`'s kept front end puts: its members' pages.
+fn members_key(checkout: &str) -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests kept members", checkout.as_bytes()))
+}
+
+fn members_value(checkout: &str) -> Vec<u8> {
+    format!("the pages of the members of {checkout}\n").into_bytes()
+}
+
+/// Whether `store` holds the pages of `checkout`'s members ([`members_key`]).
+fn holds_members(store: &Store, checkout: &str) -> bool {
+    store.get(&members_key(checkout)).unwrap().is_some_and(|it| it.bytes == members_value(checkout))
 }
 
 /// Whether `store` holds all a build of `checkout` left for it.
@@ -213,7 +327,7 @@ fn app_artifact() -> Artifact {
             src_path: "/w/src/main.rs".into(),
             crate_types: vec![CrateType::Bin],
         },
-        content: ContentId::of("blaze serve tests output", APP),
+        content: super::unit::output_key(APP).0,
         harness: true,
         package: "path+file:///w#0.1.0".into(),
         profile: UnitProfile {
@@ -249,6 +363,7 @@ fn warning_of_app(message: &str) -> Diagnostic {
         target,
         package_id: "app".into(),
         manifest_path: "/w/Cargo.toml".into(),
+        primary: true,
     };
     Diagnostic {
         level: Level::Warning,
@@ -502,11 +617,25 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             is_member,
             default_run: None,
             checksum: None,
+            tree: None,
             tests: TestSandbox::default(),
             const_macros: None,
         };
+    // The program's plan lists the files its compile gives ([`Fake`]'s store step: unit 3's),
+    // as cargo's plan lists every file it writes for a unit (`UnitPlan::outputs`): what a
+    // request certificate names its outputs by. With none listed, a simulated certificate
+    // named no output and answered whatever was at the program's path.
+    let mut plans = vec![plan; graph.units.len()];
+    if let Some(program) = plans.get_mut(3) {
+        if OUTPUT.get() {
+            program.outputs.push(APP_AT.to_owned());
+        }
+        if SIDE_OUTPUT.get() {
+            program.outputs.push(SIDE_AT.to_owned());
+        }
+    }
     Units {
-        plans: vec![plan; graph.units.len()],
+        plans,
         graph,
         packages: vec![
             package(&dep, "dep", "1.0.0", Some("registry `crates-io`".into()), false),
@@ -516,13 +645,15 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             files: vec![LockFile { path: format!("{root}/Cargo.lock"), text: "# a lock\n".into() }],
             said: Vec::new(),
         }),
-        warnings: vec![manifest],
+        warnings: match QUIET_LOAD.get() {
+            true => Vec::new(),
+            false => vec![manifest],
+        },
         notes: Vec::new(),
         target_dir: format!("{root}/target"),
         build_dir: format!("{root}/target"),
         finished: FINISHED.into(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }
@@ -530,11 +661,18 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
 /// The build of fakes; `fetched` counts each fetch by its `at`.
 pub(super) struct Fake {
     fetched: blaze_core::lock::Lock<BTreeMap<String, usize>>,
+    /// The launch host's join of a program's instants, the real one
+    /// ([`crate::serve::unit::run::launch::ProgramTimes`]): the loop tells it a client's exec,
+    /// a test plays the launcher's `Hello` and end into it as the launcher's reader would.
+    times: blaze_core::lock::Lock<crate::serve::unit::run::launch::ProgramTimes>,
 }
 
 impl Default for Fake {
     fn default() -> Fake {
-        Fake { fetched: blaze_core::lock::Lock::new("serve.tests.fetched", BTreeMap::new()) }
+        Fake {
+            fetched: blaze_core::lock::Lock::new("serve.tests.fetched", BTreeMap::new()),
+            times: blaze_core::lock::Lock::new("serve.tests.times", Default::default()),
+        }
     }
 }
 
@@ -545,6 +683,20 @@ impl Steps for Fake {
     type KeptFront = FakeInputs;
     type Linked = FakeImage;
     type Runs = FakeRuns;
+    /// The simulated front end has no Lean: what its worker found is its answer.
+    type Proving = blaze_api::Proven;
+
+    fn check_proofs(proving: blaze_api::Proven, _: Option<&str>, _: u64) -> FakeRuns {
+        FakeRuns::Over(Over(vec![Response::Proven(proving)]))
+    }
+
+    fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64) {
+        self.times.lock().execd(pid, build, exec_ns);
+    }
+
+    fn launch_spans(&self) -> Vec<crate::serve::unit::run::launch::ProgramSpans> {
+        self.times.lock().take()
+    }
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         *self.fetched.lock().entry(fetch.at.clone()).or_default() += 1;
@@ -558,22 +710,22 @@ impl Steps for Fake {
         }
         let source = match fetch.kind {
             FetchKind::IndexFile => Source {
-                files: vec![SourceFile {
-                    path: "dep".into(),
-                    bytes: blaze_vfs::Bytes::from_static(b"{}\n"),
-                    mode: blaze_vfs::Mode::Regular,
-                }],
+                files: vec![SourceFile::of(
+                    "dep".into(),
+                    blaze_vfs::Bytes::from_static(b"{}\n"),
+                    blaze_vfs::Mode::Regular,
+                )],
                 under: "dep".into(),
             },
             _ => Source {
-                files: vec![SourceFile {
-                    path: "Cargo.toml".into(),
-                    bytes: blaze_vfs::Bytes::copy_kept(
+                files: vec![SourceFile::of(
+                    "Cargo.toml".into(),
+                    blaze_vfs::Bytes::copy_kept(
                         blaze_mem::Tag::Vfs,
                         format!("# {}\n", fetch.what).as_bytes(),
                     ),
-                    mode: blaze_vfs::Mode::Regular,
-                }],
+                    blaze_vfs::Mode::Regular,
+                )],
                 under: String::new(),
             },
         };
@@ -586,11 +738,11 @@ impl Steps for Fake {
             return Ok(Library { at: LIBRARY.into(), fingerprint, source: None });
         }
         LIBRARY_READS.set(LIBRARY_READS.get() + 1);
-        let file = SourceFile {
-            path: "core/src/lib.rs".into(),
-            bytes: blaze_vfs::Bytes::from_static(b"#![no_core]\n"),
-            mode: blaze_vfs::Mode::Regular,
-        };
+        let file = SourceFile::of(
+            "core/src/lib.rs".into(),
+            blaze_vfs::Bytes::from_static(b"#![no_core]\n"),
+            blaze_vfs::Mode::Regular,
+        );
         Ok(Library {
             at: LIBRARY.into(),
             fingerprint,
@@ -604,8 +756,23 @@ impl Steps for Fake {
     }
 
     fn store_kept(&self, kept: &mut FakeInputs) -> Result<Vec<KeptPut>, ApiError> {
+        // The second store, before an idle front end is let go or at a stop: the workspace
+        // members' pages, as a real front end's second store writes them (`Stored::Sealed`).
         if kept.stored {
-            return Ok(Vec::new());
+            if kept.members {
+                return Ok(Vec::new());
+            }
+            kept.members = true;
+            MEMBER_STORES.set(MEMBER_STORES.get() + 1);
+            return Ok(vec![KeptPut {
+                put: Put {
+                    key: members_key(&kept.checkout),
+                    kind: blaze_cas::Kind::Query,
+                    bytes: members_value(&kept.checkout),
+                },
+                what: Arc::from("the fakes' pages of a checkout's members"),
+                into: crate::serve::work::PutInto::Home,
+            }]);
         }
         kept.stored = true;
         STORES.set(STORES.get() + 1);
@@ -615,6 +782,7 @@ impl Steps for Fake {
         let put = |key, bytes, what: &str| KeptPut {
             put: Put { key, kind: blaze_cas::Kind::Query, bytes },
             what: Arc::from(what),
+            into: crate::serve::work::PutInto::Home,
         };
         let checkout = &kept.checkout;
         // The shared value last: a job that waited on its last put's ticket alone answers before
@@ -631,10 +799,26 @@ impl Steps for Fake {
                 "the fakes' second value of a checkout",
             ),
             put(shared_kept_key(), SHARED_KEPT.to_vec(), "the fakes' value of every checkout"),
-        ])
+        ]
+        .into_iter()
+        .chain(SEALED_INTO.get().map(|into| KeptPut {
+            put: Put {
+                key: sealed_key(),
+                kind: blaze_cas::Kind::Query,
+                bytes: SEALED_RECORD.to_vec(),
+            },
+            what: Arc::from("the fakes' front-end record of a sealed crate"),
+            into,
+        }))
+        .collect())
     }
 
     fn lower(&self, job: &JobInput, kept: Option<FakeInputs>) -> Result<FrontEnd<Fake>, Failed> {
+        // clone: a test's record of the marks the job opens
+        BODY_MARKS_SEEN.with_borrow_mut(|it| it.push((*job.body_marks).clone()));
+        // What the model of the units that stand makes its records under ([`made_record`]).
+        let standing = job.config.invocation.env.iter().find(|(name, _)| name == "STANDING");
+        STAND_ENV.set(standing.map(|(_, value)| value.clone()).unwrap_or_default()); // clone: a test's record
         if kept.as_ref().is_some_and(|it| !it.stored) {
             return Err(Failed::Error(ApiError::new(
                 "the fakes' kept front end is lowered into unstored",
@@ -651,17 +835,26 @@ impl Steps for Fake {
                 let checkout = job.config.invocation.root.clone();
                 // A real lowering anew serves its dependencies from what the last build left
                 // in the store: the fakes count whether it is all there.
-                let guard = blaze_cas::enter();
-                let read = |at| {
-                    job.store
-                        .get(&guard, &kept_key(&checkout, at))
-                        .ok()
-                        .flatten()
-                        .is_some_and(|it| it.bytes == kept_value(&checkout, at))
+                // Each read is a task's: one direct read into its frame, on the loop's driver
+                // lent to it (`serve::direct`), as the real lowering's are.
+                let holds = |key: &blaze_cas::Key, value: &[u8]| match READS_AROUND_DIRECT.get() {
+                    // The planted bug: a read around `direct`, through the store's pool.
+                    true => (job.store.get(&blaze_cas::enter(), key).ok().flatten())
+                        .is_some_and(|it| it.bytes == value),
+                    false => blaze_mem::frame::current(|frame| {
+                        crate::serve::direct::read(&job.reads, crate::serve::direct::Which::Home, key, frame)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|bytes| bytes == value)
+                    }),
                 };
+                let read = |at| holds(&kept_key(&checkout, at), &kept_value(&checkout, at)[..]);
                 if read(0) && read(1) {
                     KEPT_READS.set(KEPT_READS.get() + 1);
                 }
+                // The home's look reads the machine's layer live (`Store::read_live`): a
+                // sealed crate's record another home put there is found through it.
+                SEALED_FOUND.set(holds(&sealed_key(), SEALED_RECORD));
                 FakeInputs { checkout, ..FakeInputs::default() }
             }
         };
@@ -690,6 +883,38 @@ impl Steps for Fake {
     fn plan_key(&self) -> QueryKey {
         QueryKey { kind: FakePlan::KIND, input: FakePlan::input(&()) }
     }
+
+    // The launch host's side, as `launched_restart` drives it: what each start hands over is
+    // kept, and the images and wants it queued are handed to the loop.
+    fn launch_marked(
+        &self,
+        store: blaze_cas::Reader,
+        waker: Option<blaze_core::Waker>,
+        marked: Vec<crate::serve::work::LaunchMarked>,
+    ) {
+        launched_restart::marked(store, waker, marked);
+    }
+
+    fn launch_kept(&self) -> Vec<crate::serve::work::LaunchKept> {
+        launched_restart::kept()
+    }
+
+    fn test_heads_marked(&self, marked: Vec<crate::serve::local::TestHeadMark, std::alloc::Global>) {
+        HEADS_MARKED.set(marked);
+    }
+
+    fn launch_wants(&self) -> Vec<String> {
+        launched_restart::wants()
+    }
+
+    fn launch_built(&self, program: &str, built: Result<(), String>) {
+        launched_restart::built(program, built);
+    }
+
+    // The launch host's code for a program, as solo.rs plays it.
+    fn held_code(&self, holder: crate::serve::work::CodeHolder, program: &str) -> Option<crate::serve::work::HeldCode> {
+        solo::held_code(holder, program)
+    }
 }
 
 pub(super) struct FakeFront {
@@ -702,6 +927,8 @@ pub(super) struct FakeFront {
 pub(super) struct FakeInputs {
     runs: Vec<usize>,
     stored: bool,
+    /// Whether its second store, of its members, was made since it was last kept.
+    members: bool,
     checkout: String,
 }
 
@@ -723,28 +950,25 @@ pub(super) struct FakeWriter {
 /// A shared reference to the inputs, as the loop posted a task with it.
 pub(super) struct FakeReader(Arc<FakeInputs>);
 
-/// A kept image as the kept images' budget sees it: what it weighs and whether a run maps it.
-/// The fakes' compiles link nothing, so only a test of the budget ([`super::job`]'s `Paths`)
-/// makes one.
-pub(super) struct FakeImage {
-    pub(super) held: u64,
-    pub(super) live: bool,
-}
+/// The fakes' kept image: their compiles link nothing, so there is none.
+pub(super) enum FakeImage {}
 
 impl Kept for FakeImage {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
-        Vec::new()
+        match *self {}
     }
 
     fn held(&self) -> u64 {
-        self.held
+        match *self {}
     }
 
     fn live(&self) -> bool {
-        self.live
+        match *self {}
     }
 
-    fn rest(&mut self) {}
+    fn rest(&mut self) {
+        match *self {}
+    }
 }
 
 impl Writer<Fake> for FakeWriter {
@@ -773,6 +997,18 @@ impl Writer<Fake> for FakeWriter {
         !self.asked.is_empty()
     }
 
+    fn idle(&self) -> bool {
+        Arc::strong_count(&self.inputs) == 1
+    }
+
+    fn write_wait(&self) -> crate::serve::work::WriteWait {
+        crate::serve::work::WriteWait {
+            runs: self.asked.len() as u32,
+            readers: (Arc::strong_count(&self.inputs) - 1) as u32,
+            ..crate::serve::work::WriteWait::default()
+        }
+    }
+
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
         Ok(Vec::new()) // the fakes read no dependency from the store
     }
@@ -781,9 +1017,33 @@ impl Writer<Fake> for FakeWriter {
         None // the fakes offer no goal
     }
 
+    // What the fakes' steps read, said: each list is known and empty, so a fake build's
+    // request certificate is written, of its view and its outputs alone. Left to the trait's
+    // defaults ("its front end does not say ..."), no build of the simulation left a
+    // certificate, and every test whose premise is a certificate's answer failed at it.
+
+    /// The fakes' steps ask for no variable by name.
+    fn env_named(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The fakes' steps read no path under the build's outputs beside their own units'.
+    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    /// The fakes run no traced step.
+    fn read_seen(&self) -> Result<Vec<crate::serve::work::Seen>, String> {
+        Ok(Vec::new())
+    }
+
     fn apply(&mut self) -> Result<bool, ApiError> {
         if self.asked.is_empty() {
             return Ok(true);
+        }
+        // A write with something to apply, as `UnitWriter::apply` does only then.
+        if !super::job::IN_WRITE_TASK.get() {
+            LOOP_APPLIES.with(|it| it.set(it.get() + 1));
         }
         if FAILS_APPLY.get() {
             return Err(ApiError::new(
@@ -823,6 +1083,12 @@ impl Writer<Fake> for FakeWriter {
         }
     }
 
+    /// The fake lowers no crates: the front-end carry has none of its builds, but for a
+    /// test that names some ([`CARRY_CRATES`]).
+    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
+        Ok(CARRY_CRATES.with_borrow(Clone::clone))
+    }
+
     fn keep(mut self) -> Result<FakeInputs, ApiError> {
         if !self.apply()? {
             return Err(ApiError::new(
@@ -835,6 +1101,7 @@ impl Writer<Fake> for FakeWriter {
         })?;
         // Kept again: what this build left is not stored yet, as a real front end's is not.
         inputs.stored = false;
+        inputs.members = false;
         Ok(inputs)
     }
 }
@@ -852,8 +1119,8 @@ pub(super) enum FakeRuns {
 impl Runs<Fake> for FakeRuns {
     fn start(
         &mut self,
-        store: &Store,
-        writer: Option<&mut FakeWriter>,
+        store: &mut Store,
+        writer: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -880,7 +1147,7 @@ impl Runs<Fake> for FakeRuns {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -920,8 +1187,8 @@ pub(super) struct Script(usize);
 impl Runs<Fake> for Script {
     fn start(
         &mut self,
-        _: &Store,
-        writer: Option<&mut FakeWriter>,
+        _: &mut Store,
+        writer: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -937,7 +1204,7 @@ impl Runs<Fake> for Script {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -964,8 +1231,8 @@ pub(super) struct Slow {
 impl Runs<Fake> for Slow {
     fn start(
         &mut self,
-        _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -981,7 +1248,7 @@ impl Runs<Fake> for Slow {
         &mut self,
         _: Completion,
         _: &mut Store,
-        writer: Option<&mut FakeWriter>,
+        writer: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1007,8 +1274,8 @@ pub(super) struct Lost;
 impl Runs<Fake> for Lost {
     fn start(
         &mut self,
-        _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1023,7 +1290,7 @@ impl Runs<Fake> for Lost {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1046,6 +1313,15 @@ fn test_record_key() -> blaze_cas::Key {
 
 const TEST_RECORD: &[u8] = b"how the tests of /w ran\n";
 
+/// The store key of the test index head `head` ([`TESTS_HEAD`]), as the runner files it and
+/// the pin `collect::TEST_HEADS` keeps it.
+fn test_head_key(head: ContentId) -> blaze_cas::Key {
+    let mut keys = crate::serve::unit::test_heads_pinned(head, None);
+    keys.next().expect("a head's own key")
+}
+
+const TEST_HEAD: &[u8] = b"the index head of the tests of /w\n";
+
 /// The tests' run as a real one is to its job (`UnitRuns`): it ends on a completion of its
 /// own, and on it keeps how its tests ran in the store, handing the put's ticket over
 /// ([`Runs::take_puts`]) for its job to wait on before it answers.
@@ -1059,8 +1335,8 @@ pub(super) struct Keeps {
 impl Runs<Fake> for Keeps {
     fn start(
         &mut self,
-        _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1077,7 +1353,7 @@ impl Runs<Fake> for Keeps {
         &mut self,
         _: Completion,
         store: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1098,6 +1374,14 @@ impl Runs<Fake> for Keeps {
         if self.tells {
             self.puts.kept([ticket]);
         }
+        if let Some(filed) = TESTS_HEAD.get() {
+            if let Some(mark) = filed.mark {
+                let key = test_head_key(mark.head);
+                let ticket = store.put(key, blaze_cas::Kind::Run, TEST_HEAD).expect("one value under its key");
+                self.puts.kept([ticket]);
+            }
+            self.puts.heads.push(filed);
+        }
         Some(true)
     }
 
@@ -1116,8 +1400,8 @@ pub(super) struct Over(Vec<Response>);
 impl Runs<Fake> for Over {
     fn start(
         &mut self,
-        _: &Store,
-        _: Option<&mut FakeWriter>,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1133,7 +1417,7 @@ impl Runs<Fake> for Over {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut FakeWriter>,
+        _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1150,8 +1434,8 @@ impl Runs<Fake> for Over {
 }
 
 impl Front<Fake> for FakeFront {
-    fn fresh(&self, _: usize) -> bool {
-        false
+    fn fresh(&self, unit: usize) -> bool {
+        PROBED_FRESH.get() == Some(unit)
     }
 
     fn compile(
@@ -1160,7 +1444,7 @@ impl Front<Fake> for FakeFront {
         unit: usize,
         phase: Phase,
         _: &mut Vec<Image<Fake>>,
-    ) -> Result<Option<Compiled>, Failed> {
+    ) -> Result<PhaseDone, Failed> {
         PHASES.with(|it| it.borrow_mut().push((unit, phase)));
         assert_ne!(PANICS_COMPILE.get(), Some(unit), "serve-test: the unit's compile panics");
         if ERRS_COMPILE.get() == Some(unit) {
@@ -1171,28 +1455,48 @@ impl Front<Fake> for FakeFront {
         }
         if phase == Phase::Names {
             SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
+            if REPLAYED_NAMES.get() == Some(unit) {
+                return Ok(PhaseDone::ReplayedNames);
+            }
             if unit == 0 && KEEP.get() {
                 HOLD.with(|it| it.borrow_mut().push(reader));
             }
         }
         if phase != Phase::Store {
-            return Ok(None);
+            return Ok(PhaseDone::Continue);
+        }
+        // The model of the units that stand: a unit stored makes its record now, and the
+        // store keeps it; one that stands replays the record it finds ([`Front::stand`]).
+        if STAND_MODEL.get() && !STANDING_TASK.get() {
+            let record = made_record(unit);
+            STAND_RECORDS.with_borrow_mut(|it| it.insert(unit, record));
+            STAND_ENDED.with_borrow_mut(|it| it.push((unit, record)));
+        }
+        if unit == 0 && SEALED_INTO.get().is_some() && !SEALED_FOUND.get() {
+            SEALED_BUILDS.set(SEALED_BUILDS.get() + 1);
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if SCRIPT_OUTPUT.get() == Some(unit) {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SCRIPT));
+            let key = super::unit::output_key(SCRIPT);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
+            let key = super::unit::output_key(APP);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && SIDE_OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SIDE));
+            let key = super::unit::output_key(SIDE);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SIDE.to_vec() });
             outputs.push(Output { path: SIDE_AT.into(), key, executable: true, made: None });
+        }
+        let mut body_sessions = Vec::new();
+        if unit == 3 && BODY_SESSIONS.get() {
+            BODY_SAVES.set(BODY_SAVES.get() + 1);
+            let (key, bytes) = body_session(BODY_SAVES.get());
+            puts.push(Put { key, kind: blaze_cas::Kind::Query, bytes });
+            body_sessions.push(("app".to_owned(), key));
         }
         let artifact = (unit == 3 && OUTPUT.get()).then(app_artifact);
         let diagnostics = match unit == 3 && WARNS.get() {
@@ -1209,12 +1513,14 @@ impl Front<Fake> for FakeFront {
             }],
             false => Vec::new(),
         };
-        Ok(Some(Compiled {
+        Ok(PhaseDone::Compiled(Compiled {
             diagnostics,
             ok: true,
             open: false,
             why: None,
             puts,
+            record: None,
+            body_sessions,
             share,
             outputs,
             artifact,
@@ -1223,6 +1529,36 @@ impl Front<Fake> for FakeFront {
             links: Vec::new(),
             misses: Vec::new(),
         }))
+    }
+
+    /// Its names, then, when the fakes' store has its record ([`STAND_RECORDS`]), its store,
+    /// which replays that record: both phases in the one task, as the real front end's.
+    fn stand(
+        &self,
+        reader: FakeReader,
+        unit: usize,
+        images: &mut Vec<Image<Fake>>,
+    ) -> Result<Option<Compiled>, Failed> {
+        STOOD.with_borrow_mut(|it| it.push(unit));
+        let stores = FakeReader(reader.0.clone()); // clone: a refcount, the store's reader
+        self.compile(reader, unit, Phase::Names, images)?;
+        let Some(record) = STAND_RECORDS.with_borrow(|it| it.get(&unit).copied()) else {
+            return Ok(None);
+        };
+        STANDING_TASK.set(true);
+        let stored = self.compile(stores, unit, Phase::Store, images);
+        STANDING_TASK.set(false);
+        STAND_ENDED.with_borrow_mut(|it| it.push((unit, record)));
+        match stored? {
+            PhaseDone::Compiled(unit) => Ok(Some(unit)),
+            _ => unreachable!("the fake Store phase returns the compiled unit"),
+        }
+    }
+
+    fn sealed(&self) -> Result<Vec<bool>, ApiError> {
+        let units = STAND_DEPS.with_borrow(Vec::len);
+        let sealed: Vec<bool> = STAND_SEALED.with_borrow(|it| (0..units).map(|at| it.contains(&at)).collect());
+        Ok(sealed)
     }
 
     fn refused(&self, _: usize, what: String) -> Diagnostic {
@@ -1289,6 +1625,7 @@ impl Front<Fake> for FakeFront {
             _ => (TestOutcome::Passed, Vec::new()),
         };
         Ok(TestResult {
+            ran: None,
             name: test.to_owned(),
             binary: "a".into(),
             executable: 0,
@@ -1297,6 +1634,7 @@ impl Front<Fake> for FakeFront {
             outcome,
             cached: None,
             outside: false,
+            not_kept: None,
         })
     }
 
@@ -1342,6 +1680,13 @@ impl Front<Fake> for FakeFront {
     fn ahead(&self, FakeReader(read): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
         AHEAD_READ.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(if filter.iter().all(|it| "a::adds".contains(&**it)) { vec![0] } else { Vec::new() })
+    }
+
+    /// The simulated front end has no Lean: its answer is empty, which tests the job's path
+    /// (the units it applies built first, the worker's answer, then the run that answers),
+    /// never a proof.
+    fn prove(&self, _: FakeReader, _: bool, _: bool) -> Result<blaze_api::Proven, Failed> {
+        Ok(blaze_api::Proven { failed: None, subset: None, records: Vec::new() })
     }
 
     fn codegen_inputs(&self, _: FakeReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
@@ -1399,12 +1744,11 @@ fn options() -> Options {
         builds: name("cache/blaze/build"),
         sources: name("cache/blaze/sources"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
-        // The simulation's files are in no file system a loader's thread could read: the
-        // stores load their packs through the daemon's driver.
-        store_loader: blaze_cas::Loader::Pumped,
+        // The simulation's files are in no file system a thread's own driver could read: the
+        // tasks' store reads run on the daemon's driver, lent (`serve::direct::Reads::Lent`).
+        reads: crate::serve::direct::Reads::Lent,
         socket: Some(name(SOCKET)),
         http: None,
-        budget: None,
         threads: 2,
         io: 2,
         env: vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/home/u".into())],
@@ -1419,8 +1763,9 @@ fn options() -> Options {
         #[cfg(unix)]
         activated: None,
         profiling: None,
-        machine: None,
         without: super::daemon::Without::default(),
+        premises: super::daemon::Premises::of_this_process().expect("the test's own executable"),
+        unheld: None,
     }
 }
 
@@ -1447,8 +1792,13 @@ struct Client {
 }
 
 fn dial(daemon: &mut SimDaemon) -> Client {
+    dial_at(daemon, SOCKET)
+}
+
+/// [`dial`] for a daemon listening at `socket`, another than [`SOCKET`] (a second home's).
+fn dial_at(daemon: &mut SimDaemon, socket: &str) -> Client {
     for _ in 0..TURNS {
-        if let Ok(conn) = daemon.driver().dial(&Address::Unix(name(SOCKET))) {
+        if let Ok(conn) = daemon.driver().dial(&Address::Unix(name(socket))) {
             return Client { conn, frames: Frames::new(), next: 1, got: Vec::new() };
         }
         daemon.turn();
@@ -1604,9 +1954,9 @@ fn a_started_daemon_is_reached_before_its_first_turn() {
 #[cfg(unix)]
 #[test]
 fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
-    // Under /tmp: a socket's path is at most about a hundred bytes, which a deeper temporary
-    // directory may pass.
-    let root = tempfile::tempdir_in("/tmp").unwrap();
+    // A socket's path is at most about a hundred bytes, which a deeper temporary directory may
+    // pass.
+    let root = blaze_core::temp::TempDir::for_test_socket("blaze-serve-socket-");
     std::fs::create_dir_all(root.path().join(SOCKET).parent().unwrap()).unwrap();
     let driver = blaze_core::native(root.path(), 2).unwrap();
     let steps = Arc::new(Fake::default());
@@ -1615,6 +1965,38 @@ fn a_cli_that_connects_as_the_daemon_says_it_listens_finds_its_socket() {
     let reached = std::os::unix::net::UnixStream::connect(root.path().join(SOCKET));
     assert!(reached.is_ok(), "a CLI that connects as start returns finds no socket: {reached:?}");
     drop(daemon);
+}
+
+/// A `BLAZE_DUCKDB` naming a file that is gone is not the start's to check (a daemon refused
+/// to start on one, `BLAZE_DUCKDB=/nix/store/..../duckdb: No such file or directory`, and a
+/// whole `blaze check` died on it, 2026-11-13): a daemon whose history was kept with one
+/// starts and serves, and only its explorer's queries say what is missing.
+#[test]
+fn a_daemon_started_with_blaze_duckdb_naming_a_missing_file_starts_and_serves() {
+    crate::release::for_tests();
+    let state = tempfile::tempdir().unwrap();
+    let gone = state.path().join("gone").join("bin").join("duckdb");
+    let (profiling, _keeper) = super::observe::keep_history(
+        state.path(),
+        Some(gone.clone().into_os_string()), // clone: a test's path
+        blaze_profile::logs::Policy::default(),
+    )
+    .unwrap_or_else(|why| panic!("the history is kept whatever the DuckDB: {why}"));
+    let unfound = profiling.duckdb().unwrap_err();
+    assert!(
+        unfound.contains(&format!("BLAZE_DUCKDB={}", gone.display()))
+            && unfound.contains("unset BLAZE_DUCKDB"),
+        "{unfound}"
+    );
+    let sim = Sim::new(64, Faults::default());
+    let steps = Arc::new(Fake::default());
+    let options = Options { profiling: Some(profiling), ..options() };
+    let mut daemon = Daemon::start(sim, options, steps.clone(), Runner::Inline(Inline::new(64)))
+        .unwrap_or_else(|why| panic!("a missing DuckDB stopped the daemon's start: {why}"));
+    let mut client = dial(&mut daemon);
+    let status = client.send(&mut daemon, Request::Status);
+    let said = client.wait(&mut daemon, status);
+    assert!(said.iter().any(|it| matches!(it, Response::Status(_))), "{said:#?}");
 }
 
 #[test]
@@ -1865,7 +2247,7 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
 
     let other = Options {
         state: name("cache/blaze/v2-other"),
-        socket: Some(name("run/blaze/other.sock")),
+        socket: Some(name(OTHER_SOCKET)),
         writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
         ..options()
     };
@@ -1876,9 +2258,120 @@ fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
         second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
         Some(SHARED.to_vec())
     );
-    assert!(
-        second.store().get(&shared_key()).unwrap().is_none(),
-        "the home's own store has none of it"
+    // The home's look finds it in place, through the machine's layer it reads behind its own
+    // records (`Config::layers`), and its own tier holds none of it.
+    assert_eq!(
+        second.store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()),
+        Some(SHARED.to_vec()),
+        "the home's look finds the layer's record"
+    );
+    assert_eq!(second.store().stored_bytes(&[shared_key()]), 0, "the home's own store has none of it");
+}
+
+/// What two daemons of two homes on one machine layer did with the sealed crate unit 0 is,
+/// its front-end record put where [`SEALED_INTO`] says.
+#[derive(Debug, PartialEq, Eq)]
+struct SealedAcrossHomes {
+    /// How many times each daemon built unit 0 for want of its record.
+    built: (usize, usize),
+    /// Whether the first daemon's home, the machine layer and the second daemon's home hold
+    /// the record, each read from that store's own tiers.
+    first_home: bool,
+    layer: bool,
+    second_home: bool,
+}
+
+fn sealed_across_homes(seed: u64, into: crate::serve::work::PutInto) -> SealedAcrossHomes {
+    let holds = |store: &Store| {
+        store.get(&sealed_key()).unwrap().is_some_and(|it| it.bytes == SEALED_RECORD)
+    };
+    // A home's look finds what its layers hold too (`Config::layers`, read in place behind
+    // its own records): a home holds the record only with it committed in its own tier.
+    let home_holds = |store: &Store| holds(store) && store.stored_bytes(&[sealed_key()]) > 0;
+    let stopped = |daemon: &mut SimDaemon| {
+        daemon.stop();
+        let mut turns = 0;
+        while daemon.turn() {
+            turns += 1;
+            assert!(turns < TURNS, "seed {seed}: the daemon never stopped");
+        }
+    };
+    SEALED_INTO.set(Some(into));
+    SEALED_FOUND.set(false);
+    let builds = SEALED_BUILDS.get();
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut first = start(sim, &steps, seed);
+    let mut client = dial(&mut first);
+    let id = client
+        .send(&mut first, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut first, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    // The stop stores the kept front end and waits for its puts, the layer's on the layer.
+    stopped(&mut first);
+    assert!(first.lost().is_empty(), "seed {seed}: {:#?}", first.lost());
+    let first_home = home_holds(first.store());
+    let first_built = SEALED_BUILDS.get() - builds;
+
+    let other = Options {
+        state: name("cache/blaze/v2-other"),
+        socket: Some(name(OTHER_SOCKET)),
+        writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
+        ..options()
+    };
+    let mut second = Daemon::start(
+        first.into_driver(),
+        other,
+        steps.clone(),
+        Runner::Inline(Inline::new(seed + 1)),
+    )
+    .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+    let mut client = dial_at(&mut second, OTHER_SOCKET);
+    let id = client
+        .send(&mut second, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut second, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    settle(&mut second, &mut client);
+    stopped(&mut second);
+    assert!(second.lost().is_empty(), "seed {seed}: {:#?}", second.lost());
+    SEALED_INTO.set(None);
+    SealedAcrossHomes {
+        built: (first_built, SEALED_BUILDS.get() - builds - first_built),
+        first_home,
+        layer: holds(second.std_store()),
+        second_home: home_holds(second.store()),
+    }
+}
+
+/// The invariant: a sealed crate's front-end record that one home's daemon put into the
+/// machine layer (`PutInto::Layer`, as `deps::store` routes every record of a sealed crate) is
+/// found by a daemon of another home on that layer, through its home's live read of it
+/// (`Store::read_live`, at the home's open): the second builds no unit of the crate, and
+/// neither home holds the record, the layer alone does, across seeds.
+///
+/// Control: the same puts routed to the first home (`PutInto::Home`, what `store` did for a
+/// crate before the route) leave the layer without it, and the second daemon builds the crate.
+#[test]
+fn a_sealed_crate_one_home_built_on_the_machine_layer_another_home_builds_none_of() {
+    use crate::serve::work::PutInto;
+    for seed in [211, 212, 213] {
+        assert_eq!(
+            sealed_across_homes(seed, PutInto::Layer),
+            SealedAcrossHomes {
+                built: (1, 0),
+                first_home: false,
+                layer: true,
+                second_home: false
+            },
+            "seed {seed}"
+        );
+    }
+    // The planted bug: the sealed crate's record put into the home.
+    assert_eq!(
+        sealed_across_homes(214, PutInto::Home),
+        SealedAcrossHomes { built: (1, 1), first_home: true, layer: false, second_home: true },
+        "the control: a record in the first home is no other home's"
     );
 }
 
@@ -2073,6 +2566,200 @@ fn a_units_compile_runs_each_of_its_phases_once_in_order() {
     }
 }
 
+/// The model of the units that stand (`job::standing`) on the fakes' plan of `[package]`
+/// (dep's library, unit 0; the program's build script compiled, 1, and run, 2; the program, 3,
+/// on 0 and 2), with the units `sealed` the fakes' sealed ones, and nothing kept yet.
+fn standing_model(sealed: &[usize]) {
+    STAND_MODEL.set(true);
+    STAND_SEALED.set(sealed.to_vec());
+    STAND_DEPS.set(vec![Vec::new(), Vec::new(), vec![1], vec![0, 2]]);
+    STAND_VERSIONS.set(BTreeMap::new());
+    STAND_RECORDS.set(BTreeMap::new());
+    STAND_ENDED.set(Vec::new());
+    STOOD.set(Vec::new());
+    PHASES.with(|it| it.borrow_mut().clear());
+}
+
+fn standing_off() {
+    STAND_MODEL.set(false);
+    STAND_SEALED.set(Vec::new());
+    STAND_DEPS.set(Vec::new());
+    super::job::standing::PLANT.set(super::job::standing::Plant::None);
+}
+
+/// A build of `/w` asked as cargo asks it, with `STANDING` at `env`, settled; what it got.
+fn standing_build(daemon: &mut SimDaemon, client: &mut Client, env: &str) -> Vec<Response> {
+    let mut vars = command_env();
+    vars.push(("STANDING".into(), env.into()));
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: vars,
+        args: Vec::new(),
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+        prebuilt: true,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(daemon, id);
+    settle(daemon, client);
+    got
+}
+
+/// An edit of unit `unit`'s sources, the `n`th: its version moves, and so does the program's
+/// file, so the view moves with it.
+fn standing_edit(daemon: &mut SimDaemon, unit: usize, n: u64) {
+    STAND_VERSIONS.with_borrow_mut(|it| it.insert(unit, n));
+    let text = format!("fn main() {{ let _ = {n}; }}\n");
+    daemon.driver().change(&name("w/src/main.rs"), text.as_bytes());
+}
+
+/// Each unit's record the builds since the last take ended with, by unit, taken.
+fn ended_records() -> Vec<(usize, ContentId)> {
+    let mut ended = STAND_ENDED.take();
+    ended.sort_by_key(|it| it.0);
+    ended
+}
+
+/// The oracle: what a fresh daemon's build of the checkout as it is now (its program's file
+/// the `n`th edit's, its units' versions as they are, under `STANDING` at `env`) ends each
+/// unit's record with, its store of records empty. The edited daemon's store is put back.
+fn fresh_records(seed: u64, n: u64, env: &str) -> Vec<(usize, ContentId)> {
+    let (kept, stood, phases) = (STAND_RECORDS.take(), STOOD.take(), PHASES.with(|it| it.take()));
+    let plant = super::job::standing::PLANT.replace(super::job::standing::Plant::None);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    sim.change(&name("w/src/main.rs"), format!("fn main() {{ let _ = {n}; }}\n").as_bytes());
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let got = standing_build(&mut daemon, &mut client, env);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the fresh daemon's build: {got:#?}");
+    assert!(STOOD.with_borrow(Vec::is_empty), "a fresh daemon stands nothing");
+    let fresh = ended_records();
+    STAND_RECORDS.set(kept);
+    STOOD.set(stood);
+    PHASES.with(|it| *it.borrow_mut() = phases);
+    super::job::standing::PLANT.set(plant);
+    fresh
+}
+
+/// The phases unit `unit` ran since the last take of [`PHASES`], in order.
+fn phases_of(ran: &[(usize, Phase)], unit: usize) -> Vec<Phase> {
+    ran.iter().filter(|it| it.0 == unit).map(|it| it.1).collect()
+}
+
+/// The invariant: after an edit of one workspace crate (the program's build script and the
+/// program, units 1 and 3), the sealed unit the last build kept (dep's library, 0) stands: one
+/// task, its names then its store, the five phase nodes of none; the edited units and every
+/// unit above them post their phases; and every unit's record equals what a fresh daemon's
+/// build of the same tree ends it with (the oracle). A standing unit whose record left the
+/// store fails the build naming the unit, never posts its phases quietly, and the build after
+/// that failure stands nothing.
+#[test]
+fn a_sealed_unit_the_last_build_kept_stands_in_one_task_and_its_record_gone_fails_by_name() {
+    standing_model(&[0]);
+    let mut sim = Sim::new(3101, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 3101);
+    let mut client = dial(&mut daemon);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert!(STOOD.with_borrow(Vec::is_empty), "the first build has nothing standing");
+    let _ = (ended_records(), PHASES.with(|it| it.take()));
+
+    standing_edit(&mut daemon, 1, 1);
+    standing_edit(&mut daemon, 3, 1);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let (ran, stood) = (PHASES.with(|it| it.take()), STOOD.take());
+    assert_eq!(stood, [0], "dep's library stands, and only it: {ran:?}");
+    assert_eq!(
+        phases_of(&ran, 0),
+        [Phase::Names, Phase::Store],
+        "the unit that stands runs its names and its store in its one task: {ran:?}"
+    );
+    for unit in [1, 3] {
+        let mut each = phases_of(&ran, unit);
+        each.sort_unstable_by_key(|it| *it as u8);
+        assert!(each == Phase::BUILD || each == Phase::CHECK, "unit {unit} ran {ran:?}");
+    }
+    let records = ended_records();
+    assert_eq!(records, fresh_records(3102, 1, "1"), "the edited build against a fresh daemon's");
+
+    // Its record gone from the store: the unit is posted standing, and fails naming itself.
+    STAND_RECORDS.with_borrow_mut(|it| it.remove(&0));
+    standing_edit(&mut daemon, 3, 2);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = got.iter().any(|it| {
+        format!("{it:?}").contains("unit 0: its record stood in the last build of this plan")
+    });
+    assert!(named, "the build names the unit whose record is gone: {got:#?}");
+    let (ran, stood) = (PHASES.with(|it| it.take()), STOOD.take());
+    assert_eq!(stood, [0], "{ran:?}");
+    assert_eq!(phases_of(&ran, 0), [Phase::Names], "nothing of it is made: {ran:?}");
+    let _ = ended_records();
+
+    // The failed build left nothing standing: the next posts every phase, and is right.
+    standing_edit(&mut daemon, 3, 3);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let (ran, stood) = (PHASES.with(|it| it.take()), STOOD.take());
+    assert!(stood.is_empty(), "after a failed build nothing stands: {stood:?}");
+    let mut each = phases_of(&ran, 0);
+    each.sort_unstable_by_key(|it| *it as u8);
+    assert_eq!(each, Phase::BUILD, "dep's library posts its phases again: {ran:?}");
+    let records = ended_records();
+    assert_eq!(records, fresh_records(3103, 3, "1"), "the build after the failure");
+    standing_off();
+}
+
+/// The controls of the test above, each a planted bug of `job::standing` its oracle catches:
+/// a sealed unit (the program, 3, sealed here) over an edited crate (dep's library, 0, here
+/// the edited path crate) stood whatever its dependencies do serves its stale record; a sealed
+/// unit (0) stood under a config whose environment moved serves the record of the old one.
+/// Unplanted, each build's records are a fresh daemon's.
+#[test]
+fn a_unit_stood_over_an_edited_crate_or_a_moved_environment_is_caught_by_the_oracle() {
+    use super::job::standing::{PLANT, Plant};
+    // Returns the second build's records and the fresh daemon's.
+    let run = |seed: u64, sealed: &[usize], edited: usize, envs: [&str; 2], plant: Plant| {
+        standing_model(sealed);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let got = standing_build(&mut daemon, &mut client, envs[0]);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+        let _ = ended_records();
+        standing_edit(&mut daemon, edited, 1);
+        PLANT.set(plant);
+        let got = standing_build(&mut daemon, &mut client, envs[1]);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{plant:?}: {got:#?}");
+        let records = ended_records();
+        let fresh = fresh_records(seed + 1, 1, envs[1]);
+        standing_off();
+        (records, fresh)
+    };
+    for (seed, sealed, edited, envs, plant) in [
+        (3111, &[3][..], 0, ["1", "1"], Plant::DepsBlind),
+        (3121, &[0][..], 3, ["1", "2"], Plant::IgnoresConfig),
+    ] {
+        let (records, fresh) = run(seed, sealed, edited, envs, Plant::None);
+        assert_eq!(records, fresh, "unplanted, seed {seed}: the build is a fresh daemon's");
+        let (records, fresh) = run(seed + 2, sealed, edited, envs, plant);
+        assert_ne!(records, fresh, "{plant:?} is not caught: the stale record went unseen");
+    }
+}
+
 #[test]
 fn a_unit_that_warned_ends_after_its_warnings_and_built_counts_the_members() {
     let mut sim = Sim::new(31, Faults::default());
@@ -2209,7 +2896,13 @@ fn an_agents_targets_are_the_views_invocation() {
             args: args.iter().map(|it| (*it).to_owned()).collect(),
             root: at.clone(),
             cwd: at.clone(),
-            env: options().env,
+            // The view is opened with what the load reads of the environment
+            // (`BuildConfig::planned`): `HOME`, and not `PATH`, which no plan reads.
+            env: options()
+                .env
+                .into_iter()
+                .filter(|(name, _)| blaze_units::query::read_by_plan(name))
+                .collect(),
             files: Vec::new(),
         }
     );
@@ -2225,36 +2918,153 @@ fn an_agents_targets_are_the_views_invocation() {
     );
 }
 
+/// A build of the head of `/w`, answered and settled, on `daemon`: what it answered.
+fn build_settled(daemon: &mut SimDaemon) -> Vec<Response> {
+    let mut client = dial(daemon);
+    let id = client
+        .send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(daemon, id);
+    settle(daemon, &mut client);
+    turn_until(daemon, |it| it.settled());
+    got
+}
+
+/// What the same build asks after a stop and a start with nothing changed: how many plan
+/// loads ran (each is a job's first stage: 0 is no job), the bytes the driver read for it, and
+/// how it ended. `drops_marks` plants the bug the control catches: the start keeps no mark.
+fn after_a_restart(seed: u64, drops_marks: bool) -> (usize, u64, Option<Response>) {
+    OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }));
+    super::daemon::DROPS_MARKS.set(drops_marks);
+    MEMBER_STORES.set(0);
+    let mut daemon = restart(daemon, &steps, seed + 1);
+    super::daemon::DROPS_MARKS.set(false);
+    // R3: the stop wrote the kept front end's members, once, and the next daemon reads them.
+    assert_eq!(MEMBER_STORES.get(), 1, "seed {seed}: the stop stores the kept front end's members once");
+    assert!(holds_members(daemon.store(), "/w"), "seed {seed}: the members' pages are in the store after the start");
+    PLANS.with(|it| it.set(0));
+    let before = daemon.driver().bytes_read();
+    let got = build_settled(&mut daemon);
+    let read = daemon.driver().bytes_read() - before;
+    OUTPUT.set(false);
+    (PLANS.with(Cell::get), read, got.last().cloned())
+}
+
+/// The invariant: after a build, a stop and a start (no engine state restored), the same
+/// request with nothing changed ends with no job and reads neither a source nor an output
+/// again: the certificate answers, its evidence from the journal's marks (`serve::local`). It
+/// answers as the build did. Needs track 2's H1-H3 (/tmp/plan/handoff-6.md): until they are
+/// in, the outputs are hashed again and the bytes read say so.
 #[test]
-fn a_start_from_the_image_runs_no_load_again() {
-    let mut sim = Sim::new(6, Faults::default());
+fn a_restart_with_nothing_changed_answers_from_the_certificate_with_no_job() {
+    for seed in [6, 7, 8] {
+        let (loads, read, done) = after_a_restart(seed, false);
+        assert_eq!(done, Some(Response::Done { ok: true }), "seed {seed}");
+        assert_eq!(loads, 0, "seed {seed}: the restarted daemon ran a job for a request nothing changed");
+        let (_, planted, _) = after_a_restart(seed, true);
+        assert!(
+            read + APP.len() as u64 <= planted,
+            "seed {seed}: with the marks the request read {read} bytes, without them {planted}: \
+             the marks spared no read of the output"
+        );
+    }
+}
+
+/// The control: a start that drops the marks reads the program's output again, which the
+/// oracle above counts.
+#[test]
+fn the_oracle_catches_a_start_that_drops_the_marks() {
+    let (_, kept, _) = after_a_restart(9, false);
+    let (_, dropped, done) = after_a_restart(9, true);
+    assert_eq!(done, Some(Response::Done { ok: true }));
+    assert!(kept < dropped, "the planted start read {dropped} bytes, the real one {kept}");
+}
+
+/// Rule 26, the edit after a start: a build after a stop, a start (database empty, nothing
+/// restored) and an edit gives byte for byte what a daemon that never stopped gives for the
+/// same edit, and what a fresh home gives for the edited checkout.
+#[test]
+fn a_restart_then_an_edit_builds_what_a_fresh_daemon_builds() {
+    const EDITED: &[u8] = b"fn main() { let _ = 1; }\n";
+    let edited_on = |seed: u64, restarts: bool| {
+        OUTPUT.set(true);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }));
+        if restarts {
+            MEMBER_STORES.set(0);
+            daemon = restart(daemon, &steps, seed + 1);
+            // R3: the stop wrote the members' pages once; the edit's build reads them.
+            assert_eq!(MEMBER_STORES.get(), 1, "seed {seed}: the stop stores the kept front end's members once");
+            assert!(holds_members(daemon.store(), "/w"), "seed {seed}: the members' pages survive the stop");
+        }
+        daemon.driver().change(&name("w/src/main.rs"), EDITED);
+        let got = build_settled(&mut daemon);
+        let said = outcome(&mut daemon, &got);
+        OUTPUT.set(false);
+        said
+    };
+    let fresh = {
+        OUTPUT.set(true);
+        let mut sim = Sim::new(150, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        sim.change(&name("w/src/main.rs"), EDITED);
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, 150);
+        let got = build_settled(&mut daemon);
+        let said = outcome(&mut daemon, &got);
+        OUTPUT.set(false);
+        said
+    };
+    assert_eq!(fresh.0, Some(Response::Done { ok: true }));
+    for seed in [151, 153, 155] {
+        let restarted = edited_on(seed, true);
+        assert_eq!(restarted, edited_on(seed, false), "seed {seed}: against the daemon that never stopped");
+        assert_eq!(restarted, fresh, "seed {seed}: against a fresh home");
+    }
+}
+
+/// Rule 26, an image of the layout before this one: one with the database's, the symbols',
+/// the library trees' and the carry sessions' sections beside the VFS's and the history's is
+/// mapped, its VFS and history used and its other sections never read (here they hold bytes
+/// no reader of theirs would take), and the next request answers.
+#[test]
+fn an_image_of_the_previous_layout_starts_by_name() {
+    use blaze_image::{Builder, Image, SectionId};
+    let mut sim = Sim::new(160, Faults::default());
     checkout(&mut sim, "[package]\n");
     let steps = Arc::new(Fake::default());
-    let mut daemon = start(sim, &steps, 6);
-    let mut client = dial(&mut daemon);
-    let id = client
-        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
-    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-    turn_until(&mut daemon, |it| it.settled());
-    assert!(
-        daemon.driver().exists(&name(&format!("{STATE}/db/image"))),
-        "the cold build wrote the image"
-    );
-
-    let mut daemon = restart(daemon, &steps, 7);
-    PLANS.with(|it| it.set(0));
-    let mut client = dial(&mut daemon);
-    let id = client
-        .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
-    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-    // Started again in this process, its database is warm only if nothing here had interned a
-    // symbol before the restart restored them.
-    let loads = PLANS.with(Cell::get);
-    assert_eq!(
-        loads == 0,
-        daemon.warm(),
-        "the load ran again exactly when the database started empty ({loads})"
-    );
+    let mut daemon = start(sim, &steps, 160);
+    assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }));
+    daemon.stop();
+    let mut turns = 0;
+    while daemon.turn() {
+        turns += 1;
+        assert!(turns < TURNS, "the daemon never stopped");
+    }
+    let mut sim = daemon.into_driver();
+    let file = name(&format!("{STATE}/db/image"));
+    let written = Image::open(sim.contents(&file)).expect("the stop wrote an image");
+    let mut builder = Builder::new();
+    for section in written.sections() {
+        builder.add(section.id, section.schema, written.whole(section).expect("a whole section"));
+    }
+    let junk = |n: u8| blaze_format::SchemaHash(ContentId([n; 32]));
+    for (at, retired) in SectionId::RETIRED.into_iter().enumerate() {
+        builder.add(retired, junk(4 + at as u8), b"not trees, not carry sessions");
+    }
+    sim.change(&file, &builder.finish().expect("the image of the layout before"));
+    let mut daemon = start(sim, &steps, 161);
+    let started = daemon.started();
+    assert!(started.mapped.is_some(), "the image was mapped: {started}");
+    assert!(started.whole(), "its VFS and history were used and nothing else read: {started}");
+    assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }));
 }
 
 #[test]
@@ -2263,7 +3073,7 @@ fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_r
     checkout(&mut sim, "[package]\n");
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 9);
-    assert!(daemon.started().restored.is_none(), "the first start has no image");
+    assert!(daemon.started().mapped.is_none(), "the first start has no image");
     let mut client = dial(&mut daemon);
     let id = client
         .send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
@@ -2274,14 +3084,10 @@ fn a_daemon_stopped_as_its_first_build_answers_writes_the_image_the_next_start_r
         daemon.driver().exists(&name(&format!("{STATE}/db/image"))),
         "the stop wrote the build's image"
     );
-    // A second daemon in one process can't take the image's symbols (`Cold::Interned`); every
-    // other start opens it.
+    // No engine state is restored, so a second daemon in one process opens it as any start.
     let started = daemon.started();
-    assert!(
-        started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
-        "the next start opens the stop's image: {started}"
-    );
-    assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
+    assert!(started.mapped.is_some(), "the next start opens the stop's image: {started}");
+    assert_eq!(started.unimaged, None, "{started}");
 }
 
 /// A stop while the cold build's settle image is still being made, with nothing asked since,
@@ -2321,11 +3127,7 @@ fn a_stop_during_an_unchanged_settle_writes_one_image_and_a_change_between_write
         );
         let daemon = start(daemon.into_driver(), &steps, seed + 10);
         let started = daemon.started();
-        assert!(
-            started.restored.is_some()
-                || matches!(started.cold, Some(super::daemon::Cold::Interned)),
-            "the next start opens the stop's image: {started}"
-        );
+        assert!(started.mapped.is_some(), "the next start opens the stop's image: {started}");
     }
 }
 
@@ -3088,14 +3890,34 @@ fn a_commit_step_that_answers_at_the_bound_counts_whatever_else_answers_then() {
             "seed {seed}: the wait's deadline is {after:?} away"
         );
         daemon.driver().record(vec![store_dir(), name("placed")]);
-        daemon.driver().slow_writes(name("placed"), after);
-        daemon.driver().release_held(after);
+        // A place of a value's bytes is steps (blaze-cas `publish::Writing`): a clear of its
+        // staged name, which takes the disk's own latency, a cut to its length, then its
+        // writes. The cut and the writes are slowed; the writes, asked as the cuts end, are
+        // timed from where the first clears ended so that they end at the deadline itself.
+        let cut = after / 4;
+        daemon.driver().slow_writes(name("placed"), cut);
+        let asked = daemon.driver().now();
         for at in 0..4 {
             assert!(
                 daemon.place_for_test(&kept_key("/w", 0), name(&format!("placed/{at}"))).is_some(),
                 "a placement asked"
             );
         }
+        for _ in 0..TURNS {
+            if daemon.driver().now() > asked {
+                break;
+            }
+            daemon.turn();
+            client.take(&mut daemon);
+        }
+        let cleared = daemon.driver().now();
+        assert!(
+            cleared > asked && cleared - asked < cut,
+            "seed {seed}: the first clears were told {:?} after the placements were asked",
+            cleared - asked
+        );
+        daemon.driver().slow_writes(name("placed"), deadline - cleared - cut);
+        daemon.driver().release_held(deadline - cleared);
         settle(&mut daemon, &mut client);
         assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
         assert_eq!(dones(&client, id), 1, "seed {seed}");
@@ -3515,6 +4337,78 @@ fn after_a_restart_the_first_lowering_reads_what_the_last_build_stored() {
             "and reads what the last build stored (crash: {crash})"
         );
     }
+}
+
+/// What a restarted daemon's first build reads of the store through `serve::direct` (this
+/// thread's readers' counts, exact: the in-line runner runs every task on the test's thread),
+/// and whether that build found what the last one stored.
+fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) {
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id =
+        client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    settle(&mut daemon, &mut client);
+    let mut daemon = restart(daemon, &steps, seed + 1000);
+    let mut client = dial(&mut daemon);
+    let (before, reads) = (crate::serve::direct::thread_counts(), KEPT_READS.get());
+    let id =
+        client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
+    let after = crate::serve::direct::thread_counts();
+    let moved = blaze_cas::direct::Counts {
+        records: after.records - before.records,
+        bytes: after.bytes - before.bytes,
+        reads: after.reads - before.reads,
+        runs: after.runs - before.runs,
+        files_opened: after.files_opened - before.files_opened,
+        maps: after.maps - before.maps,
+        mapped_bytes: after.mapped_bytes - before.mapped_bytes,
+        leaked_bytes: after.leaked_bytes - before.leaked_bytes,
+    };
+    (moved, KEPT_READS.get() == reads + 1)
+}
+
+/// The oracle: the build found the two values the last one stored, and each of them was a
+/// record read through `direct` (a read around it, through the pool, moves no direct count),
+/// with nothing a reader kept past its task.
+fn all_through_direct(moved: &blaze_cas::direct::Counts, found: bool) -> Result<(), String> {
+    if !found {
+        return Err("the restarted daemon's lowering did not find what the last build stored".to_owned());
+    }
+    if moved.records < 2 || moved.bytes == 0 {
+        return Err(format!("the build's store reads did not pass through direct: {moved:?}"));
+    }
+    if moved.leaked_bytes != 0 {
+        return Err(format!("a direct reader kept bytes past its task: {moved:?}"));
+    }
+    Ok(())
+}
+
+/// The invariant: every store read a build's tasks make is a direct read
+/// (`blaze_cas::direct`, lane M3 of the memory wave): the reads move this thread's direct
+/// counts, the values are found, and the store's page pool serves none of them.
+///
+/// The control plants a read around `direct` (`READS_AROUND_DIRECT`: the fakes' lowering
+/// reads through the pool) and the oracle catches it: the values are found and no direct
+/// count moves.
+#[test]
+fn a_builds_store_reads_all_pass_through_direct() {
+    for seed in [181, 182, 183] {
+        let (moved, found) = direct_reads_after_a_restart(seed);
+        all_through_direct(&moved, found).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+    }
+    READS_AROUND_DIRECT.set(true);
+    let (moved, found) = direct_reads_after_a_restart(184);
+    READS_AROUND_DIRECT.set(false);
+    assert!(found, "the control finds the values through the pool");
+    assert!(
+        all_through_direct(&moved, found).is_err(),
+        "the oracle misses reads made around direct: {moved:?}"
+    );
 }
 
 /// The head's next build lowers into the front end its last one kept and stored, and each
@@ -3993,6 +4887,7 @@ fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest()
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
@@ -4053,6 +4948,7 @@ fn a_write_that_fails_fails_only_the_units_after_it_and_keep_going_builds_the_re
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
@@ -4134,6 +5030,7 @@ fn under_fail_fast_a_write_that_fails_ends_the_job_at_once() {
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let began = daemon.driver().now();
@@ -4195,6 +5092,7 @@ fn a_build_script_run_after_a_write_that_failed_never_reaches_the_runner() {
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
@@ -4258,6 +5156,7 @@ fn a_unit_whose_compile_panics_fails_with_the_panic_while_its_sibling_builds() {
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
@@ -4318,6 +5217,7 @@ fn a_unit_whose_compile_errs_fails_alone_while_its_sibling_builds() {
         command: "build".into(),
         refused: None,
         verbose: 0,
+        prebuilt: true,
     };
     let targets = Targets { cargo: Some(cargo), ..agent() };
     let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
@@ -4372,11 +5272,8 @@ fn a_daemon_stopped_after_a_build_failed_on_a_panic_writes_the_image_the_next_st
     let mut daemon = restart(daemon, &steps, 47);
     assert!(daemon.driver().exists(&image), "the stop wrote the failed build's image");
     let started = daemon.started();
-    assert!(
-        started.restored.is_some() || matches!(started.cold, Some(super::daemon::Cold::Interned)),
-        "the next start opens the stop's image: {started}"
-    );
-    assert!(!matches!(started.cold, Some(super::daemon::Cold::NoImage)), "{started}");
+    assert!(started.mapped.is_some(), "the next start opens the stop's image: {started}");
+    assert_eq!(started.unimaged, None, "{started}");
 }
 
 #[test]
@@ -4497,6 +5394,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
             Does::Compile {
                 front: Arc::new(FakeFront { kind: JobKind::Build }),
                 back: Default::default(),
+                hops: Arc::from(Vec::new()),
             },
         )
     };
@@ -4574,6 +5472,52 @@ fn no_reader_posted_after_a_write_sees_the_inputs_before_it_over_many_seeds() {
         assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)], "seed {seed}");
         assert!((1..=SCRIPTS).contains(&APPLIES.get()), "seed {seed}: {} writes", APPLIES.get());
     }
+}
+
+/// One wave's build under `seed`, the planted bug set or not: how many applies ran on the loop,
+/// and how many in all.
+fn wave_applies(seed: u64, scripts: usize, plant: bool) -> (usize, usize) {
+    SEEN.with(|it| it.borrow_mut().clear());
+    APPLIES.set(0);
+    LOOP_APPLIES.set(0);
+    super::job::PLANT_WRITE_ON_LOOP.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, &format!("wave {scripts}\n"));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    super::job::PLANT_WRITE_ON_LOOP.set(false);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    let all: Vec<usize> = (1..=scripts).collect();
+    assert_eq!(seen(), vec![(0, Vec::new()), (scripts + 1, all)], "seed {seed}");
+    (LOOP_APPLIES.get(), APPLIES.get())
+}
+
+/// The loop applies no front-end write in its turn: until 2026-11-13 a job's write (a proc
+/// macro's load with its harnesses' identities and its dependencies' serve, seconds a crate
+/// under a fresh store) ran whole on the loop, so one turn lasted as long as the write, every
+/// other job and client behind it, and the readers it waited on could not be told from a hang.
+/// Now it is a task of the job holding the writer (`job::Does::Write`), and the loop only posts
+/// it and takes its result, so its turn is bounded by its own work whatever a write costs.
+///
+/// The invariant: for a wave of `N` build scripts over many seeds (each seed another order of
+/// the scripts' ends, so writes of one run up to all `N`), every apply of the writer runs on a
+/// write's task, none on the loop, and the build is the one it was: done, and the program reads
+/// every run. The control: the planted bug (`job::PLANT_WRITE_ON_LOOP`, the loop's apply of
+/// before) builds the same and the oracle sees its applies on the loop.
+#[test]
+fn the_loop_applies_no_front_end_write_over_many_seeds() {
+    const SCRIPTS: usize = 6;
+    for seed in 0..32 {
+        let (on_loop, applies) = wave_applies(seed, SCRIPTS, false);
+        assert_eq!(on_loop, 0, "seed {seed}: {on_loop} of {applies} applies ran on the loop");
+        assert!((1..=SCRIPTS).contains(&applies), "seed {seed}: {applies} writes");
+    }
+    let (on_loop, _) = wave_applies(3, SCRIPTS, true);
+    assert!(on_loop > 0, "the planted bug's applies on the loop went unseen");
 }
 
 #[test]
@@ -4768,14 +5712,14 @@ fn every_request_ends_once_over_many_seeds() {
 fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the_state() {
     use std::io::Read as _;
     let state = tempfile::tempdir().unwrap();
-    let a = super::hold(state.path(), None).unwrap();
+    let a = super::hold(state.path(), None, None).unwrap();
     let lock = state.path().join("serve.lock");
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
     let (mut heard, said) = std::io::pipe().unwrap();
     let said: std::os::fd::OwnedFd = said.into();
     let said = super::Ready::new(std::fs::File::from(said)).unwrap();
     let path = state.path().to_owned();
-    let b = std::thread::spawn(move || super::hold(&path, Some(&said)).map(drop));
+    let b = std::thread::spawn(move || super::hold(&path, None, Some(&said)).map(drop));
     let mut byte = [0u8; 1];
     heard.read_exact(&mut byte).unwrap();
     assert_eq!(super::Phase::of(byte[0]), Some(super::Phase::Waiting));
@@ -4783,6 +5727,33 @@ fn a_daemon_started_while_the_one_before_it_ends_waits_for_it_and_then_holds_the
     drop(a);
     b.join().unwrap().unwrap();
     assert_eq!(std::fs::read_to_string(&lock).unwrap(), std::process::id().to_string());
+}
+
+/// The invariant: while a daemon holds a state, anyone who asks the state's lock who holds it
+/// is told that one does, and its pid, without a socket and without waiting; and is told none
+/// does before any daemon ran there and after it let go. (agents.json A37: `stop` said no
+/// daemon ran while one did; the socket's path follows `XDG_RUNTIME_DIR`, the state's does
+/// not.)
+#[cfg(unix)]
+#[test]
+fn the_states_lock_says_whether_a_daemon_runs_and_which() {
+    let state = tempfile::tempdir().unwrap();
+    assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "no daemon ever ran here");
+    assert!(!state.path().join("serve.lock").exists(), "asking creates nothing");
+    let held = super::hold(state.path(), None, None).unwrap();
+    let lock = state.path().join("serve.lock");
+    assert_eq!(
+        super::holder(state.path()).unwrap(),
+        super::Holder::Daemon { pid: Some(std::process::id()), lock: lock.clone() }
+    );
+    // Asking does not take the daemon's place, nor leave a lock behind: asked twice, and a
+    // daemon that starts after still waits for the one that holds the state.
+    assert!(matches!(super::holder(state.path()).unwrap(), super::Holder::Daemon { .. }));
+    drop(held);
+    assert_eq!(super::holder(state.path()).unwrap(), super::Holder::None, "let go of as the daemon ends");
+    // And asking left the lock free: a daemon starts on the state at once.
+    let again = super::hold(state.path(), None, None).unwrap();
+    assert!(matches!(again.1, super::Before::Ended(pid) if pid == std::process::id()));
 }
 
 #[test]
@@ -4794,7 +5765,7 @@ fn serve_takes_activated_alone_and_names_it_among_its_flags() {
     assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
     assert!(!parse(&[]).unwrap().activated);
     let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
-    assert!(refused.contains("`--activated`, `--ready-fd N`, `--stall-bound SECS` and `--memory-gb GB`, not `--activated=yes`"), "{refused}");
+    assert!(refused.contains("`--activated`, `--ready-fd N` and `--stall-bound SECS`, not `--activated=yes`"), "{refused}");
 }
 
 #[test]
@@ -4849,58 +5820,6 @@ fn the_loops_wait_between_turns_is_a_wait_span_naming_what_ends_it() {
     );
 }
 
-/// The limit the daemon runs under: `--memory-gb` first, else `BLAZE_DAEMON_MEMORY_GB`, each a
-/// number of GiB above 0 (a fraction allowed), named as given; a text that is no such number is
-/// an error naming where it came from, never the machine's in its place.
-#[test]
-fn the_memory_limit_is_told_by_flag_then_variable_and_a_bad_one_is_an_error() {
-    use super::{MEMORY_VAR, told_limit, told_memory};
-    const GIB: u64 = 1 << 30;
-    let var = |it: &str| Some(std::ffi::OsString::from(it));
-    assert_eq!(told_limit(None, None).unwrap(), None);
-    assert_eq!(told_limit(None, var("48")).unwrap(), Some((48 * GIB, format!("{MEMORY_VAR}=48"))));
-    assert_eq!(
-        told_limit(None, var("1.5")).unwrap(),
-        Some((3 * GIB / 2, format!("{MEMORY_VAR}=1.5")))
-    );
-    let flag = told_memory("--memory-gb", "24").unwrap();
-    assert_eq!(flag, (24 * GIB, "--memory-gb=24".to_owned()));
-    assert_eq!(told_limit(Some(flag.clone()), var("48")).unwrap(), Some(flag), "the flag wins");
-    for bad in ["0", "-3", "abc", "", "inf", "NaN"] {
-        let error = told_limit(None, var(bad)).unwrap_err().to_string();
-        assert!(error.starts_with(MEMORY_VAR) && error.contains("GiB above 0"), "{bad:?}: {error}");
-    }
-}
-
-/// A daemon started under a budget makes it the limit a build's release is decided against
-/// and every subsystem's budget, before any job, and its start's line names the limit, what
-/// told it and each share. B5, coord-105: the plane carried the budget and nothing set it, so
-/// under `BLAZE_DAEMON_MEMORY_GB=48` no release was ever due and the daemon grew to 49 GiB.
-#[test]
-fn a_daemon_started_under_a_budget_makes_it_the_limit_releases_are_decided_against() {
-    use blaze_graph::admission::{self, share};
-    use blaze_mem::Tag;
-    // Far past what any test holds, so no other daemon's release in this process is made due,
-    // and no budget it sets (32 TiB at least) weighs on another test's sweep.
-    const LIMIT: u64 = (1 << 50) + (64 << 20);
-    let budget =
-        blaze_graph::Budget { bytes: LIMIT, from: "a test's limit".to_owned(), kept_back: 0 };
-    let said = super::limit_said(&budget);
-    assert!(said.starts_with("memory limit 1048576.06 GiB (a test's limit): "), "{said}");
-    assert!(said.contains("holds 917504.05 GiB") && said.contains("mir "), "{said}");
-    let mut options = options();
-    options.budget = Some(budget);
-    let steps = Arc::new(Fake::default());
-    let _daemon = Daemon::start(
-        Sim::new(3, Faults::default()),
-        options,
-        steps,
-        Runner::Inline(Inline::new(3)),
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
-    assert_eq!(admission::limit(), LIMIT, "the release's limit is the daemon's");
-    assert_eq!(blaze_mem::tag::budget(Tag::Mir), LIMIT / 64 * share(Tag::Mir), "so is each budget");
-}
 
 /// A test command line's environment: the test process's own `BLAZE_CORES`, as a real
 /// command's carries it (the daemon's budget is the process's, and the CLI compares the two
@@ -4909,4 +5828,617 @@ fn command_env() -> Vec<(String, String)> {
     let name = blaze_core::cores::VAR;
     // alloc: a test's request, once
     std::env::var(name).map(|value| vec![(name.to_owned(), value)]).unwrap_or_default()
+}
+
+mod ahead;
+mod first_look;
+mod in_process;
+mod launched_restart;
+mod solo;
+mod client_spans;
+mod solo_rows;
+mod unheld;
+
+/// The checkout's one crate as the front end's carry is given it: rooted at `src/main.rs` of
+/// the view's tree.
+fn carry_crates() -> Vec<crate::serve::front_carry::CrateRoot> {
+    vec![crate::serve::front_carry::CrateRoot::new(
+        "w w bin",
+        "src/main.rs".to_owned(),
+        syntax::Edition::CURRENT,
+        cfg::CfgOptions::default(),
+        syntax::Extensions::NONE,
+    )]
+}
+
+/// A check of the head of `/w`, ok, and the daemon turned until it settles: the carry's pass,
+/// posted at the build's end, has run.
+fn check_settled(client: &mut Client, daemon: &mut SimDaemon) {
+    let id = client.send(daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(daemon, id).last(), Some(&Response::Done { ok: true }));
+    turn_until(daemon, |it| it.settled());
+}
+
+/// The front end's carry runs on a task of its own, never the loop (rule 14): over a seed
+/// and a carried edit, every read of the carry's world is the task's, none the loop's.
+#[test]
+fn the_loop_runs_no_front_end_step_of_the_carry() {
+    CARRY_CRATES.set(carry_crates());
+    let mut sim = Sim::new(33, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 33);
+    let mut client = dial(&mut daemon);
+    check_settled(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    check_settled(&mut client, &mut daemon);
+    let built = crate::serve::front_carry::sim::take_built();
+    assert_eq!(built.iter().map(|it| it.first).collect::<Vec<_>>(), [true, false], "a seed, then a carry");
+    assert!(built[0].files > 0, "the crate's root is in the view's tree: {built:?}");
+    let (on_loop, on_task) = crate::serve::front_carry::sim::reads();
+    assert_eq!(on_loop, 0, "no read of the carry's world on the loop");
+    assert!(on_task > 0, "the carry's task read its world");
+}
+
+/// The session survives a restart (rule 26): seeded, carried over an edit, the daemon stopped
+/// (its journal marks the session), started again, the edit undone and built. The restarted
+/// daemon opens the marked session and carries it from that root, with the counts an edit of
+/// that shape carries, rather than seeding; and none of it runs on the loop.
+#[test]
+fn a_restarted_daemon_carries_from_its_mark() {
+    CARRY_CRATES.set(carry_crates());
+    let mut sim = Sim::new(34, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 34);
+    let mut client = dial(&mut daemon);
+    check_settled(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    check_settled(&mut client, &mut daemon);
+    let before = crate::serve::front_carry::sim::take_built();
+    assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
+    assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
+
+    let mut daemon = restart(daemon, &steps, 35);
+    assert_eq!(daemon.started().carries, None, "the marked sessions were used");
+    let mut client = dial(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    check_settled(&mut client, &mut daemon);
+    let after = crate::serve::front_carry::sim::take_built();
+    assert_eq!(after.len(), 1, "one pass: {after:?}");
+    assert!(!after[0].first, "the restarted daemon opened the marked session, not a seed");
+    assert_eq!(after[0].paths, 1, "carried from the root the marked session is pinned at");
+    assert_eq!(after[0].carried, before[1].carried, "an edit of the same shape carries the same");
+    assert_eq!(after[0].files, before[1].files, "and holds the same roots");
+    assert_eq!(crate::serve::front_carry::sim::reads().0, 0, "no read of the carry's world on the loop");
+}
+
+/// Whether the first pass of `/w`'s carry after a crash opened a session: seeded and carried
+/// over an edit, a snapshot (the journal and the store durable, the journal rewritten onto
+/// the image with its marks), a crash, a start and the edit undone. `drops_marks` plants the
+/// bug the control catches: the start keeps no mark.
+fn carries_after_a_crash(seed: u64, drops_marks: bool) -> (bool, Option<String>) {
+    CARRY_CRATES.set(carry_crates());
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    check_settled(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    check_settled(&mut client, &mut daemon);
+    _ = crate::serve::front_carry::sim::take_built();
+    let mark = format!("{}/w", super::local::CARRY);
+    turn_until(&mut daemon, |it| it.vfs().marked(&mark).is_some());
+    let snapshot = client.send(&mut daemon, Request::Snapshot);
+    let got = client.wait(&mut daemon, snapshot);
+    assert!(got.iter().any(|it| matches!(it, Response::Snapshotted { .. })), "{got:#?}");
+    let mut sim = daemon.into_driver();
+    sim.crash();
+    super::daemon::DROPS_MARKS.set(drops_marks);
+    let mut daemon = start(sim, &steps, seed + 1000);
+    super::daemon::DROPS_MARKS.set(false);
+    let said = daemon.started().carries.clone();
+    let mut client = dial(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    check_settled(&mut client, &mut daemon);
+    let after = crate::serve::front_carry::sim::take_built();
+    assert_eq!(after.len(), 1, "one pass: {after:?}");
+    (!after[0].first, said)
+}
+
+/// The invariant: killed once a pass's puts and its mark are durable (no stop, so no image
+/// is written at the end), the next build's pass opens the marked session (`Pass::Open`), not
+/// a seed (`Pass::Seed`), across seeds of the crash's torn tails.
+#[test]
+fn a_carry_mark_survives_a_crash_and_opens_the_session() {
+    for seed in [36, 37, 38, 39] {
+        let (opened, said) = carries_after_a_crash(seed, false);
+        assert_eq!(said, None, "seed {seed}: every mark was used");
+        assert!(opened, "seed {seed}: the pass after the crash seeded");
+    }
+}
+
+/// The control: a start that drops the marks seeds, which the oracle above catches.
+#[test]
+fn the_oracle_catches_a_start_that_keeps_no_carry_mark() {
+    let (opened, _) = carries_after_a_crash(36, true);
+    assert!(!opened, "the planted start opened a session it had no mark of");
+}
+
+/// A writer of the machine's sealed layer (`<std>/store`, [`Options::std`]) other than the
+/// daemon's own, on a simulation of its own: what `blaze store install` or another daemon's
+/// std writer commits. Its files, every one it wrote, as they are once committed.
+fn committed_by_another_writer(key: blaze_cas::Key, bytes: &[u8]) -> Vec<(FileName, Vec<u8>)> {
+    fn driven(sim: &mut Sim, other: &mut Store, effects: &mut Vec<Effect>) {
+        blaze_core::run_until_idle(sim, effects, |completion, effects| {
+            if other.owns(completion.tag) {
+                other.complete(completion, effects);
+            }
+        })
+        .expect("the effects end");
+    }
+    let mut sim = Sim::new(7, Faults::default());
+    sim.record(vec![name(STD)]);
+    let writer = Hasher::new("blaze v2 test: another writer of the layer").finish();
+    let config = blaze_cas::SharedConfig {
+        root: name(&format!("{STD}/store")),
+        writer,
+        tags: 1 << 40,
+        load_tags: crate::serve::direct::pool::loads_after(1 << 40),
+        loader: crate::serve::direct::pool::pumped(),
+    };
+    let mut effects = Vec::new();
+    let mut other = Store::open_shared(config, &mut effects);
+    driven(&mut sim, &mut other, &mut effects);
+    assert!(other.ready(), "{:?}", other.broken());
+    other.put(key, blaze_cas::Kind::Code, bytes).unwrap();
+    other.flush(&mut effects);
+    driven(&mut sim, &mut other, &mut effects);
+    let head = name(&format!("{STD}/store/w-{writer:x}/head"));
+    let mut files: Vec<FileName> = sim.recorded().iter().map(|(_, file, _)| file.clone()).collect();
+    files.push(head.clone());
+    files.sort();
+    files.dedup();
+    // The head last, as a commit makes it: a reader that lists the layer meanwhile sees the
+    // writer's last head and the packs it names.
+    files.retain(|it| *it != head && sim.exists(it));
+    files.push(head);
+    files.into_iter().map(|file| (file.clone(), sim.contents(&file))).collect()
+}
+
+/// The invariant: a sealed record a writer of the machine's layer commits after the daemon
+/// started is found through the home store by the next build: its lowering asks the home store
+/// to look at its layers again (`job.look_home`), and the job's units wait for that look, so a
+/// sealed unit's record committed meanwhile is replayed, never built again. The control: the
+/// same record before any build, when the home store has looked only at its start, is not
+/// found, so what the build finds is the look's doing.
+#[test]
+fn a_sealed_record_committed_to_the_layer_after_the_start_is_seen_by_the_next_build() {
+    for seed in 0..4 {
+        let mut sim = Sim::new(600 + seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        assert!(daemon.store().ready(), "seed {seed}: the home store opened over a layer directory it made");
+        let key = blaze_cas::Key(Hasher::new("blaze v2 test: a sealed record").part(&seed.to_le_bytes()).finish());
+        for (file, bytes) in committed_by_another_writer(key, b"a sealed unit's record") {
+            daemon.driver().change(&file, &bytes);
+        }
+        assert!(
+            daemon.store().get(&key).unwrap().is_none(),
+            "seed {seed}: found before a look: the test would prove nothing"
+        );
+        let mut client = dial(&mut daemon);
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        let found = daemon.store().get(&key).unwrap().map(|entry| entry.bytes.to_vec());
+        assert_eq!(found.as_deref(), Some(&b"a sealed unit's record"[..]), "seed {seed}: the build did not look at the layer again");
+    }
+}
+
+/// What a build of `/w` with an edit after a stop and a start, or after a crash, saw of the body
+/// entries' marks: each lowering's marks, and whether the store the edit's build read holds the
+/// value each mark of its lowering names. `crashes`: the first build is answered and the daemon
+/// loses power then, unsettled; else it settles and stops.
+fn body_marks_after(seed: u64, crashes: bool) -> (Vec<BTreeMap<String, blaze_cas::Key>>, Result<(), String>) {
+    const EDITED: &[u8] = b"fn main() { let _ = 2; }\n";
+    BODY_SESSIONS.set(true);
+    BODY_SAVES.set(0);
+    BODY_MARKS_SEEN.with_borrow_mut(Vec::clear);
+    OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut daemon = match crashes {
+        true => {
+            let mut client = dial(&mut daemon);
+            let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+            assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+            let mut sim = daemon.into_driver();
+            sim.crash();
+            start(sim, &steps, seed + 1000)
+        }
+        false => {
+            assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+            restart(daemon, &steps, seed + 1)
+        }
+    };
+    daemon.driver().change(&name("w/src/main.rs"), EDITED);
+    assert_eq!(build_settled(&mut daemon).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    let seen = BODY_MARKS_SEEN.with_borrow_mut(std::mem::take);
+    let held = match seen.last() {
+        None => Err(format!("seed {seed}: no lowering ran")),
+        Some(marks) => marks
+            .iter()
+            .find(|(_, key)| daemon.store().get(key).unwrap().is_none())
+            .map_or(Ok(()), |(krate, key)| Err(format!("seed {seed}: `{krate}`'s mark names {key:?}, which the store lost"))),
+    };
+    BODY_SESSIONS.set(false);
+    OUTPUT.set(false);
+    (seen, held)
+}
+
+/// Rule 26 for the body entries' sessions: the root a unit saved its crate's session under is
+/// marked in the journal once the unit's puts are durable (`Jobs::body_sessions`), and after a
+/// stop and a start the edit's job opens it (`JobInput::body_marks`, which a serve opens and
+/// carries when its front end kept none).
+///
+/// The invariant: the first build's lowering sees no mark; the edit's build after the restart
+/// sees exactly the first build's root for `app`, and the store holds the value it names. The
+/// control is [`the_oracle_catches_a_mark_made_before_its_puts_are_durable`].
+#[test]
+fn a_restart_then_an_edit_opens_each_crates_marked_session() {
+    for seed in [161, 163, 165] {
+        let (seen, held) = body_marks_after(seed, false);
+        assert_eq!(seen.first(), Some(&BTreeMap::new()), "seed {seed}: a checkout never built has no mark");
+        let first = body_session(1).0;
+        assert_eq!(seen.last(), Some(&BTreeMap::from([("app".to_owned(), first)])), "seed {seed}: {seen:?}");
+        held.unwrap();
+    }
+}
+
+/// The invariant: a mark never names a session whose puts a crash can lose: across seeds whose
+/// crash keeps a random prefix of what was not synced, every mark the next daemon's job opens
+/// names a value its store holds. The control: a loop that marks a session before its puts are
+/// durable (`job::MARK_EARLY`) leaves, for some seed, a mark whose value the crash lost.
+#[test]
+fn the_oracle_catches_a_mark_made_before_its_puts_are_durable() {
+    let seeds = 173..189;
+    for seed in seeds.clone() {
+        let (_, held) = body_marks_after(seed, true);
+        held.unwrap();
+    }
+    super::job::MARK_EARLY.set(true);
+    let planted: Vec<Result<(), String>> = seeds.map(|seed| body_marks_after(seed, true).1).collect();
+    super::job::MARK_EARLY.set(false);
+    assert!(planted.iter().any(Result::is_err), "no crash lost a session marked early: {planted:?}");
+}
+
+/// The head mark [`test_heads_after`]'s run files for the suite of `/w`.
+fn test_head_mark() -> crate::serve::local::TestHeadMark {
+    let id = |what: &[u8]| ContentId::of("blaze serve tests test head", what);
+    crate::serve::local::TestHeadMark { given: id(b"given"), head: id(b"head"), postings: None, state: id(b"state") }
+}
+
+/// What a start after a test run of `/w` that filed its suite's index head ([`TESTS_HEAD`])
+/// was handed of the suites' head marks (`Steps::test_heads_marked`), and whether the store
+/// holds the head each names. `crashes`: the run is answered and the daemon loses power then,
+/// unsettled; else it settles and stops. `let_go`: a second run, settled, lets the suite's
+/// head go (as one that found its head missing does) before the stop.
+fn test_heads_after(
+    seed: u64,
+    crashes: bool,
+    let_go: bool,
+) -> (Vec<crate::serve::local::TestHeadMark>, Result<(), String>) {
+    use crate::serve::work::HeadFiled;
+    TESTS_KEEP.set(true);
+    HEADS_MARKED.with_borrow_mut(Vec::clear);
+    let mark = test_head_mark();
+    TESTS_HEAD.set(Some(HeadFiled { given: mark.given, mark: Some(mark) }));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    assert!(HEADS_MARKED.with_borrow(Vec::is_empty), "seed {seed}: a new home marks no head");
+    let mut client = dial(&mut daemon);
+    let request = || Request::Test {
+        view: ViewRef::Head("/w".into()),
+        targets: agent(),
+        filter: Vec::new(),
+        all: false,
+        args: Vec::new(),
+        ub: None,
+    };
+    let id = client.send(&mut daemon, request());
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    let daemon = match crashes {
+        true => {
+            let mut sim = daemon.into_driver();
+            sim.crash();
+            start(sim, &steps, seed + 1000)
+        }
+        false => {
+            settle(&mut daemon, &mut client);
+            if let_go {
+                TESTS_HEAD.set(Some(HeadFiled { given: mark.given, mark: None }));
+                let id = client.send(&mut daemon, request());
+                assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+                settle(&mut daemon, &mut client);
+            }
+            restart(daemon, &steps, seed + 1)
+        }
+    };
+    TESTS_HEAD.set(None);
+    TESTS_KEEP.set(false);
+    let marked = HEADS_MARKED.with_borrow_mut(std::mem::take);
+    let held = marked
+        .iter()
+        .find(|it| daemon.store().get(&test_head_key(it.head)).unwrap().is_none_or(|entry| entry.bytes != TEST_HEAD))
+        .map_or(Ok(()), |it| {
+            Err(format!("seed {seed}: the mark of suite {:?} names the head {:?}, which the store lost", it.given, it.head))
+        });
+    (marked, held)
+}
+
+/// Rule persisted-state-round-trips for test selection's heads: the head a run filed is
+/// marked in the journal once the run's puts are durable (`Jobs::test_heads`), and after a stop
+/// and a start the steps are handed exactly that mark (`Steps::test_heads_marked`, which the
+/// runner's `Selectors::restore` takes), the store holding the head it names; a head let go
+/// leaves no mark.
+///
+/// The invariant: the start is handed the filed mark, equal field for field (its bytes are a
+/// function of its fields, `TestHeadMark::encode`), and its head is in the store; after a let
+/// go, nothing. The control is [`the_oracle_catches_a_test_head_marked_before_its_puts_are_durable`].
+#[test]
+fn a_restart_restores_each_suites_marked_test_head() {
+    for seed in [301, 303, 305] {
+        let (marked, held) = test_heads_after(seed, false, false);
+        assert_eq!(marked, [test_head_mark()], "seed {seed}");
+        held.unwrap();
+        let (marked, held) = test_heads_after(seed, false, true);
+        assert!(marked.is_empty(), "seed {seed}: a head let go is restored: {marked:?}");
+        held.unwrap();
+    }
+}
+
+/// The invariant: a test suite's head mark never names a head a crash can lose: across seeds
+/// whose crash keeps a random prefix of what was not synced, every mark the next start is
+/// handed names a head its store holds (a crash between the puts and the mark leaves no mark,
+/// the old one, or the new one with its head). The control: a loop that marks a head before
+/// its puts are durable (`job::MARK_EARLY`) leaves, for some seed, a mark whose head the crash
+/// lost.
+#[test]
+fn the_oracle_catches_a_test_head_marked_before_its_puts_are_durable() {
+    let seeds = 311..327;
+    for seed in seeds.clone() {
+        test_heads_after(seed, true, false).1.unwrap();
+    }
+    super::job::MARK_EARLY.set(true);
+    let planted: Vec<Result<(), String>> = seeds.map(|seed| test_heads_after(seed, true, false).1).collect();
+    super::job::MARK_EARLY.set(false);
+    assert!(planted.iter().any(Result::is_err), "no crash lost a head marked early: {planted:?}");
+}
+
+/// How many turns past its answer the first build of `/w` (on seed `seed`) takes until what it
+/// left is settled: its kept front end stored, its puts durable, its outputs placed.
+fn turns_to_settle(seed: u64) -> usize {
+    OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    let mut turns = 0;
+    while !daemon.settled() {
+        assert!(turns < TURNS, "seed {seed}: the build never settled");
+        daemon.turn();
+        turns += 1;
+    }
+    OUTPUT.set(false);
+    turns
+}
+
+/// The first build of `/w` on seed `seed`, answered, then `after` turns, then the power lost
+/// (the simulation keeps a random prefix of what was not synced); a daemon started on that disk
+/// asked the same build. Whether it was answered from a certificate (no plan load ran: no job),
+/// and which of the values the first build's kept front end put after its answer (the records
+/// that certificate rests on, `Fake::store_kept`) that daemon's store lacks.
+fn certificate_after_a_crash(seed: u64, after: usize) -> (bool, Vec<blaze_cas::Key>) {
+    OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    for _ in 0..after {
+        daemon.turn();
+    }
+    let mut sim = daemon.into_driver();
+    sim.crash();
+    let mut daemon = start(sim, &steps, seed + 1000);
+    PLANS.with(|it| it.set(0));
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}, crashed {after} turns past the answer: {got:#?}");
+    let answered = PLANS.with(Cell::get) == 0;
+    let missing = [kept_key("/w", 0), kept_key("/w", 1)]
+        .into_iter()
+        .filter(|key| daemon.store().get(key).unwrap().is_none())
+        .collect();
+    OUTPUT.set(false);
+    (answered, missing)
+}
+
+/// Every crash between the answer and the commit of what the build put after it, across seeds:
+/// for each, whether a certificate answered and what its records' store lacked.
+fn crashes_after_the_answer(seeds: std::ops::Range<u64>) -> Vec<(u64, usize, bool, Vec<blaze_cas::Key>)> {
+    let mut seen = Vec::new();
+    for seed in seeds {
+        // A few turns past settled: the certificate's own puts and its slot's write.
+        for after in 0..=turns_to_settle(seed) + 4 {
+            let (answered, missing) = certificate_after_a_crash(seed, after);
+            seen.push((seed, after, answered, missing));
+        }
+    }
+    seen
+}
+
+/// The answer before the record (/tmp/plan/12-edit-floor.md E3): what a build puts after its
+/// answer (its kept front end's records, and its units' records once they move there) settles
+/// later, and its request certificate is written by the loop only once that is durable
+/// (`Jobs::certify_held`, `Jobs::certify_settled`), never as the build ends.
+///
+/// The invariant: crashed at every turn between the answer and well past its puts' commit, on
+/// every seed, a restarted daemon that answers the same request from a certificate has every
+/// record the first build put after its answer; and some crash late enough is answered from the
+/// certificate, so the oracle is not vacuous. The control, the certificate written as the build
+/// ends (`job::CERTIFY_FIRST`), leaves for some crash a certificate that answers over a record
+/// the crash lost.
+#[test]
+fn a_crash_after_the_answer_leaves_no_certificate_without_its_record() {
+    let seeds = 201..204;
+    let seen = crashes_after_the_answer(seeds.clone());
+    for (seed, after, answered, missing) in &seen {
+        assert!(
+            !answered || missing.is_empty(),
+            "seed {seed}, crashed {after} turns past the answer: a certificate answered over records the crash lost: {missing:?}"
+        );
+    }
+    assert!(seen.iter().any(|it| it.2), "no crash was answered from a certificate: the oracle proves nothing: {seen:?}");
+    super::job::CERTIFY_FIRST.set(true);
+    let planted = crashes_after_the_answer(seeds);
+    super::job::CERTIFY_FIRST.set(false);
+    assert!(
+        planted.iter().any(|(_, _, answered, missing)| *answered && !missing.is_empty()),
+        "the certificate written first never answered over a lost record: {planted:?}"
+    );
+}
+
+/// The task watchdog's end of a lost wake (`serve::stuck`): a thread task whose thread never
+/// comes back (held on the runner, as a worker parked on a wake that never comes) is named
+/// stuck by the watchdog, here planted as its one word to the loop (`Pulse::say_stuck` with
+/// `lost`), and the loop fails its plane node with the line (`Plane::abandon`): the build ends
+/// failed, saying what was stuck, rather than hang, its other tasks are let go, the lost task's
+/// late end is dropped, and a second build is served. The control: drop the loop's take of
+/// the watchdog's word (`Daemon::take_stuck`), or make `Plane::abandon` do nothing, and the
+/// held node stays running, so the turn bound below names it.
+///
+/// The invariant: a thread task the watchdog says is lost ends its build failed with the
+/// watchdog's line, and the daemon goes on serving.
+#[test]
+fn a_lost_wake_fails_its_build_with_the_stuck_line_and_the_next_build_is_served() {
+    use blaze_graph::admission::kinds;
+    use super::pulse::StuckSaid;
+    let held = [
+        kinds::PLAN,
+        kinds::LOWER,
+        kinds::COMPILE,
+        kinds::UNIT_NAMES,
+        kinds::UNIT_BODIES,
+        kinds::UNIT_LINK,
+        kinds::PROGRAM,
+        kinds::PROGRAM_LINK,
+    ];
+    let mut sim = Sim::new(7, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 7);
+    for kind in held {
+        daemon.hold_tasks_for_test(kind, true);
+    }
+    let mut client = dial(&mut daemon);
+    let first = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let mut running = Vec::new();
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        running = daemon.running_thread_tasks_for_test();
+        !running.is_empty() || client.done(first)
+    });
+    let Some(&(request, node)) = running.first() else {
+        panic!("no thread task of the build ran, held: {:#?}", client.of(first))
+    };
+    let said = blaze_protocol::now::Stuck {
+        what: "compile of app 0.0.0".into(),
+        cycle: Vec::new(),
+        waits: "signal test.lost_wake".into(),
+        for_ms: 240_000,
+        inside: None,
+        held_by: None,
+    };
+    daemon.pulse().say_stuck(StuckSaid {
+        build: request.0,
+        node: Some(u64::from(node.0)),
+        lost: true,
+        said,
+    });
+    // The loop takes the word at its next look at the builds: then the node no longer runs.
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        !daemon.running_thread_tasks_for_test().iter().any(|it| it.1 == node)
+    });
+    // The lost thread comes back late, and the build's other held tasks run.
+    for kind in held {
+        daemon.hold_tasks_for_test(kind, false);
+    }
+    let got = client.wait(&mut daemon, first);
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let all = format!("{got:?}");
+    assert!(
+        all.contains("stuck 4 min: compile of app 0.0.0 waits on signal test.lost_wake"),
+        "the build says what was stuck: {got:#?}"
+    );
+    let second = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, second);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the next build is served: {got:#?}");
+}
+
+#[test]
+fn final_diagnostics_observe_writes_queued_by_the_last_unit() {
+    let mut writer = FakeWriter { inputs: Arc::new(FakeInputs::default()), asked: vec![3], broke: Vec::new() };
+    assert!(writer.reader().is_none());
+    let reader = writer.final_reader().unwrap();
+    assert_eq!(reader.0.runs, [3]);
+}
+
+#[test]
+fn replayed_names_settle_empty_phases_but_a_freshness_probe_does_not() {
+    for seed in [7, 17, 31] {
+        PHASES.with_borrow_mut(Vec::clear);
+        PROBED_FRESH.set(Some(0)); // The dependency missed when names looked again.
+        REPLAYED_NAMES.set(Some(3)); // The root's record appeared after its probe.
+        OUTPUT.set(true);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:?}");
+        let ran = PHASES.with(|it| it.take());
+        let phases = |at| {
+            ran.iter().filter_map(|&(u, p)| (u == at).then_some(p)).collect::<Vec<_>>()
+        };
+        assert_eq!(phases(3), [Phase::Names, Phase::Link, Phase::Store], "seed {seed}");
+        let mut dep = phases(0);
+        dep.sort_unstable_by_key(|p| *p as u8);
+        assert_eq!(dep, Phase::BUILD, "seed {seed}");
+        assert_eq!(daemon.driver().contents(&name(&APP_AT[1..])), APP, "seed {seed}");
+    }
+    PROBED_FRESH.set(None);
+    REPLAYED_NAMES.set(None);
+    OUTPUT.set(false);
 }

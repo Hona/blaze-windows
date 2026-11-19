@@ -16,14 +16,19 @@
 use blaze_api::client::Client;
 use blaze_thin::handover::Began;
 
-/// The most bytes one read of the connection takes.
 #[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
+
+/// The most bytes one read of the connection takes.
+#[cfg(any(unix, windows))]
 const RECEIVE: usize = 64 << 10;
 
 /// The connection the thin `blaze` began, as a daemon the CLI's client speaks to.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Answered {
-    socket: std::os::unix::net::UnixStream,
+    socket: UnixStream,
     /// The request's frame as the thin `blaze` sent it.
     request: Vec<u8>,
     /// The answer's bytes the thin `blaze` read, until they are taken.
@@ -32,21 +37,40 @@ struct Answered {
     sent: bool,
 }
 
+/// Whether `frame`, one whole request's, is a `ClientRows`.
+#[cfg(any(unix, windows))]
+fn is_client_rows(frame: &[u8]) -> bool {
+    let mut frames = blaze_api::frames::Frames::new();
+    frames.push(frame);
+    let Ok(Some(item)) = frames.next_ref() else { return false };
+    matches!(
+        blaze_api::frames::decode::<blaze_api::Request>(item),
+        Ok(blaze_api::Envelope { body: blaze_api::Request::ClientRows { .. }, .. })
+    )
+}
+
 /// Where two frames first differ, for the refusal.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn differs_at(ours: &[u8], theirs: &[u8]) -> usize {
     ours.iter().zip(theirs).position(|(a, b)| a != b).unwrap_or(ours.len().min(theirs.len()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl blaze_api::client::Local for Answered {
     /// The command's request, which the thin `blaze` already sent: nothing is sent, and a
-    /// frame that is not the one it sent is refused.
+    /// frame that is not the one it sent is refused. After it, the connection carries the
+    /// command's client rows (`ClientRows`, `client_rows::send`) and nothing else: they are
+    /// written to it, so a command is one connection (handoff-12 request 2a).
     fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
         if self.sent {
-            return Err(std::io::Error::other(
-                "a second request on the connection the thin `blaze` began, which carries its one request",
-            ));
+            if !is_client_rows(frame) {
+                return Err(std::io::Error::other(
+                    "a second request on the connection the thin `blaze` began, which carries its one request and \
+                     then only the command's client rows",
+                ));
+            }
+            return self.socket.write_all(frame);
         }
         self.sent = true;
         if frame != self.request {
@@ -98,36 +122,47 @@ impl blaze_api::client::Local for Answered {
 /// The client of the command `began` names: the thin `blaze`'s connection and what it read,
 /// taken from the descriptors this process was started with. An error names the descriptor
 /// or the file that is not what the thin `blaze` hands over.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn client(began: Began) -> Result<Client, String> {
     use std::io::{Read as _, Seek as _};
+    #[cfg(unix)]
     let taken = |fd: i32, what: &str| {
         crate::raw::process::inherited(fd).map_err(|error| {
             format!("`blaze {}`: {what} (descriptor {fd}): {error}", blaze_thin::handover::WORD)
         })
     };
-    let socket = std::os::unix::net::UnixStream::from(taken(began.socket, "the daemon's connection")?);
+    #[cfg(unix)]
+    let socket = UnixStream::from(taken(began.socket, "the daemon's connection")?);
+    #[cfg(unix)]
     let mut file = std::fs::File::from(taken(began.file, "the answer read so far")?);
-    let unread =
-        |error: std::io::Error| format!("`blaze {}`: reading the answer handed over: {error}", blaze_thin::handover::WORD);
+    #[cfg(windows)]
+    let (socket, mut file) = crate::raw::process::handed(began.socket, began.file)
+        .map_err(|e| format!("the connection and answer handed to the engine: {e}"))?;
+    let unread = |error: std::io::Error| {
+        format!("`blaze {}`: reading the answer handed over: {error}", blaze_thin::handover::WORD)
+    };
     // alloc: once a command, the bytes handed over
     let mut bytes = Vec::new();
     file.seek(std::io::SeekFrom::Start(0)).map_err(unread)?;
     file.read_to_end(&mut bytes).map_err(unread)?;
-    let held = blaze_thin::handover::Held::read(&bytes)
-        .map_err(|why| format!("`blaze {}`: the answer handed over: {why}", blaze_thin::handover::WORD))?;
+    let held = blaze_thin::handover::Held::read(&bytes).map_err(|why| {
+        format!("`blaze {}`: the answer handed over: {why}", blaze_thin::handover::WORD)
+    })?;
     let answered = Answered {
         socket,
         request: held.request.to_vec(), // alloc: once a command
         answer: held.answer.to_vec(),   // alloc: once a command
         sent: false,
     };
+    // The thin `blaze`'s own spans until it handed over: sent with this process's as the
+    // build's client rows (`client_rows::rows`), so the command's time is one build's.
+    super::client_rows::handed(held.timed, held.started_ns);
     // alloc: once a command, the client's link
     Ok(Client::local_from(Box::new(answered), began.id))
 }
 
 /// Off Unix there is no thin `blaze` that hands a command over.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn client(began: Began) -> Result<Client, String> {
     let _ = began;
     Err(format!(
@@ -146,7 +181,15 @@ mod tests {
 
     fn answered(request: &[u8], answer: &[u8]) -> (Answered, std::os::unix::net::UnixStream) {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-        (Answered { socket: ours, request: request.to_vec(), answer: answer.to_vec(), sent: false }, theirs)
+        (
+            Answered {
+                socket: ours,
+                request: request.to_vec(),
+                answer: answer.to_vec(),
+                sent: false,
+            },
+            theirs,
+        )
     }
 
     /// The handover's claim: the engine prints the answer the thin `blaze` began to read, the
@@ -164,15 +207,20 @@ mod tests {
         let mut seen = Vec::new();
         let ok = client
             .call_ref(Request::Status, |response, _| {
-                seen.push(matches!(response, ResponseRef::Flushed { seq: 7 } | ResponseRef::Done { ok: true }));
+                seen.push(matches!(
+                    response,
+                    ResponseRef::Flushed { seq: 7 } | ResponseRef::Done { ok: true }
+                ));
             })
             .unwrap();
         assert!(ok);
         assert_eq!(seen, [true, true]);
     }
 
-    /// The control: a request the engine makes differently from the one sent is refused, and a
-    /// second request is too.
+    /// The invariant: the connection carries the one request the thin `blaze` sent, then the
+    /// command's client rows and nothing else. Controls: a request the engine makes
+    /// differently from the one sent is refused, and a second request that is not the rows is
+    /// too.
     #[test]
     fn another_request_than_the_one_sent_is_refused() {
         let sent = frames::encode(&Envelope::new(2, Request::Status)).unwrap();
@@ -180,9 +228,25 @@ mod tests {
         let (mut other, _daemon) = answered(&sent, &[]);
         let refused = other.send(&made).unwrap_err().to_string();
         assert!(refused.contains("another request than this blaze makes"), "{refused}");
-        let (mut same, _daemon) = answered(&sent, &[]);
+        let (mut same, mut daemon) = answered(&sent, &[]);
         same.send(&sent).unwrap();
         assert!(same.send(&sent).is_err());
+        // After it, the command's client rows go on the same connection, written as made.
+        let rows = Request::ClientRows {
+            pid: 41,
+            build: 7,
+            spans: Vec::new(),
+            timed: Vec::new(),
+            events: Vec::new(),
+            folded: Vec::new(),
+            ended_ns: 2,
+            started_ns: 1,
+        };
+        let rows = frames::encode(&Envelope::new(3, rows)).unwrap();
+        same.send(&rows).unwrap();
+        let mut written = vec![0; rows.len()];
+        std::io::Read::read_exact(&mut daemon, &mut written).unwrap();
+        assert_eq!(written, rows);
         // Another id is another frame: the client is made with the id the thin `blaze` used.
         let (answered, _daemon) = answered(&sent, &[]);
         let mut client = Client::local_from(Box::new(answered), 3);

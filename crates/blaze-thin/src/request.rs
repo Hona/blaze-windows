@@ -105,10 +105,12 @@ pub fn request(asked: &Asked, sent: Sent) -> Request {
         // `-q` and no `-v`: cargo's `Verbosity` as a count is 0 either way.
         verbose: 0,
         refused: Some(REFUSED_SHOWN),
+        // The thin `blaze` routes no `--no-prebuilt` ([`crate::route`]): the full CLI reads it.
+        prebuilt: true,
     };
     let profile = if asked.release { "release" } else { "dev" };
     let targets = Targets {
-        packages: Vec::new(), // alloc: none
+        packages: asked.packages.clone(), // clone: the request owns the selectors
         profile: profile.to_owned(), // alloc: the request's, once a command
         goal: None,
         target: None,
@@ -117,7 +119,11 @@ pub fn request(asked: &Asked, sent: Sent) -> Request {
         no_default_features: false,
         cargo: Some(cargo),
     };
-    Request::Build { view: ViewRef::Head(root), targets }
+    let view = ViewRef::Head(root);
+    match asked.command {
+        crate::route::Command::Check => Request::Check {view, targets},
+        _ => Request::Build {view, targets},
+    }
 }
 
 #[cfg(test)]
