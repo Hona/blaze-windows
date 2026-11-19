@@ -1550,7 +1550,10 @@ arrived and holds the request until the watch has told every record before it
 heard as it is first written and as it is closed, not at each write. A checkout on a network
 share, on a volume with no USN journal (FAT, exFAT) or on one whose journal was never made
 can't be watched: each request on it fails, naming the checkout and why (the last says how an
-administrator makes the journal).
+administrator makes the journal). Directories outside the checkout that a build reads (the
+Windows SDK, the toolchain) are watched through the same journals, one reader per volume
+(`crates/blaze-vfs/src/outside.rs`), so a file there is vouched for and not stamped again at
+each request; a lost or reset journal confirms every directory on its volume again.
 
 `blaze clean` is normally not needed: the daemon collects what is unused on its own, and works
 harder the fuller the disk gets, so free space stays above its floor without anyone asking
@@ -1643,6 +1646,7 @@ so), and 1 otherwise. The same tree gives the same output, byte for byte.
 | `state` | the daemon image and the profile history read; the state's size against the disk's free bytes; directories of layouts this blaze no longer reads (`v2.store-format-*`, `runner-*`), with their sizes |
 | `toolchain` | the pinned Rust and its library sources; the machine's shared directory |
 | `project` | directories of 1 GiB or more with no `CACHEDIR.TAG` (not `target/`, `.git/`); a file system whose timestamps have no sub-second part |
+| `machine` | Windows only (`doctor/machine.rs`): a commit limit under 32 GiB; whether blaze's root and the workspace are on a trusted Dev Drive (else each output is written whole and scanned); each directory blaze writes that Defender scans, with the `Add-MpPreference` line that excludes it |
 | `tools` | the sandbox build scripts and proc macros run in |
 
 Each check is `ok`, `absent` or `unused` (a part a daemon starts empty), `warn` (blaze works,
@@ -1769,6 +1773,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
 | `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
 | `BLAZE_DAEMON_EXIT_UNHELD` | the daemon stops itself once no client or launcher connection has been open at its socket for a grace: `on` for 20 s, or a whole number of seconds above 0. It never stops while one is open, a connection inside the grace ends the countdown, and it stops as `blaze stop` does (writing its image), logging why and ending with exit status 78 (`UNHELD`). For test runs and scripts whose clients may be killed before they could stop it. A daemon setting: a command that sets another value than the running daemon's is refused ([The daemon](#the-daemon)) | unset: it exits only as below |
+| `BLAZE_NTFS_EDIT` | Windows: how an edited output on NTFS is placed. `auto`: a PE image of 16 MiB or less is a new sparse file renamed over the old (no exclusive open, so no wait for Defender's scan), a larger image and any other file (a PDB) is patched in place; `rename` renames every PE image, whatever its size; `rename-all` renames every output; `patch` patches every output in place; a size (`8mib`, `512kib`, bytes; `0` is `patch`) is `auto` with that limit. A daemon setting, as `BLAZE_CORES` | `auto` |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code
@@ -2069,6 +2074,11 @@ outside the script's own package, grant just the sibling inputs with `BLAZE_SCRI
 A read grant remains read-only;
 a link-search permission is not a filesystem grant. Neither the script nor a child gets
 the invoking user's unrestricted filesystem access. The sandbox-off path is not cached.
+
+Each path in that key, and in what the run printed, is written against the checkout's roots
+(`blaze_usercode::roots`), so another checkout of the project at another path or drive finds
+the same result and gets its output with its own paths in it
+([platforms.md](platforms.md#v2-build-scripts-on-windows)).
 
 ### A build script's own writable state
 
