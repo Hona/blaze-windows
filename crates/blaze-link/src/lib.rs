@@ -23,6 +23,7 @@
 pub mod args;
 mod arena;
 mod beside;
+mod checkpoint;
 mod commit;
 mod counter;
 mod cow;
@@ -76,6 +77,7 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use std::alloc::Global;
 
+pub use checkpoint::NativeBytes;
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};

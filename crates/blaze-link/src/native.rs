@@ -1273,6 +1273,9 @@ struct Load {
 
 static GRAPHS: AtomicU64 = AtomicU64::new(1);
 
+/// [`Resolved::natives_version`]s, given out once a process each.
+static NATIVES_VERSIONS: AtomicU64 = AtomicU64::new(1);
+
 /// A resolution of the natives: the objects loaded, what every global is, which COMDAT groups
 /// won, and the indexes collection walks. Built when the natives or Rust's definitions
 /// change, shared by the stages after.
@@ -1301,6 +1304,10 @@ pub(crate) struct Graph {
     /// The archives searched for names, in link-line order: input and index.
     archives: Vec<(u32, Arc<Table>)>,
     exports: Arc<Exports>,
+    /// Of each library `exports` was built of, in order, the input and member it was read
+    /// from (0 for the input itself): what a restore reads again to build it
+    /// ([`Resolved::take_checkpoint`]).
+    exports_from: Vec<(u32, u32)>,
     /// What resolution has the image export: the objects' `/EXPORT` directives', then, by
     /// name, what an ELF executable defines that a shared library it links defines or
     /// refers to ([`Stage::export_for_libraries`]).
@@ -1337,6 +1344,8 @@ impl Graph {
             // alloc: none (an empty `Vec`), replaced once per graph built
             archives: Vec::new(),
             exports: Arc::default(),
+            // alloc: none (an empty `Vec`), replaced once per graph built
+            exports_from: Vec::new(),
             asked: Arc::default(),
             wasm: HashMap::new_in(std::alloc::Global),
             entry: None,
@@ -2059,6 +2068,10 @@ struct Build {
     shared: Vec<(Arc<NativeFile>, bool, u32)>,
     /// Import libraries' members, in load order, and their archive's place on the line.
     members: Vec<(Arc<NativeFile>, u32)>,
+    /// Of each of `shared` and `members`, the input and member it was read from
+    /// ([`Graph::exports_from`]).
+    shared_from: Vec<(u32, u32)>,
+    members_from: Vec<(u32, u32)>,
     commons: HashMap<u32, (u64, u64), std::alloc::Global>,
 }
 
@@ -2078,6 +2091,9 @@ impl Build {
             shared: Vec::new(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             members: Vec::new(),
+            // alloc: none (an empty `Vec`); each grows once per graph built
+            shared_from: Vec::new(),
+            members_from: Vec::new(),
             commons: HashMap::new_in(std::alloc::Global),
         }
     }
@@ -2397,20 +2413,37 @@ impl<'a> Stage<'a> {
         objs: &[Obj],
         misses: &[usize],
     ) -> Result<Vec<Read>, LinkError> {
+        let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) =
+            (&self.new.inputs[..], &self.native, self.old);
+        let bytes = |input: u32| native.input(old, input);
+        read_objects(self.writer, &mut *self.symbols, inputs, &bytes, wanted, objs, misses)
+    }
+}
+
+/// The objects and import libraries at `wanted[misses[..]]` (input, and 0 for the input itself
+/// or member + 1), `objs` their objects: read, checked, interned and indexed, the reading and
+/// indexing in parallel. `bytes` gives an input's bytes, which what is read is of.
+fn read_objects<'b>(
+    writer: &Formats,
+    symbols: &mut Symbols,
+    inputs: &[Input],
+    bytes: &(dyn Fn(u32) -> &'b [u8] + Sync),
+    wanted: &[(u32, u32)],
+    objs: &[Obj],
+    misses: &[usize],
+) -> Result<Vec<Read>, LinkError> {
+    {
         struct Got {
             file: Arc<NativeFile>,
             base: usize,
             records: Vec<(u32, Vec<unwind::Native>)>,
         }
-        let writer = self.writer;
-        let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) =
-            (&self.new.inputs[..], &self.native, self.old);
         let mut got: Vec<Result<Got, LinkError>> = Vec::with_capacity(misses.len());
         got.clear();
         par::extend(&mut got, misses, |at| {
             let (input, member) = wanted[*at];
             let it = &inputs[input as usize];
-            let all = native.input(old, input);
+            let all = bytes(input);
             let (file, base, member_name) = if member == 0 {
                 // clone: an `Arc`: the object is the input's own file
                 (it.file.clone(), 0, None)
@@ -2499,8 +2532,8 @@ impl<'a> Stage<'a> {
                 }
             }
             starts.push((keys.len(), names.len()));
-            syms = self.symbols.intern_wide(&keys);
-            name_ids = self.symbols.names_all(&names);
+            syms = symbols.intern_wide(&keys);
+            name_ids = symbols.names_all(&names);
         }
         let mut reads: Vec<Read> = Vec::with_capacity(got.len());
         reads.clear();
@@ -2523,7 +2556,9 @@ impl<'a> Stage<'a> {
         });
         Ok(reads)
     }
+}
 
+impl<'a> Stage<'a> {
     /// The indexes of the searched archives, kept ones as they are, the rest built in
     /// parallel.
     fn indexes(&mut self, inputs: &[Input], lazy: &[u32]) -> Vec<(u32, Arc<Table>)> {
@@ -3209,8 +3244,7 @@ impl<'a> Stage<'a> {
             None => self.rebuild(&old, &refs, outside)?,
         };
         if rebuild || !gained.is_empty() {
-            static VERSIONS: AtomicU64 = AtomicU64::new(1);
-            next.natives_version = VERSIONS.fetch_add(1, Ordering::Relaxed);
+            next.natives_version = NATIVES_VERSIONS.fetch_add(1, Ordering::Relaxed);
         }
         next.refs = refs;
         next.pieces = self.new.piece_count();
@@ -3707,6 +3741,7 @@ impl<'a> Stage<'a> {
                     let as_needed = matches!(input.kind, NativeKind::Shared { as_needed: true });
                     // clone: an `Arc`: the library's file, for the exports
                     b.shared.push((input.file.clone(), as_needed, input.order));
+                    b.shared_from.push((at, 0));
                 }
             }
         }
@@ -3720,10 +3755,13 @@ impl<'a> Stage<'a> {
                     .map(|it| if let Read::Object(parsed) = it { parsed.globals } else { 0 })
                     .sum(),
             );
-            for (&(input, _), read) in round.iter().zip(reads) {
+            for (&(input, member), read) in round.iter().zip(reads) {
                 match read {
                     Read::Object(parsed) => self.register(&mut b, &parsed, input, pulled)?,
-                    Read::Shared(file) => b.members.push((file, inputs[input as usize].order)),
+                    Read::Shared(file) => {
+                        b.members.push((file, inputs[input as usize].order));
+                        b.members_from.push((input, member));
+                    }
                     Read::Index(_) => {}
                 }
             }
@@ -3786,6 +3824,9 @@ impl<'a> Stage<'a> {
         commons.sort_unstable_by_key(|it| it.0);
         let mut shared = std::mem::take(&mut b.shared);
         shared.extend(b.members.drain(..).map(|(it, order)| (it, false, order)));
+        let mut shared_from = std::mem::take(&mut b.shared_from);
+        shared_from.append(&mut b.members_from);
+        b.graph.exports_from = shared_from;
         b.graph.exports = match old.graph.as_ref().map(|it| &it.exports) {
             // clone: an `Arc`: the libraries are the image's, so are their exports
             Some(it) if it.same(&shared) => it.clone(),
@@ -4653,3 +4694,342 @@ mod tests {
         assert_eq!(settled(O_MARKS, 2, 0, false), Next::Rebuild);
     }
 }
+
+mod wire {
+    use std::alloc::Global;
+
+    use blaze_format::cursor::{Put as _, Reader};
+
+    use blaze_ids::ContentId;
+
+    use super::*;
+    use crate::checkpoint::{Wire, count, wire_struct};
+
+    impl Wire for CowFlags {
+        fn put(&self, out: &mut Vec<u8>) {
+            self.0.put(out);
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(CowFlags(Wire::take(r)?))
+        }
+    }
+
+    wire_struct!(Refs { counts, of, lists, names, listed });
+    wire_struct!(Marks { sections, frames, named, special, native });
+    wire_struct!(Slot { sym, best, strength, flags, fallback });
+
+    /// A native input read again from its bytes, as [`Stage::inputs`] reads a new one: what a
+    /// restored image holds of each input it was linked with.
+    pub(crate) fn reread_input(
+        writer: &Formats,
+        id: ContentId,
+        name: Arc<str>,
+        kind: NativeKind,
+        order: u32,
+        bytes: Arc<[u8]>,
+    ) -> Result<Input, String> {
+        let file = writer.read(&name, &bytes, &kind).map_err(|it| format!("{name}: {it}"))?;
+        check_file(&file, bytes.len()).map_err(|it| format!("{name}: {it}"))?;
+        // alloc: once per native input restored, shared by every state after
+        Ok(Input { id, name, kind, order, bytes, file: Arc::new(file) })
+    }
+
+    impl Resolved {
+        /// The native inputs it was resolved from.
+        pub(crate) fn inputs_of(&self) -> &Arc<Vec<Input>> {
+            &self.inputs
+        }
+
+        /// The resolution as a checkpoint records it, of the state whose inputs are `inputs`
+        /// and whose Rust names are `names`: its graph by what each load was read from, which
+        /// a restore reads again; never the objects themselves.
+        pub(crate) fn put_checkpoint(
+            &self,
+            inputs: &Arc<Vec<Input>>,
+            names: &Arc<BTreeMap<NameId, crate::state::RustName>>,
+            out: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let Resolved {
+                imports,
+                import_syms,
+                libraries,
+                library_orders,
+                exports,
+                stale,
+                refs,
+                pieces,
+                removals,
+                inputs: _,
+                names: resolved_names,
+                wasm,
+                graph,
+                marks,
+                natives_version: _,
+                outcomes,
+                named,
+                defined,
+                library_index,
+                commons,
+            } = self;
+            if !wasm.is_empty() {
+                return Err("a resolution of wasm imports, which no checkpoint holds".into());
+            }
+            imports.put(out);
+            import_syms.put(out);
+            libraries.put(out);
+            library_orders.put(out);
+            exports.put(out);
+            stale.put(out);
+            refs.put(out);
+            pieces.put(out);
+            removals.put(out);
+            match Arc::ptr_eq(resolved_names, names) || **resolved_names == **names {
+                true => out.put_u8(0),
+                false => {
+                    out.put_u8(1);
+                    resolved_names.put(out);
+                }
+            }
+            match graph {
+                None => out.put_u8(0),
+                Some(graph) => {
+                    out.put_u8(1);
+                    graph.put_checkpoint(inputs, out)?;
+                }
+            }
+            marks.put(out);
+            outcomes.put(out);
+            named.put(out);
+            defined.put(out);
+            library_index.put(out);
+            commons.put(out);
+            Ok(())
+        }
+
+        /// What [`Resolved::put_checkpoint`] wrote, of a state of `inputs`, `names` and `wasm`:
+        /// its graph's objects read again into `objects` (where the next stage finds them) and
+        /// its exports built again from the libraries they were.
+        pub(crate) fn take_checkpoint(
+            r: &mut Reader<'_>,
+            writer: &Formats,
+            symbols: &mut Symbols,
+            inputs: &Arc<Vec<Input>>,
+            names: &Arc<BTreeMap<NameId, crate::state::RustName>>,
+            wasm: &Arc<HashMap<NameId, blaze_codegen::wasm::Import, Global>>,
+            objects: &mut HashMap<Obj, Read, Global>,
+        ) -> Result<Resolved, String> {
+            let imports = Wire::take(r)?;
+            let import_syms = Wire::take(r)?;
+            let libraries = Wire::take(r)?;
+            let library_orders = Wire::take(r)?;
+            let exports = Wire::take(r)?;
+            let stale = Wire::take(r)?;
+            let refs = Wire::take(r)?;
+            let pieces = Wire::take(r)?;
+            let removals = Wire::take(r)?;
+            let names = match r.u8().map_err(String::from)? {
+                // clone: an `Arc`: the state's names, which the resolution was made of
+                0 => names.clone(),
+                1 => Wire::take(r)?,
+                // alloc: error path
+                other => return Err(format!("a resolution's names of tag {other}")),
+            };
+            let graph = match r.u8().map_err(String::from)? {
+                0 => None,
+                // alloc: once per restore, shared by the stages after
+                1 => Some(Arc::new(Graph::take_checkpoint(r, writer, symbols, inputs, objects)?)),
+                // alloc: error path
+                other => return Err(format!("a resolution's graph of tag {other}")),
+            };
+            Ok(Resolved {
+                imports,
+                import_syms,
+                libraries,
+                library_orders,
+                exports,
+                stale,
+                refs,
+                pieces,
+                removals,
+                // clone: an `Arc`: the state's inputs, which the resolution was made of
+                inputs: inputs.clone(),
+                names,
+                // clone: an `Arc`: the state's (empty) wasm imports
+                wasm: wasm.clone(),
+                graph,
+                marks: Wire::take(r)?,
+                // A version of this process's: the debug side file names native code anew.
+                natives_version: NATIVES_VERSIONS.fetch_add(1, Ordering::Relaxed),
+                outcomes: Wire::take(r)?,
+                named: Wire::take(r)?,
+                defined: Wire::take(r)?,
+                library_index: Wire::take(r)?,
+                commons: Wire::take(r)?,
+            })
+        }
+    }
+
+    impl Graph {
+        fn put_checkpoint(&self, inputs: &[Input], out: &mut Vec<u8>) -> Result<(), String> {
+            let Graph {
+                id: _,
+                loads,
+                by_obj: _,
+                slot_of: _,
+                slots,
+                discarded,
+                sections,
+                frames,
+                unwinds: _,
+                fdes: _,
+                supports: _,
+                named: _,
+                roots: _,
+                archives,
+                exports: _,
+                exports_from,
+                asked,
+                wasm,
+                entry,
+                outside,
+            } = self;
+            if !wasm.is_empty() || !outside.is_empty() {
+                return Err("a graph of wasm imports or of an image beside another, which no checkpoint holds".into());
+            }
+            out.put_u64(loads.len() as u64);
+            for load in loads {
+                let Load { parsed, input, pulled, sections, frames, slots } = load;
+                if *input as usize >= inputs.len() {
+                    return Err("a load of an input the state does not have".into());
+                }
+                input.put(out);
+                parsed.obj.put(out);
+                pulled.put(out);
+                sections.put(out);
+                frames.put(out);
+                slots.put(out);
+            }
+            slots.put(out);
+            discarded.put(out);
+            sections.put(out);
+            frames.put(out);
+            out.put_u64(archives.len() as u64);
+            for (input, _) in archives {
+                input.put(out);
+            }
+            exports_from.put(out);
+            asked.put(out);
+            entry.put(out);
+            Ok(())
+        }
+
+        fn take_checkpoint(
+            r: &mut Reader<'_>,
+            writer: &Formats,
+            symbols: &mut Symbols,
+            inputs: &Arc<Vec<Input>>,
+            objects: &mut HashMap<Obj, Read, Global>,
+        ) -> Result<Graph, String> {
+            let input_of = |input: u32| -> Result<&Input, String> {
+                // alloc: error path
+                inputs.get(input as usize).ok_or_else(|| format!("input {input} of {}", inputs.len()))
+            };
+            let mut graph = Graph::new();
+            let loads = count(r, 4 + 8 + 1 + 4 + 4 + 8)?;
+            // alloc: once per restore, the loads' places and what they were read from
+            let mut kept = Vec::with_capacity(loads);
+            for _ in 0..loads {
+                let input: u32 = Wire::take(r)?;
+                let obj: Obj = Wire::take(r)?;
+                let pulled: bool = Wire::take(r)?;
+                let sections: u32 = Wire::take(r)?;
+                let frames: u32 = Wire::take(r)?;
+                let slots: Vec<u32> = Wire::take(r)?;
+                if symbols.obj(&input_of(input)?.id, obj.member) != obj {
+                    return Err("a load whose object is not of its input".into());
+                }
+                kept.push((input, obj, pulled, sections, frames, slots));
+            }
+            graph.slots = Wire::take(r)?;
+            graph.discarded = Wire::take(r)?;
+            graph.sections = Wire::take(r)?;
+            graph.frames = Wire::take(r)?;
+            let archives: Vec<u32> = Wire::take(r)?;
+            let exports_from: Vec<(u32, u32)> = Wire::take(r)?;
+            graph.asked = Wire::take(r)?;
+            graph.entry = Wire::take(r)?;
+            // Each load's object and each import library member read again, as a stage reads a
+            // miss, into the objects the next stage finds kept.
+            // alloc: once per restore, what is read again
+            let mut wanted: Vec<(u32, u32)> = kept.iter().map(|it| (it.0, it.1.member)).collect();
+            wanted.extend(exports_from.iter().filter(|it| it.1 != 0).copied());
+            let objs: Vec<Obj> = wanted
+                .iter()
+                .map(|(input, member)| Ok(symbols.obj(&input_of(*input)?.id, *member)))
+                .collect::<Result<_, String>>()?;
+            let misses: Vec<usize> = (0..wanted.len()).filter(|at| !objects.contains_key(&objs[*at])).collect();
+            let bytes = |input: u32| &inputs[input as usize].bytes[..];
+            let read = read_objects(writer, symbols, inputs, &bytes, &wanted, &objs, &misses)
+                .map_err(|it| it.what)?;
+            for (at, it) in misses.iter().zip(read) {
+                objects.insert(objs[*at], it);
+            }
+            for (input, obj, pulled, sections, frames, slots) in kept {
+                let parsed = match objects.get(&obj) {
+                    // clone: an `Arc`: the image keeps each object, and the graph shares it
+                    Some(Read::Object(parsed)) => parsed.clone(),
+                    _ => return Err("a load that reads again as no object".into()),
+                };
+                if parsed.object().symbols.len() != slots.len() {
+                    return Err("a load whose object reads again with another symbol count".into());
+                }
+                graph.by_obj.insert(obj, graph.loads.len() as u32);
+                graph.loads.push(Load { parsed, input, pulled, sections, frames, slots });
+            }
+            for (at, slot) in graph.slots.iter().enumerate() {
+                if graph.slot_of.insert(slot.sym, at as u32).is_some() {
+                    return Err("a graph with one symbol in two slots".into());
+                }
+            }
+            // alloc: once per restore, the libraries the exports are built of
+            let mut roots = Vec::with_capacity(exports_from.len());
+            for (input, member) in &exports_from {
+                let it = input_of(*input)?;
+                if *member == 0 {
+                    let as_needed = matches!(it.kind, NativeKind::Shared { as_needed: true });
+                    // clone: an `Arc`: the library's file, for the exports
+                    roots.push((it.file.clone(), as_needed, it.order));
+                    continue;
+                }
+                match objects.get(&symbols.obj(&it.id, *member)) {
+                    // clone: an `Arc`: the member's file, for the exports
+                    Some(Read::Shared(file)) => roots.push((file.clone(), false, it.order)),
+                    _ => return Err("an import library member that reads again as no library".into()),
+                }
+            }
+            // alloc: once per restore, shared by the stages after
+            graph.exports = Arc::new(Exports::build(roots)?);
+            graph.exports_from = exports_from;
+            for input in archives {
+                let it = input_of(input)?;
+                let NativeFile::Archive(archive) = &*it.file else {
+                    return Err("a searched archive that reads again as no archive".into());
+                };
+                let obj = symbols.obj(&it.id, 0);
+                let table = match objects.get(&obj) {
+                    // clone: an `Arc`: the archive's index as the image keeps it
+                    Some(Read::Index(table)) => table.clone(),
+                    // alloc: once per archive searched, kept for the image's life
+                    _ => Arc::new(archive_index(archive)),
+                };
+                // clone: an `Arc`: the image's handle on the index
+                objects.insert(obj, Read::Index(table.clone()));
+                graph.archives.push((input, table));
+            }
+            graph.index();
+            Ok(graph)
+        }
+    }
+}
+
+pub(crate) use wire::reread_input;

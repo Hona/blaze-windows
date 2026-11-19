@@ -1190,6 +1190,146 @@ impl PartialEq for CowBytes {
 
 impl Eq for CowBytes {}
 
+use crate::checkpoint::{Wire, count, put_len};
+use blaze_format::cursor::{Put as _, Reader};
+
+crate::checkpoint::wire_struct!(ListRef { chunk, start, len });
+
+/// A column as its elements: pushed back in order, which lays its chunks out as they were (a
+/// column's chunks are a function of its length).
+impl<T: Chunked + Wire> Wire for CowVec<T> {
+    fn put(&self, out: &mut Vec<u8>) {
+        put_len(out, self.len);
+        for it in self.iter() {
+            it.put(out);
+        }
+    }
+    fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+        let len = count(r, 1)?;
+        if len > LONGEST_COLUMN {
+            // alloc: error path
+            return Err(format!("a column of {len} elements, past the 2^28 one holds"));
+        }
+        let mut out = CowVec::default();
+        for _ in 0..len {
+            out.push(T::take(r)?);
+        }
+        Ok(out)
+    }
+}
+
+/// A list arena as its chunks, each whole (its garbage and its unused slots too), so every
+/// [`ListRef`] into it reads what it read: a chunk's class is its length's.
+impl<T: Chunked + Wire> Wire for CowList<T> {
+    fn put(&self, out: &mut Vec<u8>) {
+        let CowList { chunks, count, fill, open, live, garbage } = self;
+        put_len(out, *count);
+        put_len(out, *fill);
+        open.put(out);
+        put_len(out, *live);
+        put_len(out, *garbage);
+        for at in 0..*count {
+            let items = chunks.get(at).expect("a chunk below the count").items();
+            put_len(out, items.len());
+            for it in items {
+                it.put(out);
+            }
+        }
+    }
+    fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+        let chunks_made = count(r, 8)?;
+        if chunks_made > ENTRIES {
+            // alloc: error path
+            return Err(format!("a list arena of {chunks_made} chunks, past the 2^18 it holds"));
+        }
+        let fill = usize::take(r)?;
+        let open = bool::take(r)?;
+        let live = usize::take(r)?;
+        let garbage = usize::take(r)?;
+        let mut list = CowList::<T>::default();
+        for at in 0..chunks_made {
+            let len = count(r, 1)?;
+            if !CLASSES.contains(&len) {
+                // alloc: error path
+                return Err(format!("a list chunk of {len} elements, which is no chunk class"));
+            }
+            // alloc: one chunk's elements, once per restore, copied into its pool slot
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(T::take(r)?);
+            }
+            *list.chunks.entry_mut(at) = Some(Chunk::new(len, &items, &items[0]));
+        }
+        let last = chunks_made.checked_sub(1).map(|at| list.chunks.get(at).expect("just made").items().len());
+        if fill > last.unwrap_or(0) || (open && last != Some(CHUNK)) {
+            // alloc: error path
+            return Err(format!("a list arena whose last chunk holds {last:?} and is filled to {fill}"));
+        }
+        list.count = chunks_made;
+        list.fill = fill;
+        list.open = open;
+        list.live = live;
+        list.garbage = garbage;
+        Ok(list)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of `the_oracle_catches_a_checkpoint_missing_written_pages`: a region's
+    /// checkpoint leaves out the pages written since its buffer.
+    pub(crate) static PLANT_DROPS_WRITTEN_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A region's bytes as its buffer, then each page written since, whole: the same pages are
+/// written after a restore as before it, so a stage copies and the file's patch writes what it
+/// would have.
+impl Wire for CowBytes {
+    fn put(&self, out: &mut Vec<u8>) {
+        let CowBytes { base, base_len, pages, len } = self;
+        put_len(out, *len);
+        out.put_bytes_u64(&base[..*base_len]);
+        #[cfg(test)]
+        if PLANT_DROPS_WRITTEN_PAGES.get() {
+            put_len(out, 0);
+            return;
+        }
+        let written: Vec<usize> = (0..len.div_ceil(PAGE)).filter(|it| pages.get(*it).is_some()).collect();
+        put_len(out, written.len());
+        for index in written {
+            put_len(out, index);
+            out.put_bytes(&pages.get(index).expect("a written page")[..]);
+        }
+    }
+    fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+        let len = usize::take(r)?;
+        if len > LONGEST_BYTES {
+            // alloc: error path
+            return Err(format!("a region of {len} bytes, past the 4 GiB its page table indexes"));
+        }
+        let base = r.bytes_u64().map_err(String::from)?;
+        if base.len() > len {
+            // alloc: error path
+            return Err(format!("a region of {len} bytes with a buffer of {}", base.len()));
+        }
+        // alloc: the region's buffer, once per restore
+        let mut bytes = CowBytes { base: Arc::new(base.to_vec()), base_len: base.len(), pages: Tree::default(), len };
+        let written = count(r, 8 + PAGE)?;
+        let mut last = None;
+        for _ in 0..written {
+            let index = usize::take(r)?;
+            if index >= len.div_ceil(PAGE) || last.is_some_and(|it| it >= index) {
+                // alloc: error path
+                return Err(format!("page {index} of a region of {len} bytes, out of order or past its end"));
+            }
+            last = Some(index);
+            let page = r.take(PAGE).map_err(String::from)?;
+            *bytes.pages.entry_mut(index) = Some(share::<Bytes, u8, PAGE>(page, &0));
+        }
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

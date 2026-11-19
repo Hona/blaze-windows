@@ -2371,3 +2371,22 @@ mod tests {
         assert_eq!(column.value(syms[0]), Ok(Value::Image(0x1000)), "cells keep the kind");
     }
 }
+
+impl<T: crate::checkpoint::Wire> crate::checkpoint::Wire for Owned<T> {
+    fn put(&self, out: &mut Vec<u8>) {
+        let Owned { items, owners } = self;
+        items.put(out);
+        owners.put(out);
+    }
+    fn take(r: &mut blaze_format::cursor::Reader<'_>) -> Result<Self, String> {
+        let items: Arc<Vec<T>> = crate::checkpoint::Wire::take(r)?;
+        let owners: Arc<Vec<PieceId>> = crate::checkpoint::Wire::take(r)?;
+        if items.len() != owners.len() {
+            // alloc: error path
+            return Err(format!("a writer's list of {} entries and {} owners", items.len(), owners.len()));
+        }
+        Ok(Owned { items, owners })
+    }
+}
+
+crate::checkpoint::wire_struct!(Lists { rebase, binds, got, functions, debug, totals });

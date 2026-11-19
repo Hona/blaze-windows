@@ -869,3 +869,145 @@ fn a_spliced_commit_is_not_synced_and_a_whole_one_is() {
     let file = super::contents(disk.file(TO));
     assert_eq!(image.digest().unwrap(), Digest::of(&file).root(), "the digest follows a rollback");
 }
+
+/// A restore with no native inputs to hand back: the model's images have none.
+fn no_natives(id: ContentId, name: &str) -> Result<std::sync::Arc<[u8]>, String> {
+    Err(format!("the model links no native input, and the checkpoint names {name} ({id:?})"))
+}
+
+impl Kept {
+    /// The daemon stopped and started again: the image is its checkpoint restored, the file,
+    /// the build and the digest held as a caller's store holds them.
+    fn restart(&mut self) -> Result<(), String> {
+        let checkpoint = self.image.checkpoint().map_err(|it| format!("the checkpoint: {it}"))?;
+        self.image = Image::restore(name(TO), output(true), &checkpoint, &mut no_natives)
+            .map_err(|it| format!("the restore: {it}"))?;
+        Ok(())
+    }
+}
+
+/// `ops` applied one by one to two kept images of one program, one of them restarted (its
+/// checkpoint restored) after step `restart`: `Err` naming the first step whose patch differs
+/// between the two, in any byte or in the file it is of, or after which the restarted one's
+/// file is not as a fresh link of the program.
+fn restored_is_uninterrupted(ops: &[Op], restart: usize) -> Result<(), String> {
+    let mut program = Program::start();
+    let (mut kept, mut restarted) = (Kept::new(), Kept::new());
+    kept.link(&program, Plant::None)?;
+    restarted.link(&program, Plant::None)?;
+    if restart == 0 {
+        restarted.restart()?;
+    }
+    for (step, op) in ops.iter().enumerate() {
+        let next = op.apply(&program);
+        if next == program {
+            continue;
+        }
+        let said = |why: String| format!("after step {step} ({op:?}), restarted after {restart}: {why}");
+        let want = kept.link(&next, Plant::None).map_err(said)?;
+        let got = restarted.link(&next, Plant::None).map_err(said)?;
+        // The same file from the same file, patched: the writes may differ only where a
+        // restored writer builds a table whole that the kept one patched (the same bytes).
+        let same = (got.full, got.base, got.digest, got.len, got.generation)
+            == (want.full, want.base, want.digest, want.len, want.generation);
+        if !same || got.full {
+            return Err(said(format!(
+                "the restored image's patch is not the kept one's: {} bytes in {} writes (full {}, generation {}) where \
+                 the kept one's is {} in {} (full {}, generation {}), digests equal: {}",
+                got.written(),
+                got.writes.len(),
+                got.full,
+                got.generation,
+                want.written(),
+                want.writes.len(),
+                want.full,
+                want.generation,
+                got.digest == want.digest,
+            )));
+        }
+        program = next;
+        as_fresh(&restarted.file, &program).map_err(said)?;
+        if step + 1 == restart {
+            restarted.restart().map_err(said)?;
+        }
+    }
+    Ok(())
+}
+
+/// The refinement across a restart: an image restored from its checkpoint after any sequence
+/// of edits takes every later edit as the image kept in memory takes it, byte for byte: the
+/// same patch of the same file, never laid out whole, and the file behaves as a fresh link.
+#[test]
+fn a_restored_image_patches_as_the_kept_one() {
+    blaze_sim::check(Config::cases(48), |tape| {
+        let ops: Vec<Op> = tape.vec(0..=8, "ops", op);
+        let restart = tape.int_in(0..=ops.len(), "restart after");
+        if let Err(why) = restored_is_uninterrupted(&ops, restart) {
+            panic!("{why}");
+        }
+    })
+}
+
+/// The directed case: a restart after the image was patched, then one more edit of each kind.
+#[test]
+fn a_restart_after_patches_then_each_kind_of_edit_matches_the_kept_image() {
+    let ops = [
+        Op::Edit(1, 2),
+        Op::Add(2),
+        Op::Calls(0, 0b110),
+        Op::Size(1, 200),
+        Op::Frame(2),
+        Op::Reads(1, Some(0)),
+        Op::Value(0, 7),
+        Op::Remove(2),
+        Op::Edit(1, 3),
+    ];
+    restored_is_uninterrupted(&ops, 4).unwrap();
+}
+
+/// The planted bug: a checkpoint that leaves out the pages its regions wrote since their full
+/// link restores to a state whose file is another, and the restore says so instead of patching.
+#[test]
+fn the_oracle_catches_a_checkpoint_missing_written_pages() {
+    let program = Program::start();
+    let mut kept = Kept::new();
+    kept.link(&program, Plant::None).unwrap();
+    kept.link(&Op::Edit(1, 2).apply(&program), Plant::None).unwrap();
+    crate::cow::PLANT_DROPS_WRITTEN_PAGES.set(true);
+    let checkpoint = kept.image.checkpoint();
+    crate::cow::PLANT_DROPS_WRITTEN_PAGES.set(false);
+    let error = Image::restore(name(TO), output(true), &checkpoint.unwrap(), &mut no_natives)
+        .err()
+        .expect("a checkpoint missing written pages restores to another file");
+    assert!(error.what.contains("another digest"), "{error}");
+}
+
+/// A record of another layout, a torn one (cut anywhere) and one with bytes after it are each
+/// refused, never restored.
+#[test]
+fn a_checkpoint_of_another_layout_torn_or_overlong_is_refused() {
+    let program = Program::start();
+    let mut kept = Kept::new();
+    kept.link(&program, Plant::None).unwrap();
+    kept.link(&Op::Add(3).apply(&program), Plant::None).unwrap();
+    let checkpoint = kept.image.checkpoint().unwrap();
+    let restore = |bytes: &[u8]| Image::restore(name(TO), output(true), bytes, &mut no_natives);
+    restore(&checkpoint).unwrap();
+    let mut other = checkpoint.clone();
+    other[7] = b'0';
+    assert!(restore(&other).err().unwrap().what.contains("not a checkpoint of this layout"));
+    let step = (checkpoint.len() / 64).max(1);
+    for cut in (0..checkpoint.len()).step_by(step) {
+        assert!(restore(&checkpoint[..cut]).is_err(), "restored a checkpoint cut at {cut}");
+    }
+    let mut longer = checkpoint;
+    longer.push(0);
+    assert!(restore(&longer).is_err(), "restored a checkpoint with a byte after it");
+}
+
+/// What no checkpoint holds is refused by name: an image never linked.
+#[test]
+fn an_image_never_linked_has_no_checkpoint() {
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    assert!(image.checkpoint().err().unwrap().what.contains("not laid out"));
+}

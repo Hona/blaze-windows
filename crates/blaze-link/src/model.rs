@@ -1693,6 +1693,214 @@ fn exec_log(output: &Output) -> Result<(), &'static str> {
     Ok(())
 }
 
+mod wire {
+    use blaze_format::cursor::{Put as _, Reader};
+
+    use super::*;
+    use crate::checkpoint::{Wire, wire_enum, wire_struct};
+
+    impl Wire for Sym {
+        fn put(&self, out: &mut Vec<u8>) {
+            out.put_u32(self.0);
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(Sym(r.u32().map_err(String::from)?))
+        }
+    }
+
+    /// As its text: a restored name is a shared one, which compares, hashes and orders as the
+    /// literal it was.
+    impl Wire for SectionName {
+        fn put(&self, out: &mut Vec<u8>) {
+            out.put_bytes_u64(self.as_str().as_bytes());
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(SectionName::new(r.str_u64().map_err(String::from)?))
+        }
+    }
+
+    wire_enum!(Reserve { 0 => Arena, 1 => Cells, 2 => Fixed });
+
+    wire_enum!(Class {
+        0 => Text,
+        1 => Patch,
+        2 => Stubs,
+        3 => Plt,
+        4 => Rodata,
+        5 => RelRo,
+        6 => EhFrame,
+        7 => Data,
+        8 => Table,
+        9 => Got,
+        10 => InitArray,
+        11 => FiniArray,
+        12 => PreinitArray,
+        13 => Reserve(reserve),
+        14 => PatchData,
+        15 => Named { name, write, exec },
+        16 => ThreadVars,
+        17 => Tdata,
+        18 => Tbss,
+        19 => Bss,
+        20 => Synthetic(name),
+    });
+
+    wire_struct!(Prot { read, write, exec });
+    wire_struct!(Region { class, addr, capacity, size, prot, align });
+    wire_struct!(Tls { addr, init, size, align });
+
+    wire_enum!(TlsDescStep { 0 => Page, 1 => Load, 2 => Add, 3 => Call });
+
+    wire_enum!(Apply {
+        0 => Abs64,
+        1 => Abs32,
+        2 => Abs32S,
+        3 => Rel64,
+        4 => Rel32,
+        5 => Delta64,
+        6 => Delta32,
+        7 => ImageRel32,
+        8 => SecRel32,
+        9 => Section16,
+        10 => X86Branch32,
+        11 => X86GotPcRel32,
+        12 => X86TpOff32,
+        13 => X86GotTpOff32,
+        14 => X86TlsGd32,
+        15 => DtpOff32,
+        16 => DtpOff64,
+        17 => A64Call26,
+        18 => A64Jump26,
+        19 => A64Page21,
+        20 => A64Adr21,
+        21 => A64Lo12 { shift },
+        22 => A64CondBr19,
+        23 => A64TstBr14,
+        24 => A64MovW { group },
+        25 => A64GotPage21,
+        26 => A64GotLo12,
+        27 => GotRel32,
+        28 => A64TpHi12,
+        29 => A64TpLo12,
+        30 => A64TlsIePage21,
+        31 => A64TlsIeLo12,
+        32 => A64TlsDescPage21,
+        33 => A64TlsDescLo12,
+        34 => A64TlsDescAdd12,
+        35 => A64TlsDescCall,
+        36 => A64TlsDescIe(step),
+        37 => A64TlsDescLe(step),
+        38 => TlvPage21,
+        39 => TlvLo12,
+        40 => TlvRel32,
+        41 => TlsOffset,
+        42 => TpOff64,
+        43 => Native(kind),
+    });
+
+    wire_struct!(Fixup { at, apply, target, addend, minus });
+
+    wire_enum!(SymbolKind { 0 => Function, 1 => Data, 2 => Tls, 3 => Section, 4 => Other });
+
+    wire_struct!(Export { name, addr, size, kind, weak });
+    wire_struct!(Exported { name, symbol, data, weak, own });
+    wire_struct!(Library { name, as_needed });
+    wire_struct!(Bind { addr, import, addend });
+    wire_struct!(WindowsUnwind { info, handler, lsda });
+    wire_struct!(Function { addr, size, fde, windows, name });
+    wire_struct!(GotEntry { addr, holds });
+
+    wire_enum!(Holds {
+        0 => Local(addr),
+        1 => Import(import),
+        2 => TpOff(offset),
+        3 => ImportTpOff(import),
+        4 => TlsGd { import, offset },
+        5 => TlsDesc { import, offset },
+    });
+
+    /// A wasm import is never checkpointed (a wasm module is written whole by every link, so
+    /// [`crate::Image::checkpoint`] refuses one): its presence is a refusal of the restore.
+    impl Wire for Import {
+        fn put(&self, out: &mut Vec<u8>) {
+            let Import { name, library, version, kind, weak, wasm } = self;
+            name.put(out);
+            library.put(out);
+            version.put(out);
+            kind.put(out);
+            weak.put(out);
+            out.put_u8(u8::from(wasm.is_some()));
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            let it = Import {
+                name: Wire::take(r)?,
+                library: Wire::take(r)?,
+                version: Wire::take(r)?,
+                kind: Wire::take(r)?,
+                weak: Wire::take(r)?,
+                wasm: None,
+            };
+            match r.u8().map_err(String::from)? {
+                0 => Ok(it),
+                _ => Err("a wasm import, which no checkpoint holds".into()),
+            }
+        }
+    }
+
+    /// Every special but [`Special::Placed`], whose function the image's writer gives by the
+    /// name of the symbol it defines (`State::put_checkpoint` writes it so).
+    impl Wire for Special {
+        fn put(&self, out: &mut Vec<u8>) {
+            match self {
+                Special::ImageBase => out.put_u8(0),
+                Special::Start(class) => {
+                    out.put_u8(1);
+                    class.put(out);
+                }
+                Special::Stop(class) => {
+                    out.put_u8(2);
+                    class.put(out);
+                }
+                Special::Section { name, end } => {
+                    out.put_u8(3);
+                    name.put(out);
+                    end.put(out);
+                }
+                Special::WeakSection { name, end } => {
+                    out.put_u8(4);
+                    name.put(out);
+                    end.put(out);
+                }
+                Special::Placed(_) => out.put_u8(5),
+                Special::Absolute(value) => {
+                    out.put_u8(6);
+                    value.put(out);
+                }
+                Special::LiveDescriptor => out.put_u8(7),
+                Special::Got { from } => {
+                    out.put_u8(8);
+                    from.put(out);
+                }
+            }
+        }
+        fn take(r: &mut Reader<'_>) -> Result<Self, String> {
+            Ok(match r.u8().map_err(String::from)? {
+                0 => Special::ImageBase,
+                1 => Special::Start(Wire::take(r)?),
+                2 => Special::Stop(Wire::take(r)?),
+                3 => Special::Section { name: Wire::take(r)?, end: Wire::take(r)? },
+                4 => Special::WeakSection { name: Wire::take(r)?, end: Wire::take(r)? },
+                5 => return Err("a placed special read without its writer".into()),
+                6 => Special::Absolute(Wire::take(r)?),
+                7 => Special::LiveDescriptor,
+                8 => Special::Got { from: Wire::take(r)? },
+                // alloc: error path
+                other => return Err(format!("a special of tag {other}")),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
